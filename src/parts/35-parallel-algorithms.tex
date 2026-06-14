@@ -1,0 +1,1035 @@
+\chapter{Parallel and Multithreaded Algorithms}
+
+Every algorithm you have studied so far has lived a lonely life. It does one thing
+at a time. Step follows step follows step, a single thread of attention crawling
+through the work like a single reader going through a book line by line. That
+picture matched the machines of the last century, where one processor did one
+operation per tick. But the machine on your desk right now is not like that. It
+has many cores --- maybe four, maybe sixteen, maybe more --- and each of them can
+be doing useful work at the very same instant. A phone has them. A laptop has
+them. A data center has hundreds of thousands of them. If your algorithm insists
+on doing one thing at a time, all but one of those cores sit idle, sipping
+electricity and accomplishing nothing.
+
+This chapter is about teaching algorithms to use many hands at once. The good
+news is that you already know the most important idea. Divide-and-conquer
+\emph{naturally} produces independent subproblems --- ``sort the left half'' and
+``sort the right half'' have nothing to say to each other until the very end ---
+and independent work is exactly the kind of work that can be done in parallel. So
+much of what follows is the divide-and-conquer you already love, now allowed to
+run its branches side by side.
+
+The harder news is that parallelism comes with a new bookkeeping problem. When
+work happens at the same time, ``how long does this take?'' splits into two
+different questions, and we will need two different cost measures to answer them.
+Learning to think with both numbers at once is the real content of this chapter.
+
+\begin{focusbox}
+By the end of this chapter you should be able to: (1) describe an algorithm in
+the \emph{fork-join} model using \textbf{spawn}, \textbf{sync}, and
+\textbf{parallel for}; (2) compute its \emph{work} $T_1$ and its \emph{span}
+$T_\infty$, and read off its \emph{parallelism} $T_1/T_\infty$; (3) bound how
+fast it runs on $P$ processors using the work and span laws and Brent's theorem;
+(4) parallelize loops, matrix multiplication, and merge sort, and analyze each by
+solving a recurrence; and (5) avoid the classic traps --- counting work as if it
+were time, and forgetting that a \emph{race} can silently corrupt your answer.
+\end{focusbox}
+
+\section{Two ways for work to happen at once}
+
+Before any algorithm, fix the picture in your head. There are two flavors of
+``doing things at the same time,'' and confusing them causes endless grief.
+
+\begin{intuitionbox}
+\textbf{Parallelism} is many workers doing the \emph{same job faster} by
+splitting it up. Ten people painting one fence finish in a tenth of the time.
+This chapter is about parallelism: we have a result to compute, and we want it
+sooner by spreading the work across processors.
+
+\textbf{Concurrency} is many independent activities that happen to be alive at
+once --- a download, a clock, a spell-checker --- coordinated so they do not step
+on each other. Concurrency is about \emph{managing} simultaneity; parallelism is
+about \emph{exploiting} it for speed. They share machinery, but their goals
+differ.
+\end{intuitionbox}
+
+We will also make a clean simplifying assumption, the one CLRS makes, that keeps
+the analysis honest and beautiful: we imagine a friendly scheduler that we never
+have to program. We describe \emph{what may run in parallel}, and an unseen
+runtime system decides \emph{which core runs what, and when}. This separation is a
+gift. It lets us reason about an algorithm's potential speed without drowning in
+the details of any particular machine.
+
+\begin{historybox}
+This material is CLRS (4th edition) Chapter~26, ``Parallel Algorithms.'' The
+fork-join / work-span model presented there grew out of the \emph{Cilk} project at
+MIT in the 1990s (Blumofe, Leiserson, and others), whose runtime first made
+\textbf{spawn} and \textbf{sync} both practical and provably efficient. The
+work--span style of analysis traces back further, to the \emph{circuit} model of
+parallel computation and to Richard Brent's 1974 theorem, which we meet at the end
+of this chapter. If you continue to CLRS, you will find the same notation
+($T_1$, $T_\infty$, parallelism) used there, so the vocabulary you build here
+transfers directly.
+\end{historybox}
+
+\section{The fork-join model}
+
+We need a way to \emph{write down} an algorithm that says ``these two pieces may
+run at the same time.'' We use three keywords. They are deliberately few.
+
+\begin{focusbox}
+\textbf{spawn} --- placed before a procedure call, it says: ``you \emph{may} run
+this call in parallel with the statements that come after it.'' The caller does
+\emph{not} wait; it keeps going. (It is permission, not a command --- the
+scheduler is free to run it serially if no core is free.)
+
+\textbf{sync} --- ``wait here until every call I have spawned so far has
+finished.'' This is the join. After a sync, all the spawned results are safely
+available.
+
+\textbf{parallel for} --- a loop whose iterations may all run at the same time
+because they do not depend on one another.
+\end{focusbox}
+
+The name \emph{fork-join} is the shape these make. At a \textbf{spawn} the thread
+of control \emph{forks} into two strands; at a \textbf{sync} the strands
+\emph{join} back into one. Crucially there is an implicit sync at the end of every
+procedure: a procedure never returns until all the work it spawned has completed.
+That single rule keeps the model sane --- you can never accidentally use a result
+before the worker that produced it is done.
+
+Here is the canonical first example, computed two ways. Recall the Fibonacci
+numbers $F_0=0$, $F_1=1$, $F_n=F_{n-1}+F_{n-2}$. The doubly-recursive program
+below is a \emph{terrible} way to compute Fibonacci (it does exponential work),
+but it is the perfect specimen for studying parallel structure, because its two
+recursive calls are independent.
+
+\begin{algorithm}[H]
+\caption{\textsc{P-Fib}$(n)$}
+\KwIn{A nonnegative integer $n$.}
+\KwOut{The $n$th Fibonacci number $F_n$.}
+\If{$n \le 1$}{\Return $n$}
+$x \gets$ \textbf{spawn} \textsc{P-Fib}$(n-1)$\tcp*{may run in parallel}
+$y \gets$ \textsc{P-Fib}$(n-2)$\tcp*{the caller does this meanwhile}
+\textbf{sync}\tcp*{wait for the spawned call}
+\Return $x + y$\;
+\end{algorithm}
+
+Read it slowly. We \textbf{spawn} the computation of $F_{n-1}$ and store its
+eventual result in $x$. We do \emph{not} wait. The caller immediately marches on
+and computes $F_{n-2}$ into $y$ itself. Only at the \textbf{sync} do we pause to
+let the spawned strand catch up. After the sync, both $x$ and $y$ hold genuine
+values, and we may add them. If we forgot the sync, we might read $x$ before it
+was written --- a bug we will name and dread shortly.
+
+\begin{trapbox}
+\textbf{spawn does not mean ``start a thread now and run it.''} It means ``it is
+\emph{permitted} to run this in parallel.'' On a one-core machine, or when every
+core is busy, the scheduler may simply run the spawned call serially, exactly as
+an ordinary call. This is why a correct fork-join program must produce the same
+answer whether or not anything actually runs in parallel. If your answer depends
+on parallelism happening, you have written a bug, not an algorithm.
+\end{trapbox}
+
+\subsection{The computation as a graph}
+
+The cleanest way to think about a fork-join computation is as a directed graph
+that the execution traces out. Each vertex is a \emph{strand}: a maximal run of
+instructions with no spawn, sync, or return in the middle. An edge $u \to v$ means
+``$u$ must finish before $v$ may begin.'' A spawn creates a vertex with two
+out-edges (the spawned strand and the continuation); a sync creates a vertex with
+several in-edges that all must arrive before it fires. Because work cannot depend
+on itself, this graph is a \emph{directed acyclic graph} (a DAG);
+Figure~\ref{ch35:fork-join-dag} shows the smallest interesting one.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+  >=Stealth, node distance=10mm,
+  strand/.style={circle,draw=sourceblue,fill=blue!8,minimum size=6mm,inner sep=0pt,font=\small},
+]
+\node[strand] (a) {$a$};
+\node[strand,below left=8mm and 12mm of a] (b) {$b$};
+\node[strand,below right=8mm and 12mm of a] (c) {$c$};
+\node[strand,below=20mm of a] (d) {$d$};
+\draw[->,thick] (a) -- node[above left,font=\scriptsize] {spawn} (b);
+\draw[->,thick] (a) -- node[above right,font=\scriptsize] {continue} (c);
+\draw[->,thick] (b) -- (d);
+\draw[->,thick] (c) -- node[right,font=\scriptsize] {sync} (d);
+\node[align=center,font=\scriptsize,below=2mm of d] {join};
+\end{tikzpicture}
+\caption{One spawn-and-sync as a DAG. Strand $a$ forks into the spawned strand
+$b$ and the continuation $c$; both must finish before the join strand $d$ may
+run. The graph encodes \emph{dependencies}, not a schedule.}
+\label{ch35:fork-join-dag}
+\end{figure}
+
+This graph is the object we measure. Everything in the analysis below is a
+statement about it. Two numbers describe it completely for our purposes, and we
+turn to them now.
+
+\section{Work and span: the two numbers that matter}
+
+Here is the heart of the chapter. There are exactly two questions you can ask
+about a parallel computation that do not depend on the messy details of a real
+machine, and each gives a number.
+
+\begin{intuitionbox}
+\textbf{Work} $T_1$: how much \emph{total} computation is there? Equivalently,
+how long would it take on \emph{one} processor, which must do every strand
+one after another. It is the sum of the running times of all the strands --- the
+total area of the job, ignoring that some of it could overlap.
+
+\textbf{Span} $T_\infty$: how long is the \emph{longest chain of dependencies}?
+Equivalently, how long would it take on \emph{infinitely many} processors, where
+the only thing that can ever slow you down is waiting for something that genuinely
+had to happen first. It is the length of the longest path through the DAG --- the
+``critical path.''
+\end{intuitionbox}
+
+The subscripts are a memory aid: $T_1$ is the time on $1$ processor, and
+$T_\infty$ is the time on $\infty$ processors. The work is the \emph{area}; the
+span is the \emph{depth}. Hold both pictures: a wide, shallow computation has lots
+of work but a short span (very parallelizable); a tall, skinny one has a long span
+no matter how many processors you throw at it.
+
+\begin{walkbox}
+Picture a relay race versus a choir. In a relay, runner two cannot start until
+runner one finishes: the work (total distance) equals the span (longest chain), so
+extra runners standing around do not help --- the dependencies are a single line.
+In a choir, a hundred singers all sing at once: the work is a hundred voice-parts,
+but the span is just the length of \emph{one} song. As you walk, classify
+everyday tasks as ``relay-shaped'' or ``choir-shaped.'' Which kind benefits from
+more hands? That intuition \emph{is} the work--span distinction.
+\end{walkbox}
+
+\subsection{The two laws}
+
+These two numbers immediately bound the running time on a real machine with $P$
+processors, which we write $T_P$. Two laws, both obvious once stated.
+
+\begin{formalbox}
+\textbf{The work law.} $P$ processors can do at most $P$ units of work per time
+step, so to finish $T_1$ work takes at least $T_1/P$ steps:
+$$T_P \ge \frac{T_1}{P}.$$
+\textbf{The span law.} Adding processors can never make you faster than the
+critical path, which must be walked one strand after another no matter what:
+$$T_P \ge T_\infty.$$
+\end{formalbox}
+
+Read the work law as ``you cannot finish faster than sharing the total work
+perfectly,'' and the span law as ``you cannot finish faster than the longest
+unavoidable wait.'' The actual time $T_P$ is squeezed from below by both. A good
+parallel algorithm is one where these two lower bounds are also roughly
+achievable --- which is exactly what Brent's theorem, coming up, will promise.
+
+\subsection{Speedup and parallelism}
+
+Now we can finally define what we have been after.
+
+\begin{definition}[Speedup and parallelism]\label{ch35:def-speedup}
+The \emph{speedup} of a computation on $P$ processors is the ratio
+$T_1 / T_P$ --- how many times faster the $P$-processor run is than the serial
+run. The \emph{parallelism} of the computation is
+$$\frac{T_1}{T_\infty},$$
+the work divided by the span. It is a single number attached to the algorithm
+itself, with no $P$ in it.
+\end{definition}
+
+By the work law, $T_1/T_P \le P$: with $P$ processors you can never go more than
+$P$ times faster. When the speedup equals $P$ we call it \emph{perfect} (or
+\emph{linear}) speedup. By the span law, $T_1/T_P \le T_1/T_\infty$: the speedup
+can never exceed the parallelism, no matter how many processors you buy. So
+parallelism is a ceiling. If an algorithm has parallelism $1000$, then putting
+more than about $1000$ processors on it is pouring water into a full glass --- the
+extra cores cannot help, because there is not enough independent work to feed
+them. We say a computation has \emph{slack} when $P \ll T_1/T_\infty$, meaning
+there is comfortably more parallelism available than processors to use it, and in
+that happy regime good schedulers achieve near-perfect speedup.
+
+\begin{focusbox}
+Three slogans to carry forever:
+\begin{itemize}
+\item \textbf{Work} is total area; you minimize it to avoid \emph{wasting}
+computation.
+\item \textbf{Span} is critical-path depth; you minimize it to avoid
+\emph{serializing} computation.
+\item \textbf{Parallelism} $=$ work $/$ span is the most processors you can ever
+usefully employ.
+\end{itemize}
+The art is keeping work low (so you are not slower than the serial program) while
+\emph{also} keeping span low (so the parallelism is high). These two goals can
+fight, and resolving the fight is what algorithm design in this chapter is about.
+\end{focusbox}
+
+\subsection{Worked example: the work and span of \textsc{P-Fib}}
+
+Let us actually compute the two numbers for \textsc{P-Fib}$(n)$. Spawn, sync, and
+the bookkeeping cost only constant time, so the recurrences look just like the
+serial ones --- except that \emph{span} gets to take the longer of the two
+recursive branches instead of their sum, because those branches run in parallel.
+
+\textbf{Work} $T_1(n)$. On one processor, spawn is just an ordinary call, so the
+work is exactly the serial running time of double-recursive Fibonacci:
+$$T_1(n) = T_1(n-1) + T_1(n-2) + \Th(1).$$
+This is the Fibonacci recurrence itself (plus constants), so $T_1(n) =
+\Th(F_n) = \Th(\phi^n)$ where $\phi = (1+\sqrt5)/2 \approx 1.618$. The work is
+exponential. (Again: this is a bad way to compute Fibonacci; we are using it only
+to study structure.)
+
+\textbf{Span} $T_\infty(n)$. The two recursive calls run \emph{in parallel}, so
+the critical path goes through whichever one is longer, not through their sum.
+Since $T_\infty(n-1) \ge T_\infty(n-2)$, the longer branch is the $(n-1)$ one:
+$$T_\infty(n) = \max\big(T_\infty(n-1),\, T_\infty(n-2)\big) + \Th(1)
+= T_\infty(n-1) + \Th(1) = \Th(n).$$
+So the span is merely \emph{linear}. The critical path is the chain $n \to n-1 \to
+n-2 \to \cdots \to 1$, one step per level.
+
+\textbf{Parallelism.}
+$$\frac{T_1(n)}{T_\infty(n)} = \frac{\Th(\phi^n)}{\Th(n)} = \Th\!\left(\frac{\phi^n}{n}\right).$$
+This grows enormously with $n$. For $n=30$ it is already in the millions. There is
+a vast amount of independent work here --- which is the silver lining of all that
+wasteful recomputation. The lesson is sharp: high parallelism and low total work
+are \emph{different} virtues, and an algorithm can have one without the other.
+
+\begin{labbox}
+Trace \textsc{P-Fib}$(4)$ by hand and build its DAG. The call $P(4)$ spawns
+$P(3)$ and runs $P(2)$; $P(3)$ spawns $P(2)$ and runs $P(1)$; each $P(2)$ spawns
+$P(1)$ and runs $P(0)$. Count the calls (that is your work, up to constants):
+the number of calls is $2F_{n+1}-1$, which for $n=4$ is $2\cdot 5 - 1 = 9$ calls.
+Now find the longest dependency chain from the top call down to a leaf and back up
+through the adds: it has length proportional to $n=4$, not to $9$. Seeing ``$9$
+calls but a depth-$4$ critical path'' in front of you (Figure~\ref{ch35:pfib-tree})
+makes the work--span gap concrete in a way no formula can.
+\end{labbox}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+  >=Stealth, level distance=12mm, sibling distance=17mm,
+  every node/.style={circle,draw=sourceblue,fill=blue!8,inner sep=1pt,
+    minimum size=7mm,font=\scriptsize},
+  edge from parent/.style={draw,->,gray}
+]
+\node {$P4$}
+  child {node {$P3$}
+    child {node {$P2$}
+      child {node {$P1$}}
+      child {node {$P0$}}}
+    child {node {$P1$}}}
+  child {node {$P2$}
+    child {node {$P1$}}
+    child {node {$P0$}}};
+\end{tikzpicture}
+\caption{The call tree of \textsc{P-Fib}$(4)$: $9$ calls in all (that is the
+work, up to constants), but the longest root-to-leaf chain
+$P4 \to P3 \to P2 \to P1$ has only $4$ nodes. The critical path runs down this
+spine of left-most (largest-argument) children and back up through the additions,
+so the span is $\Th(n)$ while the work is $\Th(\phi^n)$.}
+\label{ch35:pfib-tree}
+\end{figure}
+
+\section{Scheduling: turning the two numbers into a real running time}
+
+We have lower bounds ($T_P \ge T_1/P$ and $T_P \ge T_\infty$). But can we
+\emph{achieve} something close to them on a real machine, with a real scheduler
+that does not know the future? Remarkably, yes --- and a simple greedy rule is
+enough.
+
+\begin{definition}[Greedy scheduler]\label{ch35:def-greedy}
+A \emph{greedy} scheduler, at every time step, assigns as many ready strands to
+processors as it can. A step is \emph{complete} if all $P$ processors are kept
+busy; it is \emph{incomplete} if fewer than $P$ ready strands exist and some
+processors idle. Greedy simply never leaves a processor idle when there is ready
+work for it.
+\end{definition}
+
+\begin{theorem}[Greedy scheduling bound]\label{ch35:thm-greedy}
+On $P$ processors, a greedy scheduler runs any computation with work $T_1$ and
+span $T_\infty$ in time
+$$T_P \le \frac{T_1}{P} + T_\infty.$$
+\end{theorem}
+
+\begin{intuitionbox}
+Why is this true? Classify each time step as \emph{complete} (all $P$ processors
+busy) or \emph{incomplete} (some idle). There cannot be many complete steps,
+because each one chews through $P$ units of work and there are only $T_1$ units
+total --- so at most $T_1/P$ complete steps. There cannot be many incomplete
+steps either: every incomplete step must make progress along the critical path
+(it ran every ready strand, so the next strand on the longest remaining path
+became ready), and the critical path has only $T_\infty$ strands --- so at most
+$T_\infty$ incomplete steps. Add the two buckets: total steps
+$\le T_1/P + T_\infty$.
+\end{intuitionbox}
+
+\begin{formalbox}
+\textbf{Proof sketch.} Count complete steps. Each uses $P$ work, and total work is
+$T_1$, so there are at most $\floor{T_1/P}$ of them. Count incomplete steps.
+Consider the subgraph of strands not yet executed; its longest path starts with a
+ready strand. On an incomplete step the scheduler runs \emph{all} ready strands
+(there were fewer than $P$), so in particular it runs the first strand of that
+longest path, shortening the remaining critical path by one. The remaining
+critical path starts at length $T_\infty$ and cannot drop below $0$, so there are
+at most $T_\infty$ incomplete steps. Every step is one or the other, giving
+$T_P \le T_1/P + T_\infty$. $\qquad\blacksquare$
+\end{formalbox}
+
+This bound, in this clean form, is essentially Graham's and Brent's, and it is the
+workhorse of the whole chapter. Read it as: \emph{greedy gets you the work term
+plus the span term, and never worse.} Compare it to the lower bound
+$T_P \ge \max(T_1/P,\, T_\infty)$. The upper and lower bounds differ by at most a
+factor of $2$, so greedy is always within a factor of $2$ of optimal. We can do
+even better when there is slack.
+
+\begin{corollary}[Near-perfect speedup with slack]\label{ch35:cor-slack}
+If $P \ll T_1/T_\infty$ (the parallelism comfortably exceeds the processor count),
+then $T_\infty \ll T_1/P$, so the span term in
+Theorem~\ref{ch35:thm-greedy} is negligible and
+$$T_P \approx \frac{T_1}{P}, \qquad \text{speedup } \frac{T_1}{T_P} \approx P.$$
+That is, when there is plenty of slack, a greedy scheduler delivers near-perfect
+linear speedup.
+\end{corollary}
+
+\begin{aestheticbox}
+This is why the work--span model is the model real systems use. A programmer
+writing in Cilk, Intel TBB, Java's fork-join framework, OpenMP tasks, or Rust's
+Rayon does \emph{not} schedule threads by hand. They express the spawn/sync
+structure and let a provably-good greedy (work-stealing) scheduler do the rest.
+The two numbers you compute on paper --- work and span --- are exactly the two
+numbers that predict how the program will scale when the hardware team doubles the
+core count next year. You are not doing abstract math; you are computing the
+slope of a performance graph.
+\end{aestheticbox}
+
+\section{Analyzing parallel loops}
+
+Most real parallel code is not double recursion; it is loops. A \textbf{parallel
+for} declares that all iterations are independent and may run at once. But ``run
+all $n$ at once'' is a lie on real hardware, and even in the model it hides a cost
+we must account for. The trick is that the runtime does not literally fork $n$
+strands in one step; it forks them with a \emph{recursive binary splitting} of the
+index range, like a balanced tournament bracket. Understanding that hidden tree is
+the whole game.
+
+Consider the simplest possible parallel loop: add two vectors,
+$C[i] \gets A[i] + B[i]$ for $i = 1 \ldots n$.
+
+\begin{algorithm}[H]
+\caption{\textsc{Vector-Add}$(A, B, C, n)$}
+\KwIn{Arrays $A$, $B$ of length $n$ and an output array $C$.}
+\KwOut{$C[i] = A[i]+B[i]$ for all $i$.}
+\textbf{parallel for} $i \gets 1$ \textbf{to} $n$\;
+\Indp $C[i] \gets A[i] + B[i]$\;
+\Indm
+\end{algorithm}
+
+\textbf{Work.} There are $n$ iterations, each doing $\Th(1)$ work, plus the
+overhead of the splitting tree. The splitting tree that forks $n$ iterations has
+$\Th(n)$ leaves and hence $\Th(n)$ internal nodes, so the bookkeeping is also
+$\Th(n)$. Total work $T_1(n) = \Th(n)$. Good --- the same as the serial loop.
+
+\textbf{Span.} Here is the subtlety. If the loop body has span $\Th(1)$, the span
+of the whole loop is \emph{not} $\Th(1)$. To reach $n$ independent iterations the
+runtime must spawn them through a balanced binary tree of depth $\Th(\log n)$
+(Figure~\ref{ch35:loop-tree}). You
+walk \emph{down} the tree (forking) and back \emph{up} (joining), so
+$$T_\infty(n) = \Th(\log n) + \Th(1) = \Th(\log n).$$
+The $\log n$ is the unavoidable price of distributing the work; the trailing
+$\Th(1)$ is the body. If the body itself had span $s$, the loop's span would be
+$\Th(\log n) + s$.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+  >=Stealth, level distance=11mm, sibling distance=20mm,
+  every node/.style={draw=quotientorange,fill=orange!8,circle,inner sep=1pt,minimum size=5mm,font=\scriptsize},
+  edge from parent/.style={draw,->,thick}
+]
+\node {1--8}
+  child {node {1--4}
+    child {node {1--2}}
+    child {node {3--4}}}
+  child {node {5--8}
+    child {node {5--6}}
+    child {node {7--8}}};
+\end{tikzpicture}
+\caption{How a \textbf{parallel for} over $8$ iterations is really executed: a
+balanced splitting tree (shown two levels deep) of depth $\Th(\log n)$. The leaves
+are the iterations. Walking down and back up this tree is why the span carries a
+$\log n$, even when each iteration is $\Th(1)$.}
+\label{ch35:loop-tree}
+\end{figure}
+
+\textbf{Parallelism.} $T_1/T_\infty = \Th(n)/\Th(\log n) = \Th(n/\log n)$. Huge.
+For a million-element vector that is on the order of $50{,}000$ --- you would need
+fifty thousand processors before the parallelism ran dry. Parallel loops over big
+arrays are about as good as parallelism gets.
+
+\begin{trapbox}
+Do not write $T_\infty = \Th(1)$ for a parallel loop just because each iteration
+is constant time. The \emph{logarithmic} cost of forking the iterations is real
+and shows up in the span every single time. Forgetting it is the most common
+mistake in span analysis. The rule of thumb: \emph{a parallel for adds $\log
+(\text{number of iterations})$ to the span.}
+\end{trapbox}
+
+\begin{walkbox}
+Why a \emph{tree} and not a single fork into $n$? Imagine one strand trying to
+spawn a million iterations by itself, one spawn at a time. That spawning loop is
+serial --- it takes a million steps just to hand out the work, so the span would be
+$\Th(n)$ and the parallelism would collapse to $\Th(1)$. The balanced tree lets
+the spawning itself be parallel: each node spawns only two children, so after
+$\log n$ levels all $n$ leaves exist. On your walk, convince yourself that
+\emph{distributing} work is itself work that must be parallelized, or it becomes
+the bottleneck.
+\end{walkbox}
+
+\section{A new hazard: races}
+
+Sequential code cannot have a race. Parallel code can, and a race is the most
+insidious bug in this chapter because the program usually \emph{works} --- until,
+one run in a thousand, it silently gives a wrong answer.
+
+\begin{definition}[Determinacy race]\label{ch35:def-race}
+A \emph{determinacy race} occurs when two strands that are \emph{not} ordered by
+the dependency DAG both access the same memory location and at least one of them
+writes to it. Because the scheduler may interleave the two strands in either
+order, the result can differ from run to run.
+\end{definition}
+
+\begin{trapbox}
+Here is the classic poison. Suppose you tried to sum an array in parallel by
+having every iteration add into a shared variable:
+\begin{center}
+\textbf{parallel for} $i \gets 1$ \textbf{to} $n$: \quad $total \gets total + A[i]$
+\end{center}
+The statement $total \gets total + A[i]$ is really three steps: \emph{read} $total$,
+\emph{add} $A[i]$, \emph{write} $total$. If two iterations read the old value
+\emph{before} either writes, one of the additions is lost. Run it on $A=[1,1,1,1]$
+and you might get $4$, or $3$, or $2$, depending on timing. The two writing
+strands are unordered in the DAG, both touch $total$, and at least one writes ---
+the definition of a race. The fix is to make the updates not collide: split the
+array, sum the halves into \emph{separate} variables in parallel, sync, then add
+the two partial sums. That is a parallel \emph{reduction}
+(Figure~\ref{ch35:reduction-tree}), and it has span $\Th(\log n)$ with no race.
+\end{trapbox}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\scriptsize,
+  every node/.style={draw=targetgreen,fill=green!8,rounded corners,
+    minimum width=8mm,minimum height=5mm,inner sep=2pt}]
+% leaves
+\node (a) at (0,0) {$A_1$};
+\node (b) at (1.5,0) {$A_2$};
+\node (c) at (3,0) {$A_3$};
+\node (d) at (4.5,0) {$A_4$};
+% level 1
+\node (ab) at (0.75,1.1) {$+$};
+\node (cd) at (3.75,1.1) {$+$};
+% root
+\node (abcd) at (2.25,2.2) {$+$};
+\draw[->] (a) -- (ab); \draw[->] (b) -- (ab);
+\draw[->] (c) -- (cd); \draw[->] (d) -- (cd);
+\draw[->] (ab) -- (abcd); \draw[->] (cd) -- (abcd);
+\node[draw=none,fill=none,right=2mm of abcd] {total};
+\end{tikzpicture}
+\caption{Race-free parallel summation (a \emph{reduction}). Pairs of partial sums
+combine up a balanced tree; siblings are computed in parallel and each ``$+$''
+node writes its own cell, so no two parallel strands ever touch the same location.
+The tree has depth $\Th(\log n)$, giving span $\Th(\log n)$ with work $\Th(n)$.}
+\label{ch35:reduction-tree}
+\end{figure}
+
+The model gives us a clean way to stay safe: \emph{a fork-join program is
+race-free if every pair of strands that touch the same location, one of them
+writing, is ordered by a spawn/sync dependency.} Put differently, never let two
+\emph{parallel} strands write the same cell, or write-and-read the same cell. In
+all the algorithms below we are careful to give each parallel branch its
+\emph{own} disjoint piece of memory to write into --- the left half writes the
+left half of the output, the right half writes the right half --- so no two
+parallel strands ever collide. That discipline is what makes the model's clean
+analysis legitimate.
+
+\section{Parallel matrix multiplication}
+
+Now we apply everything to a real, useful problem. Multiplying two $n \times n$
+matrices, $C = A \cdot B$, is the beating heart of scientific computing, graphics,
+and machine learning, and it is gorgeously parallel because \emph{every output
+entry can be computed independently}.
+
+\subsection{The straightforward version}
+
+Recall the definition $C[i][j] = \sum_{k=1}^{n} A[i][k]\,B[k][j]$. The $n^2$
+output entries do not depend on each other, so compute them all in parallel.
+
+\begin{algorithm}[H]
+\caption{\textsc{P-Matrix-Multiply}$(A, B, C, n)$}
+\KwIn{$n \times n$ matrices $A$, $B$; output matrix $C$.}
+\KwOut{$C = A \cdot B$.}
+\textbf{parallel for} $i \gets 1$ \textbf{to} $n$\;
+\Indp \textbf{parallel for} $j \gets 1$ \textbf{to} $n$\;
+\Indp $C[i][j] \gets 0$\;
+\For{$k \gets 1$ \textbf{to} $n$}{$C[i][j] \gets C[i][j] + A[i][k]\cdot B[k][j]$}
+\Indm\Indm
+\end{algorithm}
+
+Notice the inner $k$-loop is an \emph{ordinary} (serial) for, not a parallel one.
+That is deliberate: it accumulates into the single cell $C[i][j]$, so making it
+parallel would create exactly the summation race from the last section. Each
+$(i,j)$ pair owns its own output cell, so the two outer parallel loops are
+perfectly safe.
+
+\textbf{Work.} Every cell does $\Th(n)$ multiply-adds, and there are $n^2$ cells,
+so $T_1(n) = \Th(n^3)$ --- identical to the serial algorithm. We waste nothing.
+
+\textbf{Span.} The outer parallel-for contributes $\Th(\log n)$; the nested
+parallel-for inside it contributes another $\Th(\log n)$; and the serial inner
+loop is a chain of length $\Th(n)$. The span is the sum of these along the
+critical path:
+$$T_\infty(n) = \Th(\log n) + \Th(\log n) + \Th(n) = \Th(n).$$
+The serial $k$-loop dominates --- its length-$n$ chain is the critical path.
+
+\textbf{Parallelism.} $T_1/T_\infty = \Th(n^3)/\Th(n) = \Th(n^2)$. For
+$n = 1000$ that is a parallelism of a million. This simple algorithm already
+scales superbly. Its only blemish is the $\Th(n)$ span coming from the serial dot
+product. Can we do better? Yes --- by parallelizing the summation too, with a
+divide-and-conquer multiply.
+
+\subsection{Divide-and-conquer multiply, for a shorter span}
+
+Split each $n \times n$ matrix into four $n/2 \times n/2$ blocks:
+$$A = \begin{pmatrix} A_{11} & A_{12} \\ A_{21} & A_{22}\end{pmatrix},\quad
+B = \begin{pmatrix} B_{11} & B_{12} \\ B_{21} & B_{22}\end{pmatrix},\quad
+C = \begin{pmatrix} C_{11} & C_{12} \\ C_{21} & C_{22}\end{pmatrix}.$$
+Block matrix multiplication gives eight smaller products:
+$$\begin{aligned}
+C_{11} &= A_{11}B_{11} + A_{12}B_{21}, & C_{12} &= A_{11}B_{12} + A_{12}B_{22},\\
+C_{21} &= A_{21}B_{11} + A_{22}B_{21}, & C_{22} &= A_{21}B_{12} + A_{22}B_{22}.
+\end{aligned}$$
+The eight recursive multiplies are independent (each writes into a scratch area),
+so spawn all eight; sync; then add the pairs in parallel.
+
+\textbf{Work.} Eight recursive multiplies of size $n/2$, plus $\Th(n^2)$ for the
+four matrix additions:
+$$T_1(n) = 8\,T_1(n/2) + \Th(n^2).$$
+By the master theorem, $a=8$, $b=2$, $\log_b a = 3$, and $n^{\log_b a} = n^3$
+dominates $n^2$, so $T_1(n) = \Th(n^3)$ --- still cubic, as expected.
+
+\textbf{Span.} The eight multiplies run in parallel, so the span takes \emph{one}
+recursive call's span, not eight. The block additions can be done with parallel
+fors over $n^2$ entries, contributing $\Th(\log n)$:
+$$T_\infty(n) = T_\infty(n/2) + \Th(\log n).$$
+Unrolling: $\Th(\log n) + \Th(\log(n/2)) + \cdots$ over $\log n$ levels, each
+level's term at most $\Th(\log n)$, giving $T_\infty(n) = \Th(\log^2 n)$.
+
+\textbf{Parallelism.} $T_1/T_\infty = \Th(n^3)/\Th(\log^2 n) = \Th(n^3/\log^2 n)$.
+This is enormously larger than the $\Th(n^2)$ of the simple version --- the span
+dropped from $\Th(n)$ all the way to $\Th(\log^2 n)$ by refusing to do that one
+serial summation. Same work, dramatically shorter span: a textbook illustration of
+the design goal.
+
+\begin{complexitybox}
+\textbf{Parallel matrix multiply, $n \times n$.}
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Method & Work $T_1$ & Span $T_\infty$ & Parallelism \\
+\midrule
+Triple-loop (serial $k$) & $\Th(n^3)$ & $\Th(n)$ & $\Th(n^2)$ \\
+Divide-and-conquer (8-way) & $\Th(n^3)$ & $\Th(\log^2 n)$ & $\Th(n^3/\log^2 n)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+Both do the same total work. The divide-and-conquer version trades nothing in work
+for a vastly shorter critical path, hence far more parallelism.
+\end{complexitybox}
+
+\section{Parallel merge sort}
+
+Sorting is the chapter's most satisfying case study, because the obvious
+parallelization is good but not great, and fixing it teaches the deepest lesson in
+the chapter: \emph{sometimes you must parallelize the combine step too.}
+
+\subsection{The naive parallelization, and its disappointing span}
+
+Merge sort divides, sorts the two halves, and merges. The two halves are
+independent --- spawn them.
+
+\begin{algorithm}[H]
+\caption{\textsc{P-Merge-Sort}$(A, lo, hi)$}
+\KwIn{Array $A$ and bounds $lo \le hi$.}
+\KwOut{$A[lo \ldots hi]$ sorted in place.}
+\If{$lo \ge hi$}{\Return}
+$mid \gets \floor{(lo+hi)/2}$\;
+\textbf{spawn} \textsc{P-Merge-Sort}$(A, lo, mid)$\tcp*{sort left half in parallel}
+\textsc{P-Merge-Sort}$(A, mid+1, hi)$\tcp*{sort right half here}
+\textbf{sync}\;
+\textsc{Merge}$(A, lo, mid, hi)$\tcp*{serial merge: the bottleneck}
+\end{algorithm}
+
+\textbf{Work.} Two recursive sorts of size $n/2$ plus a serial merge of $\Th(n)$:
+$$T_1(n) = 2\,T_1(n/2) + \Th(n) = \Th(n \log n),$$
+by the master theorem ($a=b=2$, $\log_b a = 1$, the $n^1$ and the merge tie, so a
+log factor appears). Same as serial merge sort --- no work wasted.
+
+\textbf{Span.} The two recursive sorts run in parallel, so the span uses one of
+them; but the \textsc{Merge} is serial, contributing $\Th(n)$:
+$$T_\infty(n) = T_\infty(n/2) + \Th(n) = \Th(n).$$
+That last recurrence solves to $\Th(n)$ because the $\Th(n)$ merge at the
+\emph{top} level dominates: $n + n/2 + n/4 + \cdots = \Th(n)$.
+
+\textbf{Parallelism.} $T_1/T_\infty = \Th(n\log n)/\Th(n) = \Th(\log n)$. That is
+\emph{terrible}. A parallelism of only $\log n$ means even for a billion elements
+you can usefully employ only about $30$ processors. The villain is plain: the
+serial \textsc{Merge}, with its $\Th(n)$ span, single-handedly drags the whole
+algorithm down. We sorted in parallel but then merged in a long serial line. To
+get real parallelism, we must learn to \emph{merge in parallel}.
+
+\subsection{Merging two sorted arrays in parallel}
+
+How do you merge $X[1 \ldots n_1]$ and $Y[1 \ldots n_2]$ (both sorted) using many
+hands? The serial merge walks a single pointer down the output, which is
+inherently a chain of length $n$. We need a divide-and-conquer merge instead.
+
+\begin{intuitionbox}
+\textbf{The pivot trick.} Take the \emph{median} element of the larger array, say
+$X[q]$ where $q$ is the middle index of $X$. Everything in the merged output that
+is less than $X[q]$ comes from the front of $X$ \emph{and} the front of $Y$; we
+find where $X[q]$ belongs in $Y$ by \emph{binary search}, splitting $Y$ at some
+position $q'$. Now we have two completely independent merge problems --- merge
+$X$'s left part with $Y$'s left part, and $X$'s right part with $Y$'s right part
+--- and we know exactly where each result goes in the output. Spawn both. No race:
+the left merge writes the left output, the right merge writes the right output.
+Figure~\ref{ch35:pmerge-split} shows the split.
+\end{intuitionbox}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\scriptsize]
+% X array
+\draw (0,1.4) rectangle (5,2.0);
+\draw (2.4,1.4) rectangle (2.6,2.0);
+\fill[sourceblue!25] (2.4,1.4) rectangle (2.6,2.0);
+\node at (1.2,1.7) {$X$ left ($<X[q]$)};
+\node at (3.8,1.7) {$X$ right};
+\node[sourceblue] at (2.5,2.35) {$X[q]$};
+\draw[sourceblue,->] (2.5,2.25) -- (2.5,2.02);
+\node[left] at (-0.1,1.7) {$X$:};
+% Y array
+\draw (0,0) rectangle (5,0.6);
+\draw[targetgreen,very thick] (3.1,0) -- (3.1,0.6);
+\node at (1.5,0.3) {$Y$ left ($<X[q]$)};
+\node at (4.0,0.3) {$Y$ right};
+\node[targetgreen] at (3.1,-0.35) {split at $q'$};
+\node[left] at (-0.1,0.3) {$Y$:};
+% braces for left/right merge problems
+\draw[decorate,decoration={brace,amplitude=4pt},gray]
+  (-0.2,2.15) -- (-0.2,-0.15);
+\node[gray,align=center] at (6.6,1.0)
+  {left merge $\to Z$\\(both fronts)};
+\node[gray,align=center] at (6.6,2.0) {};
+\draw[gray,->] (5.05,1.0) -- (5.9,1.0);
+\end{tikzpicture}
+\caption{The \textsc{P-Merge} pivot trick. The median $X[q]$ of the longer array
+$X$ is located inside $Y$ by binary search (position $q'$). Everything to the left
+of both splits (less than $X[q]$) becomes one independent merge subproblem; the two
+right parts become the other. The two subproblems write into disjoint output
+regions, so they may be spawned without a race.}
+\label{ch35:pmerge-split}
+\end{figure}
+
+\begin{algorithm}[H]
+\caption{\textsc{P-Merge}$(X, p_1, r_1, Y, p_2, r_2, Z, p_3)$}
+\KwIn{Sorted ranges $X[p_1 \ldots r_1]$, $Y[p_2 \ldots r_2]$; output array $Z$
+starting at index $p_3$.}
+\KwOut{The merged sorted sequence written into $Z[p_3 \ldots]$.}
+$n_1 \gets r_1 - p_1 + 1$; \quad $n_2 \gets r_2 - p_2 + 1$\;
+\If{$n_1 < n_2$}{swap the two input ranges so that $X$ is the longer one\;}
+\If{$n_1 = 0$}{\Return\tcp*{both ranges empty}}
+$q \gets \floor{(p_1 + r_1)/2}$\tcp*{median of the longer range $X$}
+$q' \gets$ \textsc{Binary-Search}$(X[q], Y, p_2, r_2)$\tcp*{first index in $[p_2,r_2+1]$ with $Y[q'] \ge X[q]$}
+$q_3 \gets p_3 + (q - p_1) + (q' - p_2)$\tcp*{output position for $X[q]$}
+$Z[q_3] \gets X[q]$\;
+\textbf{spawn} \textsc{P-Merge}$(X, p_1, q-1, Y, p_2, q'-1, Z, p_3)$\tcp*{left halves}
+\textsc{P-Merge}$(X, q+1, r_1, Y, q', r_2, Z, q_3+1)$\tcp*{right halves}
+\textbf{sync}\;
+\end{algorithm}
+
+Here \textsc{Binary-Search}$(x, Y, p_2, r_2)$ returns the first index $q'$ in the
+range $[p_2,\, r_2+1]$ with $Y[q'] \ge x$; if no such element exists it returns
+$r_2+1$. The elements $Y[p_2 \ldots q'-1]$ are exactly those strictly below $X[q]$,
+so $q'-p_2$ of $Y$'s elements precede $X[q]$ in the output. Adding the $q-p_1$
+elements of $X$ that precede $X[q]$ gives its output slot $q_3$. The left
+recursive call then merges everything below $X[q]$ (the front of both ranges), the
+right call merges everything at or above it, and the two write into disjoint
+output regions $Z[p_3 \ldots q_3-1]$ and $Z[q_3+1 \ldots]$ --- so they cannot
+race.
+
+\textbf{Span of \textsc{P-Merge}.} Each call does a binary search ($\Th(\log n)$)
+and then recurses on two independent subproblems in parallel. By always pivoting
+on the median of the \emph{larger} array, we guarantee each recursive call handles
+at most $3/4$ of the total elements. Here is why: let $X$ be the longer range, so
+$\abs{X} \ge n/2$ and $\abs{Y} \le n/2$. Splitting $X$ at its median sends at most
+$\abs{X}/2$ of its elements to either side, and the worst case dumps \emph{all} of
+$Y$ onto one side. So a recursive call gets at most
+$\abs{X}/2 + \abs{Y} = (n-\abs{Y})/2 + \abs{Y} = n/2 + \abs{Y}/2 \le n/2 + n/4 =
+3n/4$. So
+$$T_\infty^{\text{merge}}(n) = T_\infty^{\text{merge}}(3n/4) + \Th(\log n)
+= \Th(\log^2 n).$$
+The recursion has depth $\log_{4/3} n = \Th(\log n)$, and each level costs
+$\Th(\log n)$ for its binary search, multiplying to $\Th(\log^2 n)$.
+
+\textbf{Work of \textsc{P-Merge}.} One can show (it takes a little care because
+the split is uneven) that the work is still $T_1^{\text{merge}}(n) = \Th(n)$ ---
+the binary searches sum to only $\Th(n)$ across the whole recursion, the same as
+the serial merge up to constants.
+
+\subsection{Putting it together: a genuinely parallel merge sort}
+
+Now replace the serial \textsc{Merge} in \textsc{P-Merge-Sort} with
+\textsc{P-Merge}. (A clean implementation sorts into an auxiliary array so the
+parallel merge has separate input and output regions and stays race-free.) The
+recurrences become:
+
+\textbf{Work.} Same shape, $T_1(n) = 2\,T_1(n/2) + \Th(n) = \Th(n\log n)$. The
+parallel merge does the same total work as the serial one, so the work is
+unchanged. Good --- we are not paying for the speedup in wasted computation.
+
+\textbf{Span.} Now the merge contributes only $\Th(\log^2 n)$, not $\Th(n)$:
+$$T_\infty(n) = T_\infty(n/2) + \Th(\log^2 n).$$
+Unrolling over $\log n$ levels, the per-level cost grows like $\log^2$ of the
+current size, and the sum is dominated by the top levels; it solves to
+$T_\infty(n) = \Th(\log^3 n)$.
+
+\textbf{Parallelism.} $T_1/T_\infty = \Th(n\log n)/\Th(\log^3 n) =
+\Th(n/\log^2 n)$. Compare this with the naive version's $\Th(\log n)$. We went from
+``about $30$ useful processors for a billion elements'' to ``about a million''
+(for $n=10^9$, $\log_2 n \approx 30$, so $n/\log^2 n \approx 10^9/900 \approx
+10^6$). \emph{Same work, span slashed from $\Th(n)$ to $\Th(\log^3 n)$.}
+
+\begin{complexitybox}
+\textbf{Parallel merge sort, $n$ elements.}
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Version & Work $T_1$ & Span $T_\infty$ & Parallelism \\
+\midrule
+Serial merge & $\Th(n\log n)$ & $\Th(n)$ & $\Th(\log n)$ \\
+Parallel merge & $\Th(n\log n)$ & $\Th(\log^3 n)$ & $\Th(n/\log^2 n)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+The single change --- merging in parallel instead of serially --- raises the
+parallelism by roughly a factor of $n/\log^3 n$. It is the chapter's signature
+moral: \emph{a serial combine step can be the entire bottleneck, and parallelizing
+it is where the real wins hide.}
+\end{complexitybox}
+
+\begin{focusbox}
+The pattern you just watched, twice (matrix multiply, then merge sort):
+\begin{enumerate}
+\item Parallelize the obvious independent parts (the recursive calls). Work stays
+the same; span improves only if the \emph{combine} step is cheap.
+\item Discover that a leftover \emph{serial} step (the dot product; the merge)
+dominates the span and chokes the parallelism.
+\item Parallelize \emph{that} step too, with its own divide-and-conquer. Span
+collapses; parallelism soars; work is unchanged.
+\end{enumerate}
+Whenever a parallel algorithm disappoints, look for the serial step hiding in the
+combine. It is almost always there.
+\end{focusbox}
+
+\section{Brent's theorem, and the right way to think about it}
+
+We end with the result that ties the model together and tells you, before you ever
+run anything, roughly how fast your algorithm will go on any machine you might
+buy. We already proved the working form (Theorem~\ref{ch35:thm-greedy}); now we
+name it and extract its meaning.
+
+\begin{theorem}[Brent's theorem]\label{ch35:thm-brent}
+Any computation with work $T_1$ and span $T_\infty$ can be executed on $P$
+processors in time
+$$T_P \le \frac{T_1 - T_\infty}{P} + T_\infty.$$
+\end{theorem}
+
+This is a slightly sharper cousin of the greedy bound (the $T_\infty$ work on the
+critical path is counted once, on the span side, rather than being divided again
+by $P$). For our purposes the looser $T_P \le T_1/P + T_\infty$ says everything
+important, and we will reason with it.
+
+\begin{intuitionbox}
+Brent's theorem is a promise with two terms, and you should read it as a tug of
+war between them:
+\begin{itemize}
+\item The term $T_1/P$ is the \emph{work term}: if you had no dependencies at all,
+$P$ processors would split the $T_1$ work perfectly and finish in $T_1/P$.
+\item The term $T_\infty$ is the \emph{span term}: the unavoidable serial spine
+that no number of processors can shorten.
+\end{itemize}
+For small $P$, the work term $T_1/P$ is large and dominates --- you are
+\emph{work-bound}, and buying more processors helps a lot (speedup is nearly
+linear). As $P$ grows, $T_1/P$ shrinks until it sinks below $T_\infty$; past that
+point you are \emph{span-bound}, and buying more processors does almost nothing.
+The crossover happens right around $P \approx T_1/T_\infty$ --- which is exactly
+the \emph{parallelism}. That is the precise sense in which parallelism is ``the
+number of processors worth buying.'' Figure~\ref{ch35:brent-curve} draws the two
+regimes.
+\end{intuitionbox}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[>=Stealth]
+\draw[->,thick] (0,0) -- (7.4,0) node[right,font=\small] {$P$ (processors)};
+\draw[->,thick] (0,0) -- (0,4.3) node[above,font=\small] {$T_P$ (time)};
+% work term T1/P decay
+\draw[sourceblue,very thick,domain=0.55:7,samples=120,smooth]
+  plot (\x, {2.2/\x + 0.55});
+% span floor
+\draw[trapred,thick,dashed] (0,0.55) -- (7,0.55)
+  node[right,font=\scriptsize,trapred] {$T_\infty$ floor};
+% crossover marker
+\draw[gray,dotted] (3,0) -- (3,0.55);
+\node[font=\scriptsize,gray] at (3,-0.3) {$P \approx T_1/T_\infty$};
+\node[sourceblue,font=\scriptsize] at (1.7,2.7) {work-bound};
+\node[trapred,font=\scriptsize] at (5.6,1.0) {span-bound};
+\end{tikzpicture}
+\caption{Running time $T_P$ versus processor count $P$ under Brent's bound. While
+the work term $T_1/P$ dominates (left), time falls like $1/P$ --- nearly linear
+speedup. Once it sinks to the span floor $T_\infty$ (right), more processors stop
+helping. The knee sits at the parallelism, $P \approx T_1/T_\infty$.}
+\label{ch35:brent-curve}
+\end{figure}
+
+\begin{aestheticbox}
+This single picture is why every chip vendor and cloud provider cares about your
+algorithm's span, not just its work. Two algorithms with identical work
+$\Th(n\log n)$ can have wildly different spans ($\Th(n)$ versus $\Th(\log^3 n)$ for
+our two merge sorts), and that difference \emph{is} the difference between a
+program that stops scaling at $30$ cores and one that keeps scaling to millions.
+When someone says ``this code does not scale,'' they almost always mean its span
+is too large relative to its work. You now have the vocabulary to diagnose and fix
+exactly that.
+\end{aestheticbox}
+
+\begin{remark}[A reminder about what these bounds hide]
+The model deliberately ignores real costs that matter in practice: the time to
+\emph{communicate} data between cores, the contention for shared memory and
+caches, and the overhead of the scheduler itself. A computation that is wonderful
+in work and span can still be slow if every strand fights over the same cache
+line, or if the spawned pieces are so tiny that scheduling them costs more than
+running them (which is why real implementations stop recursing and switch to
+serial code below some grain size). The work--span model tells you about an
+algorithm's \emph{inherent} parallelism --- a necessary condition for scaling, and
+the right first thing to analyze --- but it is the floor of the discipline, not
+its ceiling.
+\end{remark}
+
+\section{The whole chapter in one breath}
+
+You learned to describe computations with three keywords (\textbf{spawn},
+\textbf{sync}, \textbf{parallel for}) and to see the result as a DAG of strands.
+You measure that DAG with two numbers: \textbf{work} $T_1$ (total area, the serial
+time) and \textbf{span} $T_\infty$ (critical-path depth, the infinite-processor
+time). Their ratio is the \textbf{parallelism}, the most processors you can ever
+use. The work and span laws give lower bounds on $T_P$; the greedy/Brent bound
+$T_P \le T_1/P + T_\infty$ gives a matching upper bound, so a simple greedy
+scheduler is always within a factor of two of optimal and achieves near-perfect
+speedup when there is slack. Parallel loops cost a $\log$ in span for their
+splitting tree. Races are the new hazard, defeated by giving each parallel strand
+its own memory to write. And across matrix multiply and merge sort you saw the one
+big design move again and again: \emph{parallelize the obvious parts, find the
+serial combine step that dominates the span, and parallelize that too.} That is
+how a $\Th(n)$ span becomes $\Th(\log^3 n)$, and how an algorithm goes from barely
+parallel to embarrassingly so.
+
+\section{Exercises}
+
+\begin{exercise}[Warmup: read the two numbers]
+For each, state the work, span, and parallelism in $\Th$ notation.
+(a) A single \textbf{parallel for} of $n$ iterations, each $\Th(1)$.
+(b) A serial loop of $n$ iterations, each $\Th(1)$.
+(c) A balanced binary tree of $n$ leaves where every node does $\Th(1)$ work and a
+node's two children are spawned in parallel.
+\end{exercise}
+
+\begin{exercise}[Span by inspection]
+Consider \textsc{P-Fib}$(5)$. Without computing Fibonacci, draw the dependency
+DAG, mark a longest path from the root to a leaf and back, and confirm its length
+is $\Th(n)$ with $n=5$. How many total calls (strands) are there? Relate your two
+counts to $T_1$ and $T_\infty$.
+\end{exercise}
+
+\begin{exercise}[The forgotten logarithm]
+A student claims a \textbf{parallel for} of $n$ constant-time iterations has span
+$\Th(1)$ ``because all iterations run at once.'' Explain precisely why the true
+span is $\Th(\log n)$, referring to the splitting tree. Then give the span of two
+\emph{nested} parallel fors, each of length $n$, with a $\Th(1)$ body.
+\end{exercise}
+
+\begin{exercise}[Spot the race]
+You want the maximum of an array $A[1\ldots n]$. A colleague writes:
+\textbf{parallel for} $i$: \textbf{if} $A[i] > m$ \textbf{then} $m \gets A[i]$,
+where $m$ starts at $-\infty$. Exhibit a concrete input and interleaving on two
+processors that returns the wrong answer. Then describe a race-free parallel
+algorithm for the maximum, and give its work and span.
+\end{exercise}
+
+\begin{exercise}[Greedy bound arithmetic]
+A computation has $T_1 = 10^9$ and $T_\infty = 10^4$. (a) What is its parallelism?
+(b) Use $T_P \le T_1/P + T_\infty$ to estimate $T_P$ for $P = 100$, $P = 10^4$, and
+$P = 10^6$. (c) For which of these $P$ is the speedup close to linear, and why does
+it stop being so?
+\end{exercise}
+
+\begin{exercise}[Why the inner loop stays serial]
+In \textsc{P-Matrix-Multiply}, explain what goes wrong if you make the inner
+$k$-loop a \textbf{parallel for}. Then propose a \emph{race-free} way to
+parallelize the dot product anyway (hint: a parallel reduction / tree of partial
+sums) and state the span it would give the inner loop.
+\end{exercise}
+
+\begin{exercise}[Block multiply recurrences]
+For the divide-and-conquer matrix multiply, derive $T_1(n) = 8T_1(n/2)+\Th(n^2)$
+and $T_\infty(n) = T_\infty(n/2) + \Th(\log n)$ from the pseudocode structure,
+explaining where each term comes from. Solve both (master theorem for the work,
+unrolling for the span) and state the parallelism.
+\end{exercise}
+
+\begin{exercise}[The merge is the bottleneck]
+For naive \textsc{P-Merge-Sort} (serial merge), solve $T_\infty(n) =
+T_\infty(n/2) + \Th(n)$ carefully, showing the geometric sum
+$n + n/2 + n/4 + \cdots = \Th(n)$. Then explain in one sentence why this single
+$\Th(n)$ term, and not the recursion, is what caps the parallelism at $\Th(\log
+n)$.
+\end{exercise}
+
+\begin{exercise}[Why pivot on the larger array]
+In \textsc{P-Merge}, we always take the median of the \emph{longer} of the two
+input ranges. Prove that with this choice each recursive call receives at most
+$3/4$ of the total elements. Then explain why pivoting on the \emph{shorter}
+array could fail to give a good span.
+\end{exercise}
+
+\begin{exercise}[Challenge: parallel prefix sums]
+The \emph{prefix sums} (scan) of $A[1\ldots n]$ is the array $S$ with
+$S[i] = A[1]+A[2]+\cdots+A[i]$. The obvious serial loop has span $\Th(n)$. Design a
+parallel algorithm with work $\Th(n)$ and span $\Th(\log n)$. (Hint: an up-sweep
+that builds partial sums in a tree, then a down-sweep that pushes prefixes back
+down. Describe both passes and give a recurrence for each measure.)
+\end{exercise}
+
+\begin{exercise}[Challenge: when parallelism cannot help]
+Give an example of a natural computation whose span equals its work, $T_\infty =
+\Th(T_1)$, so its parallelism is $\Th(1)$ and no number of processors speeds it up.
+Explain what feature of the problem forces the long dependency chain. (Think about
+a computation where each step truly needs the previous step's result.)
+\end{exercise}
+
+\begin{exercise}[Challenge: grain size]
+Real implementations stop spawning and switch to serial code once subproblems are
+smaller than a \emph{grain size} $g$. Argue informally that coarsening a parallel
+loop to chunks of size $g$ changes its span to $\Th(g + \log(n/g))$ while keeping
+work $\Th(n)$. For what range of $g$ is the parallelism still $\Th(n/\log n)$ up to
+constants, and why might a real system deliberately choose a larger $g$ anyway?
+\end{exercise}

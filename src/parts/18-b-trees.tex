@@ -1,0 +1,1053 @@
+\chapter{B-Trees}
+
+Up to now, every search structure in this book has lived in a comfortable
+fantasy: that all your data fits in fast memory, and that reaching one node costs
+the same as reaching any other. A red-black tree happily chases pointers around
+RAM, and we counted each pointer-follow as one unit of work because, on real
+hardware, it more or less is. But the moment your data outgrows memory and spills
+onto a disk -- a spinning platter, or even a solid-state drive -- that fantasy
+shatters. Suddenly \emph{where} a node lives matters enormously, and the cost of a
+search is dominated not by how many comparisons you do but by how many times you
+have to go fetch a chunk of data from far away.
+
+This chapter is about the search tree that takes that brutal cost asymmetry
+seriously. The B-tree is, at heart, a binary search tree that got tired of being
+tall and skinny and decided to get \emph{short and fat} on purpose. Instead of
+one key and two children per node, a B-tree node holds dozens or hundreds of keys
+and hundreds or thousands of children. The result is a tree so shallow that you
+can index billions of records and still reach any one of them in a handful of
+disk visits. Every serious database and every modern filesystem you have ever
+touched is, underneath, organized by a B-tree or a close relative. Let us build
+one from the ground up.
+
+\section{Why Disks Change Everything}
+
+Let us begin by feeling the problem in our bones, because the entire design of the
+B-tree is a direct response to one physical fact about machines.
+
+\begin{intuitionbox}
+Imagine your data is a giant library. Fast memory (RAM) is the desk in front of
+you: tiny, but anything on it is instantly available. The disk is the warehouse
+across town: enormous, but every trip to fetch a box takes ages compared to
+reading something already on your desk. Crucially, the warehouse does not hand you
+\emph{one page} per trip -- it hands you a whole \emph{box}, because the trip
+itself is the expensive part, not the box. So the smart move is: design your data
+so that each warehouse trip brings back a box stuffed with exactly the things you
+will need next, and so that you need as few trips as possible.
+\end{intuitionbox}
+
+That ``box'' has a name. Disks (and the operating system on top of them) move data
+in fixed-size blocks called \emph{pages} -- typically something like 4 kilobytes,
+sometimes much larger. You cannot read a single byte from disk; you read a whole
+page. And the cost of reading that page is dominated by the \emph{seek}: physically
+moving a read head, or waiting out the latency of a flash lookup. Once the page is
+on its way, the difference between grabbing 8 bytes from it and grabbing 4000 bytes
+from it is negligible.
+
+Let us put numbers on it so the asymmetry is undeniable.
+
+\begin{aestheticbox}
+A modern CPU performs a few billion simple operations per second, so one
+comparison costs on the order of a nanosecond ($10^{-9}$ seconds). A single random
+read from a spinning disk costs on the order of $10$ milliseconds ($10^{-2}$
+seconds). That is a factor of roughly \emph{ten million}. One disk access is worth
+about ten million in-memory comparisons. Solid-state drives shrink the gap, but
+even there a random read costs tens of microseconds -- still tens of thousands of
+comparisons. The lesson is the same: when your data lives on disk, the number you
+must minimize is \emph{disk accesses}, and you should be willing to do a
+ridiculous amount of in-memory computation to save even one of them.
+\end{aestheticbox}
+
+Now reconsider a balanced binary search tree holding $n = 10^9$ keys (a billion).
+Its height is about $\log_2(10^9) \approx 30$. If the tree lives on disk and each
+node sits on its own page, a single search touches about $30$ different pages, and
+in the worst case that is $30$ disk seeks. At $10$ milliseconds each, that is about
+a third of a second to find \emph{one} record. A database answering thousands of
+queries per second cannot possibly afford this.
+
+\begin{focusbox}
+The binary in ``binary search tree'' is the enemy here. A binary tree spends a
+whole expensive disk access just to make \emph{one} comparison and then branch one
+of two ways. We have already paid for an entire page; we should extract far more
+than one bit of decision from it. The fix is to cram many keys into a single page
+so that one disk access lets us branch one of \emph{many} ways. Fewer, fatter nodes
+means a shorter tree means fewer disk accesses. That is the whole idea of a B-tree
+in a single sentence.
+\end{focusbox}
+
+Here is the picture of the trade we are making. On the left, the binary tree:
+deep, and each level is a separate disk trip. On the right, a B-tree: each node is
+a full page packed with keys, so the tree is only a few levels tall.
+
+\begin{center}
+\begin{tikzpicture}[every node/.style={font=\small}]
+% binary tree, tall
+\node at (-3.4,2.0) {\textbf{binary: many thin levels}};
+\foreach \y in {0,...,4}{
+  \draw[gray!60] (-5.0,1.4-0.32*\y) rectangle (-1.8,1.62-0.32*\y);
+}
+\node[align=center] at (-3.4,-0.6) {\footnotesize one comparison\\\footnotesize per disk page};
+% btree, short fat
+\node at (3.2,2.0) {\textbf{B-tree: few fat levels}};
+\draw[sourceblue,thick] (1.4,1.2) rectangle (5.0,1.62);
+\foreach \x in {1.4,2.0,2.6,3.2,3.8,4.4}{\draw[gray!50] (\x,1.2)--(\x,1.62);}
+\draw[sourceblue,thick] (1.4,0.4) rectangle (5.0,0.82);
+\foreach \x in {1.4,2.0,2.6,3.2,3.8,4.4}{\draw[gray!50] (\x,0.4)--(\x,0.82);}
+\node[align=center] at (3.2,-0.6) {\footnotesize many keys (and branches)\\\footnotesize per disk page};
+\end{tikzpicture}
+\end{center}
+
+\begin{historybox}
+B-trees were invented by Rudolf Bayer and Edward McCreight in 1970 while they were
+at Boeing Research Labs, precisely to organize large indices stored on disk. (No
+one has ever fully settled what the ``B'' stands for -- Bayer, Boeing, balanced,
+broad; Bayer himself was coy about it.) The structure was an immediate, enduring
+success: it underlies essentially every relational database index, and filesystems
+such as NTFS, HFS+, ext4's directories, and Btrfs (whose very name nods to it). In
+CLRS this is \textbf{Chapter 18, ``B-Trees.''} That chapter assumes you are
+comfortable with binary search trees (our Chapter 12) and with the general spirit
+of balanced trees (our Chapter 13 on red-black trees); if those feel shaky,
+revisit them, because a B-tree is best understood as ``a balanced search tree,
+re-derived for a world where width is cheap and height is murder.''
+\end{historybox}
+
+\section{What a B-Tree Is}
+
+Let us now pin down the object precisely. A B-tree is a rooted tree, but unlike a
+binary search tree its nodes are wide. Each node stores a sorted run of keys, and
+between and around those keys hang child pointers, one more child than there are
+keys.
+
+\begin{intuitionbox}
+Picture a single B-tree node as a row of $k$ keys laid out in increasing order,
+with $k+1$ ``gaps'' -- one before the first key, one between each adjacent pair,
+and one after the last key. Each gap holds a pointer to a child subtree, and that
+subtree contains exactly the keys that belong in that gap. So if a node has keys
+$[20, 50, 80]$, it has four children: one for keys $< 20$, one for keys strictly
+between $20$ and $50$, one for keys strictly between $50$ and $80$, and one for
+keys $> 80$. The keys in the node are the \emph{signposts} that tell you which gap
+-- which child -- to descend into next.
+\end{intuitionbox}
+
+Here is a node with three keys and its four children drawn explicitly. Notice how
+each child's allowed range is fenced in by the keys on either side.
+
+\begin{center}
+\begin{tikzpicture}[every node/.style={font=\small}]
+% the node
+\draw[sourceblue,thick] (0,2) rectangle (6,2.6);
+\foreach \x in {2,4}{\draw[sourceblue!60] (\x,2)--(\x,2.6);}
+\node at (1,2.3) {$20$};
+\node at (3,2.3) {$50$};
+\node at (5,2.3) {$80$};
+% pointer dots in the four gaps
+\foreach \x/\lab in {0/a,2/b,4/c,6/d}{
+  \fill[targetgreen] (\x,2) circle (1.6pt);
+}
+% children boxes
+\foreach \x/\txt in {-0.6/{$<20$}, 2/{$20..50$}, 4/{$50..80$}, 6.6/{$>80$}}{
+  \draw[gray!70] (\x-0.8,0.6) rectangle (\x+0.8,1.2);
+  \node at (\x,0.9) {\footnotesize \txt};
+}
+\draw[->,gray] (0,2) -- (-0.6,1.2);
+\draw[->,gray] (2,2) -- (2,1.2);
+\draw[->,gray] (4,2) -- (4,1.2);
+\draw[->,gray] (6,2) -- (6.6,1.2);
+\end{tikzpicture}
+\end{center}
+
+To keep the tree shallow and balanced we impose limits on how empty or how full a
+node may be. The key parameter is a fixed integer $t \ge 2$ called the
+\emph{minimum degree} of the tree. It is chosen once, when you build the tree,
+usually so that a full node exactly fills one disk page.
+
+\begin{formalbox}
+\textbf{Definition (B-tree).} Let $t \ge 2$ be a fixed integer, the \emph{minimum
+degree}. A \emph{B-tree} is a rooted tree with the following properties.
+\begin{enumerate}
+\item Every node $x$ stores a number of keys $x.n$, held in nondecreasing sorted
+order $x.\mathit{key}_1 \le x.\mathit{key}_2 \le \cdots \le x.\mathit{key}_{x.n}$,
+and a boolean $x.\mathit{leaf}$ saying whether $x$ is a leaf.
+\item An internal (non-leaf) node with $x.n$ keys has exactly $x.n + 1$ children,
+pointed to by $x.c_1, \ldots, x.c_{x.n+1}$. Leaves have no children.
+\item The keys separate the subtrees: if $k_i$ is any key stored in the subtree
+rooted at child $x.c_i$, then
+\[
+k_1 \le x.\mathit{key}_1 \le k_2 \le x.\mathit{key}_2 \le \cdots \le
+x.\mathit{key}_{x.n} \le k_{x.n+1}.
+\]
+\item \textbf{Every leaf is at the same depth}, which equals the tree's height
+$h$. (B-trees grow and shrink only at the root, which is how they stay perfectly
+height-balanced.)
+\item \textbf{Occupancy bounds.} Every node other than the root has at least
+$t-1$ keys, and therefore at least $t$ children if it is internal. Every node has
+at most $2t-1$ keys, and therefore at most $2t$ children if it is internal. The
+root may have as few as one key (or zero, if the tree is empty), but obeys the
+same upper bound.
+\end{enumerate}
+A node with the maximum $2t-1$ keys is called \emph{full}.
+\end{formalbox}
+
+That occupancy rule -- between $t-1$ and $2t-1$ keys -- is the heart of the
+balancing discipline, so let us make sure it feels right rather than arbitrary.
+
+\begin{intuitionbox}
+The upper bound ($2t-1$ keys) is so a node fits in one disk page; you pick $t$ to
+make a full node fill the page. The lower bound ($t-1$ keys) is so nodes are never
+too \emph{empty}. If we let nodes dwindle to one key each, the tree would drift
+back toward being binary and tall, defeating the whole purpose. Forcing every node
+at least half-full guarantees the branching factor stays large, which keeps the
+height tiny. The two bounds together say: \emph{every node is between half-full and
+completely full.} The factor-of-two slack between $t-1$ and $2t-1$ is exactly the
+room we need to absorb insertions and deletions cheaply, as you will see.
+\end{intuitionbox}
+
+\begin{trapbox}
+A frequent confusion: ``minimum degree'' $t$ counts \emph{children}, not keys. A
+non-root node has \emph{at least} $t$ children and \emph{at most} $2t$ children;
+correspondingly it has between $t-1$ and $2t-1$ keys (always one fewer key than
+children, for internal nodes). Do not mix up $t$ (a per-node minimum) with the
+\emph{order} of a B-tree, a competing piece of terminology some textbooks use for
+the maximum number of children. We will stick exclusively with CLRS's minimum
+degree $t$ to avoid the muddle. The smallest legal B-tree has $t=2$: nodes hold
+$1$ to $3$ keys and have $2$ to $4$ children. Such a tree is sometimes called a
+\emph{2-3-4 tree}, and it is the close cousin of the red-black tree from
+Chapter 13.
+\end{trapbox}
+
+\begin{example}\label{ch18:ex-small-tree}
+Let $t = 2$. Then nodes may hold $1$, $2$, or $3$ keys and (if internal) have $2$,
+$3$, or $4$ children. Here is a legal B-tree of height $2$ on the keys
+$1,2,\ldots,16$. The root holds two keys; each leaf is at the same depth.
+
+\begin{center}
+\begin{tikzpicture}[every node/.style={font=\footnotesize}, level distance=14mm]
+\node[draw,sourceblue,thick,inner sep=2pt] (root) {$\;7\;\mid\;13\;$};
+\begin{scope}[every node/.style={draw,inner sep=2pt,font=\footnotesize}]
+\node (a) at (-4.2,-1.5) {$2\mid4$};
+\node (b) at (0,-1.5) {$9\mid11$};
+\node (c) at (4.2,-1.5) {$15$};
+\end{scope}
+\begin{scope}[every node/.style={draw,gray!80,inner sep=1.6pt,font=\scriptsize}]
+\node (a1) at (-5.6,-3.0) {$1$};
+\node (a2) at (-4.2,-3.0) {$3$};
+\node (a3) at (-2.8,-3.0) {$5\mid6$};
+\node (b1) at (-1.2,-3.0) {$8$};
+\node (b2) at (0,-3.0) {$10$};
+\node (b3) at (1.2,-3.0) {$12$};
+\node (c1) at (3.2,-3.0) {$14$};
+\node (c2) at (5.2,-3.0) {$16$};
+\end{scope}
+\draw (root) -- (a); \draw (root) -- (b); \draw (root) -- (c);
+\draw (a)--(a1); \draw (a)--(a2); \draw (a)--(a3);
+\draw (b)--(b1); \draw (b)--(b2); \draw (b)--(b3);
+\draw (c)--(c1); \draw (c)--(c2);
+\end{tikzpicture}
+\end{center}
+
+Read the separators: the root's keys $7$ and $13$ split everything into three
+ranges -- ``below 7,'' ``between 7 and 13,'' ``above 13'' -- and the three child
+subtrees hold exactly those ranges. Within the leftmost child, its keys $2$ and
+$4$ split its range further. Every path from root to a leaf has the same length.
+\end{example}
+
+\section{How Tall Can a B-Tree Get?}
+
+The entire promise of the B-tree is that it is short. Let us prove it. We want an
+upper bound on the height $h$ in terms of the number of keys $n$, and we want that
+bound to be logarithmic with a \emph{large base} -- the larger the base, the
+shorter the tree.
+
+The strategy is the one you always use to bound the height of a balanced tree:
+count how few nodes a tree of height $h$ can possibly contain. If even the
+\emph{sparsest} legal tree of height $h$ must hold a lot of keys, then a tree
+holding only $n$ keys cannot be very tall.
+
+\begin{intuitionbox}
+To make a B-tree as tall as possible for a given number of keys, you make every
+node as \emph{empty} as the rules allow -- because emptier nodes branch less, so it
+takes more levels to hold the same keys. The emptiest legal tree has the root with
+a single key (its minimum) and every other node with exactly $t-1$ keys and $t$
+children (their minimum). So the number of nodes at least \emph{multiplies by} $t$
+at each level down. That geometric explosion is what forces the height to be only
+about $\log_t n$.
+\end{intuitionbox}
+
+Let us count the nodes level by level in this emptiest tree. The root is $1$ node.
+The root has at least $2$ children (one key forces two children). Each of those, and
+everything below, has at least $t$ children. So the node count is $1$ at the root,
+then $2$, and after that it multiplies by at least $t$ at every step down. Figure~\ref{ch18:fig-height-fanout}
+shows that geometric explosion; the table beside it records the per-level minimum.
+
+\begin{figure}[H]
+\begin{center}
+\begin{tikzpicture}[every node/.style={font=\footnotesize}]
+% level 0
+\node[draw,sourceblue,thick,inner sep=2pt] (r) at (0,0) {root};
+% level 1: 2 nodes
+\node[draw,inner sep=2pt] (a) at (-2.4,-1.3) {$\cdot$};
+\node[draw,inner sep=2pt] (b) at (2.4,-1.3) {$\cdot$};
+\draw (r)--(a); \draw (r)--(b);
+% level 2: t children each -> sketch a fan
+\foreach \x in {-3.4,-2.8,-2.0,-1.4}{\draw (a)--(\x,-2.6);\node[draw,gray!70,inner sep=1pt] at (\x,-2.6){\tiny$\cdot$};}
+\foreach \x in {1.4,2.0,2.8,3.4}{\draw (b)--(\x,-2.6);\node[draw,gray!70,inner sep=1pt] at (\x,-2.6){\tiny$\cdot$};}
+\node at (-2.4,-2.6) {\tiny$\ldots$};
+\node at (2.4,-2.6) {\tiny$\ldots$};
+% level labels on the right
+\node[anchor=west] at (4.1,0)    {depth $0$: $1$ node};
+\node[anchor=west] at (4.1,-1.3) {depth $1$: $\ge 2$};
+\node[anchor=west] at (4.1,-2.6) {depth $2$: $\ge 2t$};
+% brace showing fan-out factor
+\draw[decorate,decoration={brace,amplitude=4pt},quotientorange]
+  (-3.5,-2.95) -- (-1.3,-2.95);
+\node[quotientorange,anchor=north] at (-2.4,-3.05) {\tiny$\ge t$ children};
+\end{tikzpicture}
+\end{center}
+\caption{The sparsest (tallest) B-tree: the root has $\ge 2$ children, and every
+node below fans out to $\ge t$ children, so each level holds at least $t$ times as
+many nodes as the level above.}
+\label{ch18:fig-height-fanout}
+\end{figure}
+
+\begin{center}
+\begin{tabular}{c c}
+\toprule
+depth & at least this many nodes \\
+\midrule
+$0$ & $1$ \\
+$1$ & $2$ \\
+$2$ & $2t$ \\
+$3$ & $2t^2$ \\
+$\vdots$ & $\vdots$ \\
+$h$ & $2t^{h-1}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Every node except the root holds at least $t-1$ keys. The number of non-root nodes
+is at least the number of nodes at depths $1$ through $h$, which is at least
+\[
+2 + 2t + 2t^2 + \cdots + 2t^{h-1} = 2\sum_{i=0}^{h-1} t^i = 2\cdot\frac{t^h - 1}{t-1}.
+\]
+So the total number of keys satisfies
+\[
+n \;\ge\; \underbrace{1}_{\text{root}} \;+\; (t-1)\cdot 2\cdot\frac{t^h-1}{t-1}
+\;=\; 1 + 2(t^h - 1) \;=\; 2t^h - 1.
+\]
+Rearranging, $t^h \le \dfrac{n+1}{2}$, and taking $\log_t$ of both sides gives the
+result.
+
+\begin{formalbox}
+\textbf{Theorem (Height of a B-tree).} If $n \ge 1$, then any B-tree of minimum
+degree $t \ge 2$ holding $n$ keys has height
+\[
+h \;\le\; \log_t \frac{n+1}{2}.
+\]
+\end{formalbox}
+
+\begin{focusbox}
+The height is logarithmic in $n$ with base $t$. That base is the whole point.
+Compared to a red-black tree, whose height is $\log_2 n$, the B-tree's height is
+$\log_t n = \dfrac{\log_2 n}{\log_2 t}$ -- smaller by a factor of $\log_2 t$. With a
+realistic $t$ of, say, $1000$, that factor is about $10$, so the B-tree is roughly
+ten times shorter, meaning ten times fewer disk accesses per search.
+\end{focusbox}
+
+\begin{example}\label{ch18:ex-height-numbers}
+Suppose each disk page holds a node with up to $1000$ children, so $2t = 1000$ and
+$t = 500$. How tall is the tree for a billion keys, $n = 10^9$?
+\[
+h \le \log_{500}\frac{10^9 + 1}{2} \approx \log_{500}(5\times 10^8)
+= \frac{\ln(5\times 10^8)}{\ln 500} \approx \frac{20.03}{6.21} \approx 3.2,
+\]
+so $h \le 3$. Three levels! A tree of height $3$ has its root, one level of
+internal nodes, and the leaves. If you keep the root permanently cached in memory
+(databases always do -- it is just one page), then a search costs at most
+\emph{two} disk accesses to reach any of a billion records. Compare that with the
+$\approx 30$ accesses a binary tree would demand. This is not a small constant-factor
+win; it is the difference between a usable database and an unusable one.
+\end{example}
+
+\section{Searching a B-Tree}
+
+Searching is the gentlest operation and a perfect warm-up, because it does not
+change the tree at all -- it just walks down it, and the structure is practically
+begging you to do the obvious thing.
+
+\begin{intuitionbox}
+At each node you have a sorted row of keys. Scan along it (or binary-search it) to
+find where your target key would sit. Either you land exactly on it -- done -- or
+you fall into one of the gaps between two keys, and that gap's child pointer tells
+you which subtree to descend into. Repeat until you find the key or hit a leaf with
+no further child to follow, at which point the key simply is not present. It is the
+same higher-or-lower game as a binary search tree, except at each node you choose
+among many doors instead of just two.
+\end{intuitionbox}
+
+\begin{algorithm}[H]
+\caption{\textsc{B-Tree-Search}$(x, k)$ -- find key $k$ in the subtree rooted at $x$}
+\KwIn{a node $x$, a search key $k$}
+\KwOut{a pair $(y,i)$ such that $y.\mathit{key}_i = k$, or \textsc{nil} if absent}
+$i \gets 1$\;
+\While{$i \le x.n$ \textbf{and} $k > x.\mathit{key}_i$}{
+  $i \gets i + 1$\;
+}
+\If{$i \le x.n$ \textbf{and} $k = x.\mathit{key}_i$}{
+  \Return $(x, i)$\tcp*{found it in this node}
+}
+\eIf{$x.\mathit{leaf}$}{
+  \Return \textsc{nil}\tcp*{nowhere left to go}
+}{
+  \textsc{Disk-Read}$(x.c_i)$\tcp*{the only line that costs a disk access}
+  \Return \textsc{B-Tree-Search}$(x.c_i, k)$\;
+}
+\end{algorithm}
+
+The single line that matters for cost is \textsc{Disk-Read}: it is the only place
+we pay to fetch a page. We perform exactly one disk read per level of descent, so a
+search does at most $h + 1 = O(\log_t n)$ disk reads. The in-memory work per node
+is the linear scan over up to $2t-1$ keys, so the CPU time is $O(t)$ per node and
+$O(t\,h) = O(t \log_t n)$ in total. We are happily trading a lot of in-memory
+comparison work for very few disk reads -- exactly the bargain disks demand.
+
+\begin{labbox}
+Trace \textsc{B-Tree-Search} for $k = 12$ on the tree of
+Example~\ref{ch18:ex-small-tree}.
+\begin{itemize}
+\item \emph{At the root} $[7,13]$: start $i=1$. Is $12 > 7$? Yes, advance to $i=2$.
+Is $12 > 13$? No, stop. Is $12 = 13$? No. The root is not a leaf, so descend into
+$c_2$, the child for the range between $7$ and $13$ -- the node $[9,11]$.
+\item \emph{At} $[9,11]$: $12 > 9$, advance; $12 > 11$, advance to $i=3$. Now
+$i > x.n = 2$, stop. Not equal to anything here. Not a leaf, so descend into $c_3$,
+the child for keys above $11$ -- the leaf $[12]$.
+\item \emph{At the leaf} $[12]$: $12 = 12$ at $i=1$. \textbf{Found}, return this
+node and index $1$.
+\end{itemize}
+Three nodes visited, one per level -- exactly the height plus one. Now repeat the
+trace for $k = 5$ (you should find it in the leaf $[5,6]$) and for the absent
+$k = 10\tfrac12$, i.e. a key between $10$ and $11$ (you should fall off the bottom
+and return \textsc{nil}).
+\end{labbox}
+
+\section{Splitting a Full Node}
+
+Before we can insert, we need one surgical tool. Inserting a new key always
+ultimately squeezes it into some leaf, but a leaf might already be full ($2t-1$
+keys) with no room. The cure is \emph{splitting}: take a full node and break it in
+two, pushing its middle key up into the parent as a new separator.
+
+\begin{intuitionbox}
+A full node has $2t-1$ keys. That is an odd number, so it has a unique middle key,
+the one at position $t$. Splitting cleaves the node down that middle key: the
+$t-1$ keys to its left become a new left node, the $t-1$ keys to its right become a
+new right node, and the middle key itself \emph{floats up} to the parent, slotting
+in as a brand-new separator between those two new children. Each of the two halves
+has exactly $t-1$ keys -- the legal minimum -- so both are valid nodes, and the
+parent gains one key and one child. Think of it as a cell dividing: one full cell
+becomes two half-cells plus a signpost handed to the level above.
+\end{intuitionbox}
+
+Here is the picture, with $t = 3$ so a full node has $2t-1 = 5$ keys. The node
+$[\,p,q,r,s,u\,]$ splits about its middle key $r$ (position $t = 3$).
+
+\begin{center}
+\begin{tikzpicture}[every node/.style={font=\small}]
+% before
+\node at (-3.3,2.4) {\textbf{before split}};
+\draw[gray!70] (-5.2,1.6) rectangle (-3.4,2.1);
+\node at (-4.3,1.85) {$\ldots\,m\,\ldots$};
+\draw[->,gray] (-4.3,1.6) -- (-4.3,1.1);
+\draw[sourceblue,thick] (-6.0,0.4) rectangle (-2.6,0.9);
+\foreach \x in {-5.32,-4.64,-3.96,-3.28}{\draw[sourceblue!50](\x,0.4)--(\x,0.9);}
+\node at (-5.66,0.65){$p$};\node at (-4.98,0.65){$q$};
+\node[trapred] at (-4.3,0.65){$r$};
+\node at (-3.62,0.65){$s$};\node at (-2.94,0.65){$u$};
+% arrow
+\node at (-1.4,1.0) {\large $\Rightarrow$};
+% after
+\node at (3.2,2.4) {\textbf{after split}};
+\draw[gray!70] (1.4,1.6) rectangle (3.4,2.1);
+\node at (2.0,1.85) {$\ldots\,m\,$};
+\node[trapred] at (2.9,1.85) {$r$};
+\draw[->,gray] (2.4,1.6) -- (1.4,1.1);
+\draw[->,gray] (3.2,1.6) -- (4.4,1.1);
+\draw[sourceblue,thick] (0.7,0.4) rectangle (2.1,0.9);
+\draw[sourceblue!50] (1.4,0.4)--(1.4,0.9);
+\node at (1.05,0.65){$p$};\node at (1.75,0.65){$q$};
+\draw[sourceblue,thick] (3.7,0.4) rectangle (5.1,0.9);
+\draw[sourceblue!50] (4.4,0.4)--(4.4,0.9);
+\node at (4.05,0.65){$s$};\node at (4.75,0.65){$u$};
+\end{tikzpicture}
+\end{center}
+
+Notice what the parent looked like before and after: it gains exactly one key (the
+floated-up $r$) and one child pointer. For this to be safe, \textbf{the parent must
+not itself be full} when we ask it to absorb a new key -- otherwise it would
+overflow. That single requirement is what shapes the entire insertion algorithm, as
+we will see in a moment. The procedure assumes its caller hands it a non-full parent
+$x$ and the index $i$ of the full child to split.
+
+\begin{algorithm}[H]
+\caption{\textsc{B-Tree-Split-Child}$(x, i)$ -- split the full child $x.c_i$}
+\KwIn{a non-full internal node $x$ and an index $i$ with $x.c_i$ full}
+\KwOut{$x.c_i$ split in two, its median key moved up into $x$}
+$y \gets x.c_i$\tcp*{the full child, with $2t-1$ keys}
+$z \gets$ a new node; \quad $z.\mathit{leaf} \gets y.\mathit{leaf}$; \quad $z.n \gets t-1$\;
+\For{$j \gets 1$ \KwTo $t-1$}{
+  $z.\mathit{key}_j \gets y.\mathit{key}_{j+t}$\tcp*{copy $y$'s upper $t-1$ keys into $z$}
+}
+\If{\textbf{not} $y.\mathit{leaf}$}{
+  \For{$j \gets 1$ \KwTo $t$}{
+    $z.c_j \gets y.c_{j+t}$\tcp*{and $y$'s upper $t$ children}
+  }
+}
+$y.n \gets t-1$\tcp*{$y$ keeps only its lower $t-1$ keys}
+\For{$j \gets x.n+1$ \KwTo $i+1$ \textbf{(decreasing)}}{
+  $x.c_{j+1} \gets x.c_j$\tcp*{shift $x$'s children right to open a slot for $z$}
+}
+$x.c_{i+1} \gets z$\;
+\For{$j \gets x.n$ \KwTo $i$ \textbf{(decreasing)}}{
+  $x.\mathit{key}_{j+1} \gets x.\mathit{key}_j$\tcp*{shift $x$'s keys right to open a slot}
+}
+$x.\mathit{key}_i \gets y.\mathit{key}_t$\tcp*{the median floats up into $x$}
+$x.n \gets x.n + 1$\;
+\textsc{Disk-Write}$(y)$; \textsc{Disk-Write}$(z)$; \textsc{Disk-Write}$(x)$\;
+\end{algorithm}
+
+Every loop runs at most $t$ times, so the whole split is $O(t)$ in-memory work plus
+three disk writes -- a tidy $O(1)$ in disk accesses. Note that splitting never
+touches anything below $y$ and $z$; it is purely local surgery at one parent and
+its one full child.
+
+\begin{trapbox}
+Two off-by-one traps lurk here. First, the median sits at index $t$, \emph{not}
+$t-1$ or $t+1$; with $2t-1$ keys indexed $1\ldots 2t-1$, position $t$ has exactly
+$t-1$ keys on each side. Second, $z$ receives keys $y.\mathit{key}_{t+1}$ through
+$y.\mathit{key}_{2t-1}$ -- that is the loop ``$z.\mathit{key}_j \gets
+y.\mathit{key}_{j+t}$ for $j=1\ldots t-1$.'' The lower keys
+$y.\mathit{key}_1\ldots y.\mathit{key}_{t-1}$ stay in $y$, and we simply set
+$y.n = t-1$ to forget the rest. If you accidentally leave the median in one of the
+halves, that half ends up with $t$ keys and the parent never receives its
+separator, and the whole structure quietly corrupts.
+\end{trapbox}
+
+\section{Insertion in a Single Downward Pass}
+
+Now the clever part. The naive plan would be: walk down to the right leaf, insert
+there, and if the leaf overflows, split it and push the median up, possibly
+triggering a cascade of splits all the way back up to the root. That works, but it
+walks the path \emph{twice} -- once down, once back up -- which on disk means
+re-reading pages we already paid for. B-trees use a slicker, \emph{single-pass}
+strategy that fixes problems on the way down, so it never has to come back up.
+
+\begin{focusbox}
+\textbf{The single-pass insight: split full nodes \emph{before} you enter them.}
+As you descend toward the target leaf, whenever you are about to step into a child
+that is full, split it first. Splitting it pushes a key up into the current node --
+but you guaranteed the current node was non-full before you arrived, so it can
+safely absorb that key. By induction, every node you stand on during the descent is
+non-full, so every split you ever need to do has a safe place to put its median.
+You never overflow, you never recurse upward, and you touch each page on the path
+exactly once.
+\end{focusbox}
+
+There is one node this trick cannot help with: the root, which has no parent to
+absorb a pushed-up key. So the root gets special handling. If the root is full when
+we begin, we grow a brand-new empty root above it and split the old root into two
+children of the new one (Figure~\ref{ch18:fig-rootsplit}). This is the \emph{only}
+way a B-tree gains height, and it explains property 4 of the definition -- since
+growth happens at the top, all leaves stay at the same depth automatically.
+
+\begin{figure}[H]
+\begin{center}
+\begin{tikzpicture}[every node/.style={font=\footnotesize}]
+% before: a full root (t=2 so 3 keys)
+\node at (-3.6,1.5) {\textbf{full root ($t=2$)}};
+\draw[sourceblue,thick] (-5.2,0.6) rectangle (-2.0,1.1);
+\foreach \x in {-4.13,-3.06}{\draw[sourceblue!50](\x,0.6)--(\x,1.1);}
+\node at (-4.66,0.85){$p$};
+\node[trapred] at (-3.6,0.85){$q$};
+\node at (-2.53,0.85){$r$};
+\node at (-0.9,0.85){\large$\Rightarrow$};
+% after: new root with q, two children p and r
+\node at (3.0,1.9) {\textbf{new root, tree one taller}};
+\draw[sourceblue,thick] (2.7,1.2) rectangle (3.3,1.6);
+\node[trapred] at (3.0,1.4){$q$};
+\draw[sourceblue,thick] (1.6,0.2) rectangle (2.2,0.6);
+\node at (1.9,0.4){$p$};
+\draw[sourceblue,thick] (3.8,0.2) rectangle (4.4,0.6);
+\node at (4.1,0.4){$r$};
+\draw[->,gray] (2.85,1.2)--(1.9,0.6);
+\draw[->,gray] (3.15,1.2)--(4.1,0.6);
+\end{tikzpicture}
+\end{center}
+\caption{Growing the tree at the root. A full root splits about its median $q$,
+which becomes the sole key of a fresh root sitting one level higher; the two halves
+$p$ and $r$ become its children. Because the new level appears above everything,
+all leaves still share the same depth.}
+\label{ch18:fig-rootsplit}
+\end{figure}
+
+\begin{algorithm}[H]
+\caption{\textsc{B-Tree-Insert}$(T, k)$ -- insert key $k$ into B-tree $T$}
+\KwIn{a B-tree $T$ and a key $k$ to insert}
+\KwOut{$T$ updated to contain $k$, all invariants preserved}
+$r \gets T.\mathit{root}$\;
+\eIf{$r.n = 2t-1$}{
+  $s \gets$ a new node; \quad $s.\mathit{leaf} \gets \textsc{false}$; \quad $s.n \gets 0$\;
+  $s.c_1 \gets r$; \quad $T.\mathit{root} \gets s$\tcp*{new empty root above the old one}
+  \textsc{B-Tree-Split-Child}$(s, 1)$\tcp*{split old root; tree grows one level}
+  \textsc{B-Tree-Insert-Nonfull}$(s, k)$\;
+}{
+  \textsc{B-Tree-Insert-Nonfull}$(r, k)$\;
+}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{B-Tree-Insert-Nonfull}$(x, k)$ -- insert $k$ into the non-full node $x$ or below it}
+\KwIn{a node $x$ that is \emph{not} full, and a key $k$}
+$i \gets x.n$\;
+\eIf{$x.\mathit{leaf}$}{
+  \While{$i \ge 1$ \textbf{and} $k < x.\mathit{key}_i$}{
+    $x.\mathit{key}_{i+1} \gets x.\mathit{key}_i$\tcp*{shift keys right to make room}
+    $i \gets i - 1$\;
+  }
+  $x.\mathit{key}_{i+1} \gets k$; \quad $x.n \gets x.n + 1$\;
+  \textsc{Disk-Write}$(x)$\tcp*{drop $k$ into the leaf, done}
+}{
+  \While{$i \ge 1$ \textbf{and} $k < x.\mathit{key}_i$}{
+    $i \gets i - 1$\;
+  }
+  $i \gets i + 1$\tcp*{$x.c_i$ is the child we must descend into}
+  \textsc{Disk-Read}$(x.c_i)$\;
+  \If{$x.c_i.n = 2t-1$}{
+    \textsc{B-Tree-Split-Child}$(x, i)$\tcp*{full child! split it before descending}
+    \If{$k > x.\mathit{key}_i$}{
+      $i \gets i + 1$\tcp*{the pushed-up median may shift which half we want}
+    }
+  }
+  \textsc{B-Tree-Insert-Nonfull}$(x.c_i, k)$\;
+}
+\end{algorithm}
+
+That little ``if $k > x.\mathit{key}_i$ then $i \gets i+1$'' is easy to overlook
+but essential. After a split, the median key has just landed at position $i$ in
+$x$, creating a new child at $i+1$. If our key $k$ is bigger than that median, it
+belongs in the right half, so we must redirect into $x.c_{i+1}$ instead of
+$x.c_i$.
+
+\subsection{A Fully Traced Insertion}
+
+Let us watch the machinery run. Take $t = 2$ (so nodes hold $1$ to $3$ keys, and
+full means $3$ keys). We start from this tree and insert the key $4$.
+
+\begin{center}
+\begin{tikzpicture}[every node/.style={font=\footnotesize}, level distance=14mm]
+\node[draw,sourceblue,thick,inner sep=2pt] (root) {$\;10\;$};
+\node[draw,inner sep=2pt] (a) at (-2.3,-1.5) {$1\mid3\mid7$};
+\node[draw,inner sep=2pt] (b) at (2.3,-1.5) {$14\mid16$};
+\draw (root)--(a); \draw (root)--(b);
+\end{tikzpicture}
+\end{center}
+
+\begin{labbox}
+\textbf{Inserting $4$ into the tree above ($t=2$).}
+\begin{enumerate}
+\item \emph{Check the root.} The root $[10]$ has $1$ key, which is not $2t-1 = 3$,
+so the root is not full. We call \textsc{Insert-Nonfull} on it.
+\item \emph{At the root, choose a child.} Scanning, $4 < 10$, so we head for the
+left child $c_1 = [1,3,7]$. But that child has $3$ keys -- it is \emph{full}! We
+must split it before descending.
+\item \emph{Split the full child.} The median of $[1,3,7]$ is $3$ (position
+$t = 2$). It floats up into the root, which becomes $[3,10]$. The child splits into
+$[1]$ (left) and $[7]$ (right). The tree is now:
+\begin{center}
+\begin{tikzpicture}[every node/.style={font=\footnotesize}, level distance=12mm]
+\node[draw,sourceblue,thick,inner sep=2pt] (root) {$\;3\;\mid\;10\;$};
+\node[draw,inner sep=2pt] (a) at (-3,-1.3) {$1$};
+\node[draw,inner sep=2pt] (b) at (0,-1.3) {$7$};
+\node[draw,inner sep=2pt] (c) at (3,-1.3) {$14\mid16$};
+\draw (root)--(a);\draw(root)--(b);\draw(root)--(c);
+\end{tikzpicture}
+\end{center}
+\item \emph{Redirect after the split.} Back in the root, the median $3$ now sits at
+position $i=1$. Is $k=4 > 3$? Yes, so bump $i$ to $2$: we descend into $c_2 = [7]$,
+the right half.
+\item \emph{At the leaf.} Node $[7]$ is a non-full leaf. We slide $4$ into place:
+$4 < 7$, so $4$ goes before $7$, giving the leaf $[4,7]$. Disk-write it. Done.
+\end{enumerate}
+The final tree:
+\begin{center}
+\begin{tikzpicture}[every node/.style={font=\footnotesize}, level distance=12mm]
+\node[draw,sourceblue,thick,inner sep=2pt] (root) {$\;3\;\mid\;10\;$};
+\node[draw,inner sep=2pt] (a) at (-3,-1.3) {$1$};
+\node[draw,inner sep=2pt] (b) at (0,-1.3) {$4\mid7$};
+\node[draw,inner sep=2pt] (c) at (3,-1.3) {$14\mid16$};
+\draw (root)--(a);\draw(root)--(b);\draw(root)--(c);
+\end{tikzpicture}
+\end{center}
+Notice we proactively split $[1,3,7]$ even though, in hindsight, it had room for
+$4$ after the split. The single-pass discipline does not gamble: it splits any full
+node it might pass through, guaranteeing the leaf at the bottom always has room.
+\end{labbox}
+
+\begin{walkbox}
+Here is something to chew on while you stretch your legs. The single-pass insert
+sometimes splits a node that, it turns out, did not strictly \emph{need} splitting
+-- the eventual insertion happened elsewhere, or the node had spare room. Is that
+wasteful? Now think about the alternative: an insert that descends first and splits
+on the way back up only when forced. That avoids ``unnecessary'' splits but must
+keep the whole root-to-leaf path of pages in memory and re-walk it. On disk, which
+cost dominates -- a few extra splits, or re-reading the path? And does your answer
+change if the tree lives entirely in RAM? Sit with which resource is actually
+scarce in each setting; that is the real lesson of this chapter.
+\end{walkbox}
+
+\begin{complexitybox}
+\textbf{B-tree operations, minimum degree $t$, $n$ keys, height $h = O(\log_t n)$.}
+\begin{center}
+\begin{tabular}{l c c}
+\toprule
+operation & disk accesses & CPU time \\
+\midrule
+search & $O(h) = O(\log_t n)$ & $O(t\,h) = O(t \log_t n)$ \\
+insert & $O(h) = O(\log_t n)$ & $O(t\,h) = O(t \log_t n)$ \\
+delete & $O(h) = O(\log_t n)$ & $O(t\,h) = O(t \log_t n)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+Each operation visits $O(h)$ nodes, one disk access per node, and does $O(t)$
+in-memory work per node (a scan plus at most one split or merge). Since
+$t\log_t n = t\,\frac{\log_2 n}{\log_2 t}$, increasing $t$ shortens the tree but
+adds per-node work; you choose $t$ to make a node fill exactly one page, which
+minimizes the thing that actually hurts -- disk accesses.
+\end{complexitybox}
+
+\section{Why Insertion Is Correct}
+
+Let us pause to convince ourselves the single-pass insert really does preserve
+every B-tree property. The argument rests on one clean invariant.
+
+\begin{formalbox}
+\textbf{Descent invariant.} Every call \textsc{B-Tree-Insert-Nonfull}$(x,k)$ is
+made on a node $x$ that is \emph{not full}, i.e. $x.n \le 2t-2$.
+\end{formalbox}
+
+\emph{Why the invariant holds.} \textsc{B-Tree-Insert} establishes it for the
+first call: if the original root was full, we split it so the new root $s$ holds a
+single key (non-full); if it was not full, we call directly on it. Now suppose we
+are at a non-full node $x$ and about to recurse into child $x.c_i$. If $x.c_i$ is
+full, we split it first. After the split, $x.c_i$ (and its new sibling) each hold
+$t-1$ keys -- well below $2t-1$ -- so whichever half we descend into is non-full.
+If $x.c_i$ was not full to begin with, we descend into it unchanged, still
+non-full. Either way the next call receives a non-full node. By induction the
+invariant holds all the way down.
+
+\emph{Why that makes everything correct.} Because the node we land on is always
+non-full, the leaf at the bottom always has room to absorb $k$ without overflowing,
+so we never violate the upper bound $2t-1$. Every split we perform takes a full
+node to two half-full ($t-1$-key) nodes and lifts one key into a guaranteed-non-full
+parent, so no node ever drops below $t-1$ keys or exceeds $2t-1$. The sorted order
+(property 3) is maintained because we always insert $k$ into the gap where it
+belongs and because a split's median is exactly the correct separator between its
+two halves. Finally, height grows only when we split the root, and that adds one
+level uniformly above everything, so all leaves stay at equal depth (property 4).
+Every property survives. $\qed$
+
+\section{Deletion}
+
+Deletion is the fussiest operation, and honestly it is where most first-time
+implementers get tangled. But the guiding idea is a perfect mirror of insertion, so
+hold onto that symmetry and the cases will feel less like a thicket.
+
+\begin{intuitionbox}
+Insertion's enemy was \emph{overflow}: a node getting too full, cured by splitting.
+Deletion's enemy is the opposite, \emph{underflow}: a node dropping below $t-1$
+keys, cured by either \emph{borrowing} a key from a sibling or \emph{merging} with a
+sibling. And just as insertion split full nodes on the way \emph{down} so the leaf
+always had room, deletion will \emph{fatten} thin nodes on the way down so that
+whenever we finally remove a key, the node we remove it from has a key to spare. We
+maintain the mirror-image invariant: \emph{never step into a node with only the
+minimum $t-1$ keys; first top it up to at least $t$.}
+\end{intuitionbox}
+
+\begin{focusbox}
+\textbf{The deletion descent invariant.} Whenever \textsc{B-Tree-Delete} is called
+recursively on a node, that node has at least $t$ keys (one more than the minimum
+$t-1$). The root is exempt -- it is allowed to be thin -- which is why deletion can
+shrink the tree's height only by emptying the root.
+\end{focusbox}
+
+To enforce that invariant we need two repair moves. Suppose we want to descend into
+a child $c$ that has only $t-1$ keys (the minimum). Before descending, we fatten it:
+
+\begin{itemize}
+\item \textbf{Borrow (rotate).} If an \emph{adjacent sibling} of $c$ has at least
+$t$ keys (a key to spare), rotate one key across. The separator key in the parent
+that sits between $c$ and that sibling moves \emph{down} into $c$, and the
+sibling's extreme key (and a child pointer, if internal) moves \emph{up} to take
+the separator's place. Now $c$ has $t$ keys and the sibling still has at least
+$t-1$. Everybody is legal.
+\item \textbf{Merge.} If \emph{both} adjacent siblings have only $t-1$ keys
+(nobody can spare a key), merge $c$ with one of them. Pull the separator key down
+from the parent and fuse $c$, that separator, and the sibling into one node. The
+merged node has $(t-1) + 1 + (t-1) = 2t-1$ keys -- a perfectly full but legal node
+-- and the parent loses one key and one child.
+\end{itemize}
+
+Figure~\ref{ch18:fig-borrow} shows a borrow and Figure~\ref{ch18:fig-merge} a
+merge; in both, the parent's separator is the hinge the keys rotate around.
+
+\begin{figure}[H]
+\begin{center}
+\begin{tikzpicture}[every node/.style={font=\footnotesize}]
+% BORROW
+\node at (-3.6,2.5) {\textbf{borrow from right sibling}};
+\draw[gray!70] (-5.0,1.7) rectangle (-2.6,2.15);
+\node at (-4.4,1.92){$a$};\node at (-3.2,1.92){$s$};
+\draw[sourceblue,thick] (-6.0,0.7) rectangle (-5.0,1.15);
+\node at (-5.5,0.92){$c$};
+\draw[sourceblue,thick] (-3.7,0.7) rectangle (-2.1,1.15);
+\node at (-3.35,0.92){$g$};\node at (-2.45,0.92){$h$};
+\draw[->,gray] (-3.2,1.7)--(-3.2,1.15);
+\node at (-1.55,1.2){\large$\Rightarrow$};
+\draw[gray!70] (-5.0+4.2,1.7) rectangle (-2.6+4.2,2.15);
+\node at (-4.4+4.2,1.92){$a$};\node at (-3.2+4.2,1.92){$g$};
+\draw[sourceblue,thick] (-6.0+4.4,0.7) rectangle (-5.0+4.4+0.6,1.15);
+\node at (-5.5+4.4-0.1,0.92){$c$};\node at (-5.5+4.4+0.7,0.92){$s$};
+\draw[sourceblue,thick] (-3.7+4.4,0.7) rectangle (-2.1+4.4,1.15);
+\node at (-2.9+4.4,0.92){$h$};
+\end{tikzpicture}
+\end{center}
+\caption{Borrowing. The thin child $c$ takes the parent separator $s$, and the
+donor sibling's smallest key $g$ rises to become the new separator.}
+\label{ch18:fig-borrow}
+\end{figure}
+
+\begin{figure}[H]
+\begin{center}
+\begin{tikzpicture}[every node/.style={font=\footnotesize}]
+% MERGE
+\node at (-3.6,2.5) {\textbf{merge two thin siblings}};
+\draw[gray!70] (-5.2,1.7) rectangle (-2.4,2.15);
+\node at (-4.5,1.92){$a$};\node at (-3.8,1.92){$s$};\node at (-3.1,1.92){$b$};
+\draw[sourceblue,thick] (-6.0,0.7) rectangle (-5.0,1.15);
+\node at (-5.5,0.92){$c$};
+\draw[sourceblue,thick] (-3.7,0.7) rectangle (-2.7,1.15);
+\node at (-3.2,0.92){$g$};
+\draw[->,gray] (-3.8,1.7)--(-4.6,1.15);
+\node at (-1.6,1.2){\large$\Rightarrow$};
+\draw[gray!70] (1.4,1.7) rectangle (3.0,2.15);
+\node at (1.8,1.92){$a$};\node at (2.6,1.92){$b$};
+\draw[sourceblue,thick] (1.0,0.7) rectangle (3.4,1.15);
+\node at (1.4,0.92){$c$};\node at (2.2,0.92){$s$};\node at (3.0,0.92){$g$};
+\end{tikzpicture}
+\end{center}
+\caption{Merging. When neither sibling can spare a key, the separator $s$ drops
+down and fuses the two thin children into one full node; the parent shrinks by one
+key and one child.}
+\label{ch18:fig-merge}
+\end{figure}
+
+With those two moves in hand, the deletion itself splits into a few cases depending
+on where the key to remove lives and whether it is in a leaf.
+
+\begin{formalbox}
+\textbf{Deleting key $k$ from the subtree rooted at $x$ (sketch).} First ensure
+$x$ has at least $t$ keys (borrow/merge as above, unless $x$ is the root). Then:
+\begin{description}
+\item[Case 1 -- $k$ is in $x$ and $x$ is a leaf.] Just remove $k$ from $x$. Since
+$x$ had $\ge t$ keys it still has $\ge t-1$. Done.
+\item[Case 2 -- $k$ is in $x$ and $x$ is internal.] We cannot leave a hole, so we
+replace $k$ with a neighboring key that can fill its slot.
+\begin{itemize}
+\item[\emph{2a.}] If the child $y$ \emph{left} of $k$ has $\ge t$ keys, find $k$'s
+\emph{predecessor} $k'$ (the largest key in $y$'s subtree), recursively delete $k'$
+from that subtree, and overwrite $k$ with $k'$.
+\item[\emph{2b.}] Symmetrically, if the child $z$ \emph{right} of $k$ has $\ge t$
+keys, use $k$'s \emph{successor}.
+\item[\emph{2c.}] If both flanking children have only $t-1$ keys, \emph{merge} $k$
+and the right child into the left child (a full $2t-1$-key node), then recursively
+delete $k$ from that merged child.
+\end{itemize}
+\item[Case 3 -- $k$ is not in $x$.] Find the child $x.c_i$ whose subtree must
+contain $k$. If $x.c_i$ has only $t-1$ keys, fatten it first (borrow from a sibling,
+or merge), then recurse into the appropriate child to delete $k$.
+\end{description}
+\end{formalbox}
+
+\begin{intuitionbox}
+Case 2 is the only genuinely new idea, and it is the same trick as deleting from an
+ordinary binary search tree: to remove an internal key without leaving a gap,
+replace it with its \emph{predecessor} or \emph{successor}, then delete \emph{that}
+key from where it lives (always lower down, eventually in a leaf). The predecessor
+is the rightmost key in the left subtree; the successor is the leftmost key in the
+right subtree. We prefer whichever side has a key to spare so the recursion lands on
+a node that is already fat enough -- preserving the invariant. If neither side can
+spare a key, we merge them and the problem shrinks to one level down.
+\end{intuitionbox}
+
+\begin{labbox}
+\textbf{A deletion that triggers a merge ($t = 2$).} Start from this tree and delete
+the key $6$.
+\begin{center}
+\begin{tikzpicture}[every node/.style={font=\footnotesize}, level distance=13mm]
+\node[draw,sourceblue,thick,inner sep=2pt] (root) {$\;3\;\mid\;9\;$};
+\node[draw,inner sep=2pt] (a) at (-3,-1.4) {$1$};
+\node[draw,inner sep=2pt] (b) at (0,-1.4) {$6$};
+\node[draw,inner sep=2pt] (c) at (3,-1.4) {$11\mid13$};
+\draw (root)--(a);\draw(root)--(b);\draw(root)--(c);
+\end{tikzpicture}
+\end{center}
+\begin{enumerate}
+\item \emph{At the root} $[3,9]$: $6$ is not here. It lies between $3$ and $9$, so
+it belongs in the middle child $c_2 = [6]$.
+\item \emph{Fatten before descending.} Child $[6]$ has only $t-1 = 1$ key -- the
+minimum. Can it borrow? Its left sibling $[1]$ has $1$ key (nothing to spare); its
+right sibling $[11,13]$ has $2$ keys, but that is across the separator $9$, and to
+keep the example pointed let us suppose we look left first and, finding no donor,
+\emph{merge} $[6]$ with its left sibling $[1]$. We pull the separator $3$ down: the
+merged node is $[1,3,6]$, and the root loses a key, becoming $[9]$.
+\begin{center}
+\begin{tikzpicture}[every node/.style={font=\footnotesize}, level distance=13mm]
+\node[draw,sourceblue,thick,inner sep=2pt] (root) {$\;9\;$};
+\node[draw,inner sep=2pt] (a) at (-2.4,-1.3) {$1\mid3\mid6$};
+\node[draw,inner sep=2pt] (c) at (2.4,-1.3) {$11\mid13$};
+\draw (root)--(a);\draw(root)--(c);
+\end{tikzpicture}
+\end{center}
+\item \emph{Delete from the fattened leaf.} Now recurse into $[1,3,6]$, a leaf with
+$3$ keys. It is Case 1: simply remove $6$, leaving $[1,3]$. Done.
+\end{enumerate}
+\begin{center}
+\begin{tikzpicture}[every node/.style={font=\footnotesize}, level distance=13mm]
+\node[draw,sourceblue,thick,inner sep=2pt] (root) {$\;9\;$};
+\node[draw,inner sep=2pt] (a) at (-2.4,-1.3) {$1\mid3$};
+\node[draw,inner sep=2pt] (c) at (2.4,-1.3) {$11\mid13$};
+\draw (root)--(a);\draw(root)--(c);
+\end{tikzpicture}
+\end{center}
+The merge fixed the underflow \emph{on the way down}, so by the time we removed $6$
+the leaf had keys to spare. Had the root dropped to zero keys during such a merge,
+we would discard it and make the merged node the new root -- that is the lone way a
+B-tree loses height.
+\end{labbox}
+
+\begin{trapbox}
+The classic deletion bug is forgetting to fatten \emph{before} you descend, and
+instead deleting first and patching up underflow afterward. The patch-up-afterward
+style does work, but it forces you to walk back up the path -- exactly the
+double-pass cost we worked so hard to avoid in insertion -- and it is far easier to
+get the cascade of merges wrong. The disciplined recipe is always: \emph{guarantee
+the node you are about to enter has $\ge t$ keys, then enter it.} If you maintain
+that one invariant religiously, every removal you finally perform leaves a legal
+node behind, and you never recurse upward.
+\end{trapbox}
+
+Like search and insert, deletion visits one node per level and does $O(t)$
+in-memory work (one borrow or merge) at each, so it costs $O(h) = O(\log_t n)$ disk
+accesses and $O(t\log_t n)$ CPU time -- the same budget as everything else.
+
+\section{Stepping Back}
+
+\begin{aestheticbox}
+You now understand the data structure that, more than any other, makes large-scale
+data storage practical. When PostgreSQL, MySQL/InnoDB, Oracle, or SQLite build an
+index on a column, that index is a B-tree (often the B$^+$-tree variant, which
+stores all real data in the leaves and chains the leaves together for fast range
+scans -- a small twist on what you have just learned). When you query
+``\texttt{WHERE id = 91823}'' and it returns in a millisecond from a table of a
+billion rows, you are watching a height-$3$ B-tree do its two disk reads.
+Filesystems use them to map filenames to locations. Key-value stores, time-series
+databases, and even some in-memory systems use them because the same width-over-height
+logic that beats disk latency also beats CPU-cache-miss latency: a cache line is just
+a very small, very fast ``page,'' and the B-tree's instinct to pack many keys into one
+fetched block is exactly right there too.
+\end{aestheticbox}
+
+\begin{focusbox}
+The one idea to carry away: \textbf{a B-tree is a balanced search tree re-tuned for a
+world where each access is expensive, so it maximizes the work done per access by
+making nodes wide.} Width $\Rightarrow$ low height $\Rightarrow$ few accesses. Every
+detail -- the $t-1$-to-$2t-1$ occupancy band, splitting full nodes on the way down,
+fattening thin nodes on the way down, growing and shrinking only at the root -- is in
+service of that single principle.
+\end{focusbox}
+
+\section*{Exercises}
+\addcontentsline{toc}{section}{Exercises}
+
+\begin{exercise}\label{ch18:ex-warmup-bounds}
+For a B-tree with minimum degree $t = 4$, state: (a) the minimum and maximum number
+of keys in a non-root node; (b) the minimum and maximum number of children of an
+internal non-root node; (c) the maximum number of keys in any node. Then state how
+many keys the \emph{root} is allowed to have at minimum.
+\end{exercise}
+
+\begin{exercise}\label{ch18:ex-height-count}
+Using the height theorem, compute an upper bound on the height of a B-tree with
+$t = 100$ holding $n = 10^6$ keys, then $n = 10^{12}$ keys. Roughly how many disk
+accesses does a search cost in each case if the root is kept cached in memory?
+\end{exercise}
+
+\begin{exercise}\label{ch18:ex-build}
+Starting from an empty B-tree with $t = 2$, insert the keys
+$F$, $S$, $Q$, $K$, $C$, $L$, $H$, $T$, $V$, $W$, $M$, $R$, $N$, $P$ in this
+order (compare them alphabetically). Draw the tree after every insertion that causes a split. (This is
+the classic CLRS build-up exercise; doing it by hand cements the single-pass
+insert.)
+\end{exercise}
+
+\begin{exercise}\label{ch18:ex-minkeys}
+Show that a B-tree of minimum degree $t$ and height $h$ holding $n$ keys must
+satisfy $n \le 2(2t)^h - 1$ as well (the \emph{maximum} number of keys, from the
+fullest possible tree), and combine it with the chapter's lower bound to sandwich
+$n$. What does the upper bound tell you about the \emph{smallest} possible height
+for $n$ keys?
+\end{exercise}
+
+\begin{exercise}\label{ch18:ex-split-trace}
+Let $t = 3$. First check yourself: how many keys does a full node hold? Write that
+full node's keys as $10, 20, 30, 40, 50$, identify the median that floats up under
+\textsc{B-Tree-Split-Child}, and write out the two resulting child nodes and the key
+handed to the parent.
+\end{exercise}
+
+\begin{exercise}\label{ch18:ex-why-not-full-parent}
+\textsc{B-Tree-Split-Child} requires that the parent be non-full before it is
+called. Explain concretely what goes wrong if you split a child whose parent is
+already full, and explain how \textsc{B-Tree-Insert-Nonfull}'s descent guarantees
+the parent is never full at the moment of a split.
+\end{exercise}
+
+\begin{exercise}\label{ch18:ex-delete-trace}
+Take the final tree from the deletion lab in this chapter (the one with root $[9]$,
+left child $[1,3]$, right child $[11,13]$, with $t=2$). Delete the key $9$. Which
+deletion case applies, and what does the tree look like afterward? (Hint: $9$ lives
+in an internal node, so you are in Case 2 -- decide whether to use its predecessor
+or successor based on which flanking child can spare a key.)
+\end{exercise}
+
+\begin{exercise}\label{ch18:ex-onepass-vs-twopass}
+Argue carefully why the single-pass insertion never needs to revisit a node it has
+already left on its way down. Phrase your answer in terms of the descent invariant.
+Then describe a scenario in which a \emph{two-pass} (descend, then split upward)
+insertion would re-read the same disk page multiple times, and count how many extra
+disk reads it incurs in the worst case for a tree of height $h$.
+\end{exercise}
+
+\begin{exercise}\label{ch18:ex-choose-t}
+A disk page holds $4096$ bytes. Each key plus its associated child pointer occupies
+$32$ bytes, and a node needs an extra $8$-byte header. Roughly what is the largest
+minimum degree $t$ such that a full node still fits in one page? Show your
+arithmetic, and explain why you would choose $t$ this large rather than, say,
+$t = 2$.
+\end{exercise}
+
+\begin{exercise}\label{ch18:ex-bplus}
+\emph{(Reading ahead.)} Look up the B$^+$-tree variant. In a B$^+$-tree, all real
+records live in the leaves and internal nodes hold only separator keys, and the
+leaves are linked in a chain. Explain in one paragraph why this layout makes
+\emph{range queries} (``give me every key between $40$ and $90$ in sorted order'')
+faster than in the plain B-tree of this chapter.
+\end{exercise}

@@ -1,0 +1,974 @@
+\chapter{Disjoint Sets and Union-Find}
+
+Here is a question that sounds almost too simple to be the subject of a whole
+chapter. You are given a pile of objects -- people, computers on a network,
+pixels in a photograph, cells in a maze -- and from time to time someone tells
+you that two of them belong together. ``Alice and Bob are friends.'' ``Cable
+runs from router 3 to router 7.'' ``This pixel touches that pixel and they are
+the same color.'' As these facts arrive, the objects clump up into groups. And
+at any moment, someone might stop you and ask: \emph{are these two particular
+objects currently in the same group?}
+
+That is the entire problem. You maintain a collection of groups, you
+occasionally merge two groups into one, and you occasionally ask whether two
+objects share a group. It is called the \emph{disjoint-set} or
+\emph{union-find} problem, and the reason it deserves a chapter is that the
+fast solution is one of the small miracles of computer science: a data
+structure so close to free that we need a function almost nobody has ever heard
+of just to describe how close to free it is.
+
+\begin{intuitionbox}
+Picture a room full of strangers. Each begins alone, a group of one. You
+walk around announcing introductions: ``you two know each other now.'' When
+two people meet, their entire friend-groups silently merge -- if Alice knew
+Carol and Bob knew Dave, then after Alice meets Bob, all four are one group.
+At any point I can tap two people on the shoulder and ask, ``same group?'' To
+answer instantly, each group elects a single \emph{leader}, and everyone in
+the group knows (perhaps after a short chain of pointers) who their leader is.
+Two people are in the same group exactly when they share a leader. That single
+idea -- \emph{a group is named by its leader} -- is the whole chapter.
+\end{intuitionbox}
+
+We will start with the slowest reasonable version, watch exactly where it
+hurts, and add two small tricks. Those two tricks together turn a structure
+that could cost $\Theta(n)$ per operation into one that costs, for all
+practical purposes, a constant. Then we will meet the strange, slow-growing
+function that measures precisely how close to constant we got.
+
+\section{What We Are Actually Building}
+\label{ch19:problem}
+
+Let us pin the problem down. We have a universe of $n$ elements. They are
+partitioned into \emph{disjoint sets} -- ``disjoint'' meaning no element lives
+in two sets at once, so every element belongs to exactly one set. We want to
+support three operations.
+
+\begin{formalbox}
+A \textbf{disjoint-set data structure} maintains a collection
+$\mathcal{S} = \{S_1, S_2, \dots, S_k\}$ of disjoint dynamic sets. Each set is
+identified by a \emph{representative}, which is some fixed member of the set.
+Three operations are supported:
+\begin{itemize}
+  \item $\textsc{Make-Set}(x)$: create a new set whose only member (and
+        representative) is $x$. Since $x$ joins no other set, the sets stay
+        disjoint.
+  \item $\textsc{Union}(x, y)$: replace the two sets containing $x$ and $y$,
+        say $S_x$ and $S_y$, by their union $S_x \cup S_y$, and destroy the two
+        originals. The new set gets one representative (often a member of one
+        of the two old sets).
+  \item $\textsc{Find-Set}(x)$: return the representative of the set
+        containing $x$.
+\end{itemize}
+\end{formalbox}
+
+Notice how cleanly $\textsc{Find-Set}$ answers our shoulder-tap question.
+``Are $x$ and $y$ in the same set?'' is just the test
+$\textsc{Find-Set}(x) = \textsc{Find-Set}(y)$. We never need a separate
+``same-set'' operation; representatives give it to us for free. The only
+promise the representative must keep is \emph{stability}: if you call
+$\textsc{Find-Set}$ twice on the same element with no intervening
+$\textsc{Union}$, you must get the same answer both times. Which element
+serves as representative is up to us, and we will exploit that freedom
+ruthlessly.
+
+\begin{focusbox}
+Hold these three operations in your head as the contract. Everything that
+follows -- linked lists, forests, ranks, path compression -- is just
+\emph{implementation} behind that contract. The user only ever sees
+$\textsc{Make-Set}$, $\textsc{Union}$, and $\textsc{Find-Set}$.
+\end{focusbox}
+
+\subsection{A motivating use: connected components}
+\label{ch19:components}
+
+Before we build anything, let us see why this contract is worth honoring. A
+\emph{graph} is a set of vertices and a set of edges joining them; two vertices
+are in the same \emph{connected component} if you can walk from one to the
+other along edges. Suppose edges arrive one at a time and, after each, you want
+to know how many components remain, or whether two given vertices are connected
+yet. Union-find answers this beautifully.
+
+\begin{algorithm}[H]
+\caption{\textsc{Connected-Components}$(G)$}
+\KwIn{A graph $G = (V, E)$.}
+\KwOut{A disjoint-set structure where $u, v$ share a set iff they are connected.}
+\ForEach{vertex $v \in V$}{
+  $\textsc{Make-Set}(v)$\;
+}
+\ForEach{edge $(u, v) \in E$}{
+  \If{$\textsc{Find-Set}(u) \neq \textsc{Find-Set}(v)$}{
+    $\textsc{Union}(u, v)$\;
+  }
+}
+\Return the disjoint-set structure\;
+\end{algorithm}
+
+After this runs, the procedure $\textsc{Same-Component}(u,v)$ is just one line:
+return whether $\textsc{Find-Set}(u) = \textsc{Find-Set}(v)$. We will meet this
+exact pattern again in the chapter on minimum spanning trees, where Kruskal's
+algorithm leans entirely on union-find to avoid creating cycles. So this is not
+a toy: it is a workhorse you will reuse.
+
+\begin{aestheticbox}
+Union-find quietly powers a surprising amount of real software. Kruskal's
+minimum-spanning-tree algorithm uses it to detect whether adding an edge would
+form a cycle. Image-processing tools use it for \emph{connected-component
+labeling} -- finding the blobs in a black-and-white image. Compilers use it for
+\emph{unification} in type inference, merging type variables that must be
+equal. Maze generators carve passages by unioning cells. Even physics
+simulations of percolation (does water seep through a porous rock?) are, at
+heart, union-find. It is the data structure you did not know you were already
+using.
+\end{aestheticbox}
+
+\section{First Try: a Linked-List Representation}
+\label{ch19:linkedlist}
+
+Let us build the simplest thing that could possibly work, so we can feel its
+weaknesses honestly. Represent each set as a \emph{linked list}. The first
+object in the list is the representative. Each object stores a pointer to the
+next object in its list, and -- this is the clever part -- also a pointer
+straight back to the representative.
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=12mm,
+  obj/.style={draw, rounded corners, minimum width=8mm, minimum height=7mm,
+    fill=blue!4},
+  rep/.style={obj, fill=green!10, very thick},
+  >={Stealth[length=2.2mm]}]
+  \node[rep] (a) {$c$};
+  \node[obj, right=of a] (b) {$h$};
+  \node[obj, right=of b] (c) {$e$};
+  \node[obj, right=of c] (d) {$b$};
+  \draw[->] (a) -- (b);
+  \draw[->] (b) -- (c);
+  \draw[->] (c) -- (d);
+  \draw[->, dashed, blue!55!black, bend right=38] (b) to (a);
+  \draw[->, dashed, blue!55!black, bend right=45] (c) to (a);
+  \draw[->, dashed, blue!55!black, bend right=50] (d) to (a);
+  \node[below=10mm of b, font=\small, gray] {dashed = ``back to representative'' pointer};
+\end{tikzpicture}
+\end{center}
+
+The solid arrows chain the list together (so we can walk it); the dashed arrows
+let every member point home to the representative $c$. With this layout,
+$\textsc{Make-Set}$ and $\textsc{Find-Set}$ are both gloriously fast.
+
+\begin{itemize}
+  \item $\textsc{Make-Set}(x)$: build a one-element list. Constant time.
+  \item $\textsc{Find-Set}(x)$: follow $x$'s back-pointer to the
+        representative. Constant time.
+\end{itemize}
+
+The trouble is $\textsc{Union}$. To union two lists, we append one onto the
+other. Appending the list is cheap -- splice one tail onto the other. But every
+object on the appended list now has the \emph{wrong} back-pointer: it still
+points to its old representative. We must walk the appended list and repoint
+each one to the new representative. That walk costs time proportional to the
+length of the list we appended.
+
+\begin{trapbox}
+The expensive part of the linked-list union is not joining the lists -- that is
+one pointer splice. It is \emph{updating every back-pointer} on the list that
+got absorbed. Beginners often assume union is cheap because ``it's just a list
+append.'' The back-pointers are the hidden tax, and they are what make this
+representation slow.
+\end{trapbox}
+
+\subsection{How bad can it get? A worst-case sequence}
+\label{ch19:linkedlist-worst}
+
+Naively, $\textsc{Union}(x,y)$ might always append $y$'s list onto $x$'s. An
+adversary can exploit this. Suppose we make $n$ singleton sets
+$x_1, \dots, x_n$, then perform $n-1$ unions, always appending the long
+accumulated list onto a fresh singleton:
+
+\[
+\textsc{Union}(x_2, x_1),\ \textsc{Union}(x_3, x_2),\ \dots,\
+\textsc{Union}(x_n, x_{n-1}).
+\]
+
+\begin{center}
+\begin{tikzpicture}[
+  bar/.style={draw, fill=trapred!20, minimum height=4mm},
+  >={Stealth[length=2mm]}, font=\small]
+  \foreach \k/\h in {1/1,2/2,3/3,4/4,5/5}{
+    \node[bar, minimum width=\h*4mm, anchor=west] at (0, -\k*6mm) {};
+    \node[anchor=east] at (-1mm, -\k*6mm) {union \k};
+    \node[anchor=west] at (\h*4mm+2mm, -\k*6mm) {repoint \h};
+  }
+  \node[anchor=west] at (0, -6*6mm) {$\vdots$};
+  \node[font=\footnotesize, gray, anchor=west] at (0,-7.4*6mm)
+    {each union absorbs the growing list, so the work climbs $1,2,3,\dots,n-1$};
+\end{tikzpicture}
+\end{center}
+
+Watch the cost if each union repoints the \emph{growing} side. The first union
+repoints $1$ object, the second repoints $2$, the third $3$, and so on, so the
+total update work across all $n-1$ unions is
+\[
+1 + 2 + 3 + \cdots + (n-1) = \frac{(n-1)\,n}{2} = \Theta(n^2).
+\]
+Averaged over the $2n-1$ operations in the sequence, that is $\Theta(n)$ per
+operation. For a million elements, a single union near the end could touch a
+million back-pointers. That is the pain point. Now let us fix it.
+
+\subsection{The weighted-union heuristic}
+\label{ch19:weighted}
+
+The fix is embarrassingly simple, and it is the first appearance of a theme
+that will repeat: \emph{when you merge two things, always absorb the smaller
+into the larger}. Keep, with each list, a count of its length. When you union,
+append the shorter list onto the longer one, and repoint only the shorter
+list's back-pointers. This is the \emph{weighted-union heuristic}.
+
+Why does this help so dramatically? Think about a single object $x$, and ask:
+how many times can $x$'s back-pointer ever be updated? Its back-pointer is
+updated only when $x$ is on the \emph{smaller} of two lists being merged. But
+the moment that happens, $x$ lands in a merged list at least \emph{twice} as
+big as the one it left. So each time $x$ gets repointed, the size of $x$'s set
+at least doubles.
+
+\begin{intuitionbox}
+A quantity that at least doubles each time something happens cannot have that
+something happen very often. Start at size $1$; after $k$ doublings the set has
+size at least $2^k$. Since no set exceeds $n$, we need $2^k \le n$, so
+$k \le \log_2 n$. Therefore \emph{any single object's back-pointer is updated
+at most $\log_2 n$ times over the entire history of the structure.}
+\end{intuitionbox}
+
+Summing across all $n$ objects, the total back-pointer work over any sequence
+of operations is at most $n \log_2 n$. The earlier quadratic blow-up is gone.
+
+\begin{formalbox}
+\textbf{Theorem (weighted union).} Using the linked-list representation with
+the weighted-union heuristic, any sequence of $m$ \textsc{Make-Set},
+\textsc{Union}, and \textsc{Find-Set} operations, of which $n$ are
+\textsc{Make-Set}, takes $O(m + n \log n)$ time in total.
+\end{formalbox}
+
+This is a genuinely good result -- it is exactly the bound CLRS proves for this
+representation. But we are going to do better still, because there is a second,
+sleeker way to picture sets that opens the door to near-constant time. We trade
+lists for trees.
+
+\section{The Forest Representation}
+\label{ch19:forest}
+
+Here is the idea that carries us the rest of the way. Represent each set not as
+a list but as a \emph{rooted tree}. Each element has a single pointer to its
+\emph{parent}. The root of a tree points to itself (a convenient way to say ``I
+am the representative''). The whole structure is therefore a \emph{forest} -- a
+collection of these trees, one per set. The representative of a set is the root
+of its tree.
+
+\begin{center}
+\begin{tikzpicture}[
+  level distance=11mm, sibling distance=15mm,
+  every node/.style={draw, circle, minimum size=7mm, fill=blue!4,
+    inner sep=0pt, font=\small},
+  >={Stealth[length=2mm]}, edge from parent/.style={draw,->}]
+  \node[fill=green!12, very thick] {$c$}
+    child {node {$h$}}
+    child {node {$e$}
+      child {node {$b$}}
+    };
+\end{tikzpicture}
+\hspace{1.4cm}
+\begin{tikzpicture}[
+  level distance=11mm, sibling distance=12mm,
+  every node/.style={draw, circle, minimum size=7mm, fill=blue!4,
+    inner sep=0pt, font=\small},
+  >={Stealth[length=2mm]}, edge from parent/.style={draw,->}]
+  \node[fill=green!12, very thick] {$f$}
+    child {node {$g$}}
+    child {node {$d$}};
+\end{tikzpicture}
+\end{center}
+
+Each arrow points from a child \emph{up} to its parent. Note: these are not
+binary trees and not search trees. There is no ordering, no balance condition
+yet, and a node may have any number of children. The only thing that matters is
+\emph{which root you reach by walking up}.
+
+The three operations become:
+
+\begin{itemize}
+  \item $\textsc{Make-Set}(x)$: make a one-node tree. Set $x.p = x$ (its parent
+        is itself). Constant time.
+  \item $\textsc{Find-Set}(x)$: walk up parent pointers from $x$ until you hit a
+        node that is its own parent. That node is the root; return it.
+  \item $\textsc{Union}(x, y)$: find the two roots, then make one root point to
+        the other. One pointer change (plus two finds).
+\end{itemize}
+
+Here is the bare-bones pseudocode, before any cleverness.
+
+\begin{algorithm}[H]
+\caption{Naive forest operations}
+\SetKwProg{Fn}{function}{}{}
+\Fn{\textsc{Make-Set}$(x)$}{
+  $x.p \gets x$\;
+}
+\Fn{\textsc{Find-Set}$(x)$}{
+  \While{$x \neq x.p$}{
+    $x \gets x.p$\;
+  }
+  \Return $x$\;
+}
+\Fn{\textsc{Union}$(x, y)$}{
+  $\textsc{Link}\big(\textsc{Find-Set}(x), \textsc{Find-Set}(y)\big)$\;
+}
+\Fn{\textsc{Link}$(u, v)$}{
+  \tcp{$u$ and $v$ are roots}
+  $u.p \gets v$\;
+}
+\end{algorithm}
+
+The cost of everything is the cost of $\textsc{Find-Set}$, which is the cost of
+walking from a node to its root -- that is, the \emph{height} of the tree. And
+here is the catch: nothing yet stops the trees from growing tall and stringy.
+If $\textsc{Link}$ always hangs the first root under the second, the same
+adversarial union chain from before builds a single path of $n$ nodes, and
+$\textsc{Find-Set}$ on the deepest node walks all $n$ of them. We are right back
+to $\Theta(n)$.
+
+\begin{walkbox}
+Before reading on, take this on a walk. The linked-list version had a
+weighted-union trick: absorb the smaller into the larger. The forest version is
+stringy because we attach roots carelessly. What is the analogous ``attach the
+smaller thing under the larger thing'' rule for trees -- and what should
+``smaller'' even mean when the thing is a tree, not a list? There are two
+natural answers, and they behave almost identically. See if you can invent at
+least one of them.
+\end{walkbox}
+
+\section{Trick One: Union by Rank}
+\label{ch19:rank}
+
+The trees got tall because we attached roots blindly. The cure is the same
+philosophy as weighted union: \emph{when you link two roots, put the shorter
+tree under the taller one's root.} If you always hang the shorter tree beneath
+the taller, the combined tree's height does not grow -- the shorter tree's
+nodes are now one level deeper, but they were shallower to begin with, so they
+still fit under the old height. The total height only increases when you link
+two trees of \emph{equal} height, and even then it goes up by just one.
+
+We could track exact heights, but tracking heights exactly becomes a nuisance
+once we add the second trick (path compression will secretly shrink trees
+without us updating heights). So instead we track an \emph{upper bound} on the
+height called the \emph{rank}. Every node carries an integer $x.\textit{rank}$.
+A fresh singleton has rank $0$. When we link two roots:
+
+\begin{itemize}
+  \item if their ranks differ, hang the lower-rank root under the higher-rank
+        root, and \emph{no rank changes};
+  \item if their ranks are equal, pick either as the new root and increment its
+        rank by one.
+\end{itemize}
+
+\begin{algorithm}[H]
+\caption{Forest with union by rank}
+\SetKwProg{Fn}{function}{}{}
+\Fn{\textsc{Make-Set}$(x)$}{
+  $x.p \gets x$\;
+  $x.\textit{rank} \gets 0$\;
+}
+\Fn{\textsc{Union}$(x, y)$}{
+  $u \gets \textsc{Find-Set}(x)$\;
+  $v \gets \textsc{Find-Set}(y)$\;
+  \lIf{$u = v$}{\Return \tcp*[h]{already in the same set; nothing to do}}
+  $\textsc{Link}(u, v)$\;
+}
+\Fn{\textsc{Link}$(u, v)$}{
+  \tcp{$u$, $v$ are distinct roots}
+  \uIf{$u.\textit{rank} > v.\textit{rank}$}{
+    $v.p \gets u$\;
+  }
+  \Else{
+    $u.p \gets v$\;
+    \If{$u.\textit{rank} = v.\textit{rank}$}{
+      $v.\textit{rank} \gets v.\textit{rank} + 1$\;
+    }
+  }
+}
+\end{algorithm}
+
+\begin{center}
+\begin{tikzpicture}[
+  every node/.style={draw, circle, minimum size=6mm, fill=blue!4,
+    inner sep=0pt, font=\footnotesize},
+  rt/.style={fill=green!12, very thick},
+  >={Stealth[length=1.8mm]}, edge from parent/.style={draw,->},
+  level distance=8mm, sibling distance=8mm]
+  % Case 1: unequal ranks
+  \begin{scope}
+    \node[rt] (u) at (0,0) {$u$};
+    \node (uc) at (0,-8mm) {};
+    \node[rt] (v) at (16mm,2mm) {$v$};
+    \draw[->] (v) -- (u);
+    \node[draw=none,fill=none,font=\footnotesize] at (0,-13mm) {rank $2$};
+    \node[draw=none,fill=none,font=\footnotesize] at (16mm,-3mm) {rank $1$};
+    \draw[fill=blue!4] (-3mm,-6mm) -- (3mm,-6mm) -- (0,0) -- cycle;
+    \draw[fill=blue!4] (13mm,-2.5mm) -- (19mm,-2.5mm) -- (16mm,2mm) -- cycle;
+    \node[draw=none,fill=none,font=\small,align=center] at (8mm,-19mm)
+      {unequal ranks:\\lower hangs under higher,\\no rank changes};
+  \end{scope}
+  % Case 2: equal ranks
+  \begin{scope}[xshift=46mm]
+    \node[rt] (u2) at (0,0) {$u$};
+    \node[rt] (v2) at (14mm,4mm) {$v$};
+    \draw[->] (u2) -- (v2);
+    \node[draw=none,fill=none,font=\footnotesize] at (0,-9mm) {was rank $1$};
+    \node[draw=none,fill=none,font=\footnotesize] at (18mm,9mm) {rank $1{\to}2$};
+    \draw[fill=blue!4] (-3mm,-5.5mm) -- (3mm,-5.5mm) -- (0,0) -- cycle;
+    \draw[fill=blue!4] (11mm,-1.5mm) -- (17mm,-1.5mm) -- (14mm,4mm) -- cycle;
+    \node[draw=none,fill=none,font=\small,align=center] at (7mm,-19mm)
+      {equal ranks:\\either becomes root,\\its rank goes up by one};
+  \end{scope}
+\end{tikzpicture}
+\end{center}
+
+The two cases of \textsc{Link}: a triangle is the rest of each root's tree.
+Only the equal-rank case ever raises a rank, and only by one.
+
+\subsection{Why rank controls height}
+\label{ch19:rank-bound}
+
+The payoff is a clean guarantee. Let us argue it gently, because the argument
+explains exactly \emph{why} rank works.
+
+\begin{lemma}
+\label{ch19:lem-rank-size}
+With union by rank (and no path compression), any root of rank $r$ is the root
+of a tree containing at least $2^r$ nodes.
+\end{lemma}
+
+\begin{proof}[Why it is true]
+We argue by induction on the number of links performed. A fresh node has rank
+$0$ and a tree of $1 = 2^0$ node, so the base case holds. Now consider a link.
+If two roots of \emph{different} rank are joined, the surviving root's rank does
+not change, and its tree only grew, so its size still beats $2^r$. The only
+interesting case is linking two roots of \emph{equal} rank $r$. By the
+inductive hypothesis each had at least $2^r$ nodes, so the merged tree has at
+least $2^r + 2^r = 2^{r+1}$ nodes -- and its new rank is exactly $r+1$. The
+bound holds.
+\end{proof}
+
+\begin{corollary}
+\label{ch19:cor-rank-log}
+Every rank is at most $\lfloor \log_2 n \rfloor$, where $n$ is the number of
+elements. Hence every tree has height at most $\lfloor \log_2 n \rfloor$, and
+$\textsc{Find-Set}$ runs in $O(\log n)$ time.
+\end{corollary}
+
+\begin{proof}[Why it is true]
+A root of rank $r$ owns at least $2^r$ nodes, and no tree can own more than $n$
+nodes, so $2^r \le n$, giving $r \le \log_2 n$. Since rank is an upper bound on
+height, the height is at most $\log_2 n$ too.
+\end{proof}
+
+So union by rank alone already matches the $O(\log n)$ per-operation behavior of
+weighted lists -- but now in a tree, which sets up the second trick. Let us
+trace it to make it concrete.
+
+\begin{labbox}
+\textbf{Trace union by rank.} Start with singletons $a,b,c,d,e,f,g,h$, each
+rank $0$. Execute, in order:
+\[
+\textsc{Union}(a,b),\ \textsc{Union}(c,d),\ \textsc{Union}(a,c),\
+\textsc{Union}(e,f),\ \textsc{Union}(a,e).
+\]
+\begin{enumerate}
+  \item $\textsc{Union}(a,b)$: equal ranks $0$. Hang $a$ under $b$; now
+        $b.\textit{rank}=1$. Tree: root $b$, child $a$.
+  \item $\textsc{Union}(c,d)$: equal ranks $0$. Hang $c$ under $d$;
+        $d.\textit{rank}=1$. Tree: root $d$, child $c$.
+  \item $\textsc{Union}(a,c)$: roots are $b$ (rank $1$) and $d$ (rank $1$).
+        Equal! Hang $b$ under $d$; $d.\textit{rank}=2$. Now $d$ roots all of
+        $a,b,c,d$.
+  \item $\textsc{Union}(e,f)$: equal ranks $0$. Hang $e$ under $f$;
+        $f.\textit{rank}=1$.
+  \item $\textsc{Union}(a,e)$: roots are $d$ (rank $2$) and $f$ (rank $1$).
+        Different! Hang the lower, $f$, under $d$. No rank changes; $d$ stays
+        rank $2$.
+\end{enumerate}
+Final tree rooted at $d$: children $c$, $b$, $f$; under $b$ is $a$; under $f$ is
+$e$. The deepest node ($a$ or $e$) is $2$ steps from the root -- and indeed
+$\textit{rank}(d) = 2$. Check that this $8$-node tree has height $2 \le
+\log_2 8 = 3$, as the corollary promises.
+\end{labbox}
+
+\begin{center}
+\begin{tikzpicture}[
+  every node/.style={draw, circle, minimum size=6.5mm, fill=blue!4,
+    inner sep=0pt, font=\small},
+  rt/.style={fill=green!12, very thick},
+  >={Stealth[length=2mm]}, edge from parent/.style={draw,->},
+  level distance=11mm, level 1/.style={sibling distance=15mm}]
+  \node[rt] (droot) {$d$}
+    child {node {$b$} child {node {$a$}}}
+    child {node {$c$}}
+    child {node {$f$} child {node {$e$}}};
+  \node[draw=none,fill=none,font=\footnotesize,right=4mm of droot] {rank $2$};
+\end{tikzpicture}
+\end{center}
+
+The tree the trace builds. Its height is $2$, matching $\textit{rank}(d)=2$, and
+comfortably under the $\log_2 8 = 3$ ceiling.
+
+\section{Trick Two: Path Compression}
+\label{ch19:compression}
+
+Now for the genuinely beautiful idea. Every time you call
+$\textsc{Find-Set}(x)$, you walk a path from $x$ up to the root. That walk is
+free information: along the way you visited a whole chain of nodes, and you
+\emph{now know the root for every one of them}. So why throw that away? On the
+way back, repoint every node you visited directly at the root. The next
+$\textsc{Find-Set}$ on any of them is then a single hop. This is
+\emph{path compression}.
+
+\begin{center}
+\begin{tikzpicture}[
+  every node/.style={draw, circle, minimum size=6.5mm, fill=blue!4,
+    inner sep=0pt, font=\small},
+  >={Stealth[length=2mm]}, node distance=10mm]
+  % before
+  \node[fill=green!12, very thick] (r1) {$r$};
+  \node[below=of r1] (a1) {$a$};
+  \node[below=of a1] (b1) {$b$};
+  \node[below=of b1] (c1) {$c$};
+  \draw[->] (a1)--(r1); \draw[->] (b1)--(a1); \draw[->] (c1)--(b1);
+  \node[draw=none, fill=none, below=4mm of c1, font=\small] {before \textsc{Find}$(c)$};
+  % arrow
+  \node[draw=none, fill=none, right=22mm of a1, font=\Large] {$\Longrightarrow$};
+  % after
+  \node[fill=green!12, very thick, right=46mm of r1] (r2) {$r$};
+  \node[below left=8mm and 1mm of r2] (a2) {$a$};
+  \node[below=8mm of r2] (b2) {$b$};
+  \node[below right=8mm and 1mm of r2] (c2) {$c$};
+  \draw[->] (a2)--(r2); \draw[->] (b2)--(r2); \draw[->] (c2)--(r2);
+  \node[draw=none, fill=none, below=10mm of b2, font=\small] {after \textsc{Find}$(c)$};
+\end{tikzpicture}
+\end{center}
+
+A single $\textsc{Find}(c)$ walked $c \to b \to a \to r$; afterward $a$, $b$,
+and $c$ \emph{all} point straight at $r$. The tree got dramatically flatter, and
+it cost nothing extra -- we were walking that path anyway. The implementation is
+a two-line recursion.
+
+\begin{algorithm}[H]
+\caption{\textsc{Find-Set} with path compression}
+\SetKwProg{Fn}{function}{}{}
+\Fn{\textsc{Find-Set}$(x)$}{
+  \If{$x \neq x.p$}{
+    $x.p \gets \textsc{Find-Set}(x.p)$\;
+    \tcp{recurse to the root, then repoint $x$ straight at it}
+  }
+  \Return $x.p$\;
+}
+\end{algorithm}
+
+Read that recursion carefully. The call $\textsc{Find-Set}(x.p)$ returns the
+root and, as a side effect, compresses everything above $x$. Then the line
+$x.p \gets (\text{that root})$ snaps $x$ itself onto the root. By the time the
+outermost call returns, every node on the original path points directly at the
+root.
+
+\begin{trapbox}
+Path compression changes node \emph{depths} but we deliberately do \emph{not}
+update ranks when it happens. After compression a node's rank may be larger
+than its actual height. That is fine and intentional: rank stays a valid
+\emph{upper bound} on height, which is all our analysis ever needed, and
+recomputing exact heights after every find would be slow and pointless. Rank is
+a budget, not a measurement.
+\end{trapbox}
+
+\begin{walkbox}
+Here is something delightful to chew on. Path compression makes
+$\textsc{Find-Set}$ \emph{change the structure} even though it is, semantically,
+a read-only query -- you only asked ``who is the representative?'' yet the tree
+quietly rearranged. This is the same flavor of self-improvement you saw in
+amortized analysis: an operation pays a little extra now to make all future
+operations cheaper. Convince yourself that the answer it returns is never
+wrong, no matter how much it rearranges -- the root of $x$'s tree is the same
+before and after, because compression never moves a node to a \emph{different}
+tree.
+\end{walkbox}
+
+\section{Putting It Together, and the Near-Constant Result}
+\label{ch19:together}
+
+Use both tricks -- union by rank \emph{and} path compression -- on the forest,
+and something remarkable happens. The bound on a sequence of operations drops
+from $O(m \log n)$ to something almost, but not quite, linear. Here is the
+celebrated result, and then we will spend real effort making the strange
+function in it feel ordinary.
+
+\begin{formalbox}
+\textbf{Theorem (Tarjan).} On a forest with union by rank and path
+compression, any sequence of $m$ disjoint-set operations, of which $n$ are
+\textsc{Make-Set}, runs in total time
+\[
+O\big(m \, \alpha(n)\big),
+\]
+where $\alpha$ is the \emph{inverse Ackermann function}.
+\end{formalbox}
+
+The function $\alpha(n)$ grows so slowly that for every $n$ you will ever
+encounter -- every $n$ that could be written down with atoms in the observable
+universe -- $\alpha(n) \le 4$. So the average cost per operation is bounded by a
+constant that, in any real program, never exceeds $4$ or $5$. The structure is
+\emph{effectively} constant-time per operation, even though, famously, it is
+provably \emph{not} constant in the strict asymptotic sense.
+
+\subsection{Where does inverse Ackermann come from?}
+\label{ch19:ackermann}
+
+You do not need the full proof -- it is intricate, and CLRS devotes a careful
+section to it. But you deserve to know \emph{why} such a bizarre function shows
+up at all, because the why is intuitive. The whole effect comes from how
+violently fast a related function \emph{grows}, and $\alpha$ is its sluggish
+inverse.
+
+Start with a function that grows absurdly fast. Define a tower of operations
+where each level is the iterate of the level below:
+
+\begin{itemize}
+  \item Repeated addition is multiplication: $a \cdot b = a + a + \cdots + a$
+        ($b$ times).
+  \item Repeated multiplication is exponentiation: $a^b = a \cdot a \cdots a$
+        ($b$ times).
+  \item Repeated exponentiation is \emph{tetration}: a tower
+        $a^{a^{\cdot^{\cdot^{a}}}}$ of height $b$.
+\end{itemize}
+
+Keep climbing this ladder of operations -- each one iterating the previous --
+and you get the \emph{Ackermann function} $A(k, j)$, which grows faster than any
+primitive-recursive function. To get a feel for the violence, the iterated
+power of two,
+\[
+2,\quad 2^2 = 4,\quad 2^{2^2} = 16,\quad 2^{2^{2^2}} = 65536,\quad
+2^{2^{2^{2^2}}} = 2^{65536},
+\]
+reaches a number with about $20{,}000$ digits in just \emph{five} steps. The
+inverse Ackermann function $\alpha(n)$ asks the reverse question:
+\emph{how many steps up this tower do I need before I exceed $n$?} Because the
+tower explodes so fast, the answer stays tiny forever.
+
+\begin{center}
+\begin{tikzpicture}[font=\small, >={Stealth[length=2mm]},
+  tower/.style={draw, rounded corners, fill=structurepurple!12,
+    minimum height=6mm, inner xsep=4pt}]
+  \node[tower] (s1) {$2$};
+  \node[tower, right=6mm of s1] (s2) {$4$};
+  \node[tower, right=6mm of s2] (s3) {$16$};
+  \node[tower, right=6mm of s3] (s4) {$65536$};
+  \node[tower, right=6mm of s4] (s5) {$2^{65536}$};
+  \draw[->] (s1)--(s2); \draw[->] (s2)--(s3);
+  \draw[->] (s3)--(s4); \draw[->] (s4)--(s5);
+  \node[font=\footnotesize, gray, below=2mm of s3]
+    {each step raises $2$ to the previous value: explosive up, glacial inverse};
+\end{tikzpicture}
+\end{center}
+
+Reading this strip \emph{left to right} is the tower exploding; reading it
+\emph{right to left} -- ``how many boxes back from $n$ to reach $2$?'' -- is
+$\alpha$. Five boxes already carry you past anything you could store, so
+$\alpha(n)$ never climbs past a tiny handful.
+
+\begin{intuitionbox}
+Think of $\alpha(n)$ as the answer to: ``how many times must I apply this
+ferociously-fast tower-building before I pass $n$?'' Since one application can
+leap from $65536$ to $2^{65536}$, you essentially never need more than a
+handful of applications. The single-variable inverse Ackermann
+$\alpha(n) \le 4$ for all $n$ below roughly $2^{2^{2^{2^{16}}}}$ -- a number so
+large it has no name and no physical meaning. For your laptop, your cluster,
+and every dataset humanity will ever assemble, $\alpha(n)$ is a small constant.
+\end{intuitionbox}
+
+\subsection{A gentle sketch of why we win}
+\label{ch19:sketch}
+
+Here is the shape of the argument, without the full machinery. Union by rank
+alone guarantees that ranks along any root path strictly increase, and that
+ranks never exceed $\log_2 n$. Path compression then attacks those paths: every
+time a node is found, it leaps closer to the root, so a node can only be ``far
+from the root'' a limited number of times before it is essentially adjacent to
+the root.
+
+The accounting trick (this is amortized analysis, the previous chapter's tool)
+groups nodes into rank \emph{blocks} and charges the cost of each step of a
+find either to the operation itself or to a node whose rank is about to jump it
+into a higher block. A node can only be charged this way a number of times
+related to how many rank blocks exist -- and because ranks grow only to
+$\log_2 n$ while the block boundaries are spaced by the tower function, the
+number of blocks is about $\alpha(n)$. Multiply $m$ operations by $\alpha(n)$
+charges each and you get the $O(m\,\alpha(n))$ bound.
+
+\begin{focusbox}
+You do not need to reproduce the proof. You need three things: \textbf{(1)} both
+heuristics are needed for the $\alpha$ bound -- either one alone gives only
+$O(\log n)$ per operation; \textbf{(2)} $\alpha$ is the inverse of a function
+that grows faster than any tower, so it is bounded by a tiny constant for all
+realistic $n$; \textbf{(3)} therefore union-find is, in every practical sense,
+constant time per operation.
+\end{focusbox}
+
+\begin{historybox}
+The forest idea with union by rank and path compression is due to Bernard
+Galler and Michael Fischer (1964) and was analyzed by Robert Tarjan, who in
+1975 proved the $\Theta(m\,\alpha(n))$ bound and, with van Leeuwen, refined it.
+Tarjan also showed the bound is essentially tight: \emph{no} pointer-based
+structure can do disjoint sets in true linear time, so the inverse Ackermann
+factor is not an artifact of a weak proof -- it is real. This is one of the few
+places in algorithms where an everyday data structure is provably,
+unavoidably, \emph{not} constant time, yet is constant time for all practical
+purposes. In CLRS this is \textbf{Chapter 19, ``Data Structures for Disjoint
+Sets''} (it was Chapter 21 in the second and third editions, so older
+references and problem sets may cite it that way). The inverse-Ackermann
+analysis lives in that chapter's final, starred section.
+\end{historybox}
+
+\subsection{What each variant costs}
+\label{ch19:costs}
+
+\begin{complexitybox}
+For a sequence with $n$ \textsc{Make-Set}s and $m$ operations total:
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Representation & \textsc{Find-Set} (worst) & Sequence cost \\
+\midrule
+Linked list, arbitrary union & $O(1)$ & $O(n^2)$ in the bad case \\
+Linked list, weighted union & $O(1)$ & $O(m + n \log n)$ \\
+Forest, naive link & $O(n)$ & $O(mn)$ in the bad case \\
+Forest, union by rank only & $O(\log n)$ & $O(m \log n)$ \\
+Forest, path compression only & --- & $O(m \log n)$ (amortized) \\
+Forest, rank \emph{and} compression & --- & $\boxed{O(m\,\alpha(n))}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+The last row is what you should actually implement. The two heuristics together
+cost two extra fields per node (a parent pointer and a small rank) and a few
+lines of code, and they buy you effectively constant time.
+\end{complexitybox}
+
+\section{A Complete Worked Example}
+\label{ch19:fullexample}
+
+Let us run the finished structure -- forest, union by rank, path compression --
+on a small connected-components problem so you see all the pieces move together.
+
+Vertices: $1, 2, 3, 4, 5, 6$. Edges arrive in this order:
+\[
+(1,2),\ (3,4),\ (5,6),\ (1,3),\ (2,5).
+\]
+Every vertex starts as a singleton: parent itself, rank $0$.
+
+\begin{labbox}
+\textbf{Trace.} We write $p[\,]$ for the parent array and $r[\,]$ for ranks.
+Initially $p[i]=i$ and $r[i]=0$ for all $i$.
+\begin{enumerate}
+  \item \textbf{Edge $(1,2)$.} $\textsc{Find}(1)=1$, $\textsc{Find}(2)=2$.
+        Equal rank, link $1$ under $2$: $p[1]=2$, $r[2]=1$.
+  \item \textbf{Edge $(3,4)$.} Roots $3,4$, equal rank: $p[3]=4$, $r[4]=1$.
+  \item \textbf{Edge $(5,6)$.} Roots $5,6$, equal rank: $p[5]=6$, $r[6]=1$.
+        Now three components: $\{1,2\}$, $\{3,4\}$, $\{5,6\}$.
+  \item \textbf{Edge $(1,3)$.} $\textsc{Find}(1)$ walks $1\to 2$, returns $2$
+        (rank $1$). $\textsc{Find}(3)$ walks $3\to 4$, returns $4$ (rank $1$).
+        Equal rank, link $2$ under $4$: $p[2]=4$, $r[4]=2$. Component
+        $\{1,2,3,4\}$ rooted at $4$.
+  \item \textbf{Edge $(2,5)$.} $\textsc{Find}(2)$ walks $2\to 4$, returns $4$
+        (rank $2$). $\textsc{Find}(5)$ walks $5\to 6$, returns $6$ (rank $1$).
+        Different rank: hang the smaller, $6$, under $4$: $p[6]=4$. No rank
+        change. Everything is now one component, rooted at $4$.
+\end{enumerate}
+\textbf{Now watch path compression earn its keep.} Call $\textsc{Find}(5)$.
+The path is $5 \to 6 \to 4$. Compression repoints: $p[5]=4$ and $p[6]=4$ (it
+already was). Next call $\textsc{Find}(1)$: path $1 \to 2 \to 4$; afterwards
+$p[1]=4$ and $p[2]=4$. After a few finds, \emph{every} vertex points directly
+at $4$, and all subsequent finds are a single hop. The tree has been ironed
+flat.
+\end{labbox}
+
+\begin{center}
+\begin{tikzpicture}[
+  every node/.style={draw, circle, minimum size=6.5mm, fill=blue!4,
+    inner sep=0pt, font=\small},
+  >={Stealth[length=2mm]},
+  level 1/.style={sibling distance=20mm},
+  level distance=12mm,
+  edge from parent/.style={draw,->}]
+  \node[fill=green!12, very thick] {$4$}
+    child {node {$1$}}
+    child {node {$2$}}
+    child {node {$3$}}
+    child {node {$5$}}
+    child {node {$6$}};
+  \node[draw=none, fill=none, below=18mm, font=\small]
+    {after compression: a flat star, every \textsc{Find} is one hop};
+\end{tikzpicture}
+\end{center}
+
+\section{Implementation Notes}
+\label{ch19:impl}
+
+In real code you almost never use explicit node objects with pointers. You use
+two integer arrays indexed $0 \dots n-1$: a \texttt{parent} array and a
+\texttt{rank} array. $\textsc{Make-Set}(i)$ sets \lstinline|parent[i] = i| and
+\lstinline|rank[i] = 0|. This is cache-friendly and trivially fast.
+
+A common and excellent variant of $\textsc{Find}$ avoids recursion (and its
+stack depth) using \emph{path halving}: as you walk up, make every node point to
+its grandparent. It compresses almost as well as full compression and runs in a
+single tight loop.
+
+\begin{algorithm}[H]
+\caption{\textsc{Find-Set} with path halving (iterative)}
+\SetKwProg{Fn}{function}{}{}
+\Fn{\textsc{Find-Set}$(x)$}{
+  \While{$x \neq \texttt{parent}[x]$}{
+    $\texttt{parent}[x] \gets \texttt{parent}[\texttt{parent}[x]]$\;
+    \tcp{point $x$ at its grandparent, then step up}
+    $x \gets \texttt{parent}[x]$\;
+  }
+  \Return $x$\;
+}
+\end{algorithm}
+
+\begin{trapbox}
+A subtle but classic bug: comparing the \emph{representatives} but unioning the
+\emph{original elements} correctly. In $\textsc{Union}(x,y)$ you must call
+$\textsc{Find-Set}$ on both \emph{first}, link the two roots, and never link an
+element to itself. Linking a root to itself ($u.p \gets u$ when $u = v$) is a
+silent no-op that wastes a rank increment in some buggy variants; always check
+that the two roots are distinct before incrementing any rank.
+\end{trapbox}
+
+Many implementations replace rank with \emph{size} (the number of nodes in the
+tree) and link the smaller tree under the larger -- ``union by size.'' It
+achieves the same $O(\alpha(n))$ bound, and size is sometimes useful on its own
+(``how big is this component?''). Rank and size are two flavors of the same
+``small under big'' idea you have now seen three times: weighted lists, union by
+rank, union by size. Whenever you merge structures, absorbing the small into the
+large is almost always the move.
+
+\section{Summary}
+\label{ch19:summary}
+
+You started with a problem so plain it barely seemed to need an algorithm:
+group objects, merge groups, ask if two objects share a group. You built it four
+ways, each better than the last.
+
+\begin{itemize}
+  \item \textbf{Linked lists} give instant $\textsc{Find}$ but slow
+        $\textsc{Union}$; the weighted-union heuristic (small list onto big)
+        tames it to $O(m + n \log n)$.
+  \item \textbf{Forests} name each set by a tree root. Naive linking can build
+        a stringy path of height $n$.
+  \item \textbf{Union by rank} attaches the shorter tree under the taller,
+        keeping height $O(\log n)$.
+  \item \textbf{Path compression} flattens the find path on every query, so
+        the structure improves itself as it is used.
+\end{itemize}
+
+Together, rank and compression give $O(m\,\alpha(n))$ -- effectively constant
+time per operation, where $\alpha$, the inverse Ackermann function, is bounded
+by a tiny constant for every input you will ever meet. Two integer arrays and a
+dozen lines of code buy you one of the fastest data structures in existence.
+
+\begin{aestheticbox}
+The deep lesson here outlasts the data structure. Twice you saw an operation
+make \emph{future} operations cheaper -- weighted union limited how often a node
+could be moved, and path compression flattened paths on the fly. That is the
+heartbeat of amortized analysis: a cheap investment now, repaid many times
+over. When you meet Fibonacci heaps in the next chapter, you will see the same
+philosophy at a grander scale. Union-find is the cleanest, smallest place to
+fall in love with it.
+\end{aestheticbox}
+
+\section{Exercises}
+\label{ch19:exercises}
+
+\begin{exercise}
+\textbf{(Warmup: trace it.)} Start with singletons $1$ through $8$. Using the
+forest with union by rank (no path compression), perform $\textsc{Union}(1,2)$,
+$\textsc{Union}(3,4)$, $\textsc{Union}(5,6)$, $\textsc{Union}(7,8)$,
+$\textsc{Union}(1,3)$, $\textsc{Union}(5,7)$, $\textsc{Union}(1,5)$. Draw the
+final tree and give the rank of the root. What is the height of the tree?
+\end{exercise}
+
+\begin{exercise}
+\textbf{(Same set?)} Explain in one or two sentences why the test
+$\textsc{Find-Set}(x) = \textsc{Find-Set}(y)$ correctly decides whether $x$ and
+$y$ are in the same set, and why no separate operation is needed. What property
+of representatives makes this work?
+\end{exercise}
+
+\begin{exercise}
+\textbf{(The weighted-union doubling argument.)} In the linked-list
+representation with weighted union, prove carefully that a single fixed object's
+back-pointer is updated at most $\lfloor \log_2 n \rfloor$ times over any
+sequence of operations. Where exactly does the ``set at least doubles'' step
+come from?
+\end{exercise}
+
+\begin{exercise}
+\textbf{(Rank versus height.)} Give a concrete sequence of operations (using
+both union by rank and path compression) after which some node's rank is
+strictly greater than the actual height of its tree. Explain why this does not
+break the analysis.
+\end{exercise}
+
+\begin{exercise}
+\textbf{(Path compression alone.)} Suppose you use path compression but
+\emph{not} union by rank -- $\textsc{Link}$ always hangs the first root under
+the second. Argue informally that the amortized cost per operation is still
+$O(\log n)$, not the bad $O(n)$ of the naive forest. (Hint: compression keeps
+ironing the trees flat even without rank.)
+\end{exercise}
+
+\begin{exercise}
+\textbf{(Union by size.)} Rewrite $\textsc{Make-Set}$, $\textsc{Link}$, and the
+rank logic to use ``union by size'' instead: store the number of nodes in each
+tree at its root, and on a link hang the smaller-size tree under the larger.
+Prove the analogue of Lemma~\ref{ch19:lem-rank-size}: a tree of height $h$
+contains at least $2^h$ nodes, so heights stay $O(\log n)$.
+\end{exercise}
+
+\begin{exercise}
+\textbf{(Counting components.)} Augment the structure with a global counter so
+that after any sequence of operations you can report, in $O(1)$ time, how many
+disjoint sets currently exist. Specify exactly where the counter is initialized,
+incremented, and decremented, and prove it stays correct.
+\end{exercise}
+
+\begin{exercise}
+\textbf{(Kruskal preview.)} You are given a graph whose edges arrive one at a
+time, and you must print ``CYCLE'' the first time an edge connects two vertices
+already in the same component, and ``ADD'' otherwise. Write pseudocode using
+union-find, and argue its total running time over $m$ edges and $n$ vertices is
+$O((m+n)\,\alpha(n))$. You have just written the core of Kruskal's algorithm.
+\end{exercise}
+
+\begin{exercise}
+\textbf{(How big is $\alpha$, really?)} The two-argument Ackermann-style tower
+satisfies (roughly) $A(2) = 4$, $A(3) = 16$, $A(4) = 65536$, and
+$A(5) = 2^{65536}$. Using the intuition that $\alpha(n)$ is ``the least $k$ with
+$A(k) \ge n$,'' explain why $\alpha(n) \le 4$ for every $n$ that could be stored
+in the memory of any physically possible computer. Why does this make the
+``not constant time'' result a mathematical curiosity rather than a practical
+worry?
+\end{exercise}
+
+\begin{exercise}
+\textbf{(Challenge: offline minimum / interval merging.)} You process a stream
+of integers from a fixed range $1 \dots n$. Some are ``insert $k$'' and some are
+``extract the current minimum.'' Design a way to use union-find so that each
+extract finds the next still-present value quickly, by unioning each removed
+value with its successor. Explain why each value is removed at most once and the
+whole process is $O((n + q)\,\alpha(n))$ for $q$ operations. (This is the
+classic ``union-find as a pointer to the next free slot'' trick.)
+\end{exercise}

@@ -1,0 +1,1098 @@
+\chapter{String Matching}
+
+Open any document on your computer and press the keys that mean ``find.'' Type a
+word. In a heartbeat, every occurrence lights up. You have just asked a machine
+the oldest question in text processing: \emph{where, inside this long string,
+does that short string appear?} It feels instant, but underneath there is an
+algorithm, and the obvious way of doing it is not the way your editor actually
+does it. The obvious way can be made to crawl. The clever ways -- there are
+several, and they are gorgeous -- never crawl.
+
+This chapter is about that question and its answers. We have a long
+\emph{text}, and a short \emph{pattern}, and we want every place the pattern
+sits inside the text. We will start with the method you would invent in thirty
+seconds, watch exactly where it wastes its effort, and then meet three escapes
+from that waste, each more cunning than the last: a method built on
+\emph{hashing} (Rabin--Karp), a method built on a little \emph{machine} you
+compile from the pattern (finite automata), and finally the famous
+Knuth--Morris--Pratt algorithm, whose secret -- the \emph{prefix function} --
+is one of those ideas that feels like magic until you see it, and then feels
+inevitable. By the end you will understand not just how each works, but why it
+runs as fast as it does, counted character by character.
+
+\chapterline
+
+\section{Setting the stage}
+\label{ch31:setup}
+
+Let us fix notation once, carefully, because string matching is a place where
+sloppy indexing causes real pain.
+
+We are given a \emph{text} $T$, an array of $n$ characters $T[1\,..\,n]$, and a
+\emph{pattern} $P$, an array of $m$ characters $P[1\,..\,m]$, with $m \le n$.
+The characters are drawn from a finite \emph{alphabet} $\Sigma$. For English
+text $\Sigma$ might be the $26$ letters plus punctuation and a space; for DNA it
+is just $\{\texttt{A},\texttt{C},\texttt{G},\texttt{T}\}$; for raw bytes it is
+the $256$ values $0$ through $255$. We write $|\Sigma|$ for the alphabet size.
+
+\begin{definition}[Valid shift]
+\label{ch31:def-shift}
+We say the pattern $P$ \emph{occurs with shift} $s$ in the text $T$ if
+$0 \le s \le n - m$ and
+\[
+  T[s+1\,..\,s+m] = P[1\,..\,m],
+\]
+that is, $T[s+j] = P[j]$ for every $j = 1, 2, \ldots, m$. When this holds we
+call $s$ a \emph{valid shift}; otherwise $s$ is an \emph{invalid shift}. The
+\emph{string-matching problem} is to find all valid shifts.
+\end{definition}
+
+The shift $s$ is best read as ``how far the pattern has slid to the right before
+it lines up.'' Shift $0$ means the pattern sits at the very front of the text. If
+$\texttt{abcab}$ is the text and $\texttt{ab}$ is the pattern, then $s=0$ and
+$s=3$ are valid, because the pattern lines up at positions $1$ and $4$.
+
+\begin{intuitionbox}
+Picture two strips of paper. The long one is the text, laid flat on the table.
+The short one is the pattern, sitting on top of it. You slide the pattern strip
+to the right, one notch at a time, and at each resting place you peer down
+through the layers and check: do all $m$ characters underneath match the $m$
+characters on top? Each resting place is a \emph{shift}. There are exactly
+$n-m+1$ of them, from $s=0$ (flush left) to $s=n-m$ (flush right). String
+matching is the discipline of checking those resting places \emph{without doing
+more peering than you have to}.
+\end{intuitionbox}
+
+Figure~\ref{ch31:fig-shifts} draws the strips for a tiny example: the pattern
+sliding across the text, one shift at a time.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\ttfamily\small,
+  cell/.style={draw,minimum size=6mm,inner sep=0pt},
+  tcell/.style={cell,fill=sourceblue!12},
+  pcell/.style={cell,fill=quotientorange!22},
+  good/.style={cell,fill=targetgreen!28},
+  lbl/.style={font=\sffamily\scriptsize}
+]
+% text row: abcab
+\foreach \c [count=\i from 0] in {a,b,c,a,b} {
+  \node[tcell] (t\i) at (\i*0.65,0) {\c};
+}
+\node[lbl,left=2mm of t0] {$T$};
+% shift 0: pattern ab over positions 0,1 -> a,b match -> valid
+\node[lbl,left=2mm of t0,yshift=-7mm] {$s=0$};
+\node[good] at (0*0.65,-0.7) {a};
+\node[good] at (1*0.65,-0.7) {b};
+\node[lbl,right=8mm of t4,yshift=-7mm] {valid};
+% shift 1: positions 1,2 -> b,c vs a,b -> mismatch
+\node[lbl,left=2mm of t0,yshift=-14mm] {$s=1$};
+\node[pcell] at (1*0.65,-1.4) {a};
+\node[pcell] at (2*0.65,-1.4) {b};
+\node[lbl,right=8mm of t4,yshift=-14mm] {mismatch};
+% shift 2: positions 2,3 -> c,a vs a,b -> mismatch
+\node[lbl,left=2mm of t0,yshift=-21mm] {$s=2$};
+\node[pcell] at (2*0.65,-2.1) {a};
+\node[pcell] at (3*0.65,-2.1) {b};
+\node[lbl,right=8mm of t4,yshift=-21mm] {mismatch};
+% shift 3: positions 3,4 -> a,b -> valid
+\node[lbl,left=2mm of t0,yshift=-28mm] {$s=3$};
+\node[good] at (3*0.65,-2.8) {a};
+\node[good] at (4*0.65,-2.8) {b};
+\node[lbl,right=8mm of t4,yshift=-28mm] {valid};
+\end{tikzpicture}
+\caption{The pattern $P=\texttt{ab}$ slid across $T=\texttt{abcab}$. Each row is
+one shift $s$. There are $n-m+1=4$ candidate shifts; the green rows ($s=0$ and
+$s=3$) line up exactly, the orange ones do not. String matching is the art of
+checking these rows without re-reading the text underneath.}
+\label{ch31:fig-shifts}
+\end{figure}
+
+\begin{focusbox}
+Two numbers will haunt every analysis in this chapter: $n$, the text length, and
+$m$, the pattern length. There are $n-m+1$ candidate shifts. The whole game is
+how much work you spend per shift, and -- the deeper trick -- how much work you
+can \emph{avoid} by remembering what you already learned at earlier shifts.
+\end{focusbox}
+
+A word on strings as a tool. We use $\Sigma^*$ for the set of all finite
+strings over $\Sigma$, including the empty string $\eps$. If $w$ is a string,
+$|w|$ is its length. The \emph{concatenation} of $x$ and $y$, written $xy$, is
+$x$ followed by $y$, of length $|x|+|y|$. A string $w$ is a \emph{prefix} of
+$x$, written $w \sqsubset x$, if $x = wy$ for some string $y$ -- $w$ is a chunk
+off the front. It is a \emph{suffix}, written $w \sqsupset x$, if $x = yw$ for
+some $y$ -- a chunk off the back. Thus $\texttt{ab} \sqsubset \texttt{abcab}$
+and $\texttt{cab} \sqsupset \texttt{abcab}$. These two relations, prefix and
+suffix, are the entire vocabulary we need for the deepest algorithm in the
+chapter, so let them settle in.
+
+\section{The naive matcher: just try every shift}
+\label{ch31:naive}
+
+Here is the algorithm you would write without thinking. Slide the pattern to
+each of the $n-m+1$ shifts. At each one, compare characters left to right until
+either they all match (report the shift) or one of them disagrees (give up,
+slide one notch right, start over).
+
+\begin{algorithm}[H]
+\caption{\textsc{Naive-String-Matcher}}
+\KwIn{Text $T[1\,..\,n]$, pattern $P[1\,..\,m]$.}
+\KwOut{Every valid shift $s$.}
+\For{$s \leftarrow 0$ \KwTo $n-m$}{
+  $j \leftarrow 1$\;
+  \While{$j \le m$ \textbf{and} $T[s+j] = P[j]$}{
+    $j \leftarrow j + 1$\;
+  }
+  \If{$j = m+1$}{
+    report ``$P$ occurs with shift $s$''\;
+  }
+}
+\end{algorithm}
+
+The inner \textbf{while} marches $j$ forward as long as characters agree. If it
+makes it all the way to $j = m+1$, every one of the $m$ characters matched, so
+$s$ is valid. Otherwise it bailed early.
+
+\begin{labbox}
+Let us trace it. Text $T = \texttt{a b a b a b c a}$ (so $n=8$) and pattern
+$P = \texttt{a b a b c}$ (so $m=5$). The candidate shifts run from $0$ to $3$.
+
+\textbf{Shift $s=0$:} compare $T[1]=\texttt{a}$ vs $P[1]=\texttt{a}$ (ok),
+$T[2]=\texttt{b}$ vs $P[2]=\texttt{b}$ (ok), $T[3]=\texttt{a}$ vs $P[3]=\texttt{a}$
+(ok), $T[4]=\texttt{b}$ vs $P[4]=\texttt{b}$ (ok), $T[5]=\texttt{a}$ vs
+$P[5]=\texttt{c}$ -- \emph{mismatch}. Four comparisons matched, the fifth failed.
+
+\textbf{Shift $s=1$:} compare $T[2]=\texttt{b}$ vs $P[1]=\texttt{a}$ --
+\emph{mismatch} on the very first character. One comparison.
+
+\textbf{Shift $s=2$:} $T[3]=\texttt{a}$ vs $\texttt{a}$ (ok), $T[4]=\texttt{b}$
+vs $\texttt{b}$ (ok), $T[5]=\texttt{a}$ vs $\texttt{a}$ (ok), $T[6]=\texttt{b}$
+vs $\texttt{b}$ (ok), $T[7]=\texttt{c}$ vs $\texttt{c}$ (ok). All five match!
+Report shift $s=2$.
+
+\textbf{Shift $s=3$:} $T[4]=\texttt{b}$ vs $P[1]=\texttt{a}$ -- mismatch.
+
+The only valid shift is $s=2$, and indeed $T[3\,..\,7]=\texttt{ababc}=P$. Go
+back and notice the painful part: at shift $0$ we worked through four matching
+characters before the fifth betrayed us, and then at shift $1$ we threw that
+knowledge away and started from scratch. Hold that thought -- it is the whole
+reason the rest of this chapter exists.
+\end{labbox}
+
+\subsection{How slow can the naive matcher be?}
+
+Each shift costs at most $m$ comparisons in the inner loop, and there are
+$n-m+1$ shifts, so the total is at most $(n-m+1)\,m$ comparisons. In the worst
+case this bound is tight. Take a text of $n$ copies of the letter \texttt{a} and
+a pattern of $m$ \texttt{a}'s followed by one \texttt{b}, e.g.
+$T=\texttt{aaaaaa}$ and $P=\texttt{aab}$. At every shift the inner loop matches
+all the leading \texttt{a}'s and only fails on the final \texttt{b}, so each of
+the $n-m+1$ shifts burns the full $m$ comparisons.
+
+\begin{complexitybox}
+Naive string matching uses $O((n-m+1)\,m)$ character comparisons, which is
+$O(nm)$ in the worst case. It uses $O(1)$ extra space and needs no preprocessing
+of the pattern. Its average case on random text is actually decent -- close to
+$O(n)$ -- because mismatches usually come fast. But the worst case is genuinely
+quadratic, and that is what we are out to beat.
+\end{complexitybox}
+
+\begin{trapbox}
+The naive matcher's flaw is not that it checks every shift -- in the worst case
+every shift really might be valid, so you cannot avoid \emph{looking} at each.
+The flaw is that it re-reads text characters it has already examined. At shift
+$0$ it read $T[1\,..\,5]$; at shift $1$ it re-read $T[2]$; and so on. A single
+text character can be inspected up to $m$ times. The fast algorithms all share
+one promise: \emph{look at each text character a bounded number of times} --
+ideally just once.
+\end{trapbox}
+
+\begin{aestheticbox}
+Why care about beating $O(nm)$? Because $n$ is often colossal. A genome is three
+billion characters. A web-scale text index runs to terabytes. A log file you are
+grepping might be gigabytes. If your pattern is a few dozen characters and your
+matcher is quadratic in the bad case, an adversary -- or just unlucky data -- can
+turn a one-second search into an hour. Linear-time matching is not a luxury; at
+that scale it is the difference between a tool that works and one that hangs.
+\end{aestheticbox}
+
+\section{Rabin--Karp: matching by fingerprint}
+\label{ch31:rabinkarp}
+
+Here is a completely different angle, and it starts with a question that sounds
+unrelated. Comparing two strings of length $m$ takes up to $m$ character
+comparisons. But comparing two \emph{numbers} takes one operation. What if we
+could turn each length-$m$ window of text into a single number, and turn the
+pattern into a single number, and just compare numbers?
+
+That is the Rabin--Karp idea. We assign to every string a numeric
+\emph{fingerprint}, computed so that equal strings always get equal
+fingerprints. Then, instead of comparing the pattern against each text window
+character by character, we compare fingerprints -- one cheap integer comparison
+per window.
+
+\subsection{Treating a string as a number}
+
+Suppose for a moment the alphabet is the ten digits $\{0,1,\ldots,9\}$, so
+$|\Sigma| = 10$. Then a string \emph{is} a number written in base $10$. The
+pattern $P = \texttt{31415}$ has the value
+\[
+  p = 3\cdot 10^4 + 1\cdot 10^3 + 4\cdot 10^2 + 1\cdot 10^1 + 5\cdot 10^0
+    = 31415.
+\]
+For a general alphabet, treat each character as a ``digit'' in base
+$d = |\Sigma|$, and the same construction gives every length-$m$ string a value
+between $0$ and $d^m - 1$. Let $t_s$ denote the value of the length-$m$ text
+window starting after shift $s$, i.e. of $T[s+1\,..\,s+m]$. Then $s$ is a valid
+shift exactly when $t_s = p$ -- provided we computed both values correctly.
+
+There are two problems, and Rabin--Karp solves both with one stroke each.
+
+\textbf{Problem one: the numbers are astronomically large.} A pattern of length
+$m=20$ over bytes has a value up to $256^{20}$, a $48$-digit number. Arithmetic
+on such numbers is not $O(1)$ -- it is exactly the per-character work we were
+trying to escape. \emph{Fix:} do all arithmetic modulo a prime $q$. Choose $q$
+small enough that $dq$ fits in one machine word, so every operation is genuinely
+$O(1)$. Now $p$ and each $t_s$ are reduced mod $q$ to a small number we call a
+\emph{fingerprint}.
+
+\textbf{Problem two: computing each $t_s$ from scratch costs $m$ operations,
+which buys us nothing.} \emph{Fix:} compute $t_{s+1}$ from $t_s$ in
+\emph{constant} time with a \emph{rolling} update. Slide the window one step
+right: you drop the high-order character $T[s+1]$ and append the new low-order
+character $T[s+m+1]$. In base $d$ that is
+\[
+  t_{s+1} = d\,\bigl(t_s - T[s+1]\cdot d^{\,m-1}\bigr) + T[s+m+1].
+\]
+Read it left to right: subtract off the contribution of the leaving character
+($T[s+1]$, which sat in the top place worth $d^{m-1}$), shift everything up one
+place by multiplying by $d$, then add the entering character in the ones place.
+This is the same trick a car odometer uses, and it is the heart of the method.
+Figure~\ref{ch31:fig-roll} shows one such step on the decimal example.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\ttfamily\small,
+  cell/.style={draw,minimum size=6.5mm,inner sep=0pt},
+  tcell/.style={cell,fill=sourceblue!10},
+  win/.style={cell,fill=quotientorange!22},
+  lbl/.style={font=\sffamily\scriptsize}
+]
+% digits 2 3 5 9 0 2 ...
+\foreach \c [count=\i from 1] in {2,3,5,9,0,2,3} {
+  \node[tcell] (a\i) at (\i*0.7,0) {\c};
+}
+\node[lbl,left=2mm of a1] {$T$};
+% window s=0 : positions 1..5 (23590)
+\draw[quotientorange,thick,rounded corners]
+   ($(a1.north west)+(-1pt,2pt)$) rectangle ($(a5.south east)+(1pt,-2pt)$);
+\node[lbl,quotientorange,below=1pt of a3,yshift=-1mm] {window $t_0=8$};
+% window s=1 : positions 2..6 (35902)
+\draw[targetgreen,thick,rounded corners]
+   ($(a2.north west)+(-2pt,5pt)$) rectangle ($(a6.south east)+(2pt,-5pt)$);
+\node[lbl,targetgreen,above=4mm of a4] {window $t_1$};
+% arrows: leaving and entering
+\draw[->,trapred,thick] (a1.south) to[bend right=35] ($(a1.south)+(0,-0.9)$)
+   node[below,lbl,trapred]{leaves: drop $2\cdot 10^4$};
+\draw[->,targetgreen,thick] (a6.north) to[bend left=35] ($(a6.north)+(0,0.9)$)
+   node[above,lbl,targetgreen]{enters: add $2$};
+\end{tikzpicture}
+\caption{One rolling step on $T=\texttt{235902\ldots}$ with $m=5$, $d=10$,
+$q=13$. The window slides from $T[1\,..\,5]$ (orange) to $T[2\,..\,6]$ (green):
+the high digit $T[1]=2$ leaves the top place (worth $10^4$) and the new digit
+$T[6]=2$ enters the ones place. The new fingerprint
+$t_1=\bigl(10(t_0-T[1]\cdot h)+T[6]\bigr)\bmod 13$ costs $O(1)$, not $O(m)$.}
+\label{ch31:fig-roll}
+\end{figure}
+
+\begin{intuitionbox}
+A fingerprint is a tiny summary of a long string -- like the last few digits of
+a credit card number, or a checksum. If two strings are equal, their
+fingerprints are equal, guaranteed. The converse is \emph{not} guaranteed: two
+different strings can collide on the same fingerprint, the way two people can
+share a birthday. So a fingerprint match is a \emph{strong hint}, not a proof.
+Rabin--Karp uses fingerprints to skip the expensive character-by-character check
+almost everywhere, and only does the real check on the rare windows whose
+fingerprints actually match the pattern's.
+\end{intuitionbox}
+
+\subsection{Modular arithmetic and the spurious-hit check}
+
+Working modulo $q$ means $t_s$ is really $t_s \bmod q$. The valid-shift test
+becomes: if $t_s \equiv p \pmod q$, the window is a \emph{candidate}. But
+congruence mod $q$ does not imply equality of the underlying strings -- two
+different windows can be congruent mod $q$ by coincidence. We call such a window
+a \emph{spurious hit}. So whenever the fingerprints match, we must \emph{verify}
+by comparing the actual characters $T[s+1\,..\,s+m]$ against $P[1\,..\,m]$. If
+they truly match, report $s$; if not, it was a spurious hit and we move on.
+
+\begin{algorithm}[H]
+\caption{\textsc{Rabin-Karp-Matcher}}
+\KwIn{Text $T[1\,..\,n]$, pattern $P[1\,..\,m]$, radix $d=|\Sigma|$, prime $q$.}
+\KwOut{Every valid shift $s$.}
+$h \leftarrow d^{\,m-1} \bmod q$ \tcp*{value of the top place}
+$p \leftarrow 0$;\quad $t \leftarrow 0$\;
+\For{$i \leftarrow 1$ \KwTo $m$}{
+  $p \leftarrow (d\cdot p + P[i]) \bmod q$ \tcp*{Horner: fingerprint of $P$}
+  $t \leftarrow (d\cdot t + T[i]) \bmod q$ \tcp*{fingerprint of $T[1..m]$}
+}
+\For{$s \leftarrow 0$ \KwTo $n-m$}{
+  \If{$p = t$}{
+    \If{$P[1\,..\,m] = T[s+1\,..\,s+m]$}{
+      report ``$P$ occurs with shift $s$''\;
+    }
+  }
+  \If{$s < n-m$}{
+    $t \leftarrow \bigl(d\,(t - T[s+1]\cdot h) + T[s+m+1]\bigr) \bmod q$\;
+  }
+}
+\end{algorithm}
+
+The first loop is \emph{Horner's rule}: building a number digit by digit, each
+step multiplying the running total by the base and adding the next digit, all
+mod $q$. The second loop walks the windows, comparing fingerprints, verifying
+hits, and rolling the window forward. (In real code, after subtracting
+$T[s+1]\cdot h$ the value can go negative; add $q$ before taking the mod to keep
+it in range.)
+
+\begin{labbox}
+Let us do the classic decimal example. Text
+$T = \texttt{2 3 5 9 0 2 3 1 4 1 5 2 6 7 3 9 9 2 1}$ ($n=19$),
+pattern $P = \texttt{3 1 4 1 5}$ ($m=5$), radix $d=10$, prime $q=13$.
+
+First the pattern's fingerprint. By Horner mod $13$:
+$31415 \bmod 13$. Compute $31415 = 13 \cdot 2416 + 7$, so $p = 7$.
+
+Now the first window $T[1\,..\,5] = \texttt{23590}$:
+$23590 = 13\cdot 1814 + 8$, so $t_0 = 8$. Since $8 \ne 7$, no candidate.
+
+Roll forward. The high digit leaving is $T[1]=2$, the place value
+$h = 10^4 \bmod 13$. Since $10^4 = 10000 = 13\cdot 769 + 3$, we have $h = 3$.
+Each roll: $t' = (10\,(t - T[\text{leave}]\cdot 3) + T[\text{enter}]) \bmod 13$.
+
+The window $\texttt{31415}$ appears as $T[7\,..\,11]$, i.e. at shift $s=6$. Its
+true value $31415 \bmod 13 = 7 = p$, so the fingerprints match: a candidate. We
+verify $T[7\,..\,11]=\texttt{31415}=P$ -- a real hit. Report $s=6$.
+
+Watch for a spurious hit. The window $\texttt{67399}$ has value
+$67399 = 13\cdot 5184 + 7$, so its fingerprint is also $7 = p$! The fingerprints
+match, but $\texttt{67399} \ne \texttt{31415}$. The verification step catches
+the lie and we correctly do \emph{not} report it. That window was a spurious hit
+-- two strings sharing a fingerprint by coincidence, exactly the collision the
+intuition box warned about.
+\end{labbox}
+
+\subsection{Why it is usually fast, and why it can be slow}
+
+Preprocessing -- computing $p$, $t_0$, and $h$ -- is $\Theta(m)$. The main loop
+runs $n-m+1$ times; each iteration does $O(1)$ fingerprint work plus, only on a
+hit, an $O(m)$ verification. So the running time hinges entirely on how often
+fingerprints match.
+
+In the worst case fingerprints match every time. The cruel input is $T$ all
+\texttt{a}'s, $P$ all \texttt{a}'s: every window equals the pattern, every shift
+is a real hit, and we pay $\Theta(m)$ to verify each, for $\Theta((n-m+1)m)$ --
+right back to naive's quadratic. But that input is degenerate. On ``ordinary''
+data, with a well-chosen prime $q$, spurious hits are rare. If we model the
+fingerprints as roughly uniform over the $q$ residues, the chance a given
+invalid shift looks like a hit is about $1/q$. With at most $n$ shifts, the
+expected number of spurious hits is about $n/q$, and the expected verification
+work is $O((n/q)\,m)$. If $q$ is chosen larger than $m$ (easy, since $q$ can be
+nearly word-sized), this is $O(n)$, and the whole algorithm runs in expected
+\[
+  O(n) + O(v\cdot m),
+\]
+where $v$ is the number of valid shifts -- linear, plus the unavoidable cost of
+confirming the real occurrences.
+
+\begin{complexitybox}
+\textbf{Rabin--Karp.} Preprocessing $\Theta(m)$. Worst-case matching
+$\Theta((n-m+1)m)$ -- no better than naive, attained when fingerprints collide
+constantly. Expected matching $O(n + vm)$ on data where collisions are rare and
+$q$ is large, which for a small fixed number of occurrences is $O(n)$. Extra
+space $O(1)$.
+\end{complexitybox}
+
+\begin{historybox}
+Michael Rabin and Richard Karp introduced this fingerprinting matcher in 1987.
+Its real power shows up beyond single-pattern search: because a fingerprint is
+just a number, you can keep a \emph{set} of pattern fingerprints in a hash table
+and search for many patterns at once, or extend the rolling-hash idea to two
+dimensions to find a small image inside a big one. CLRS covers Rabin--Karp in
+Section 32.2. The same rolling hash powers modern tools like \texttt{rsync} and
+content-defined chunking.
+\end{historybox}
+
+\begin{walkbox}
+Rabin--Karp gets its speed from a probabilistic gamble: it bets that
+fingerprints rarely collide. But an adversary who \emph{knows your prime $q$} can
+craft a text where every window collides, dragging you back to $O(nm)$. How would
+you defend against such an adversary? (Hint: what if $q$, or the radix, were
+chosen at random and kept secret -- how does that change the analysis, and what
+does it cost you?) This is the same randomization idea that rescued quicksort and
+hashing.
+\end{walkbox}
+
+\section{String matching with finite automata}
+\label{ch31:automata}
+
+The next idea throws away probability entirely and returns to a guarantee. It
+also delivers the dream from the trap box: \emph{read each text character exactly
+once, never backing up.} The price is some upfront cleverness -- we compile the
+pattern into a little machine.
+
+\subsection{What a string-matching automaton is}
+
+A \emph{finite automaton} is a tiny processor with a finite set of \emph{states}.
+It starts in a designated start state, then reads the text one character at a
+time, and each character makes it jump to a new state according to a fixed
+\emph{transition function} $\delta$. Some states are marked \emph{accepting}.
+For string matching we build the machine so that, after reading $T[1\,..\,i]$,
+its current state is precisely \emph{how much of the pattern we have matched so
+far} -- a number from $0$ to $m$. State $m$ is accepting: reaching it means the
+last $m$ characters we read were exactly the pattern, so we have just found an
+occurrence ending at position $i$.
+
+\begin{definition}[String-matching automaton]
+\label{ch31:def-automaton}
+For a pattern $P[1\,..\,m]$ the matching automaton has state set
+$Q = \{0, 1, \ldots, m\}$, start state $0$, single accepting state $m$, and
+transition function $\delta(q, a)$ defined for a state $q$ and a character
+$a \in \Sigma$ by
+\[
+  \delta(q, a) = \text{the length of the longest prefix of } P
+  \text{ that is also a suffix of } P_q\,a,
+\]
+where $P_q = P[1\,..\,q]$ is the length-$q$ prefix of the pattern and $P_q\,a$
+means $P_q$ with the character $a$ appended.
+\end{definition}
+
+That definition is doing a lot of work, so let us unpack it slowly. The state
+$q$ means ``the last $q$ characters I read were $P[1\,..\,q]$.'' Now a new
+character $a$ arrives. The string I have matched, with $a$ stuck on the end, is
+$P_q\,a$. The new state must answer: \emph{after seeing $a$, what is the longest
+prefix of $P$ I can still claim to have just matched at the end?} That is the
+longest prefix of $P$ that is a suffix of $P_q\,a$. If $a$ happened to be exactly
+$P[q+1]$, then $P_q\,a = P[1\,..\,q+1]$ is itself a prefix of $P$, and we advance
+to state $q+1$. If $a$ was wrong, we cannot advance -- but we might not have to
+fall all the way to $0$, because a shorter prefix of $P$ might still match at the
+tail. The automaton precomputes the exactly right landing state for every
+$(q, a)$ pair.
+
+\begin{intuitionbox}
+Think of climbing a ladder with $m$ rungs, where rung $q$ means ``I have matched
+the first $q$ characters of the pattern.'' Each text character you read either
+moves you up one rung (you read the character the pattern wanted next) or knocks
+you down to some lower rung (you read something else). The brilliance is in
+exactly \emph{how far down} a wrong character knocks you. It does not necessarily
+send you back to the ground, because the characters you just read might form the
+start of a fresh match. The transition function $\delta$ has memorized the right
+landing rung for every situation, so the machine never hesitates.
+\end{intuitionbox}
+
+Once $\delta$ is built, scanning is breathtakingly simple.
+
+\begin{algorithm}[H]
+\caption{\textsc{Finite-Automaton-Matcher}}
+\KwIn{Text $T[1\,..\,n]$, transition function $\delta$, pattern length $m$.}
+\KwOut{Every valid shift $s$.}
+$q \leftarrow 0$ \tcp*{start state: nothing matched yet}
+\For{$i \leftarrow 1$ \KwTo $n$}{
+  $q \leftarrow \delta(q, T[i])$ \tcp*{one table lookup, no backtracking}
+  \If{$q = m$}{
+    report ``$P$ occurs with shift $s = i - m$''\;
+  }
+}
+\end{algorithm}
+
+Look at how little it does: one lookup per text character, and a check for the
+accepting state. There is no inner loop. The pointer $i$ never moves backward.
+This is the structure of \texttt{grep} on a fixed string, and of the lexical
+analyzer in every compiler.
+
+\subsection{A worked machine}
+
+Let $P = \texttt{ababaca}$, so $m = 7$, over the alphabet
+$\Sigma = \{\texttt{a}, \texttt{b}, \texttt{c}\}$. The states are $0$ through
+$7$. We compute $\delta(q,a)$ for each by the definition: the longest prefix of
+$P$ that is a suffix of $P_q a$.
+
+Take $\delta(5, \texttt{b})$. State $5$ means we have matched
+$P_5 = \texttt{ababa}$. Append \texttt{b}: we get $\texttt{ababab}$. What is the
+longest prefix of \texttt{ababaca} that is a suffix of \texttt{ababab}? Check
+suffixes longest-first: \texttt{ababab}? not a prefix of $P$.
+\texttt{babab}? no. \texttt{abab}? yes -- \texttt{abab} is a prefix of $P$
+(it is $P_4$). So $\delta(5, \texttt{b}) = 4$. We read a wrong character and only
+slipped from rung $5$ to rung $4$, not to the ground.
+
+Take $\delta(5, \texttt{a})$. Append \texttt{a} to \texttt{ababa}: get
+\texttt{ababaa}. Longest prefix of $P$ that is a suffix? \texttt{a} works
+($P_1$); \texttt{aa} is not a prefix of $P$. So $\delta(5, \texttt{a}) = 1$.
+
+And the happy case $\delta(5, \texttt{c})$. Append \texttt{c}: \texttt{ababac},
+which is $P_6$ itself -- a prefix of $P$. So $\delta(5, \texttt{c}) = 6$: we
+advance. Here is the full table:
+
+\begin{center}
+\begin{tabular}{c|ccc}
+\toprule
+state $q$ & $\delta(q,\texttt{a})$ & $\delta(q,\texttt{b})$ & $\delta(q,\texttt{c})$ \\
+\midrule
+$0$ & $1$ & $0$ & $0$ \\
+$1$ & $1$ & $2$ & $0$ \\
+$2$ & $3$ & $0$ & $0$ \\
+$3$ & $1$ & $4$ & $0$ \\
+$4$ & $5$ & $0$ & $0$ \\
+$5$ & $1$ & $4$ & $6$ \\
+$6$ & $7$ & $0$ & $0$ \\
+$7$ & $1$ & $2$ & $0$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Here is the same machine as a picture, showing only the ``spine'' of forward
+transitions (the ones that climb toward the accepting state) for clarity.
+
+\begin{center}
+\begin{tikzpicture}[
+  >=Stealth, node distance=12mm,
+  state/.style={circle,draw,structurepurple,thick,minimum size=8mm,inner sep=1pt},
+  accept/.style={circle,draw,targetgreen,very thick,minimum size=8mm,double},
+  every edge/.style={draw,->,thick}
+]
+\node[state] (q0) {$0$};
+\node[state,right=of q0] (q1) {$1$};
+\node[state,right=of q1] (q2) {$2$};
+\node[state,right=of q2] (q3) {$3$};
+\node[state,right=of q3] (q4) {$4$};
+\node[state,right=of q4] (q5) {$5$};
+\node[state,right=of q5] (q6) {$6$};
+\node[accept,right=of q6] (q7) {$7$};
+\path
+ (q0) edge node[above,font=\scriptsize]{a} (q1)
+ (q1) edge node[above,font=\scriptsize]{b} (q2)
+ (q2) edge node[above,font=\scriptsize]{a} (q3)
+ (q3) edge node[above,font=\scriptsize]{b} (q4)
+ (q4) edge node[above,font=\scriptsize]{a} (q5)
+ (q5) edge node[above,font=\scriptsize]{c} (q6)
+ (q6) edge node[above,font=\scriptsize]{a} (q7);
+\draw[->,thick] ([yshift=3mm]q0.north) -- (q0.north);
+\end{tikzpicture}
+\end{center}
+
+\begin{labbox}
+Let us run the machine on $T = \texttt{a b a b a b a c a b a}$ ($n=11$). Start in
+state $q=0$. Read each character and look up $\delta$.
+
+\begin{center}
+\begin{tabular}{c c c c}
+\toprule
+$i$ & $T[i]$ & new state $q=\delta(q,T[i])$ & note \\
+\midrule
+$1$ & a & $\delta(0,a)=1$ & \\
+$2$ & b & $\delta(1,b)=2$ & \\
+$3$ & a & $\delta(2,a)=3$ & \\
+$4$ & b & $\delta(3,b)=4$ & \\
+$5$ & a & $\delta(4,a)=5$ & \\
+$6$ & b & $\delta(5,b)=4$ & wrong char, slip to $4$ \\
+$7$ & a & $\delta(4,a)=5$ & \\
+$8$ & c & $\delta(5,c)=6$ & \\
+$9$ & a & $\delta(6,a)=7$ & \textbf{accept!} shift $s=9-7=2$ \\
+$10$ & b & $\delta(7,b)=2$ & \\
+$11$ & a & $\delta(2,a)=3$ & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+At $i=9$ the machine entered state $7=m$, so the pattern $\texttt{ababaca}$ occurs
+with shift $2$ -- check: $T[3\,..\,9]=\texttt{ababaca}=P$. Notice especially row
+$i=6$: a stray \texttt{b} where the pattern wanted \texttt{c}. The naive matcher
+would have restarted; the automaton simply slipped from state $5$ to state $4$ and
+kept reading $T$ forward, never re-examining a single character.
+\end{labbox}
+
+\subsection{Cost, and the one catch}
+
+Scanning is gloriously cheap: the loop runs $n$ times with one table lookup each,
+so matching is $\Theta(n)$ -- guaranteed, no probability, no backtracking. The
+catch is building $\delta$. The table has $m+1$ states times $|\Sigma|$ characters
+$= (m+1)|\Sigma|$ entries, and the straightforward way to compute each entry tests
+prefixes against suffixes, costing up to $O(m)$ per entry, for $O(m^2|\Sigma|)$
+preprocessing. (A cleverer construction, closely related to the prefix function
+of the next section, brings this down to $O(m|\Sigma|)$.)
+
+\begin{complexitybox}
+\textbf{Finite-automaton matcher.} Matching $\Theta(n)$ -- and this is the
+worst case, not just the average. Preprocessing $O(m^2|\Sigma|)$ by the direct
+construction, $O(m|\Sigma|)$ by the slicker one. Extra space $O(m|\Sigma|)$ for
+the transition table. The matching phase reads each text character exactly once
+and never backtracks.
+\end{complexitybox}
+
+\begin{trapbox}
+The automaton's transition table is $\Theta(m|\Sigma|)$ in size. For DNA
+($|\Sigma|=4$) or text that is a delight. But for Unicode, where $|\Sigma|$ can
+be over a million, the table is a monster -- it can dwarf the text you are
+searching. This dependence on $|\Sigma|$ is the automaton's real weakness, and it
+is exactly the weakness KMP, our final algorithm, was designed to remove.
+\end{trapbox}
+
+\section{The Knuth--Morris--Pratt algorithm}
+\label{ch31:kmp}
+
+We now reach the crown jewel. KMP achieves the same $\Theta(n)$ scan as the
+automaton, with the same no-backtracking guarantee, but its preprocessing is
+$\Theta(m)$ and -- crucially -- \emph{independent of the alphabet size}. It needs
+no transition table at all. Instead it carries one small array, the
+\emph{prefix function}, that captures the pattern's internal self-similarity. The
+prefix function is, in a sense, the automaton's table compressed down to its
+essence.
+
+\subsection{The insight: a mismatch already tells you a lot}
+
+Return one final time to the painful moment in the naive matcher. We were
+matching $P$ against the text, we had successfully matched $q$ characters, and
+then character $q+1$ disagreed. The naive matcher slides the pattern one step and
+restarts from the beginning. But think about what we \emph{know}. We know the
+last $q$ text characters were exactly $P[1\,..\,q]$. That is hard-won information
+about the text, paid for with $q$ comparisons. KMP refuses to throw it away.
+
+Here is the question KMP asks. We matched $P[1\,..\,q]$ and then failed. We must
+slide the pattern forward -- but how far can we slide it without missing a
+possible match? A match cannot start anywhere that would contradict the $q$
+characters we already verified. The pattern, after sliding, must agree with the
+tail of $P[1\,..\,q]$ wherever they now overlap. In other words: we want the
+longest \emph{proper} prefix of $P[1\,..\,q]$ that is also a suffix of
+$P[1\,..\,q]$. That length tells us the new state to drop to -- \emph{and it
+depends only on the pattern, not on the text at all.}
+
+\begin{definition}[Prefix function]
+\label{ch31:def-prefix}
+The \emph{prefix function} of a pattern $P[1\,..\,m]$ is the array
+$\pi[1\,..\,m]$ where
+\[
+  \pi[q] = \text{the length of the longest proper prefix of } P[1\,..\,q]
+  \text{ that is also a suffix of } P[1\,..\,q].
+\]
+``Proper'' means strictly shorter than $P[1\,..\,q]$ itself (so we never pick the
+whole thing). When no proper prefix is also a suffix, $\pi[q] = 0$.
+\end{definition}
+
+\begin{intuitionbox}
+The prefix function measures how much the pattern \emph{repeats its own
+beginning} inside itself. Suppose you have matched the first $q$ characters and
+then hit a wall. Those $q$ characters are $P[1\,..\,q]$. If the \emph{end} of
+that chunk happens to re-spell the \emph{beginning} of the pattern -- say the
+last $3$ characters of what you matched are also the first $3$ characters of $P$
+-- then you have effectively already matched $3$ characters of a \emph{fresh}
+attempt, for free, without re-reading any text. So you do not restart from zero;
+you restart from $3$. The prefix function precomputes, for every $q$, exactly how
+big that free head start is. It is the pattern looking in a mirror.
+\end{intuitionbox}
+
+\subsection{Computing the prefix function by hand}
+
+Let $P = \texttt{ababaca}$ again, $m=7$. We fill $\pi[q]$ for $q=1,\ldots,7$.
+
+\begin{itemize}
+\item $\pi[1]$: $P[1\,..\,1]=\texttt{a}$. A proper prefix is strictly shorter, so
+the only candidate is the empty string. $\pi[1]=0$.
+\item $\pi[2]$: $P[1\,..\,2]=\texttt{ab}$. Proper prefixes: \texttt{a}. Is
+\texttt{a} a suffix of \texttt{ab}? No (the suffix of length $1$ is \texttt{b}).
+$\pi[2]=0$.
+\item $\pi[3]$: $\texttt{aba}$. Proper prefixes \texttt{ab}, \texttt{a}. Is
+\texttt{ab} a suffix? The length-$2$ suffix is \texttt{ba}; no. Is \texttt{a} a
+suffix? The length-$1$ suffix is \texttt{a}; yes. $\pi[3]=1$.
+\item $\pi[4]$: $\texttt{abab}$. Is \texttt{aba} a suffix? Length-$3$ suffix is
+\texttt{bab}; no. Is \texttt{ab} a suffix? Length-$2$ suffix is \texttt{ab};
+yes. $\pi[4]=2$.
+\item $\pi[5]$: $\texttt{ababa}$. Is \texttt{abab} a suffix? Length-$4$ suffix is
+\texttt{baba}; no. Is \texttt{aba} a suffix? Length-$3$ suffix \texttt{aba};
+yes. $\pi[5]=3$.
+\item $\pi[6]$: $\texttt{ababac}$. Length-$5$ suffix \texttt{babac}? no.
+Length-$4$ \texttt{abac}? no. Length-$3$ \texttt{bac}? no. Length-$2$
+\texttt{ac}? no. Length-$1$ \texttt{c}? no. $\pi[6]=0$.
+\item $\pi[7]$: $\texttt{ababaca}$. Down the suffixes\ldots only \texttt{a}
+(length $1$) is a prefix and a suffix. $\pi[7]=1$.
+\end{itemize}
+
+\begin{center}
+\begin{tabular}{c|ccccccc}
+\toprule
+$q$ & $1$ & $2$ & $3$ & $4$ & $5$ & $6$ & $7$ \\
+$P[q]$ & a & b & a & b & a & c & a \\
+$\pi[q]$ & $0$ & $0$ & $1$ & $2$ & $3$ & $0$ & $1$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Read $\pi[5]=3$ aloud: ``if I have matched \texttt{ababa} and then fail, the
+last $3$ characters \texttt{aba} are also the first $3$, so I restart from a head
+start of $3$.'' That single number is what the automaton needed a whole table
+column to express. Figure~\ref{ch31:fig-prefix} draws this overlap: the longest
+proper prefix of \texttt{ababa} that is also a suffix.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\ttfamily\small,
+  cell/.style={draw,minimum size=6.5mm,inner sep=0pt},
+  base/.style={cell,fill=gray!8},
+  pre/.style={cell,fill=sourceblue!22},
+  suf/.style={cell,fill=targetgreen!28},
+  both/.style={cell,fill=structurepurple!28},
+  lbl/.style={font=\sffamily\scriptsize}
+]
+% P[1..5] = a b a b a
+\foreach \c [count=\i from 1] in {a,b,a,b,a} {
+  \node[base] (p\i) at (\i*0.75,0) {\c};
+}
+\node[lbl,left=2mm of p1] {$P[1\,..\,5]$};
+% prefix aba = positions 1,2,3 (blue brace above)
+\draw[decorate,decoration={brace,amplitude=4pt},sourceblue,thick]
+  ($(p1.north west)+(0,3pt)$) -- ($(p3.north east)+(0,3pt)$)
+  node[midway,above=4pt,lbl,sourceblue]{prefix \texttt{aba}};
+% suffix aba = positions 3,4,5 (green brace below)
+\draw[decorate,decoration={brace,amplitude=4pt,mirror},targetgreen,thick]
+  ($(p3.south west)+(0,-3pt)$) -- ($(p5.south east)+(0,-3pt)$)
+  node[midway,below=4pt,lbl,targetgreen]{suffix \texttt{aba}};
+\end{tikzpicture}
+\caption{Why $\pi[5]=3$ for $P=\texttt{ababaca}$. Inside $P[1\,..\,5]=\texttt{ababa}$,
+the prefix \texttt{aba} (blue, positions $1$--$3$) equals the suffix \texttt{aba}
+(green, positions $3$--$5$); they even overlap at position $3$. That length-$3$
+agreement is the free head start KMP keeps after a mismatch at state $5$.}
+\label{ch31:fig-prefix}
+\end{figure}
+
+\subsection{Computing the prefix function cleverly}
+
+Filling $\pi$ by brute force, as above, costs $O(m^2)$. There is a beautiful
+linear way, and it uses the prefix function to compute \emph{itself}. Process
+$q$ from $2$ upward, carrying a variable $k = \pi[q-1]$, the length matched so
+far. To extend to position $q$, we want to match $P[q]$ against $P[k+1]$. If they
+agree, the matched length grows: $k \leftarrow k+1$. If they disagree, we fall
+back to the next-shorter candidate, which is precisely $\pi[k]$ -- the prefix
+function calling on itself -- and try again, until either we match or $k$ hits
+$0$.
+
+\begin{algorithm}[H]
+\caption{\textsc{Compute-Prefix-Function}}
+\KwIn{Pattern $P[1\,..\,m]$.}
+\KwOut{The prefix-function array $\pi[1\,..\,m]$.}
+$\pi[1] \leftarrow 0$\;
+$k \leftarrow 0$ \tcp*{length of the current longest prefix-suffix}
+\For{$q \leftarrow 2$ \KwTo $m$}{
+  \While{$k > 0$ \textbf{and} $P[k+1] \ne P[q]$}{
+    $k \leftarrow \pi[k]$ \tcp*{fall back to the next-best candidate}
+  }
+  \If{$P[k+1] = P[q]$}{
+    $k \leftarrow k + 1$ \tcp*{extend the match by one}
+  }
+  $\pi[q] \leftarrow k$\;
+}
+\Return $\pi$\;
+\end{algorithm}
+
+\subsection{KMP itself}
+
+With $\pi$ in hand, matching is the automaton's spirit without the automaton's
+table. We scan the text with a pointer $i$ that never retreats, and a state $q$
+counting how much of the pattern is currently matched. On a mismatch we do not
+restart -- we consult $\pi[q]$ to find the right fallback state, exactly as
+\textsc{Compute-Prefix-Function} fell back on itself.
+
+\begin{algorithm}[H]
+\caption{\textsc{KMP-Matcher}}
+\KwIn{Text $T[1\,..\,n]$, pattern $P[1\,..\,m]$.}
+\KwOut{Every valid shift $s$.}
+$\pi \leftarrow \textsc{Compute-Prefix-Function}(P)$\;
+$q \leftarrow 0$ \tcp*{number of pattern characters matched so far}
+\For{$i \leftarrow 1$ \KwTo $n$}{
+  \While{$q > 0$ \textbf{and} $P[q+1] \ne T[i]$}{
+    $q \leftarrow \pi[q]$ \tcp*{mismatch: slide using the prefix function}
+  }
+  \If{$P[q+1] = T[i]$}{
+    $q \leftarrow q + 1$ \tcp*{match: advance the state}
+  }
+  \If{$q = m$}{
+    report ``$P$ occurs with shift $s = i - m$''\;
+    $q \leftarrow \pi[q]$ \tcp*{look for the next, possibly overlapping, match}
+  }
+}
+\end{algorithm}
+
+The two loops are siblings. \textsc{Compute-Prefix-Function} matches the pattern
+against \emph{itself}; \textsc{KMP-Matcher} matches the pattern against the
+\emph{text}. Both advance on agreement and both consult $\pi$ on disagreement.
+After a full match we set $q \leftarrow \pi[m]$ so that overlapping occurrences
+(think of pattern \texttt{aa} in text \texttt{aaa}) are not missed.
+
+\begin{labbox}
+Run KMP with $P = \texttt{ababaca}$ (and $\pi = [0,0,1,2,3,0,1]$ from above) on
+$T = \texttt{a b a b a b a c a b a}$ ($n=11$). Start $q=0$.
+
+\begin{center}
+\begin{tabular}{c c l c}
+\toprule
+$i$ & $T[i]$ & action & $q$ after \\
+\midrule
+$1$ & a & $P[1]=$a matches; advance & $1$ \\
+$2$ & b & $P[2]=$b matches; advance & $2$ \\
+$3$ & a & $P[3]=$a matches; advance & $3$ \\
+$4$ & b & $P[4]=$b matches; advance & $4$ \\
+$5$ & a & $P[5]=$a matches; advance & $5$ \\
+$6$ & b & $P[6]=$c $\ne$ b: fall back $q\!\leftarrow\!\pi[5]=3$; now $P[4]=$b matches; advance & $4$ \\
+$7$ & a & $P[5]=$a matches; advance & $5$ \\
+$8$ & c & $P[6]=$c matches; advance & $6$ \\
+$9$ & a & $P[7]=$a matches; advance $\to 7=m$: \textbf{report }$s=2$; set $q\!\leftarrow\!\pi[7]=1$ & $1$ \\
+$10$ & b & $P[2]=$b matches; advance & $2$ \\
+$11$ & a & $P[3]=$a matches; advance & $3$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Study row $i=6$. We had matched $5$ characters (\texttt{ababa}) and the text gave
+us \texttt{b} where the pattern wanted \texttt{c}. Instead of crawling back, KMP
+consulted $\pi[5]=3$: the prefix \texttt{aba} of what we matched is also its
+suffix, so we keep a head start of $3$ and immediately try $P[4]=\texttt{b}$
+against the same $T[6]=\texttt{b}$ -- it matches, and we are at state $4$ without
+having moved $i$ backward at all. That is the whole magic, in one row.
+\end{labbox}
+
+\subsection{Why KMP is linear: an amortized argument}
+
+The scary part of KMP is the inner \textbf{while} loop. Could it spin many times
+per character and blow up the cost? The answer is a clean amortized argument, and
+it rests on watching the state $q$ as a kind of bank balance.
+
+\begin{focusbox}
+Watch the value of $q$ across the whole run. Each iteration of the outer
+\textbf{for} loop increases $q$ by \emph{at most $1$} (the single ``advance''
+line). Each iteration of the inner \textbf{while} loop \emph{strictly decreases}
+$q$ (since $\pi[q] < q$ always -- the prefix is \emph{proper}). And $q$ never
+goes below $0$. So $q$ is a counter that rises by at most $1$ per text character
+and can never fall below zero.
+\end{focusbox}
+
+\begin{formalbox}
+Use the \emph{potential method}. Let the potential be the current value of $q$,
+which starts at $0$ and is always $\ge 0$. Across the $n$ iterations of the outer
+loop, the total \emph{increase} in $q$ is at most $n$ (at most $1$ per
+iteration). Every inner-\textbf{while} iteration decreases $q$ by at least $1$.
+Since total decrease cannot exceed total increase plus the starting value, the
+inner loop executes at most $n$ times \emph{over the entire algorithm} -- not
+per character, but in total. Hence the matching phase does $O(n)$ work. Computing
+$\pi$ is the same argument over $P$, giving $O(m)$. Together, KMP runs in
+$\Theta(n + m) = \Theta(n)$ time.
+\end{formalbox}
+
+This is the same accounting trick that tames the dynamic array and the union-find
+structure: a single operation may be expensive, but expensive steps must be
+``paid for'' by cheap ones that came before, so the average over the whole run is
+small. Here, every fall-back must have been earned by an earlier advance.
+
+Figure~\ref{ch31:fig-potential} plots $q$ across the trace from the lab above.
+Every up-step is one advance; every down-step is a fall-back. Because $q$ can
+only fall as far as it has previously climbed, the total descent over the whole
+run is bounded by the total ascent, which is at most $n$.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\sffamily\scriptsize,x=8.5mm,y=5mm]
+% axes
+\draw[->] (0.5,0) -- (12,0) node[right]{$i$};
+\draw[->] (0.5,0) -- (0.5,7.3) node[above]{$q$};
+\foreach \y in {1,...,7} \draw (0.4,\y) -- (0.5,\y) node[left,inner sep=1pt]{\y};
+\foreach \x in {1,...,11} \node[below] at (\x,0) {\x};
+% q values after each i: 1,2,3,4,5,4,5,6,1,2,3
+\def\qs{1/1,2/2,3/3,4/4,5/5,6/4,7/5,8/6,9/1,10/2,11/3}
+% draw step line from (0,0)
+\draw[sourceblue,very thick]
+  (0.5,0) -- (1,1) -- (2,2) -- (3,3) -- (4,4) -- (5,5)
+  -- (5,4) -- (6,4)          % i=6 fall-back 5->4 then advance to 4
+  -- (7,5) -- (8,6)
+  -- (9,7)                   % i=9 advance to 7 (match)
+  -- (9,1)                   % reset q<-pi[7]=1
+  -- (10,2) -- (11,3);
+% mark the match
+\fill[targetgreen] (9,7) circle (2pt);
+\node[targetgreen,above right=-1pt and 1pt of {(9,7)}] {match, $q=m$};
+% mark a fall-back
+\node[trapred,left=5pt] at (5.5,4.5) {fall-back};
+\end{tikzpicture}
+\caption{The state $q$ during the KMP run on $T=\texttt{abababacaba}$ with
+$P=\texttt{ababaca}$. Diagonal rises are advances (at most one per text
+character); vertical drops are fall-backs through $\pi$ (at $i=6$, and the reset
+to $\pi[7]=1$ after the match at $i=9$). Total drop $\le$ total rise $\le n$, so
+the inner loop fires $O(n)$ times in all.}
+\label{ch31:fig-potential}
+\end{figure}
+
+\begin{complexitybox}
+\textbf{Knuth--Morris--Pratt.} Preprocessing $\Theta(m)$, and -- unlike the
+automaton -- \emph{independent of $|\Sigma|$}. Matching $\Theta(n)$ in the worst
+case. Total $\Theta(n+m)$. Extra space $\Theta(m)$ for the array $\pi$. Each text
+character is examined a small \emph{amortized} constant number of times; the
+pointer $i$ never moves backward.
+\end{complexitybox}
+
+\begin{historybox}
+Donald Knuth, James Morris, and Vaughan Pratt published this algorithm in 1977.
+The story is charming: Knuth and Pratt derived it by analyzing what an
+automaton-based matcher really needed, while Morris had invented essentially the
+same thing while building a text editor and was annoyed by the naive matcher's
+re-reading. It was among the first algorithms whose worst-case linearity was
+proved rather than hoped for. CLRS treats finite-automaton matching in Section
+32.3 and KMP in Section 32.4; the prefix function there is named exactly as we
+have it. KMP also relates to the \emph{failure function} idea reused in
+Aho--Corasick multi-pattern matching.
+\end{historybox}
+
+\begin{trapbox}
+A common confusion: people think the inner \textbf{while} loop makes KMP
+quadratic because ``it has a loop inside a loop.'' It does not. The number of
+nested-loop iterations is bounded \emph{globally}, not per outer step, by the
+potential argument. Counting loops by their nesting depth, rather than by how
+many times they truly run, is one of the most frequent analysis errors in all of
+algorithms -- and KMP is the classic cautionary tale.
+\end{trapbox}
+
+\section{Putting the four side by side}
+\label{ch31:summary}
+
+We have climbed from the obvious to the optimal. Here is the whole landscape.
+
+\begin{center}
+\begin{tabular}{l l l l}
+\toprule
+Algorithm & Preprocessing & Matching & Notes \\
+\midrule
+Naive & $0$ & $O((n-m+1)m)$ & no extra space; re-reads text \\
+Rabin--Karp & $\Theta(m)$ & $O(n+vm)$ expected & worst case $O((n-m+1)m)$ \\
+Finite automaton & $O(m|\Sigma|)$ & $\Theta(n)$ & big table; $|\Sigma|$-dependent \\
+KMP & $\Theta(m)$ & $\Theta(n)$ & small array; $|\Sigma|$-independent \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Here $v$ is the number of valid shifts. Notice the arc of the chapter. Naive is
+simplest but re-reads text. Rabin--Karp escapes re-reading on \emph{average} by
+gambling on fingerprints. The automaton escapes it \emph{always} but pays in a
+fat, alphabet-sized table. KMP keeps the automaton's iron-clad linear guarantee
+while shrinking the table down to a single $m$-element array that does not care
+how big the alphabet is. That progression -- obvious, then probabilistic, then
+guaranteed-but-heavy, then guaranteed-and-light -- is the shape of progress in
+algorithm design itself.
+
+\begin{aestheticbox}
+String matching is not a museum piece. KMP and its relatives run inside
+\texttt{grep}, inside your editor's find, inside DNA aligners scanning genomes,
+inside network intrusion detectors comparing packets against attack signatures at
+line rate, and inside the tokenizers of compilers. The automaton view is the
+backbone of regular-expression engines. And Rabin--Karp's rolling hash is the
+engine of file-syncing and deduplication tools that decide which blocks of a
+multi-gigabyte file actually changed. The ideas in this short chapter quietly run
+a large fraction of the text the world processes.
+\end{aestheticbox}
+
+\begin{recoverybox}
+If only one sentence survives from this chapter, let it be this: the fast string
+matchers all win by \emph{never re-reading the text} -- they invest a little
+preprocessing of the pattern so that, when a match breaks down, they already know
+exactly how far to slide without going back. Rabin--Karp buys that with a
+fingerprint; the automaton with a table; KMP with the prefix function. Same goal,
+three trades.
+\end{recoverybox}
+
+\section{Exercises}
+\label{ch31:exercises}
+
+\begin{exercise}[Warmup: trace the naive matcher]
+Run \textsc{Naive-String-Matcher} on $T=\texttt{aaabaaaab}$ and
+$P=\texttt{aaab}$. List every shift, the number of character comparisons it
+makes at that shift, and which shifts are valid. What is the total comparison
+count?
+\end{exercise}
+
+\begin{exercise}[The quadratic worst case]
+Exhibit a text and pattern, each parameterized by $n$ and $m$, on which the naive
+matcher makes exactly $(n-m+1)\,m$ character comparisons. Argue briefly why no
+shift can be skipped on your input.
+\end{exercise}
+
+\begin{exercise}[Rolling hash by hand]
+With radix $d=10$ and prime $q=11$, compute the Rabin--Karp fingerprint of the
+pattern $P=\texttt{2718}$ (so $m=4$), and the fingerprint of the first
+length-$4$ window $\texttt{9271}$ of $T=\texttt{927183}$. Then use the rolling
+update to obtain the fingerprint of the second window $\texttt{2718}$ and the
+third window $\texttt{7183}$. Show every modular step, and say which window is a
+real match for $P$.
+\end{exercise}
+
+\begin{exercise}[Spurious hits]
+For $d=10$ and $q=13$, find two distinct $3$-digit strings that have the same
+Rabin--Karp fingerprint. Explain why the verification step in
+\textsc{Rabin-Karp-Matcher} is not optional, using your example.
+\end{exercise}
+
+\begin{exercise}[Choosing the prime]
+Suppose your text has length $n=10^6$ and you want the \emph{expected} number of
+spurious hits to be at most $1$. Using the estimate that the expected number of
+spurious hits is about $n/q$, what is the smallest prime $q$ that suffices? How
+large does the machine word need to be so that $d\cdot q$ fits, for byte data
+($d=256$)?
+\end{exercise}
+
+\begin{exercise}[Compute a prefix function]
+Compute the prefix function $\pi$ for $P=\texttt{aabaabaaa}$ by hand, showing the
+longest prefix-that-is-a-suffix at each position. Then verify your answer by
+running \textsc{Compute-Prefix-Function} and listing the value of $k$ at the end
+of each iteration of the outer loop.
+\end{exercise}
+
+\begin{exercise}[KMP trace]
+Using the pattern $P=\texttt{ababaca}$ and its prefix function
+$\pi=[0,0,1,2,3,0,1]$, trace \textsc{KMP-Matcher} on
+$T=\texttt{abacababacaba}$. Make a table with columns $i$, $T[i]$, the value of
+$q$ before, any fall-backs taken, and $q$ after. Report all valid shifts.
+\end{exercise}
+
+\begin{exercise}[Building one automaton transition]
+For the pattern $P=\texttt{aabab}$, compute $\delta(4,\texttt{a})$ and
+$\delta(4,\texttt{b})$ from the definition (longest prefix of $P$ that is a
+suffix of $P_4\,a$). Recall $P_4=\texttt{aaba}$. Show the suffixes you test.
+\end{exercise}
+
+\begin{exercise}[Why $q$ never overshoots]
+Prove the invariant that drives KMP's correctness: at the top of the outer
+\textbf{for} loop in \textsc{KMP-Matcher}, $q$ equals the length of the longest
+prefix of $P$ that is a suffix of $T[1\,..\,i-1]$. (Hint: induct on $i$, using
+the definition of the prefix function for the mismatch case.)
+\end{exercise}
+
+\begin{exercise}[Amortized counting]
+Consider the pattern $P=\texttt{aaaaab}$ ($m=6$) and the text of $n$ \texttt{a}'s.
+Trace how the state $q$ rises and how the inner \textbf{while} loop fires across
+the scan. Confirm by direct count that the \emph{total} number of inner-loop
+iterations over the whole text is at most $n$, matching the potential argument,
+even though some individual characters trigger several fall-backs.
+\end{exercise}
+
+\begin{exercise}[Challenge: two-dimensional matching]
+You are given an $n\times n$ grid of characters and an $m\times m$ pattern grid,
+and you want every position where the small grid sits inside the big one.
+Describe how to combine the row-wise rolling hash of Rabin--Karp with a second
+rolling hash down the columns to solve this in expected $O(n^2)$ time after
+$O(m^2)$ preprocessing. What is the analogue of a spurious hit here?
+\end{exercise}
+
+\begin{exercise}[Challenge: shrinking the automaton table]
+The direct automaton construction costs $O(m^2|\Sigma|)$. Explain how the prefix
+function $\pi$ lets you compute the transition $\delta(q,a)$ for any state $q$ and
+character $a$ on the fly in amortized $O(1)$, so that you never store the full
+$\Theta(m|\Sigma|)$ table. (Hint: $\delta(q,a)$ either advances to $q+1$ when
+$P[q+1]=a$, or behaves like $\delta(\pi[q],a)$ otherwise -- which is exactly the
+inner loop of KMP.)
+\end{exercise}
