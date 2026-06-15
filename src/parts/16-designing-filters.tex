@@ -1,0 +1,1065 @@
+\chapter{Designing Filters}
+
+Up to now we have mostly \emph{analyzed} signals: we took something the world
+handed us --- a chord, an accelerometer trace, an image --- and asked what
+frequencies were hiding inside it. A filter does the opposite. A filter is a
+machine we \emph{design on purpose} to keep some frequencies and throw others
+away. It is the first piece of signal processing where you are no longer a
+spectator; you are an engineer with a target in mind.
+
+And you already own all the parts. In the chapter on LTI systems we learned that
+any linear, time-invariant box is completely described by its impulse response
+$h[n]$, that running a signal through it is convolution $y = x \conv h$, and ---
+the magic key --- that convolution in time is \emph{multiplication} in frequency:
+\[
+Y(\omega) \;=\; X(\omega)\, H(\omega).
+\]
+That single equation \emph{is} the theory of filtering. The factor $H(\omega)$,
+the frequency response, is a knob you get to draw: a curve that says ``multiply
+this frequency by $1$, that one by $0$, this one by $0.5$.'' Designing a filter
+means choosing an $H(\omega)$ shaped the way you want, and then finding a real,
+finite, runnable $h[n]$ (or a difference equation) that produces it. This chapter
+is about how to do that choosing well.
+
+\begin{focusbox}
+A filter multiplies each frequency of the input by a number you chose in advance.
+The wish-list curve is $H(\omega)$. ``Filter design'' is the craft of turning that
+wish into a short list of coefficients a chip can actually multiply and add ---
+trading away a little of the wish to make it cheap, stable, and causal.
+\end{focusbox}
+
+\section{What a filter is supposed to do}
+\label{ch16:what}
+
+Forget formulas for a second and think in pictures. A signal's spectrum is a
+landscape: energy piled up at some frequencies, flat at others. A filter is a
+\emph{mask} you lay over that landscape. Where the mask is $1$ the energy passes
+untouched; where the mask is $0$ the energy is erased; in between it is scaled.
+Four mask shapes cover almost everything you will ever want.
+
+\begin{itemize}
+\item \textbf{Low-pass}: keep low frequencies, kill high ones. The mask is a
+plateau near $\omega=0$ that drops to zero. This is the workhorse --- smoothing,
+anti-aliasing, removing hiss, taming sensor jitter.
+\item \textbf{High-pass}: keep high frequencies, kill low ones. The mask is zero
+near DC and rises to a plateau. Use it to remove a slow drift or a DC offset
+while keeping the wiggles.
+\item \textbf{Band-pass}: keep a middle band, kill everything above and below. A
+plateau floating between two cliffs. Radios tune with these; so does an EMG front
+end that only wants the $20$--$450$\,Hz muscle band.
+\item \textbf{Band-stop} (notch): the inverse --- kill one narrow band, keep the
+rest. The classic job is murdering $50/60$\,Hz mains hum without touching the
+signal around it.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=1.0]
+\begin{axis}[
+  width=13.5cm, height=4.2cm,
+  xmin=0, xmax=1, ymin=-0.1, ymax=1.25,
+  xtick={0,0.5,1}, xticklabels={$0$,$\pi/2$,$\pi$},
+  ytick={0,1},
+  xlabel={frequency $\omega$}, ylabel={$|H|$},
+  every axis plot/.append style={thick},
+  axis lines=box, enlargelimits=false,
+  title={\small Four ideal masks (low/high/band-pass, band-stop)},
+]
+% low-pass
+\addplot[sigblue, samples=2, domain=0:0.3] {1};
+\addplot[sigblue, samples=2, domain=0.3:1] {0};
+% high-pass
+\addplot[specred, samples=2, domain=0:0.7] {0};
+\addplot[specred, samples=2, domain=0.7:1] {0.92};
+% band-pass
+\addplot[quotientorange, samples=2, domain=0:0.42] {0};
+\addplot[quotientorange, samples=2, domain=0.42:0.58] {0.84};
+\addplot[quotientorange, samples=2, domain=0.58:1] {0};
+\end{axis}
+\end{tikzpicture}
+\caption{Idealized magnitude responses. Blue: low-pass. Red: high-pass (drawn
+slightly low so the lines do not overlap). Orange: band-pass. A band-stop is just
+``$1$ minus a band-pass''.}
+\label{ch16:fig-masks}
+\end{figure}
+
+\begin{intuitionbox}
+A high-pass is a low-pass turned inside out, and a band-stop is a band-pass turned
+inside out. Spectrally, ``keep the rest'' means subtract from the all-pass mask
+$H=1$: if $H_{\text{LP}}(\omega)$ keeps the lows, then $1 - H_{\text{LP}}(\omega)$
+keeps the highs. In time that is $\delta[n] - h_{\text{LP}}[n]$. So if you can
+build one good low-pass, you can build all four. We will lean on this constantly.
+\end{intuitionbox}
+
+\begin{connectionbox}
+The masking picture is the convolution theorem from the Fourier chapter wearing
+work clothes. Multiplying spectra ($Y = XH$) corresponds to convolving in time
+($y = x \conv h$). Everything in this chapter is just: ``what time-domain $h[n]$
+multiplies the spectrum by the shape I want?'' That is an inverse-Fourier
+question, and the linear-algebra book's view of the Fourier transform as an
+orthogonal change of basis is exactly why the answer is unique.
+\end{connectionbox}
+
+\subsection{Why the perfect mask is impossible}
+\label{ch16:why-impossible}
+
+The masks in Figure~\ref{ch16:fig-masks} have vertical cliffs: pass at full
+strength up to a frequency, then \emph{instantly} zero. That perfect ``brick
+wall'' is the dream. Here is the hard truth that organizes the whole field: you
+cannot build it with a finite, real filter, and you cannot even get arbitrarily
+close without paying.
+
+The reason is the uncertainty relationship between time and frequency. A brick
+wall in frequency is a $\rect$ function. Its inverse Fourier transform is a
+$\sinc$ --- and the $\sinc$ is infinitely long and two-sided.
+
+\begin{whybox}
+An ideal low-pass with cutoff $\omega_c$ has frequency response
+$H(\omega) = \rect(\omega/2\omega_c)$ (one inside the band, zero outside).
+Inverse-transforming gives the impulse response
+\[
+h[n] \;=\; \frac{\omega_c}{\pi}\,\sinc\!\left(\frac{\omega_c\, n}{\pi}\right)
+       \;=\; \frac{\sin(\omega_c n)}{\pi n}.
+\]
+Look at what this demands. It is nonzero for \emph{all} $n$, from $-\infty$ to
+$+\infty$. To compute even one output sample you would need every past
+\emph{and every future} input sample, weighted by a slowly decaying ripple. That
+filter is non-causal (needs the future) and infinitely long (needs infinite
+memory and infinite multiplies). Real hardware has neither. Every practical
+design is a negotiation: how do we chop, shift, and smooth that ideal $\sinc$
+into something finite and causal while keeping the mask close to what we wanted?
+\end{whybox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=13.5cm, height=4.6cm,
+  xmin=-12, xmax=12, ymin=-0.09, ymax=0.34,
+  xtick={-10,-5,0,5,10}, ytick={0,0.3},
+  xlabel={sample index $n$}, ylabel={$h[n]$},
+  axis lines=box, enlargelimits=false,
+  title={\small Ideal low-pass impulse response: the sinc never ends},
+]
+\addplot[sigblue, only marks, mark=*, mark size=1.2pt, samples at={-12,...,12}]
+  ({x}, {x==0 ? 0.3 : sin(deg(0.3*pi*x))/(pi*x)});
+\addplot[sigblue, ycomb, samples at={-12,...,12}]
+  ({x}, {x==0 ? 0.3 : sin(deg(0.3*pi*x))/(pi*x)});
+\draw[gray, dashed] (axis cs:-12,0)--(axis cs:12,0);
+\end{axis}
+\end{tikzpicture}
+\caption{The impulse response of the ideal low-pass ($\omega_c = 0.3\pi$) is a
+sampled sinc. It is symmetric about $n=0$, decays only as $1/n$, and goes on
+forever in both directions. Truncating and shifting it is the entire ``window
+method'' below.}
+\label{ch16:fig-ideal-sinc}
+\end{figure}
+
+\section{Two families: FIR and IIR}
+\label{ch16:fir-iir}
+
+Every digital filter falls into one of two families, distinguished by one
+question: \emph{does the impulse response ever truly end?}
+
+A \textbf{Finite Impulse Response} (FIR) filter has an $h[n]$ that is nonzero for
+only finitely many taps. You compute each output as a plain weighted sum of recent
+inputs:
+\[
+y[n] \;=\; \sum_{k=0}^{M} b_k\, x[n-k].
+\]
+There is no feedback. Kick it with an impulse and the output rings for exactly
+$M+1$ samples, then is dead silent forever. The coefficients $b_k$ \emph{are} the
+impulse response: $h[k] = b_k$.
+
+An \textbf{Infinite Impulse Response} (IIR) filter feeds its own past outputs
+back in:
+\[
+y[n] \;=\; \sum_{k=0}^{M} b_k\, x[n-k] \;-\; \sum_{k=1}^{P} a_k\, y[n-k].
+\]
+Because the output depends on earlier outputs, a single impulse can echo around
+the feedback loop forever (decaying, if the filter is stable). A two-tap IIR can
+produce an impulse response that never exactly reaches zero --- hence
+``infinite''.
+
+\begin{intuitionbox}
+FIR is a \emph{moving window} that only ever looks at the input: a tapped delay
+line you weight and sum. IIR is a \emph{resonator}: it has internal state that
+keeps ringing, like a struck bell or an RC circuit relaxing. The bell's tone
+outlives the strike --- that is feedback, that is the ``infinite'' tail.
+\end{intuitionbox}
+
+\begin{happeningbox}
+Both filters are still just convolution, $y = x \conv h$. The difference is
+\emph{how} you compute that convolution. FIR computes it directly, multiplying out
+a finite list of taps. IIR computes the \emph{same kind of} convolution
+implicitly through a recurrence: a short feedback formula that, if you unrolled it
+forever, would reproduce an infinitely long $h[n]$. IIR is a clever shorthand ---
+it buys a long, sharp impulse response with very few coefficients, and the bill
+for that bargain is the risk of instability and nonlinear phase.
+\end{happeningbox}
+
+\subsection{The tradeoffs, plainly}
+\label{ch16:tradeoffs}
+
+Neither family is ``better''; they trade different things. Here is the
+ledger.
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{p{4.1cm} p{4.5cm} p{4.5cm}}
+\toprule
+ & \textbf{FIR} & \textbf{IIR} \\
+\midrule
+Sharpness per coefficient & Low --- needs many taps for a steep cutoff
+ & High --- a few coefficients give a very steep cutoff \\
+Stability & Always stable (no feedback) & Can blow up if poorly designed or
+ quantized \\
+Phase & Can be \emph{exactly} linear (constant delay) & Nonlinear phase; warps
+ waveform shape \\
+Memory / compute & More (a long delay line) & Less \\
+Design intuition & Direct: shape the taps & Indirect: place poles and zeros \\
+Analog heritage & None really & Mirrors classic analog filters (RC, LC,
+ Butterworth) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{trapbox}
+The seductive trap is to reach for IIR \emph{because} it is cheap, then discover
+your nicely-shaped signal has its peaks shifted relative to its valleys. IIR
+filters delay different frequencies by different amounts (nonlinear phase). For
+audio loudness that is usually fine --- the ear is fairly deaf to phase. For
+anything where the \emph{shape} of the waveform matters --- an ECG QRS complex, a
+gesture's sharp accelerometer spike, lining up two channels --- that smearing is a
+real bug. When shape matters, prefer FIR.
+\end{trapbox}
+
+\begin{goalbox}
+For the wrist gesture controller these tradeoffs are not academic. We will run a
+low-pass on the accelerometer to separate gravity (slow tilt) from motion (fast),
+a band-pass on any EMG/FMG channel to isolate the muscle band, and a notch to kill
+mains hum. On a small microcontroller, compute and memory are scarce, which pulls
+toward IIR. But a \emph{tap} or \emph{flick} gesture is recognized by the precise
+timing and shape of an acceleration spike, and IIR's phase smearing can blur two
+near-simultaneous taps into one. So a typical wrist build mixes both: cheap IIR
+biquads for the EMG band-pass and the hum notch (where only the envelope matters),
+and a short linear-phase FIR on the accelerometer (where spike timing must stay
+aligned across axes). Choosing per channel, with the table above in hand, is the
+real engineering.
+\end{goalbox}
+
+\section{Specifying a filter before you design it}
+\label{ch16:spec}
+
+You cannot hit a target you have not drawn. Before any design method, you write a
+\emph{specification}: a tolerance template the magnitude response must live inside.
+Because the brick wall is impossible (Section~\ref{ch16:why-impossible}), the spec
+deliberately leaves slack. Five numbers describe a low-pass spec.
+
+\begin{itemize}
+\item \textbf{Passband edge} $\omega_p$: up to here, keep the signal.
+\item \textbf{Stopband edge} $\omega_s$: beyond here, kill the signal.
+\item \textbf{Transition band} $(\omega_p, \omega_s)$: the ramp in between, where
+we make no promises. Its \emph{width} is what costs you taps. Narrow transition =
+expensive filter.
+\item \textbf{Passband ripple} $\delta_p$: how much the gain is allowed to wobble
+around $1$ in the passband (often quoted in dB).
+\item \textbf{Stopband attenuation} $\delta_s$: how far down the leftover must be
+pushed in the stopband (e.g. $-60$\,dB means leakage no larger than $0.001$).
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=13.5cm, height=5.4cm,
+  xmin=0, xmax=1, ymin=-0.08, ymax=1.22,
+  xtick={0.32,0.5}, xticklabels={$\omega_p$,$\omega_s$},
+  ytick={0,0.06,0.94,1,1.06}, yticklabels={$0$,$\delta_s$,$1-\delta_p$,$1$,$1+\delta_p$},
+  xlabel={frequency $\omega$}, ylabel={$|H(\omega)|$},
+  axis lines=box, enlargelimits=false,
+  title={\small A low-pass tolerance template},
+]
+% passband tolerance band
+\addplot[draw=none, fill=sigblue!18, domain=0:0.32, samples=2] {1.06} \closedcycle;
+\addplot[draw=none, fill=white, domain=0:0.32, samples=2] {0.94} \closedcycle;
+% stopband tolerance
+\addplot[draw=none, fill=specred!18, domain=0.5:1, samples=2] {0.06} \closedcycle;
+% transition shading
+\addplot[draw=none, fill=gray!12, domain=0.32:0.5, samples=2] {1.22} \closedcycle;
+% a plausible response curve
+\addplot[sigblue, very thick, samples=120, domain=0:1]
+  {1.0/sqrt(1+ (x/0.40)^12) + 0.018*cos(deg(40*x))*exp(-3*x)};
+% edge guides
+\draw[gray,dashed] (axis cs:0.32,-0.08)--(axis cs:0.32,1.22);
+\draw[gray,dashed] (axis cs:0.5,-0.08)--(axis cs:0.5,1.22);
+\node[gray] at (axis cs:0.41,1.13) {\scriptsize transition};
+\end{axis}
+\end{tikzpicture}
+\caption{The spec is a corridor, not a curve. The response (blue) must stay inside
+the passband ripple band (top left), may do anything in the gray transition, and
+must stay under the stopband ceiling $\delta_s$ (bottom right). Tightening any of
+$\delta_p$, $\delta_s$, or the transition width raises the filter's order.}
+\label{ch16:fig-spec}
+\end{figure}
+
+\begin{formalbox}
+Magnitudes are usually quoted in decibels, $|H|_{\text{dB}} = 20\log_{10}|H|$.
+Handy landmarks: a gain of $1$ is $0$\,dB; the half-power point $|H| = 1/\sqrt2$ is
+$-3$\,dB (this defines the conventional ``cutoff'' for analog-style filters);
+$|H| = 0.1$ is $-20$\,dB; $|H| = 0.001$ is $-60$\,dB. Passband ripple of
+$0.1$\,dB means the gain stays within $\pm 1.2\%$ of unity. The decibel scale is
+used because attenuation requirements span many orders of magnitude and our
+perception of ``how much is left'' is roughly logarithmic.
+\end{formalbox}
+
+\section{Linear phase: the FIR superpower}
+\label{ch16:linphase}
+
+Before designing anything, understand the one property that makes FIR worth its
+extra taps: it can have \emph{exactly linear phase}, which means \emph{constant
+delay for every frequency} --- and that means it does not distort waveform shape.
+
+What is phase doing? The frequency response is complex,
+$H(\omega) = |H(\omega)|\,e^{\jj\phi(\omega)}$. The magnitude $|H|$ says how much
+each frequency is scaled; the phase $\phi(\omega)$ says how much each frequency is
+\emph{delayed}. A sinusoid at frequency $\omega$ passing through the filter comes
+out shifted by $\phi(\omega)$ radians, i.e. delayed in time by
+$-\phi(\omega)/\omega$ samples. This is the \emph{group delay}.
+
+\begin{whybox}
+If $\phi(\omega) = -\alpha\,\omega$ is a straight line through the origin, then the
+delay $-\phi(\omega)/\omega = \alpha$ is the \emph{same constant} for every
+frequency. Every component of the signal is held back by exactly $\alpha$ samples,
+so they all stay in step. The waveform comes out delayed but otherwise
+\emph{unchanged in shape}. If instead $\phi(\omega)$ bends, low and high
+components are delayed by different amounts, they slide out of alignment, and a
+crisp spike spreads into a lopsided smear --- even when the magnitude response is
+perfect. Constant delay = no shape distortion. That is the prize.
+\end{whybox}
+
+Here is the key fact: an FIR filter has exactly linear phase \emph{whenever its taps
+are symmetric} (or antisymmetric) about their center, $h[k] = h[M-k]$. Symmetry is
+a geometric condition you can guarantee by construction. The ideal sinc in
+Figure~\ref{ch16:fig-ideal-sinc} is symmetric about $n=0$; if we keep that
+symmetry while truncating and just shift the whole thing right so it starts at
+$n=0$ (making it causal), linear phase is preserved automatically. The shift is
+exactly the constant group delay $\alpha = M/2$ samples.
+
+\begin{intuitionbox}
+Symmetric taps mean the filter treats ``a bit before the center'' and ``a bit
+after the center'' identically. There is no front-to-back lopsidedness to make one
+frequency lag another. The filter's only effect on timing is a bulk delay equal to
+half its length. IIR filters, built from feedback, cannot generally be symmetric
+in this way, which is the deep reason they have nonlinear phase.
+\end{intuitionbox}
+
+\begin{connectionbox}
+This is the inner-product / symmetry idea from the linear algebra book. A
+real-symmetric tap vector projects onto cosines and sines in a balanced way; the
+imaginary parts of the response arrange themselves into a pure linear phase term
+$e^{-\jj\alpha\omega}$ that factors out, leaving a purely real ``zero-phase''
+gain. Symmetry in the coefficient vector becomes linearity in the phase.
+\end{connectionbox}
+
+\section{FIR design by the window method}
+\label{ch16:window}
+
+Now we actually build something. The window method is the most intuitive FIR
+design technique, and it falls right out of everything above:
+
+\begin{enumerate}
+\item Start from the ideal filter's impulse response (the infinite sinc).
+\item \textbf{Truncate} it to $M+1$ taps --- chop off the tails.
+\item \textbf{Shift} it to start at $n=0$ so the filter is causal.
+\item Multiply the kept taps by a smooth \textbf{window} to tame the damage done by
+the chop.
+\end{enumerate}
+
+Steps 1--3 alone already give a working filter. Let us see why step 4 is needed.
+
+\subsection{Truncation, and the ripples it causes}
+\label{ch16:gibbs}
+
+Chopping the sinc to a finite length is, in the frequency domain, multiplying the
+ideal $\rect$ mask by something not nice at all. Truncating $h[n]$ to a window of
+length $N$ is the same as \emph{multiplying} the infinite ideal $h[n]$ by a
+rectangular window $w[n]$ (one inside the kept range, zero outside). By the
+convolution theorem, multiplication in time is convolution in frequency:
+\[
+H_{\text{trunc}}(\omega) \;=\; H_{\text{ideal}}(\omega) \conv W(\omega).
+\]
+The spectrum of a rectangular window is a $\sinc$-shaped curve with a tall main
+lobe and slowly-decaying side lobes. Convolving the clean brick wall with that
+smears the cliff into a ramp and --- worse --- sprinkles \emph{ringing ripples} on
+both sides of the edge. This overshoot near the cliff is the \textbf{Gibbs
+phenomenon}, and it is stubborn: making the filter longer makes the ripples
+narrower but \emph{not} shorter. The first overshoot stays near $9\%$ no matter
+how many taps you add.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=13.5cm, height=5.2cm,
+  xmin=0, xmax=1, ymin=-0.12, ymax=1.2,
+  xtick={0,0.3,0.5,1}, xticklabels={$0$,$\omega_c$,,$\pi$},
+  ytick={0,1},
+  xlabel={frequency $\omega$}, ylabel={$|H(\omega)|$},
+  axis lines=box, enlargelimits=false,
+  legend style={font=\scriptsize, at={(0.98,0.95)}, anchor=north east},
+  title={\small Truncation rings (Gibbs); a window smooths it},
+]
+% rectangular-window result: ringing approximation of a step at 0.3
+\addplot[specred, thick, samples=180, domain=0.001:1]
+  {0.5 - 0.62*( (x-0.3) ) - 0.16*sin(deg(60*(x-0.3)))/(60*(x-0.3)+0.0001) };
+\addplot[sigblue, very thick, samples=120, domain=0:1]
+  {1/sqrt(1+(x/0.315)^16)};
+\legend{rectangular (rings), windowed (smooth)}
+\draw[gray,dashed] (axis cs:0.3,-0.12)--(axis cs:0.3,1.2);
+\end{axis}
+\end{tikzpicture}
+\caption{Schematic of the window method's effect near the cutoff. A bare
+rectangular truncation (red) overshoots and rings around the edge. A tapered
+window (blue) trades a slightly wider transition for a much cleaner, ripple-free
+stopband. The plotted curves are illustrative shapes, not an exact computation.}
+\label{ch16:fig-gibbs}
+\end{figure}
+
+\subsection{Why a window helps, and which one}
+\label{ch16:windows}
+
+The cure is to stop chopping abruptly. Instead of multiplying by a hard
+rectangle, multiply the ideal taps by a window $w[n]$ that \emph{tapers smoothly}
+to zero at the ends. A gentler taper has a spectrum with much lower side lobes, so
+the smearing it convolves into the response has far weaker ripples.
+
+\begin{whybox}
+Everything hinges on one tradeoff inside the window's own spectrum: \emph{main-lobe
+width versus side-lobe height}. A wide, smooth taper (low side lobes) gives a
+clean stopband --- deep attenuation, tiny ripples --- but its fat main lobe
+smears the cliff into a wide, gentle transition band. A narrow taper (the
+rectangle is the extreme) gives the sharpest possible transition but tall side
+lobes and ugly ringing. \emph{You are buying stopband cleanliness with transition
+width.} Choosing a window is choosing where on that line to sit.
+\end{whybox}
+
+A few standard windows, from sharpest-but-leakiest to smoothest:
+
+\begin{center}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{p{2.8cm} p{3.2cm} p{6.2cm}}
+\toprule
+\textbf{Window} & \textbf{Peak side lobe} & \textbf{Character} \\
+\midrule
+Rectangular & $-13$\,dB & sharpest transition, worst stopband (rings) \\
+Hann & $-31$\,dB & gentle all-rounder, easy default \\
+Hamming & $-41$\,dB & like Hann but flatter stopband near the edge \\
+Blackman & $-58$\,dB & very clean stopband, wider transition \\
+Kaiser ($\beta$) & tunable & one knob $\beta$ slides the whole tradeoff \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The Kaiser window deserves a note: its single parameter $\beta$ lets you dial
+exactly between ``sharp'' and ``clean'', and Kaiser gave simple formulas that take
+your spec (desired stopband attenuation and transition width) and spit out both
+$\beta$ \emph{and} the number of taps you need. That makes it the practical
+default when you have a real spec to hit.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=13.5cm, height=4.4cm,
+  xmin=0, xmax=1, ymin=-0.05, ymax=1.1,
+  xtick={0,0.5,1}, xticklabels={$0$,$M/2$,$M$},
+  ytick={0,1},
+  xlabel={tap index $n$ (normalized)}, ylabel={$w[n]$},
+  axis lines=box, enlargelimits=false,
+  legend style={font=\scriptsize, at={(0.5,-0.32)}, anchor=north, legend columns=4},
+  title={\small Window shapes: how each taper falls to zero},
+]
+\addplot[gray, thick, samples=2, domain=0:1] {1}; % rectangular
+\addplot[sigblue, thick, samples=80, domain=0:1] {0.5-0.5*cos(deg(2*pi*x))}; % Hann
+\addplot[specred, thick, samples=80, domain=0:1] {0.54-0.46*cos(deg(2*pi*x))}; % Hamming
+\addplot[quotientorange, thick, samples=80, domain=0:1]
+  {0.42-0.5*cos(deg(2*pi*x))+0.08*cos(deg(4*pi*x))}; % Blackman
+\legend{rect, Hann, Hamming, Blackman}
+\end{axis}
+\end{tikzpicture}
+\caption{The same length, four tapers. The rectangle keeps every tap at full
+weight then drops to zero at the ends --- that cliff is what rings. Hann, Hamming,
+and Blackman fade the end taps out, each a little more gently, buying lower side
+lobes at the cost of a wider main lobe.}
+\label{ch16:fig-windows}
+\end{figure}
+
+\subsection{Worked design: a low-pass with the Hamming window}
+\label{ch16:worked-fir}
+
+Let us design a real filter end to end. \textbf{Spec}: sampling rate
+$f_s = 1000$\,Hz; pass everything below about $100$\,Hz; suppress everything above
+about $200$\,Hz by at least $40$\,dB. (This is exactly the kind of accelerometer
+low-pass we will want.)
+
+\textbf{Step 1 --- normalize.} Digital filters live in normalized frequency
+$\omega = 2\pi f / f_s$ (radians/sample), or in cycles/sample $f/f_s$. The natural
+cutoff to aim the sinc at is the \emph{middle} of the transition band,
+$f_c = 150$\,Hz, so $\omega_c = 2\pi (150/1000) = 0.3\pi$.
+
+\textbf{Step 2 --- choose length from the window.} A Hamming window gives about
+$53$\,dB stopband attenuation (plenty for our $40$\,dB) and a transition width of
+roughly $\Delta\omega \approx 6.6\pi/M$ in normalized terms. We want the
+transition to fit inside $100$--$200$\,Hz, i.e.
+$\Delta\omega = 2\pi(100/1000) = 0.2\pi$. Solving $0.2\pi = 6.6\pi/M$ gives
+$M \approx 33$, so take $M=34$ (an even $M$ gives an odd number of taps $M+1=35$,
+which centers a tap exactly at the middle --- convenient for a clean integer
+delay).
+
+\textbf{Step 3 --- the ideal taps, truncated and shifted.} Center the sinc at
+$\alpha = M/2 = 17$ and evaluate:
+\[
+h_{\text{ideal}}[n] \;=\; \frac{\sin\!\big(\omega_c (n-\alpha)\big)}{\pi (n-\alpha)},
+\qquad n = 0, 1, \dots, 34,
+\]
+with the removable point $h_{\text{ideal}}[\alpha] = \omega_c/\pi$.
+
+\textbf{Step 4 --- apply the window.} Multiply tap by tap:
+\[
+h[n] \;=\; h_{\text{ideal}}[n]\cdot w[n], \qquad
+w[n] = 0.54 - 0.46\cos\!\Big(\frac{2\pi n}{M}\Big).
+\]
+That is the filter. Thirty-five symmetric coefficients, exactly linear phase
+(constant delay of $17$ samples = $17$\,ms here), guaranteed stable. In code:
+
+\begin{lstlisting}[language=Python]
+import numpy as np
+
+fs   = 1000.0
+fc   = 150.0                 # cutoff at middle of transition band
+M    = 34                    # filter order -> M+1 = 35 taps
+wc   = 2*np.pi*fc/fs         # = 0.3*pi rad/sample
+n    = np.arange(M+1)
+a    = M/2                   # center / group delay (samples)
+
+# ideal low-pass sinc, centered and shifted to be causal
+x = wc*(n - a)
+h_ideal = np.where(x == 0, wc/np.pi, np.sin(x)/(np.pi*(n - a)))
+
+# Hamming window, then taper the ideal taps
+w = 0.54 - 0.46*np.cos(2*np.pi*n/M)
+h = h_ideal * w
+h /= h.sum()                 # normalize DC gain to exactly 1
+
+# frequency response, to check against the spec
+W   = np.linspace(0, np.pi, 512)
+H   = np.array([np.sum(h*np.exp(-1j*om*n)) for om in W])
+mag_dB = 20*np.log10(np.abs(H) + 1e-12)
+\end{lstlisting}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=13.5cm, height=5.6cm,
+  xmin=0, xmax=500, ymin=-80, ymax=8,
+  xtick={0,100,150,200,300,400,500},
+  ytick={0,-3,-40,-60}, yticklabels={$0$,$-3$,$-40$,$-60$},
+  xlabel={frequency (Hz)}, ylabel={$|H|$ (dB)},
+  axis lines=box, enlargelimits=false,
+  title={\small Magnitude response of the 35-tap Hamming low-pass},
+]
+% passband corridor
+\addplot[draw=none, fill=sigblue!12, domain=0:100, samples=2] {8} \closedcycle;
+% stopband requirement line
+\draw[specred, dashed, thick] (axis cs:200,-40)--(axis cs:500,-40);
+\draw[gray, dashed] (axis cs:100,-80)--(axis cs:100,8);
+\draw[gray, dashed] (axis cs:200,-80)--(axis cs:200,8);
+% modeled response: smooth low-pass with stopband floor near -53 dB and lobes
+\addplot[sigblue, very thick, samples=160, domain=2:500]
+  { max( 20*log10( 1/sqrt(1+(x/162)^14) ) ,
+         -53 + 6*abs(cos(deg(0.055*x))) ) };
+\node[specred, anchor=south west] at (axis cs:210,-38) {\scriptsize $-40$\,dB spec};
+\node[gray] at (axis cs:150,5) {\scriptsize $f_c$};
+\end{axis}
+\end{tikzpicture}
+\caption{The designed filter (modeled curve). It is flat through the $100$\,Hz
+passband, falls through the transition, and sits well below the $-40$\,dB spec line
+(dashed red) by $200$\,Hz, with a stopband floor near $-53$\,dB set by the Hamming
+window. Spec met.}
+\label{ch16:fig-fir-resp}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=13.5cm, height=4.6cm,
+  xmin=0, xmax=1, ymin=-1.6, ymax=1.6,
+  xtick={0,0.5,1}, xticklabels={$0$,$0.5$,$1.0$},
+  ytick={-1,0,1},
+  xlabel={time (s)}, ylabel={accel (a.u.)},
+  axis lines=box, enlargelimits=false,
+  legend style={font=\scriptsize, at={(0.98,0.97)}, anchor=north east},
+  title={\small The low-pass at work: a slow tilt buried in fast jitter},
+]
+% noisy input: slow sine + high-frequency wiggle
+\addplot[sigblue!45, samples=200, domain=0:1]
+  {sin(deg(2*pi*x)) + 0.45*sin(deg(2*pi*40*x)) + 0.3*cos(deg(2*pi*55*x))};
+% smoothed output: just the slow component, slightly delayed
+\addplot[specred, very thick, samples=120, domain=0:1]
+  {sin(deg(2*pi*(x-0.017)))};
+\legend{raw input, after low-pass}
+\end{axis}
+\end{tikzpicture}
+\caption{What the 35-tap low-pass does to a signal shaped like the accelerometer
+problem: a slow $1$\,Hz tilt (the part we want) drowning in $40$--$55$\,Hz jitter.
+The filter passes the slow component nearly untouched and erases the fast jitter,
+delaying everything by the constant $17$-sample group delay. This is gravity
+separated from vibration.}
+\label{ch16:fig-fir-action}
+\end{figure}
+
+\begin{walkbox}
+Suppose the verification plot showed the stopband only reaching $-35$\,dB --- one
+nudge short of spec. What is the cheapest fix? Not more taps (Hamming's floor is
+fixed by the \emph{window}, not the length; more taps only narrows the
+transition). The right move is to switch to a window with deeper side lobes ---
+Blackman ($-58$\,dB floor) --- and then, since Blackman's transition is wider,
+bump the length back up to keep the $100$--$200$\,Hz transition. This is the window
+method's whole logic in one decision: \emph{window sets the floor, length sets the
+transition.}
+\end{walkbox}
+
+\begin{trapbox}
+A subtle bookkeeping bug: after windowing, the DC gain $\sum_k h[k]$ is usually
+close to $1$ but not exactly $1$, so a constant input comes out slightly scaled.
+The one-line fix is to normalize, \texttt{h /= h.sum()} (for a low-pass). Forget
+it and your gravity estimate on the accelerometer drifts by a percent or two ---
+small, but it accumulates in an orientation estimate.
+\end{trapbox}
+
+\section{IIR design: borrow from the analog masters}
+\label{ch16:iir}
+
+FIR is built directly in the digital world. IIR design takes a different,
+historically older route: \emph{steal a great analog filter and convert it to
+digital.} Analog engineers spent a century perfecting smooth, efficient
+frequency-response shapes out of resistors, capacitors, and inductors. Those
+shapes are described by their \emph{poles and zeros} in the $s$-plane (the Laplace
+domain of the previous chapter), and we can transplant them into the digital
+$z$-plane.
+
+\subsection{The Butterworth prototype: maximally flat}
+\label{ch16:butterworth}
+
+The most beloved analog prototype is the \textbf{Butterworth} low-pass. Its
+defining property is geometric and easy to picture: it is \emph{maximally flat} in
+the passband. Its magnitude-squared response is
+\[
+|H(\jj\Omega)|^2 \;=\; \frac{1}{1 + (\Omega/\Omega_c)^{2N}},
+\]
+where $N$ is the filter order and $\Omega_c$ the cutoff. Read that formula
+geometrically. At $\Omega = 0$ the response is exactly $1$, and the first $2N-1$
+derivatives are zero --- the curve leaves DC as flat as a table. At $\Omega =
+\Omega_c$ it is always $1/\sqrt2$ ($-3$\,dB), regardless of $N$. Far past cutoff it
+rolls off at $20N$\,dB per decade --- doubling $N$ doubles the steepness.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=13.5cm, height=5.0cm,
+  xmin=0, xmax=3, ymin=-0.03, ymax=1.08,
+  xtick={1}, xticklabels={$\Omega_c$},
+  ytick={0,0.707,1}, yticklabels={$0$,$\tfrac{1}{\sqrt2}$,$1$},
+  xlabel={frequency $\Omega/\Omega_c$}, ylabel={$|H|$},
+  axis lines=box, enlargelimits=false,
+  legend style={font=\scriptsize, at={(0.98,0.95)}, anchor=north east},
+  title={\small Butterworth low-pass: higher order = sharper, still flat},
+]
+\addplot[sigblue, thick, samples=120, domain=0:3] {1/sqrt(1+(x)^(2*1))};
+\addplot[specred, thick, samples=120, domain=0:3] {1/sqrt(1+(x)^(2*2))};
+\addplot[quotientorange, thick, samples=120, domain=0:3] {1/sqrt(1+(x)^(2*4))};
+\addplot[structurepurple, thick, samples=140, domain=0:3] {1/sqrt(1+(x)^(2*8))};
+\draw[gray,dashed] (axis cs:1,-0.03)--(axis cs:1,1.08);
+\draw[gray,dashed] (axis cs:0,0.707)--(axis cs:3,0.707);
+\legend{$N=1$,$N=2$,$N=4$,$N=8$}
+\end{axis}
+\end{tikzpicture}
+\caption{Butterworth magnitude for several orders. Every curve passes through
+$-3$\,dB at $\Omega_c$ and is monotonic (no ripple). Higher order squares off the
+corner. This single shape, with order chosen to meet a spec, covers a huge
+fraction of real IIR designs.}
+\label{ch16:fig-butter}
+\end{figure}
+
+\begin{intuitionbox}
+The poles of an order-$N$ Butterworth sit on a semicircle in the left half of the
+$s$-plane, perfectly evenly spaced (Figure~\ref{ch16:fig-butter-poles}). That geometric tidiness --- points equally
+spread on a circle, exactly like the roots of unity from the DFT chapter --- is
+\emph{why} the passband is so flat: the contributions of the poles balance to
+cancel every low-order wiggle. Other prototypes move those poles onto an ellipse
+(Chebyshev: steeper, but ripple appears) or add zeros (elliptic: steepest of all,
+ripple in both bands). Butterworth is the ``no ripple anywhere'' choice.
+\end{intuitionbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=2.4]
+\draw[->,gray!70] (-1.35,0)--(1.0,0) node[right]{\scriptsize $\sigma$};
+\draw[->,gray!70] (0,-1.2)--(0,1.2) node[above]{\scriptsize $\jj\Omega$};
+\draw[gray, thick] (0,0) circle (1);
+% order-4 Butterworth poles: angles 112.5, 157.5, 202.5, 247.5 deg (left half)
+\foreach \a in {112.5,157.5,202.5,247.5}{
+  \node[structurepurple] at ({cos(\a)},{sin(\a)}) {\large $\times$};
+}
+\draw[gray!50,dashed] (0,0)--({cos(112.5)},{sin(112.5)});
+\node[gray] at (-0.32,0.18) {\scriptsize $\tfrac{\pi}{8}$};
+\node[structurepurple,anchor=west] at (0.15,-0.95) {\scriptsize order-4 poles};
+\end{tikzpicture}
+\caption{The four poles of an order-4 Butterworth low-pass in the analog
+$s$-plane. They sit on a circle of radius $\Omega_c$, evenly spaced and confined
+to the stable left half-plane. Equal spacing on the circle (the same geometry as
+roots of unity) is what makes the passband maximally flat. Higher orders add more
+poles around the same semicircle.}
+\label{ch16:fig-butter-poles}
+\end{figure}
+
+\begin{historybox}
+Stephen Butterworth, a British engineer, described this filter in a 1930 paper
+titled simply ``On the theory of filter amplifiers.'' He wanted an amplifier whose
+gain was as flat as possible across the passband for radio work, and he showed the
+all-poles-on-a-circle design achieved it. He reportedly noted that the
+mathematics, while elegant, required solving high-degree equations ``which can
+only be done by hard work'' --- a reminder that before computers, even choosing a
+filter order was labor. Today \texttt{scipy.signal.butter(N, Wc)} returns the
+coefficients in microseconds.
+\end{historybox}
+
+\subsection{The bilinear transform: warping analog into digital}
+\label{ch16:bilinear}
+
+We have a gorgeous analog design $H_a(s)$. How do we make it digital, i.e. find an
+$H(z)$ with the same shape? The bridge is the \textbf{bilinear transform}:
+\[
+s \;=\; \frac{2}{T}\,\frac{1 - z^{-1}}{1 + z^{-1}}.
+\]
+Substituting this into $H_a(s)$ turns the continuous transfer function into a
+discrete one with the same general response. Why this particular substitution?
+Recall from the last chapter that the analog $s$-plane's imaginary axis (real
+frequencies) must map onto the digital $z$-plane's unit circle (digital
+frequencies), and the stable left-half $s$-plane must map \emph{inside} the unit
+circle (so stable analog filters become stable digital filters). The bilinear
+transform is the simplest algebraic map that does exactly this.
+
+\begin{happeningbox}
+The bilinear transform takes the \emph{entire} infinite analog frequency axis
+($\Omega$ from $0$ to $\infty$) and squashes it onto the \emph{finite} digital
+range ($\omega$ from $0$ to $\pi$). Infinite into finite means the mapping must
+compress as you go up: it is the warp
+\[
+\Omega \;=\; \frac{2}{T}\tan\!\Big(\frac{\omega}{2}\Big).
+\]
+Near $\omega = 0$ this is nearly linear ($\Omega \approx \omega/T$) --- digital and
+analog frequencies agree. But as $\omega \to \pi$, the $\tan$ blows up, so high
+digital frequencies get pulled from ever-higher analog frequencies. This
+\emph{frequency warping} is the one quirk of the method: a Butterworth corner you
+placed at a particular analog frequency lands at a slightly different digital
+frequency than you would naively expect.
+\end{happeningbox}
+
+\begin{whybox}
+The cure for warping is to ``pre-warp'': before designing the analog prototype,
+deliberately distort the target cutoff by the \emph{inverse} of the warp, so that
+after the bilinear transform squashes it, it lands exactly where you wanted. If
+you want a digital cutoff at $\omega_c$, design the analog prototype for
+$\Omega_c = \tfrac{2}{T}\tan(\omega_c/2)$. The warp and the pre-warp cancel at the
+cutoff, and your $-3$\,dB point ends up precisely on target. Every library's
+\texttt{butter} does this for you automatically; knowing it exists explains why the
+band edges still come out right despite the nonlinear map.
+\end{whybox}
+
+\subsection{Worked design: a Butterworth low-pass in three lines}
+\label{ch16:worked-iir}
+
+Same spec target as before --- a low-pass on a $1000$\,Hz stream with cutoff near
+$150$\,Hz --- but now IIR.
+
+\begin{lstlisting}[language=Python]
+from scipy.signal import butter, sosfilt
+import numpy as np
+
+fs = 1000.0
+fc = 150.0                       # -3 dB cutoff (Hz)
+N  = 4                           # order: ~24 dB/octave rolloff
+
+# design: 'sos' = cascade of second-order sections (numerically robust)
+sos = butter(N, fc/(fs/2), btype='low', output='sos')
+
+# apply to a signal x
+# y = sosfilt(sos, x)            # causal IIR filtering
+\end{lstlisting}
+
+Four coefficients-worth of work (two biquad sections) gives a rolloff that an FIR
+would need dozens of taps to match. That is the IIR bargain: sharpness for almost
+nothing. The bills are the two we already named --- nonlinear phase, and a
+stability you must respect.
+
+\begin{buildbox}
+\textbf{Run IIR as biquads, never as one big polynomial.} A high-order IIR written
+as a single long difference equation is a numerical minefield on a
+fixed-point/16-bit micro: the coefficients span a huge dynamic range and tiny
+rounding errors can push a pole outside the unit circle, turning your stable filter
+into an oscillator. The fix is universal: factor the filter into a \emph{cascade of
+second-order sections} (``biquads''), each a tiny $2$-pole/$2$-zero stage. SciPy's
+\texttt{output='sos'} gives you exactly this. On an Arduino-class chip a biquad is
+five multiplies and four adds per sample --- trivial --- and the cascade stays
+stable. This is the standard way audio codecs, EQs, and our wrist controller's
+EMG band-pass are actually run.
+\end{buildbox}
+
+\begin{trapbox}
+\textbf{Stability is not optional with IIR.} An FIR is unconditionally stable; an
+IIR is stable only if every pole sits strictly inside the unit circle. Quantizing
+coefficients, or designing too high an order with too sharp a cutoff, can nudge a
+pole onto or outside the circle, and the filter \emph{self-oscillates} or blows up
+--- there is no input that fixes it. Always verify the designed poles' radii
+($<1$), keep the order modest, and run as biquads. When in doubt, an FIR cannot do
+this to you.
+\end{trapbox}
+
+\section{FIR versus IIR, decided by the spectrum plot}
+\label{ch16:compare}
+
+Put the two designs side by side and the choice becomes concrete. For the
+\emph{same} $-3$\,dB cutoff, the order-$4$ Butterworth and the $35$-tap Hamming FIR
+have comparable magnitude rolloff --- but their phase behavior is night and day.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=13.5cm, height=5.0cm,
+  xmin=0, xmax=500, ymin=-2, ymax=30,
+  xtick={0,100,150,200,300,400,500},
+  ytick={0,17},
+  xlabel={frequency (Hz)}, ylabel={group delay (samples)},
+  axis lines=box, enlargelimits=false,
+  legend style={font=\scriptsize, at={(0.98,0.95)}, anchor=north east},
+  title={\small Group delay: FIR is flat (linear phase), IIR bends},
+]
+% FIR: constant group delay = M/2 = 17
+\addplot[sigblue, very thick, samples=2, domain=0:500] {17};
+% IIR: rising group delay near cutoff, then falling
+\addplot[specred, thick, samples=120, domain=2:500]
+  { 4 + 9/( (1+( (x-150)/70 )^2 ) ) };
+\draw[gray,dashed] (axis cs:150,-2)--(axis cs:150,30);
+\legend{FIR (35-tap Hamming), IIR (order-4 Butterworth)}
+\end{axis}
+\end{tikzpicture}
+\caption{The deciding picture. The FIR delays every frequency by exactly $17$
+samples (flat blue line) --- waveform shape preserved. The IIR's delay (red)
+peaks near the cutoff: frequencies there lag the others, smearing shape. Same
+magnitude job, very different effect on timing.}
+\label{ch16:fig-groupdelay}
+\end{figure}
+
+\begin{aestheticbox}
+This is why ``which filter?'' is never a one-size answer. If you only care
+\emph{how loud} each frequency ends up --- audio tone shaping, an envelope, a power
+estimate --- IIR's cheap sharpness wins and nobody hears the phase. If you care
+\emph{when} things happen --- aligning sensor channels, preserving the shape of a
+transient, measuring a delay --- FIR's flat group delay is worth every extra tap.
+The spectrum plot tells you the magnitude story; the group-delay plot tells you the
+timing story; a good engineer reads both before committing.
+\end{aestheticbox}
+
+\begin{applicationbox}
+\textbf{The mains-hum notch.} A microphone or a biopotential amplifier picks up a
+sharp $50$ or $60$\,Hz tone from the power grid. The ideal cure is a band-stop so
+narrow it removes only the hum and leaves the music or muscle signal intact. This
+is the textbook IIR job: a single biquad with a complex-conjugate pair of zeros
+right on the unit circle at the hum frequency (forcing the gain to exactly zero
+there) and a matching pole pair just inside the circle (so the notch is razor
+thin), as in Figure~\ref{ch16:fig-notch-pz}. Two coefficient-pairs, a notch you
+could not begin to match with a short FIR. The pole radius sets the notch width; push it toward $1$ for a narrower notch
+--- but not \emph{onto} the circle, or you lose stability.
+\end{applicationbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=2.6]
+% unit circle
+\draw[gray, thick] (0,0) circle (1);
+\draw[->,gray!70] (-1.25,0)--(1.3,0) node[right]{\scriptsize Re};
+\draw[->,gray!70] (0,-1.25)--(0,1.3) node[above]{\scriptsize Im};
+% notch angle ~ 60/500*pi rad ~ 21.6 deg for f0=60, fs=1000 (half-band=500)
+% zeros on the circle, poles just inside at radius 0.92
+\def\ang{38}
+% zeros (on circle)
+\node[specred] at ({cos(\ang)},{sin(\ang)}) {\large $\circ$};
+\node[specred] at ({cos(-\ang)},{sin(-\ang)}) {\large $\circ$};
+% poles (inside, radius 0.9)
+\node[sigblue] at ({0.9*cos(\ang)},{0.9*sin(\ang)}) {\large $\times$};
+\node[sigblue] at ({0.9*cos(-\ang)},{0.9*sin(-\ang)}) {\large $\times$};
+% angle guide
+\draw[gray!60,dashed] (0,0)--({cos(\ang)},{sin(\ang)});
+\node[gray] at ({0.55*cos(\ang)+0.05},{0.55*sin(\ang)+0.12}) {\scriptsize $\omega_0$};
+\node[specred,anchor=west] at (1.05,0.78) {\scriptsize $\circ$ zeros (on circle)};
+\node[sigblue,anchor=west] at (1.05,0.62) {\scriptsize $\times$ poles (just inside)};
+\end{tikzpicture}
+\caption{Pole-zero plot of a mains-hum notch biquad. A conjugate pair of zeros
+sits exactly \emph{on} the unit circle at the hum angle $\omega_0 = 2\pi f_0/f_s$,
+forcing the gain to zero there. A conjugate pole pair sits at the same angle but
+just inside the circle (radius near $0.9$); the closer the poles creep toward the
+circle, the narrower the notch --- but a pole \emph{on} the circle would make the
+filter unstable.}
+\label{ch16:fig-notch-pz}
+\end{figure}
+
+\begin{goalbox}
+\textbf{The wrist controller's filter stack, decided.}
+\begin{itemize}
+\item \emph{Accelerometer, separate gravity from motion}: a low-pass with cutoff
+around $1$--$3$\,Hz isolates the slow gravity/tilt component; subtract it to get
+the fast motion (Figure~\ref{ch16:fig-fir-action} shows this separation in
+action). Channels must stay time-aligned across $x,y,z$ so a flick spike
+looks simultaneous --- use a short \textbf{linear-phase FIR} so all three axes
+share one constant delay.
+\item \emph{EMG/FMG muscle band}: band-pass roughly $20$--$450$\,Hz to grab muscle
+activity, then rectify and low-pass to get an envelope. Phase does not matter for
+an envelope, so use cheap \textbf{IIR biquads}.
+\item \emph{Mains hum}: a single \textbf{IIR notch} biquad at $50$ or $60$\,Hz.
+\end{itemize}
+And the limit, stated plainly: this stack cleans up and bands the signals,
+but no amount of filtering lets a \emph{wrist-mounted IMU alone} recover individual
+finger joint angles. Filtering separates gravity from motion and isolates frequency
+bands; it cannot manufacture information the sensor never captured. Coarse,
+discrete wrist and forearm gestures --- yes. Continuous per-finger pose needs
+sensors on the fingers (rings) or richer forearm sensing (multi-channel EMG/FMG),
+as we discuss in the hand-sensing chapter. A filter is a frequency-shaped scalpel,
+not a source of new degrees of freedom.
+\end{goalbox}
+
+\section{Design checklist}
+\label{ch16:checklist}
+
+The whole chapter compresses to a procedure you can run every time.
+
+\begin{enumerate}
+\item \textbf{Write the spec}: band type; passband and stopband edges; allowed
+ripple $\delta_p$; required attenuation $\delta_s$. Draw the tolerance corridor.
+\item \textbf{Decide phase}: does waveform \emph{shape}/timing matter? Yes $\to$
+lean FIR (linear phase). No, only magnitude $\to$ IIR is fine and cheaper.
+\item \textbf{If FIR}: pick a window from your stopband attenuation (window sets
+the floor), then a length from your transition width (length sets the steepness);
+build the windowed sinc; normalize the DC gain.
+\item \textbf{If IIR}: pick a prototype (Butterworth for no ripple), choose the
+order from your rolloff/attenuation need, design via the bilinear transform (the
+library pre-warps for you), and emit second-order sections.
+\item \textbf{Verify}: plot the magnitude against the corridor \emph{and} the
+group delay. For IIR, check every pole radius $< 1$.
+\item \textbf{Implement}: FIR as a tapped sum; IIR as cascaded biquads. Confirm on
+real data, on the real hardware, at the real sample rate.
+\end{enumerate}
+
+\begin{recoverybox}
+If only one sentence survives: \emph{a filter is a frequency mask you design, FIR
+shapes that mask with a windowed sinc and gives you exact linear phase at the cost
+of taps, IIR borrows an analog prototype through the bilinear transform and gives
+you cheap sharpness at the cost of phase and a stability you must watch.} Everything
+else is detail in service of hitting a tolerance corridor.
+\end{recoverybox}
+
+\section{Exercises}
+\label{ch16:exercises}
+
+\begin{exercise}
+A signal is sampled at $f_s = 8000$\,Hz. You want a low-pass that passes audio up
+to $3000$\,Hz and strongly rejects everything above $3800$\,Hz. Give the passband
+edge, the stopband edge, and the transition width, all in (a) Hz, (b) cycles per
+sample, and (c) radians per sample. Why is $\omega = \pi$ the highest meaningful
+frequency here, and what Hz does it correspond to?
+\end{exercise}
+
+\begin{exercise}
+The ideal low-pass impulse response is $h[n] = \sin(\omega_c n)/(\pi n)$. (a) Use
+l'Hopital or the small-angle limit to show $h[0] = \omega_c/\pi$. (b) Explain in
+words why $h[n]$ being nonzero for all $n$ makes the ideal filter both non-causal
+and infinitely long. (c) What single operation makes a truncated version causal,
+and how many samples of delay does it cost?
+\end{exercise}
+
+\begin{exercise}
+You truncate the ideal sinc to $21$ taps with a rectangular window and find the
+first stopband ripple reaches $-21$\,dB. A colleague says ``just use $201$ taps,
+the ripple will vanish.'' Explain why they are wrong (name the phenomenon), what
+$201$ taps \emph{does} improve, and what actually lowers that first ripple.
+\end{exercise}
+
+\begin{exercise}
+Show that a symmetric FIR, $h[k] = h[M-k]$, has linear phase. (Hint: group the
+$k$ and $M-k$ terms in $H(\omega) = \sum_k h[k] e^{-\jj\omega k}$, factor out
+$e^{-\jj\omega M/2}$, and show what remains is purely real.) State the constant
+group delay in samples.
+\end{exercise}
+
+\begin{exercise}
+Design, on paper, a $15$-tap Hamming-windowed low-pass with normalized cutoff
+$\omega_c = 0.25\pi$. Write the formula for each tap $h[n]$ ($n=0,\dots,14$),
+identify the center tap and its value, and state the filter's group delay. You do
+not need to compute all the numbers --- show the setup and compute $h[7]$ (the
+center) and $h[6]$ exactly.
+\end{exercise}
+
+\begin{exercise}
+For a Butterworth low-pass, $|H(\jj\Omega)|^2 = 1/(1+(\Omega/\Omega_c)^{2N})$.
+(a) Verify the gain at $\Omega = \Omega_c$ is $1/\sqrt2$ for every order $N$.
+(b) Show the asymptotic rolloff far above cutoff is $20N$\,dB per decade of
+frequency. (c) What order $N$ is needed to reach $-60$\,dB attenuation one decade
+above the cutoff?
+\end{exercise}
+
+\begin{exercise}
+The bilinear transform warps frequencies by $\Omega = \tfrac{2}{T}\tan(\omega/2)$.
+For $T=1$, you want a digital cutoff at $\omega_c = 0.4\pi$. (a) What analog cutoff
+$\Omega_c$ should you pre-warp to? (b) By what percentage does it differ from the
+naive choice $\Omega_c = \omega_c$? (c) Explain why ignoring pre-warping matters
+more for high cutoffs than low ones.
+\end{exercise}
+
+\begin{exercise}
+You implement an order-$8$ Butterworth as a single $9$-coefficient difference
+equation in $16$-bit fixed point and the output slowly grows without bound even
+for a tiny input. (a) What has most likely happened to at least one pole? (b) Why
+does a cascade of four biquads avoid this? (c) Could this failure ever happen to
+an FIR filter? Justify.
+\end{exercise}
+
+\begin{exercise}
+For the wrist controller, you must low-pass the three accelerometer axes to extract
+gravity. A teammate proposes an order-$2$ IIR Butterworth (cheap) on each axis.
+(a) What artifact will this introduce that could misalign the three axes during a
+fast flick? (b) Propose an FIR alternative and state what you trade to get the fix.
+(c) For the separate EMG envelope path, argue why the same teammate's IIR choice is
+actually the right call there.
+\end{exercise}
+
+\begin{exercise}
+Design a $60$\,Hz notch (band-stop) as a single biquad for $f_s = 1000$\,Hz.
+(a) At what angle on the unit circle do you place the zeros, and why exactly on the
+circle? (b) Where do you place the poles to make the notch narrow, and what
+constrains how close to the circle they may go? (c) Sketch the resulting magnitude
+response and mark the notch frequency and the $-3$\,dB notch width.
+\end{exercise}
+
+\begin{exercise}
+(Open-ended build.) On an Arduino or Raspberry Pi, implement the $35$-tap FIR
+low-pass from Section~\ref{ch16:worked-fir} as a circular buffer of the last $35$
+samples. (a) Estimate the multiply-accumulate count per output sample. (b) At
+$f_s = 1000$\,Hz, what fraction of the CPU does that consume on your board?
+(c) Now implement the order-$4$ IIR as two biquads and compare the per-sample
+cost. Which would you ship, and on which channel?
+\end{exercise}

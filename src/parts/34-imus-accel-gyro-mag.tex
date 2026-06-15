@@ -1,0 +1,820 @@
+\chapter{Inertial Sensors: Accelerometers, Gyroscopes, Magnetometers}
+
+For thirty-three chapters we have treated signals as abstractions: a function $x(t)$,
+a sequence $x[n]$, a vector in some space, a spectrum. Now we plug into the physical
+world. The wrist tracker we are building toward does not receive a tidy waveform from
+the heavens -- it has to \emph{generate} its signals by pressing tiny pieces of
+silicon against the laws of mechanics and electromagnetism. This chapter is about the
+three sensors that almost every motion-sensing project leans on: the
+\textbf{accelerometer}, the \textbf{gyroscope}, and the \textbf{magnetometer}.
+Together they form what the industry calls an \emph{IMU} (Inertial Measurement Unit),
+and when a magnetometer is added, a \emph{MARG} array (Magnetic, Angular Rate, and
+Gravity).
+
+The goal here is not to memorize datasheets. It is to \emph{see}, geometrically, what
+each sensor actually measures, what its raw signal looks like when a real arm moves,
+and -- crucially -- what it cannot tell you no matter how cleverly you process it. By
+the end you should be able to wire an MPU-6050 or BNO055 to a microcontroller, stream
+its numbers, recognize the shape of a wrist flick in the trace, and understand exactly
+why a wrist IMU sees the bulk motion of the hand but leaves the fingers to a different
+sensor -- one we add in the capstone, not because fingers are unreachable, but because
+they live in a different physical channel.
+
+\section{Three sensors, three different physical questions}
+\label{ch34:three-questions}
+
+It is tempting to lump the three sensors together as ``the motion chip,'' because on
+a modern board they share one package and one I2C address. But they answer three
+genuinely different physical questions, and confusing them is the most common source
+of bugs in motion code.
+
+\begin{itemize}
+\item The \textbf{accelerometer} answers: \emph{which way is the proof mass being
+  pushed, and how hard?} It measures \emph{specific force} -- acceleration minus the
+  effect of gravity, in a sense we will make precise -- in units of $\mathrm{m/s^2}$
+  or $g$ (where $1\,g \approx 9.81\,\mathrm{m/s^2}$).
+\item The \textbf{gyroscope} answers: \emph{how fast is the chip rotating right now?}
+  It measures \emph{angular rate} about each of its three axes, in $\mathrm{deg/s}$ or
+  $\mathrm{rad/s}$.
+\item The \textbf{magnetometer} answers: \emph{which way is the ambient magnetic field
+  pointing, as seen from the chip?} It measures the magnetic flux density vector in
+  microtesla ($\mathrm{\mu T}$) or gauss ($1\,\mathrm{G}=100\,\mathrm{\mu T}$).
+\end{itemize}
+
+\begin{intuitionbox}
+A clean mnemonic for what each sensor ``knows'':
+\begin{itemize}
+\item Accelerometer: knows \emph{down} (when you hold still) and \emph{shoves} (when
+  you move). It is a tilt sensor that is also a bump detector.
+\item Gyroscope: knows \emph{turning}. It is blind to which way is down and blind to
+  steady motion -- it only feels change in orientation.
+\item Magnetometer: knows \emph{north} (roughly). It is a compass, and like a compass
+  it is easily fooled by nearby iron and motors.
+\end{itemize}
+Each sensor is excellent at one thing and useless at the others. Fusion
+(Chapter~36) is the art of combining their strengths; this chapter is about
+respecting what each one does and does not measure.
+\end{intuitionbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small]
+  \foreach \x/\name/\q/\unit in {0/Accelerometer/specific force/m$\cdot$s$^{-2}$,
+       4.6/Gyroscope/angular rate/deg$\cdot$s$^{-1}$,
+       9.2/Magnetometer/magnetic field/$\mu$T} {
+     \draw[rounded corners,thick,fill=blue!4] (\x,0) rectangle (\x+3.8,1.5);
+     \node[font=\bfseries] at (\x+1.9,1.15) {\name};
+     \node at (\x+1.9,0.65) {\q};
+     \node[font=\itshape\footnotesize] at (\x+1.9,0.2) {\unit};
+  }
+  \draw[rounded corners,thick,fill=violet!8] (3,-2.0) rectangle (9.8,-0.9);
+  \node[font=\bfseries] at (6.4,-1.2) {IMU / MARG package (one I2C device)};
+  \node[font=\footnotesize] at (6.4,-1.7) {3+3 axes, sometimes 3 more for the magnetometer};
+  \foreach \x in {1.9,6.5,11.1} { \draw[-{Latex[]},gray] (\x,0) -- (6.4,-0.9); }
+\end{tikzpicture}
+\caption{The three inertial/field sensors and what each physically measures. On a
+9-axis board (e.g.\ MPU-9250, BNO055) all three live in one package and share a
+bus, but they answer independent physical questions.}
+\label{ch34:fig-overview}
+\end{figure}
+
+\section{The accelerometer: a mass on springs}
+\label{ch34:accel}
+
+\subsection{The mechanical picture}
+
+Strip away the silicon and an accelerometer is embarrassingly simple: a small
+\emph{proof mass} suspended by springs inside a frame. When the frame accelerates, the
+mass lags behind (inertia), the springs stretch, and the displacement of the mass
+relative to the frame tells you the force. Newton's second law for the mass, written
+in the frame of the chip, gives a spring displacement $x$ obeying
+\[
+  m\,\ddot{x} + b\,\dot{x} + k\,x \;=\; -\,m\,a_{\text{frame}} + m\,g_{\text{axis}},
+\]
+where $a_{\text{frame}}$ is the frame's acceleration and $g_{\text{axis}}$ is the
+component of gravity along the sensing axis. In steady state ($\ddot{x}=\dot{x}=0$) the
+displacement is proportional to $g_{\text{axis}} - a_{\text{frame}}$. That combination
+is the whole story, and it has a name.
+
+\begin{definition}[Specific force]
+\label{ch34:def-specific-force}
+An accelerometer measures \emph{specific force} (also called proper acceleration):
+\[
+  \vec{a}_{\text{meas}} \;=\; \vec{a}_{\text{true}} \;-\; \vec{g},
+\]
+where $\vec{a}_{\text{true}}$ is the true acceleration of the device in an inertial
+frame and $\vec{g}$ is the gravitational acceleration vector (pointing \emph{down},
+magnitude $\approx 9.81\,\mathrm{m/s^2}$). All quantities are expressed in the chip's
+own (body) coordinate frame.
+\end{definition}
+
+This minus sign is the single most misunderstood fact about accelerometers, so let us
+nail it with the two cases everyone gets wrong.
+
+\begin{trapbox}
+\textbf{A sitting accelerometer reads $+1\,g$ upward, not zero.}
+A chip resting flat on a table is not accelerating ($\vec{a}_{\text{true}}=0$), so it
+reports $\vec{a}_{\text{meas}} = -\vec{g}$, a vector of magnitude $9.81\,\mathrm{m/s^2}$
+pointing \emph{up}. The table pushes the proof mass up against its springs exactly as
+if the whole thing were accelerating upward at $1\,g$ in deep space. \\[4pt]
+\textbf{A freely falling accelerometer reads zero.}
+Drop the chip and $\vec{a}_{\text{true}} = \vec{g}$, so
+$\vec{a}_{\text{meas}} = \vec{g}-\vec{g} = 0$. The proof mass and frame fall together;
+the springs relax. This is why an accelerometer detects free fall and why phones can
+sense a drop before impact.
+\end{trapbox}
+
+\begin{whybox}
+Why does it measure $\vec a_{\text{true}}-\vec g$ rather than plain acceleration?
+Because gravity acts on the proof mass and the frame \emph{equally} (equivalence
+principle). Only forces transmitted \emph{through the springs} stretch them, and
+gravity is not transmitted through the springs -- it pulls the mass directly. So the
+springs report everything \emph{except} the gravity-driven part of the motion, which
+is exactly $\vec a_{\text{true}} - \vec g$. The sensor cannot, even in principle,
+distinguish ``sitting in gravity'' from ``accelerating upward in free space.'' That is
+not a defect; it is general relativity showing up in a cheap chip.
+\end{whybox}
+
+\subsection{How MEMS makes it tiny}
+
+A modern accelerometer is a \emph{MEMS} device (Micro-Electro-Mechanical System): the
+mass and springs are etched out of silicon, tens of microns across. The proof mass
+carries a comb of fingers interleaved with fixed fingers, forming a set of capacitors.
+When the mass moves, one gap shrinks and the other grows, so the differential
+capacitance changes by femtofarads. A capacitance-to-voltage converter turns this into
+a voltage, an on-chip ADC digitizes it, and you read the number over I2C.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=1.0,font=\small]
+  \draw[thick] (-3.4,-1.4) rectangle (3.4,1.4);
+  \draw[thick,decorate,decoration={zigzag,segment length=4pt,amplitude=3pt}]
+     (-3.4,0) -- (-1.6,0);
+  \draw[thick,decorate,decoration={zigzag,segment length=4pt,amplitude=3pt}]
+     (1.6,0) -- (3.4,0);
+  \draw[thick,fill=blue!12,rounded corners] (-1.6,-0.9) rectangle (1.6,0.9);
+  \node at (0,0) {proof mass};
+  \foreach \y in {-0.6,-0.2,0.2,0.6} {
+     \draw[thick,blue!60!black] (1.6,\y) -- (2.3,\y);
+  }
+  \foreach \y in {-0.4,0,0.4} {
+     \draw[thick,red!60!black] (3.4,\y) -- (2.5,\y);
+  }
+  \node[font=\footnotesize,align=center] at (2.3,1.85)
+     {interleaved comb\\(differential capacitor)};
+  \draw[-{Latex[]},thick] (-2.6,-1.85) -- (-1.0,-1.85)
+     node[midway,below,font=\footnotesize] {frame accelerates $\to$};
+  \draw[-{Latex[]},thick,blue!60!black] (0.2,-1.15) -- (-0.6,-1.15)
+     node[midway,below,font=\footnotesize] {mass lags};
+\end{tikzpicture}
+\caption{A MEMS accelerometer in cartoon form. The proof mass hangs on silicon
+springs; comb fingers form a differential capacitor whose imbalance reports the
+mass's displacement, hence the specific force along this axis. Three such structures,
+mutually perpendicular, give a 3-axis sensor.}
+\label{ch34:fig-mems-accel}
+\end{figure}
+
+\subsection{Tilt sensing: getting angles from gravity}
+
+Because a still accelerometer reports $-\vec g$ in body coordinates, it is a very good
+inclinometer. If the chip is tilted, gravity's $9.81\,\mathrm{m/s^2}$ gets distributed
+across the three axes, and the split tells you the orientation relative to vertical.
+With $(a_x,a_y,a_z)$ the measured components (in any consistent unit), the standard
+formulas are
+\[
+  \text{roll}\;\phi = \operatorname{atan2}(a_y,\,a_z), \qquad
+  \text{pitch}\;\theta = \operatorname{atan2}\!\big(-a_x,\,\sqrt{a_y^2+a_z^2}\big).
+\]
+
+\begin{example}[Reading tilt from a still chip]
+\label{ch34:ex-tilt}
+Suppose a level board reads $(a_x,a_y,a_z)=(0,0,+1)\,g$. Now tip it forward by
+$30^\circ$ about the $y$-axis. Gravity now projects as
+$a_x = -\sin 30^\circ = -0.5\,g$ and $a_z = \cos 30^\circ = 0.866\,g$, so
+$\theta = \operatorname{atan2}(0.5,\,0.866) = 30^\circ$. The accelerometer has become a
+protractor -- \emph{as long as the chip is not also being shaken}, because any real
+acceleration adds to gravity and corrupts the angle.
+\end{example}
+
+\begin{trapbox}
+Tilt-from-gravity works only when the device is (nearly) still. The instant the arm
+moves, $\vec a_{\text{true}}\ne 0$ and the measured vector is the \emph{sum} of gravity
+and motion; you can no longer separate them from one sample. You also cannot get
+\emph{yaw} (heading, rotation about vertical) from an accelerometer at all -- rotating
+about the gravity vector leaves the gravity projection unchanged. Yaw needs the
+gyroscope or the magnetometer.
+\end{trapbox}
+
+\section{The gyroscope: rotation through the Coriolis effect}
+\label{ch34:gyro}
+
+A MEMS gyroscope has no spinning wheel. Instead it exploits the \emph{Coriolis force}:
+a mass driven to vibrate back and forth along one axis, when the whole frame rotates,
+feels a sideways force proportional to the rotation rate. Concretely, a proof mass is
+electrostatically driven to oscillate at velocity $\vec v$ along a ``drive'' axis. If
+the chip rotates with angular rate $\vec\Omega$, the mass experiences a Coriolis
+acceleration
+\[
+  \vec a_{\text{Cor}} \;=\; -\,2\,\vec\Omega \times \vec v,
+\]
+perpendicular to both. This tiny sideways motion is picked up by a second
+(``sense'') capacitor, and its amplitude is proportional to $\abs{\vec\Omega}$
+(Figure~\ref{ch34:fig-coriolis}). Three such resonators give angular rate about
+$x$, $y$, $z$.
+
+\begin{intuitionbox}
+Picture walking straight out along a spoke of a spinning merry-go-round. Even though
+you walk in a ``straight'' line, you get pushed sideways -- that push is Coriolis, and
+its strength grows with how fast the platform spins. The MEMS gyro replaces your
+walking with a mass vibrating thousands of times per second and measures the sideways
+push electronically. No spin rate, no push; that is why a gyro reads zero when the chip
+is held still, regardless of how it is oriented.
+\end{intuitionbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,scale=1.0]
+  % drive oscillation (horizontal)
+  \draw[thick,fill=blue!10,rounded corners] (-0.5,-0.5) rectangle (0.5,0.5);
+  \node at (0,0) {\footnotesize mass};
+  \draw[{Latex[]}-{Latex[]},very thick,blue!60!black] (-1.5,0) -- (-0.6,0);
+  \draw[{Latex[]}-{Latex[]},very thick,blue!60!black] (0.6,0) -- (1.5,0);
+  \node[blue!60!black,font=\footnotesize] at (0,-1.0) {drive $\vec v$ (vibration)};
+  % rotation of frame
+  \draw[-{Latex[]},very thick,structurepurple] (2.3,0.9) arc (60:-60:1.0);
+  \node[structurepurple,font=\footnotesize] at (3.4,0) {$\vec\Omega$};
+  % Coriolis (vertical) sense
+  \draw[-{Latex[]},very thick,red!65!black] (0,0.6) -- (0,1.5);
+  \draw[-{Latex[]},very thick,red!65!black] (0,-0.6) -- (0,-1.5);
+  \node[red!65!black,font=\footnotesize,align=center] at (-1.9,1.2)
+     {Coriolis push\\$-2\,\vec\Omega\times\vec v$\\(sense axis)};
+\end{tikzpicture}
+\caption{The Coriolis principle inside a MEMS gyroscope. The proof mass is driven to
+vibrate along the horizontal drive axis (blue). When the frame rotates at rate
+$\vec\Omega$ (purple), the mass feels a sideways Coriolis acceleration
+$-2\,\vec\Omega\times\vec v$ (red) along the perpendicular sense axis; a sense capacitor
+reports its amplitude, which is proportional to the rotation rate. No rotation means no
+sideways push, so a still gyro reads zero.}
+\label{ch34:fig-coriolis}
+\end{figure}
+
+\begin{focusbox}
+\textbf{The gyro measures rate, not angle.} To get an \emph{orientation angle} you must
+integrate: $\theta(t) = \theta(0) + \int_0^t \Omega(\tau)\,\dd\tau$. In discrete time,
+$\theta[n] = \theta[n-1] + \Omega[n]\,\Delta t$. This integration is both the gyro's
+superpower (smooth, fast, gravity-independent angle changes) and its curse (any
+constant error in $\Omega$ accumulates without bound). We return to this as
+\emph{drift} below.
+\end{focusbox}
+
+\begin{connectionbox}
+Integrating angular rate to get angle is the discrete antiderivative from the calculus
+companion: $\theta[n]=\theta[n-1]+\Omega[n]\Delta t$ is the rectangle rule applied
+sample by sample. The same operation as a system has transfer function
+$H(z) = \dfrac{\Delta t}{1-z^{-1}}$ -- a pure integrator, with a pole at $z=1$. From
+Chapter~15 you already know a pole on the unit circle means infinite DC gain: the
+integrator amplifies any constant (bias) input without limit. That single pole at
+$z=1$ \emph{is} gyro drift, expressed in the language of the $z$-transform.
+\end{connectionbox}
+
+\section{The magnetometer: a chip-scale compass}
+\label{ch34:mag}
+
+A magnetometer measures the local magnetic flux density vector $\vec B$ in the chip's
+frame. Most consumer parts use the \emph{Hall effect} or, more sensitively,
+\emph{anisotropic/giant magnetoresistance} (AMR/GMR), where the electrical resistance
+of a thin ferromagnetic film changes with the field threading it. Three orthogonal
+sensing elements give $(B_x,B_y,B_z)$ in microtesla.
+
+Outdoors and away from metal, the dominant field is the Earth's, magnitude roughly
+$25$--$65\,\mathrm{\mu T}$ depending on latitude, tilted into the ground by the
+\emph{inclination angle}. Projected onto the horizontal plane it points toward magnetic
+north, which is why a magnetometer plus an accelerometer (to define horizontal) yields
+a tilt-compensated compass -- the only one of the three sensors that gives an
+\emph{absolute} heading rather than a relative change.
+
+\begin{trapbox}
+The magnetometer is the diva of the three. Any nearby ferromagnetic material or
+current distorts the field: a \emph{hard-iron} offset (a permanent magnet or
+magnetized screw shifts the whole reading by a constant vector) and a \emph{soft-iron}
+distortion (nearby iron warps the field directionally, turning the locus of readings
+from a sphere into an ellipsoid). A wrist device sits centimeters from a watch motor,
+a metal buckle, maybe a phone -- magnetometer heading on the wrist is notoriously
+unreliable and \emph{must} be calibrated (Chapter~35) before it is worth anything.
+\end{trapbox}
+
+\section{Units, ranges, and what the raw numbers mean}
+\label{ch34:units}
+
+Each sensor has a configurable \emph{full-scale range} (FSR). A wider range covers
+more violent motion but spends fewer ADC codes per unit, so resolution drops. You read
+a raw signed integer (typically 16-bit, $-32768$ to $+32767$) and convert with a
+\emph{sensitivity} (LSB per physical unit) from the datasheet.
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Sensor & Typical FSR options & Example sensitivity & Unit \\
+\midrule
+Accelerometer & $\pm2,\pm4,\pm8,\pm16\,g$ & $16384$ LSB/$g$ at $\pm2g$ & $g$ \\
+Gyroscope & $\pm250,\pm500,\pm1000,\pm2000$ & $131$ LSB/(deg/s) at $\pm250$ & deg/s \\
+Magnetometer & $\pm4800\,\mathrm{\mu T}$ (AK8963) & $0.15\,\mathrm{\mu T}$/LSB & $\mu$T \\
+\bottomrule
+\end{tabular}
+\caption{Representative full-scale ranges and sensitivities for the MPU-9250 family.
+The physical value is (raw integer)$\div$(sensitivity), or raw$\times$resolution for
+the magnetometer.}
+\label{ch34:tab-ranges}
+\end{table}
+
+\begin{example}[From raw counts to $g$]
+\label{ch34:ex-counts}
+At the $\pm2\,g$ setting the accelerometer gives $16384$ counts per $g$. A reading of
+$a_z^{\text{raw}} = 16500$ converts to $16500/16384 = 1.007\,g$ -- a chip lying flat,
+reading the expected $+1\,g$ of supported gravity, with a 0.7\% bias we would trim out
+in calibration. A gyro reading of $\Omega_x^{\text{raw}} = 262$ at $\pm250$ deg/s
+becomes $262/131 = 2.0\,\mathrm{deg/s}$, a slow drift you might mistake for real
+rotation if you skipped bias removal.
+\end{example}
+
+\begin{focusbox}
+\textbf{Choosing a range for the wrist.} Human limb motion rarely exceeds a few $g$ at
+the wrist for ordinary gestures, but a sharp flick or a tap against a surface can spike
+to $8$--$16\,g$. Wrist angular rates in fast gestures reach several hundred deg/s. For
+a gesture controller, $\pm8\,g$ and $\pm1000\,\mathrm{deg/s}$ are sensible defaults:
+wide enough not to clip on a snap, tight enough to keep resolution.
+\end{focusbox}
+
+\subsection{Noise, bias, and drift -- the three error families}
+
+These three words get used loosely; keep them distinct, because each is fought with a
+different tool.
+
+\begin{itemize}
+\item \textbf{Noise} is random, zero-mean, sample-to-sample jitter. It is quoted as a
+  \emph{noise density}, e.g.\ $300\,\mathrm{\mu g/\sqrt{Hz}}$ for an accelerometer or
+  $0.01\,\mathrm{(deg/s)/\sqrt{Hz}}$ for a gyro. Multiply by $\sqrt{\text{bandwidth}}$
+  to get RMS noise. Noise is beaten by \emph{averaging / low-pass filtering}, at the
+  cost of bandwidth (Chapter~20's SNR tradeoff exactly).
+\item \textbf{Bias} (offset) is a constant added to every reading -- a gyro that reads
+  $1.8\,\mathrm{deg/s}$ while perfectly still, or an accelerometer axis offset by
+  $0.02\,g$. Bias is beaten by \emph{calibration}: measure it while stationary and
+  subtract.
+\item \textbf{Drift} is slow change \emph{over time} -- bias that wanders with
+  temperature, or the unbounded angle error you get from integrating a biased gyro.
+  Drift is the reason a gyro alone cannot hold orientation for more than seconds; it is
+  beaten only by \emph{fusion} with an absolute reference (gravity, magnetic north) in
+  Chapter~36.
+\end{itemize}
+
+\begin{connectionbox}
+Gyro bias and noise interact viciously under integration. Treat the rate as
+$\Omega[n] = \Omega_{\text{true}} + b + w[n]$ with constant bias $b$ and white noise
+$w$ of per-sample variance $\sigma^2$. Integrating, the bias produces a \emph{linear}
+angle error $b\,n\Delta t$, while the noise produces a random walk: the angle is the
+sum $\theta_{\text{noise}}=\sum_{k=1}^n w[k]\,\Delta t$ of independent steps, so its
+variance grows \emph{linearly} with the number of samples,
+$\Var[\theta_{\text{noise}}] = n\,\Delta t^2\,\sigma^2$ (the discrete Brownian motion
+of the probability companion). The standard deviation therefore grows like $\sqrt{n}$,
+i.e.\ like $\sqrt{t}$. So the deterministic bias term ($\propto t$) dominates the
+stochastic walk ($\propto \sqrt{t}$) at long times -- which is exactly why removing
+bias buys you the most.
+\end{connectionbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=5.4cm,
+  xlabel={time $t$ (s)}, ylabel={integrated angle error (deg)},
+  domain=0:10, samples=120,
+  xmin=0, xmax=10, ymin=-2, ymax=22,
+  axis lines=left, legend pos=north west, legend cell align=left,
+  enlargelimits=false,
+]
+\addplot[specred, very thick] {1.8*x};
+\addlegendentry{bias $1.8^\circ$/s $\rightarrow$ linear}
+\addplot[sigblue, thick, dashed] {0.9*sqrt(x)};
+\addlegendentry{noise $\rightarrow \sqrt{t}$ envelope}
+\addplot[sigblue, thick, dashed, forget plot] {-0.9*sqrt(x)};
+\end{axis}
+\end{tikzpicture}
+\caption{Why integrating a gyroscope drifts. A constant bias of $1.8^\circ$/s grows
+the angle error \emph{linearly} (red), swamping the $\sqrt{t}$ random walk from white
+noise (blue, dashed envelope). After ten seconds the bias alone has produced an
+$18^\circ$ error. Remove bias first; fuse for the rest.}
+\label{ch34:fig-drift}
+\end{figure}
+
+\section{Reading an IMU over I2C}
+\label{ch34:reading}
+
+The three sensors share a serial bus, almost always \emph{I2C} (two wires: SDA data,
+SCL clock) or sometimes SPI for higher rates. You address the chip, point at a register,
+and read back bytes. The mechanics are identical across the popular boards; only the
+register map differs.
+
+\begin{buildbox}
+\textbf{Wiring an MPU-6050/9250 to an Arduino or Pi.} Four wires: \texttt{VCC}
+(3.3\,V -- many breakouts have a regulator and tolerate 5\,V, but the bare chip is
+3.3\,V), \texttt{GND}, \texttt{SDA}, \texttt{SCL}. On an Arduino Uno, \texttt{SDA}=A4,
+\texttt{SCL}=A5; on a Raspberry Pi, GPIO2/GPIO3 (pins 3/5). Add $4.7\,\mathrm{k\Omega}$
+pull-ups to 3.3\,V on SDA and SCL if your breakout lacks them. The default 7-bit
+address is \texttt{0x68} (\texttt{0x69} if AD0 is tied high). \\[4pt]
+On power-up the MPU-6050 is asleep; you must clear the \texttt{PWR\_MGMT\_1} register
+(\texttt{0x6B}) to wake it. Accelerometer data starts at register \texttt{0x3B}, six
+bytes (X,Y,Z high/low), big-endian; gyro at \texttt{0x43}. On the 9250 the AK8963
+magnetometer hangs off an auxiliary I2C bus and needs the chip put in
+``bypass/passthrough'' mode (or master mode) before you can reach it -- a classic
+gotcha that sends beginners hunting for a dead magnetometer that was never enabled.
+\end{buildbox}
+
+\begin{lstlisting}[language=Python,caption={Minimal MPU-6050 read over I2C on a Raspberry Pi.},label=ch34:py-mpu]
+import smbus, time
+bus = smbus.SMBus(1)          # I2C bus 1 on a Pi
+ADDR = 0x68
+bus.write_byte_data(ADDR, 0x6B, 0)        # wake from sleep
+
+def read_word(reg):
+    hi = bus.read_byte_data(ADDR, reg)
+    lo = bus.read_byte_data(ADDR, reg + 1)
+    val = (hi << 8) | lo
+    return val - 65536 if val >= 0x8000 else val   # signed 16-bit
+
+ACC_LSB = 16384.0   # LSB per g at +/-2g
+GYR_LSB = 131.0     # LSB per (deg/s) at +/-250 deg/s
+while True:
+    ax = read_word(0x3B) / ACC_LSB
+    ay = read_word(0x3D) / ACC_LSB
+    az = read_word(0x3F) / ACC_LSB
+    gx = read_word(0x43) / GYR_LSB
+    print(f"a=({ax:+.2f},{ay:+.2f},{az:+.2f}) g  gx={gx:+.1f} deg/s")
+    time.sleep(0.02)   # ~50 Hz
+\end{lstlisting}
+
+\begin{buildbox}
+\textbf{The BNO055 shortcut.} Bosch's BNO055 bundles an accelerometer, gyro,
+magnetometer \emph{and} a built-in ARM core running sensor fusion. You can ask it
+directly for an orientation quaternion or Euler angles over I2C -- no integration math
+on your part. This is wonderful for a quick prototype and dangerous for understanding:
+the fusion is a black box you cannot tune, and its magnetometer-driven yaw still
+suffers all the wrist-proximity problems above. Prototype on a BNO055, but learn on a
+raw MPU so you know what the black box is hiding (Chapter~36 opens it).
+\end{buildbox}
+
+\begin{focusbox}
+\textbf{Sampling rate and aliasing -- the same Nyquist rule.} An IMU is an ADC, so
+Chapter~18 applies without exception. If you read at $50\,\mathrm{Hz}$, any vibration
+above $25\,\mathrm{Hz}$ aliases down into your gesture band and masquerades as slow
+motion. Good IMUs include a configurable analog/digital low-pass (the
+\texttt{CONFIG}/\texttt{DLPF} register on the MPU) -- set its cutoff below your output
+Nyquist frequency. For wrist gestures, an internal DLPF around $20$--$40\,\mathrm{Hz}$
+and an output rate of $100$--$200\,\mathrm{Hz}$ is a comfortable, alias-safe choice.
+\end{focusbox}
+
+\section{What wrist motion actually looks like}
+\label{ch34:wrist-traces}
+
+Enough abstraction -- what do the numbers \emph{do} when an arm moves? Three
+qualitative regimes dominate any wrist trace, and learning to read them by eye is half
+of gesture recognition (Chapter~38).
+
+\begin{enumerate}
+\item \textbf{Rest.} Accelerometer reads a steady vector of magnitude $\approx 1\,g$
+  whose direction encodes wrist orientation; gyro reads $\approx 0$ plus bias and
+  noise; magnetometer reads a steady (if distorted) field.
+\item \textbf{Slow reorientation} (turning the wrist). Gyro shows a smooth bump
+  (nonzero rate during the turn, back to zero after); the accelerometer's gravity
+  split shifts to a new steady direction; integrating the gyro bump gives the angle
+  turned.
+\item \textbf{Sharp gesture} (a flick, tap, or snap). Both the accelerometer and gyro
+  show a brief, large, oscillatory transient -- a spike with ringing as the arm
+  decelerates. This is the signature gesture recognizers key on.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=13cm, height=4.6cm,
+  xlabel={time $t$ (s)}, ylabel={accel (g)},
+  domain=0:6, samples=200,
+  xmin=0, xmax=6, ymin=-2.2, ymax=2.6,
+  axis lines=left, enlargelimits=false,
+  title={Accelerometer (one axis) across a wrist sequence},
+]
+\addplot[sigblue, thick] {
+  ( x<1.5 )*( 1 + 0.03*sin(deg(40*x)) )
++ ( x>=1.5 && x<3 )*( 1 - 0.55*(x-1.5)/1.5 )
++ ( x>=3 && x<3.8 )*( 0.45 + 0.03*sin(deg(40*x)) )
++ ( x>=3.8 && x<4.4 )*( 0.45 + 1.8*sin(deg(360*(x-3.8)/0.6))*exp(-3*(x-3.8)) )
++ ( x>=4.4 )*( 0.45 + 0.03*sin(deg(40*x)) )
+};
+\node[font=\footnotesize] at (axis cs:0.75,1.6) {rest $\approx 1g$};
+\node[font=\footnotesize] at (axis cs:2.25,-1.4) {slow tilt};
+\node[font=\footnotesize] at (axis cs:4.1,2.2) {flick};
+\end{axis}
+\end{tikzpicture}
+\caption{A stylized single-axis accelerometer trace through a wrist sequence: a steady
+$\approx 1\,g$ at rest, a smooth baseline shift as the wrist slowly tilts (gravity
+re-projecting onto this axis), then a sharp damped-oscillatory transient from a flick.
+Real traces are noisier but show these same three textures.}
+\label{ch34:fig-wrist-accel}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=13cm, height=4.6cm,
+  xlabel={time $t$ (s)}, ylabel={rate (deg/s)},
+  domain=0:6, samples=200,
+  xmin=0, xmax=6, ymin=-260, ymax=260,
+  axis lines=left, enlargelimits=false,
+  title={Gyroscope (same axis, same sequence)},
+]
+\addplot[specred, thick] {
+  ( x<1.5 )*( 2 + 1.5*sin(deg(55*x)) )
++ ( x>=1.5 && x<3 )*( 80*sin(deg(180*(x-1.5)/1.5)) )
++ ( x>=3 && x<3.8 )*( 2 + 1.5*sin(deg(55*x)) )
++ ( x>=3.8 && x<4.4 )*( 230*sin(deg(540*(x-3.8)/0.6))*exp(-3.5*(x-3.8)) )
++ ( x>=4.4 )*( 2 + 1.5*sin(deg(55*x)) )
+};
+\node[font=\footnotesize] at (axis cs:0.75,60) {rest $\approx 0$};
+\node[font=\footnotesize] at (axis cs:2.25,150) {turn (one bump)};
+\node[font=\footnotesize] at (axis cs:4.4,-180) {flick (ringing)};
+\end{axis}
+\end{tikzpicture}
+\caption{The gyroscope on the same sequence. At rest it sits near zero (a small bias
+visible). The slow turn is a single smooth bump whose \emph{area} is the angle turned.
+The flick is a violent damped oscillation -- the rate signature recognizers exploit.}
+\label{ch34:fig-wrist-gyro}
+\end{figure}
+
+\begin{happeningbox}
+Notice the division of labor across the two plots. During the slow tilt the
+accelerometer baseline \emph{shifts} (gravity re-projects) while the gyro shows a
+\emph{bump} (the rate of that shift). During rest the accelerometer holds a nonzero
+$1\,g$ value while the gyro sits at zero. The two sensors encode the \emph{same}
+orientation change in complementary ways: the accelerometer sees it as a new static
+direction, the gyro sees it as a transient rate. That complementarity is precisely what
+makes fusion possible -- and it is why neither sensor alone suffices.
+\end{happeningbox}
+
+\section{What the wrist can and cannot read}
+\label{ch34:limits}
+
+This is the most important section in the chapter, and the one most often skipped in
+hobbyist tutorials. We are building an instrument controller driven by \emph{finger
+movements}, and we need a precise map of which channel carries which information. The
+headline, stated up front so the rest of the chapter does not read as a letdown:
+\emph{finger movement is detectable from a forearm/wrist band} -- just not from the IMU,
+and not as continuous joint angles. It lives in the tendon and electrical channels,
+which we read with the right sensor plus a per-finger calibration step.
+
+\begin{goalbox}
+\textbf{What the wrist band \emph{can} do for the instrument controller:}
+\begin{itemize}
+\item \textbf{IMU:} detect discrete gestures -- flicks, taps, twists, shakes, knocks,
+  and the broad direction of an arm sweep -- which have large, distinctive
+  accelerometer/gyro signatures
+  (Figures~\ref{ch34:fig-wrist-accel}--\ref{ch34:fig-wrist-gyro}). Track wrist
+  orientation (roll/pitch reliably from gravity; yaw only with fusion and a trustworthy
+  magnetometer, which the wrist often is not), driving continuous parameters such as
+  pitch-bend, volume, or a filter sweep. Track gross arm rhythm: conducting beats,
+  strums, tempo from periodicity in the trace.
+\item \textbf{FMG / EMG on the same band:} detect \emph{which finger moved and how
+  hard}. The flexor and extensor tendons that drive the fingers run through the forearm,
+  right under a wrist/forearm band. When you curl the index finger, a specific bundle of
+  tendons bulges (a force-myography, FMG, signal you can read with a small pressure or
+  strain array) and a specific group of motor units fires (a surface-EMG signal). Each
+  finger produces a repeatable spatial \emph{signature} across the band
+  (Figure~\ref{ch34:fig-tendon-channel}). With a short per-user calibration, those
+  signatures become reliable per-finger detections.
+\end{itemize}
+\end{goalbox}
+
+\begin{whybox}
+Why fingers \emph{are} reachable from the forearm, even though the IMU is blind to them.
+The muscles that move your fingers are not in your fingers -- they are in your forearm,
+and they pull the fingers through long tendons. So the \emph{control signal} for every
+finger physically passes under a forearm band twice over: mechanically, as tendon and
+muscle bulk that an FMG pressure array feels, and electrically, as the motor-unit action
+potentials that surface EMG picks up. The IMU misses all of this because finger muscles
+move almost no mass at the wrist -- there is no inertial signature to see. Change the
+sensor to one that reads tendons or electrical activity and the finger information is
+right there, strong and repeatable. This is exactly what WristFlex (FMG) and the Myo /
+MyoWare sEMG bands demonstrated.
+\end{whybox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small]
+  % forearm cross-section
+  \draw[thick,fill=orange!8] (0,0) circle (1.6);
+  \node[font=\footnotesize] at (0,0) {forearm};
+  % band ring of sensors
+  \foreach \a in {0,45,...,315} {
+     \fill[purple!55!black] (\a:1.6) circle (0.09);
+  }
+  \node[purple!55!black,font=\footnotesize] at (90:2.15) {FMG/EMG band};
+  % tendon bundles inside, one highlighted
+  \fill[blue!25] (-0.4,0.4) circle (0.18);
+  \fill[blue!25] (0.4,0.5) circle (0.18);
+  \fill[red!60!black] (0.6,-0.2) circle (0.2);
+  \draw[-{Latex[]},red!60!black,thick] (2.6,-0.6) -- (0.85,-0.25)
+     node[right=14pt,below,font=\footnotesize,align=left]
+     {index-finger tendon\\bulges $\to$ local sensors fire};
+  \node[blue!50!black,font=\footnotesize] at (-1.5,0.9) {other tendons};
+\end{tikzpicture}
+\caption{Why the fingers are readable from the forearm. A cross-section of the forearm
+under the band: the muscles and tendons that drive each finger pass right beneath the
+sensor ring. Moving one finger bulges a specific tendon bundle (red) and fires a
+specific group of motor units, lighting up a characteristic subset of the FMG/EMG
+sensors. Each finger leaves a repeatable spatial signature, which per-finger calibration
+turns into a reliable detection. The IMU, by contrast, sits rigidly with the band and
+feels none of this.}
+\label{ch34:fig-tendon-channel}
+\end{figure}
+
+\begin{trapbox}
+\textbf{The genuinely hard part, stated plainly:} a wrist-worn band cannot recover
+\emph{continuous per-joint finger angles}. Telling \emph{that} the index finger flexed,
+and roughly how forcefully, is easy and repeatable. Reconstructing the exact angle of
+each of its three joints, continuously, is underdetermined: many distinct finger poses
+produce nearly the same forearm tendon bulge and EMG pattern, so the mapping from
+band signal to full hand pose is not invertible. The IMU is worse still -- it sees only
+the bulk motion of the forearm and hand, so it carries \emph{no} per-finger information
+at all. Continuous per-joint angles need sensors \emph{on the fingers}: IMU rings, flex
+sensors, or instrumented gloves (see ``Learning on the Rings'' for finger-worn
+continuous tracking). We give that as an upgrade path in the capstone, not as a
+prerequisite -- because nothing the user wants for playing an instrument requires it.
+\end{trapbox}
+
+\begin{aestheticbox}
+This framing is not a disappointment; it is the design brief. The IMU gives reliable
+discrete gestures and wrist orientation; FMG/EMG on the same band gives reliable
+per-finger detection after calibration; only continuous per-joint angles stay out of
+reach without finger-worn sensors. That tells us exactly how to architect the
+instrument: map wrist tilt and arm motion (IMU) to continuous expressive parameters,
+read note and finger \emph{selection} from the muscle/tendon channel (FMG/EMG, with the
+per-finger calibration of Chapter~37 and the capstone), and treat full continuous finger
+pose as an optional ring-based upgrade. Every musical action the user actually wants --
+which finger, how hard, with what wrist gesture and tilt -- sits on the doable side of
+this line.
+\end{aestheticbox}
+
+\begin{historybox}
+The path from spinning-wheel gyros to the chip on your wrist is short and recent.
+Coriolis vibrating-structure gyros were proposed mid-20th century, but practical MEMS
+versions only arrived in the 1990s as silicon micromachining matured (Charles Stark
+Draper Laboratory and Bosch were early movers). The 2007 smartphone era drove the cost
+of a full 6-axis IMU below a dollar, which is the only reason a hobbyist wrist tracker
+is feasible at all. The Earth's magnetic field they lean on for heading has itself been
+mapped for navigation since Gauss formalized geomagnetism in the 1830s -- the compass
+in your IMU is the oldest idea in the package by two centuries.
+\end{historybox}
+
+\section{A worked end-to-end example}
+\label{ch34:worked}
+
+Let us tie units, integration, and drift together on one concrete number, the kind you
+will actually compute in firmware.
+
+\begin{example}[Estimating a wrist twist angle]
+\label{ch34:ex-twist}
+You sample the gyro's roll axis at $f_s = 100\,\mathrm{Hz}$ ($\Delta t = 0.01\,$s),
+$\pm250\,\mathrm{deg/s}$ range ($131$ LSB per deg/s). During a one-second twist you
+record raw values averaging $6550$ counts, i.e.\ $6550/131 = 50.0\,\mathrm{deg/s}$.
+Integrating over the second:
+\[
+  \Delta\theta = \sum_{n=1}^{100} \Omega[n]\,\Delta t \approx 50.0 \times 1.0
+  = 50^\circ .
+\]
+Now suppose you forgot to remove a bias of $1.8\,\mathrm{deg/s}$. Over the active
+second it adds only $1.8^\circ$ -- tolerable. But if you keep integrating during the
+following ten seconds of rest, the bias alone adds $18^\circ$ of phantom rotation
+(Figure~\ref{ch34:fig-drift}). \emph{Lesson:} integrate the gyro only when motion is
+actually happening, remove bias first, and lean on the accelerometer (gravity) to
+re-anchor roll/pitch whenever the wrist is still -- the seed of complementary fusion.
+\end{example}
+
+\begin{labbox}
+Wire up any IMU you have, log $(a_x,a_y,a_z,g_x,g_y,g_z)$ at $100\,\mathrm{Hz}$ to a
+file, and perform four motions back to back: hold still 3\,s, slowly rotate the wrist
+$90^\circ$, hold still 3\,s, then a single sharp flick. Plot all six channels. Confirm
+by eye: (1) the accelerometer magnitude stays near $1\,g$ except during the flick;
+(2) the slow rotation is a smooth gyro bump whose integral is about $90^\circ$;
+(3) the flick is a brief, large transient in both sensors. You have now reproduced
+Figures~\ref{ch34:fig-wrist-accel} and~\ref{ch34:fig-wrist-gyro} with your own arm.
+\end{labbox}
+
+\section{Summary}
+\label{ch34:summary}
+
+\begin{itemize}
+\item An accelerometer measures \emph{specific force} $\vec a_{\text{true}}-\vec g$:
+  it reads $+1\,g$ at rest, $0$ in free fall, and serves as a tilt sensor only when
+  motion is small. It cannot sense yaw.
+\item A gyroscope measures \emph{angular rate} via the Coriolis effect: zero at rest
+  regardless of orientation, excellent for fast smooth angle \emph{changes}, but its
+  integral drifts because constant bias accumulates linearly with time.
+\item A magnetometer measures the \emph{magnetic field vector}, giving absolute heading
+  -- but it is severely corrupted by nearby iron and currents, a real problem on the
+  wrist, and demands calibration.
+\item Raw readings are signed integers scaled by a datasheet sensitivity; choose a
+  full-scale range wide enough not to clip and treat the IMU as an ADC bound by Nyquist
+  (use the on-chip low-pass).
+\item Errors come in three flavors -- noise (fight with filtering), bias (fight with
+  calibration), drift (fight with fusion).
+\item For the wrist controller: the IMU delivers discrete gestures and orientation, but
+  \emph{not} individual fingers. Which finger moved, and how hard, is read instead from
+  the tendon/electrical channel -- FMG or EMG on the same band, made reliable by a short
+  per-finger calibration (Chapter~37 and the capstone). Only continuous per-joint finger
+  angles stay out of reach without finger-worn sensors, an optional upgrade.
+\end{itemize}
+
+Chapter~35 takes the raw numbers seriously and builds proper calibration and sensor
+models; Chapter~36 fuses the three sensors into a single drift-free orientation; and
+Chapter~37 turns to the FMG/EMG sensors that read the fingers directly.
+
+\section{Exercises}
+\label{ch34:exercises}
+
+\begin{exercise}
+A 3-axis accelerometer at rest reads $(a_x,a_y,a_z)=(0.50,\,0.00,\,0.866)\,g$. What is
+the chip's pitch and roll? Verify that the vector magnitude is consistent with the chip
+being stationary, and explain what a magnitude of $1.3\,g$ would have told you instead.
+\end{exercise}
+
+\begin{exercise}
+Explain, using Definition~\ref{ch34:def-specific-force}, why an accelerometer in a
+satellite in orbit reads approximately zero on all axes even though the satellite is
+very much under the influence of Earth's gravity.
+\end{exercise}
+
+\begin{exercise}
+A gyroscope is set to $\pm2000\,\mathrm{deg/s}$, with sensitivity $16.4$ LSB per
+deg/s. A raw reading is $-9840$ counts. Convert to deg/s. If this rate is held constant
+for $0.5\,$s, what angle is swept?
+\end{exercise}
+
+\begin{exercise}
+You integrate a gyro at $200\,\mathrm{Hz}$. The bias is $0.6\,\mathrm{deg/s}$ and you
+fail to remove it. How much phantom angle accumulates after (a) 5\,s, (b) 1\,minute?
+Compare to the $\sqrt{t}$ growth of a noise random walk with per-sample standard
+deviation $0.05\,\mathrm{deg/s}$ and comment on which error dominates at one minute.
+\end{exercise}
+
+\begin{exercise}
+At $\pm2\,g$ an accelerometer has $16384$ LSB/$g$; at $\pm16\,g$ it has $2048$
+LSB/$g$. By what factor does the smallest resolvable acceleration change between the
+two ranges, and what is the engineering tradeoff you are making when you widen the
+range for the wrist controller?
+\end{exercise}
+
+\begin{exercise}
+A magnetometer is rotated through all orientations while held far from metal; the cloud
+of $(B_x,B_y,B_z)$ readings should trace a sphere. After mounting it on a wrist near a
+steel buckle, the cloud becomes an off-center ellipsoid. Identify which distortion
+shifts the center and which warps it into an ellipsoid, and state what each implies you
+must estimate during calibration.
+\end{exercise}
+
+\begin{exercise}
+You sample an IMU at $40\,\mathrm{Hz}$ with the internal low-pass disabled, and a
+$55\,\mathrm{Hz}$ mechanical vibration (e.g.\ from a nearby motor) is present. To what
+apparent frequency does it alias? Using Chapter~18's rule, choose an internal low-pass
+cutoff and output rate that make a $30\,\mathrm{Hz}$ gesture band alias-free.
+\end{exercise}
+
+\begin{exercise}
+Sketch (or describe) the accelerometer-magnitude and gyro traces you would expect from
+each of: (a) the wrist held perfectly still; (b) a slow $180^\circ$ wrist rotation;
+(c) two sharp taps a quarter-second apart. For each, name the feature a recognizer
+would key on.
+\end{exercise}
+
+\begin{exercise}
+A student claims their smartwatch app reads individual finger flexion ``from the IMU
+alone.'' Using the physics of this chapter, give two concrete reasons the \emph{IMU}
+cannot carry per-finger information, then name the sensor channel on the same band that
+\emph{can} detect which finger moved, and explain in one sentence why the finger
+control signal is physically present under a forearm band even though the IMU misses it.
+\end{exercise}
+
+\begin{exercise}
+Detecting \emph{which} finger moved from a forearm band is achievable; reconstructing
+the \emph{exact continuous angle} of every finger joint from the same band is not.
+Explain the difference in terms of invertibility: why can many distinct finger poses
+map to nearly the same FMG/EMG signature, and what kind of additional sensor removes the
+ambiguity?
+\end{exercise}
+
+\begin{exercise}
+Derive the discrete integrator transfer function $H(z)=\Delta t/(1-z^{-1})$ from the
+update $\theta[n]=\theta[n-1]+\Omega[n]\Delta t$, and explain in one sentence how its
+pole at $z=1$ corresponds to gyroscope drift.
+\end{exercise}

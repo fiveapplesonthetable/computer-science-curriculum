@@ -1,0 +1,885 @@
+\chapter{The Fast Fourier Transform}
+
+In the last chapter we built the Discrete Fourier Transform (DFT): the machine that
+takes $N$ samples of a signal and tells you, for each of $N$ frequencies, how much of
+that frequency is present and in what phase. Geometrically, the DFT projects your
+signal vector onto $N$ rotating phasors and reads off the coordinates. It is the right
+idea. The problem is that, done the obvious way, it is \emph{slow} -- so slow that for
+a long time people simply did not compute spectra of real signals at all.
+
+Then, in 1965, two researchers published a four-page note describing an algorithm that
+computed the very same numbers, exactly, but vastly faster. It did not approximate the
+DFT; it reorganized the arithmetic so that enormous amounts of redundant work
+collapsed. Spectra that would have taken a day took a second. Whole fields -- radar,
+seismology, medical imaging, digital audio, wireless -- were rebuilt on top of it. The
+algorithm is the \emph{Fast Fourier Transform} (FFT), and it is one of the most
+consequential pieces of arithmetic ever written down.
+
+This chapter is about \emph{why} the FFT is fast and \emph{how} it works, built from
+the geometry up. We will see exactly where the wasted work in the naive DFT hides, watch
+divide-and-conquer expose it, draw the famous butterfly, understand the strange
+bit-reversal shuffle, and then -- crucially -- learn to actually \emph{use} an FFT:
+zero-padding, reading the output of a real-valued FFT, and what the numbers mean. By the
+end you will both understand the FFT and be able to call one correctly, which matters
+because our wrist gesture controller will run an FFT on a tiny microcontroller hundreds
+of times per second.
+
+\section{Recalling the DFT, and counting its cost}
+\label{ch09:dft-cost}
+
+Let $x[0], x[1], \dots, x[N-1]$ be our $N$ samples. The DFT produces $N$ complex
+numbers $X[0], \dots, X[N-1]$ by
+\begin{equation}
+\label{ch09:dft-defn}
+X[k] \;=\; \sum_{n=0}^{N-1} x[n]\, e^{-\jj\, 2\pi k n / N},
+\qquad k = 0, 1, \dots, N-1 .
+\end{equation}
+Each $X[k]$ asks: ``how much does the signal align with the phasor that completes
+exactly $k$ whole turns over the window?'' The factor $e^{-\jj 2\pi k n/N}$ is that
+phasor, sampled at instant $n$.
+
+That exponential appears so often that it earns a name. Define the \textbf{twiddle
+factor}
+\begin{equation}
+\label{ch09:twiddle}
+W_N \;=\; e^{-\jj\, 2\pi / N},
+\qquad\text{so that}\qquad
+X[k] \;=\; \sum_{n=0}^{N-1} x[n]\, W_N^{\,kn}.
+\end{equation}
+$W_N$ is a single small clockwise rotation: it is the $N$th root of unity sitting just
+below the positive real axis on the unit circle. All the phasors in the DFT are just
+powers of this one number. That is the secret the FFT will exploit, but first let us see
+the cost of ignoring it.
+
+\begin{intuitionbox}
+The DFT is a matrix-vector product. Stack the outputs into a vector
+$\vec{X}$ and the inputs into $\vec{x}$; then $\vec{X} = \mat{F}\,\vec{x}$, where the
+$N\times N$ matrix $\mat{F}$ has entries $F_{kn} = W_N^{kn}$. Every row of $\mat{F}$ is
+one phasor; multiplying by $\mat{F}$ measures the overlap of $\vec{x}$ with each. A
+dense $N\times N$ matrix times a vector takes about $N^2$ multiply-add operations. That
+single sentence is the entire performance problem.
+\end{intuitionbox}
+
+\begin{focusbox}
+\textbf{The naive DFT is $O(N^2)$.} Each of the $N$ outputs $X[k]$ is a sum over $N$
+inputs, so it needs $N$ complex multiplications and $N-1$ complex additions. With $N$
+outputs that is $N^2$ complex multiplies in total. Double $N$ and the work
+\emph{quadruples}.
+\end{focusbox}
+
+To feel why $O(N^2)$ hurts, put numbers on it. A complex multiply is a handful of real
+multiplies and adds; call the whole DFT ``$N^2$ operations'' for scale.
+
+\begin{center}
+\begin{tabular}{r r r r}
+\toprule
+$N$ & $N^2$ (naive) & $N\log_2 N$ (FFT) & speedup \\
+\midrule
+$64$       & $4{,}096$        & $384$           & $\approx 11\times$ \\
+$1{,}024$  & $1{,}048{,}576$  & $10{,}240$      & $\approx 102\times$ \\
+$65{,}536$ & $\approx 4.3\times 10^{9}$ & $\approx 1.0\times 10^{6}$ & $\approx 4096\times$ \\
+$10^{6}$   & $10^{12}$        & $\approx 2\times 10^{7}$ & $\approx 50000\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+A one-million-point spectrum is $10^{12}$ operations the naive way -- minutes to hours on
+a real machine -- versus $2\times10^{7}$ with the FFT, a small fraction of a second. The
+gap is not a constant factor you can shrug off; it grows without bound. Figure
+\ref{ch09:fig-growth} shows the two curves pulling apart.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=11.5cm, height=6.4cm,
+  xlabel={transform size $N$}, ylabel={operations (relative)},
+  domain=2:256, samples=60,
+  ymode=log, xmode=log, log basis x=2,
+  xmin=2, xmax=256, ymin=1, ymax=80000,
+  grid=both, grid style={gray!18},
+  legend pos=north west, legend cell align=left,
+  axis lines=box,
+]
+\addplot[specred, very thick, samples=60] {x^2};
+\addlegendentry{naive DFT $\sim N^2$}
+\addplot[sigblue, very thick, samples=60] {x*log2(x)};
+\addlegendentry{FFT $\sim N\log_2 N$}
+\addplot[gray, dashed, thick, samples=60] {x};
+\addlegendentry{linear $N$ (reference)}
+\end{axis}
+\end{tikzpicture}
+\caption{Operation count versus $N$ on log--log axes. The naive DFT (red) climbs as
+$N^2$; the FFT (blue) hugs the nearly linear $N\log_2 N$ curve. The vertical gap
+\emph{between} them keeps widening, which is why the FFT is not a minor optimization but
+a change in what is computable.}
+\label{ch09:fig-growth}
+\end{figure}
+
+\begin{connectionbox}
+This is exactly the divide-and-conquer story from the algorithms companion. Sorting went
+from $O(N^2)$ (insertion/selection sort) to $O(N\log N)$ (mergesort) by splitting the
+problem in half, solving the halves, and stitching the results together cheaply. The FFT
+is the same recursion applied to the DFT: split, recurse, combine. If you have met the
+Master Theorem, the FFT satisfies $T(N) = 2\,T(N/2) + O(N)$, whose solution is
+$O(N\log N)$. The whole intellectual content of this chapter is finding the cheap
+``combine'' step.
+\end{connectionbox}
+
+\section{Where the redundancy hides}
+\label{ch09:redundancy}
+
+Before we can remove wasted work we have to \emph{see} it. The naive DFT recomputes the
+same phasor values over and over and never reuses partial sums between different outputs.
+Two structural facts about $W_N$ are the key.
+
+\begin{whybox}
+\textbf{Two symmetries of the twiddle factor.} Because $W_N = e^{-\jj 2\pi/N}$ lives on
+the unit circle:
+\begin{itemize}
+\item \emph{Periodicity:} $W_N^{\,k+N} = W_N^{\,k}$. Going one extra full turn returns
+you to the same point. So there are really only $N$ distinct phasor values, even though
+the index $kn$ in \eqref{ch09:twiddle} ranges up to $(N-1)^2$.
+\item \emph{Half-turn (the crucial one):} $W_N^{\,k + N/2} = -W_N^{\,k}$, because half a
+revolution is a sign flip: $e^{-\jj\pi} = -1$. And $W_N^{2} = W_{N/2}$: skipping every
+other point on an $N$-circle lands you exactly on an $(N/2)$-circle.
+\end{itemize}
+These tiny identities are the entire engine of the FFT. The first says values repeat; the
+second says a size-$N$ problem secretly \emph{contains} a size-$N/2$ problem. Figure
+\ref{ch09:fig-twiddle} shows the half-turn symmetry on the unit circle.
+\end{whybox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Stealth, scale=2.1, every node/.style={font=\footnotesize}]
+\draw[gray!45] (-1.25,0) -- (1.25,0);
+\draw[gray!45] (0,-1.25) -- (0,1.25);
+\draw[gray!55,thick] (0,0) circle (1);
+% the eight powers of W_8 (clockwise from +1)
+\foreach \k in {0,...,7}{
+  \pgfmathsetmacro{\ang}{-45*\k}
+  \fill[sigblue] (\ang:1) circle (0.9pt);
+}
+% highlight W^1 and W^5 = -W^1 (half-turn apart)
+\draw[->,very thick,quotientorange] (0,0) -- (-45:1);
+\draw[->,very thick,specred] (0,0) -- (135:1);
+\node[anchor=north west] at (-45:1.02) {$W_8^{1}$};
+\node[anchor=south east] at (135:1.02) {$W_8^{5}=-W_8^{1}$};
+\node[anchor=south west] at (0:1.02) {$W_8^{0}=1$};
+\node[anchor=north] at (-90:1.05) {$W_8^{2}$};
+\node[anchor=east] at (180:1.04) {$W_8^{4}=-1$};
+\end{tikzpicture}
+\caption{The eight twiddle factors $W_8^{k}=e^{-\jj 2\pi k/8}$ are equally spaced on the
+unit circle, stepping clockwise. A power and its half-turn partner sit diametrically
+opposite: $W_8^{5}=-W_8^{1}$ (orange and red). That single sign flip is the half-turn
+identity $W_N^{k+N/2}=-W_N^{k}$ that lets one twiddle multiply produce two outputs in the
+butterfly.}
+\label{ch09:fig-twiddle}
+\end{figure}
+
+The naive computation throws all this away. When it computes $X[k]$ and then $X[k+N/2]$,
+it grinds through two full independent sums even though, term by term, their phasors
+differ only by a sign. Multiply that wasted symmetry across all $N$ outputs and you have
+found the factor that the FFT recovers.
+
+\section{Divide and conquer: split by even and odd}
+\label{ch09:split}
+
+Assume $N$ is a power of two (we will return to other sizes). The Cooley--Tukey idea is
+to split the \emph{input} samples into two interleaved halves -- the even-indexed
+samples and the odd-indexed samples -- compute a DFT of each half, and then combine. Let
+\begin{equation}
+\label{ch09:eo-defn}
+e[m] = x[2m], \qquad o[m] = x[2m+1], \qquad m = 0,\dots, \tfrac{N}{2}-1 .
+\end{equation}
+Now split the sum in \eqref{ch09:twiddle} into its even and odd terms:
+\begin{align}
+X[k]
+&= \sum_{n \text{ even}} x[n]\,W_N^{kn} \;+\; \sum_{n \text{ odd}} x[n]\,W_N^{kn} \notag\\
+&= \sum_{m=0}^{N/2-1} x[2m]\,W_N^{k(2m)}
+   \;+\; \sum_{m=0}^{N/2-1} x[2m+1]\,W_N^{k(2m+1)} .
+\label{ch09:split-1}
+\end{align}
+Look at the exponents. In the even sum, $W_N^{k(2m)} = (W_N^{2})^{km} = W_{N/2}^{km}$ --
+the size-$N$ twiddle became a size-$N/2$ twiddle, exactly by the identity $W_N^2 =
+W_{N/2}$. In the odd sum, pull one factor of $W_N^{k}$ out front:
+$W_N^{k(2m+1)} = W_N^{k}\,W_{N/2}^{km}$. Substituting,
+\begin{equation}
+\label{ch09:split-2}
+X[k] \;=\; \underbrace{\sum_{m=0}^{N/2-1} e[m]\,W_{N/2}^{km}}_{\displaystyle E[k]}
+\;+\; W_N^{k}\,\underbrace{\sum_{m=0}^{N/2-1} o[m]\,W_{N/2}^{km}}_{\displaystyle O[k]}.
+\end{equation}
+
+\begin{happeningbox}
+Read \eqref{ch09:split-2} slowly: $E[k]$ is \emph{the DFT of the even samples} and
+$O[k]$ is \emph{the DFT of the odd samples}, each a transform of length $N/2$. We have
+rewritten one size-$N$ DFT in terms of two size-$N/2$ DFTs plus a single twiddle
+multiply $W_N^k$ on the odd half. That is the divide-and-conquer split: a big projection
+expressed as two small projections, glued by a rotation.
+\end{happeningbox}
+
+There is a catch and it is a gift. $E[k]$ and $O[k]$ are defined for $k = 0, \dots,
+N/2-1$ only, because they are length-$N/2$ transforms. But $X[k]$ needs $k$ all the way
+to $N-1$. How do we get the top half of the output from half-length transforms? The
+half-turn identity. For the top half, write $k + N/2$ with $k$ in the lower range:
+\begin{align}
+X[k]        &= E[k] + W_N^{k}\,O[k], \label{ch09:butterfly-lo}\\
+X[k + N/2]  &= E[k] - W_N^{k}\,O[k], \qquad k = 0, \dots, \tfrac{N}{2}-1 .
+\label{ch09:butterfly-hi}
+\end{align}
+The minus sign in \eqref{ch09:butterfly-hi} is the half-turn $W_N^{k+N/2} = -W_N^k$
+doing its work; and $E$, $O$ are periodic with period $N/2$, so $E[k+N/2]=E[k]$ and
+likewise for $O$. \emph{Two outputs come out of one twiddle multiply.} The product
+$W_N^k\,O[k]$ is computed once and then added and subtracted. Half the multiplications
+just vanished -- and that is only the top level of the recursion.
+
+\begin{walkbox}
+Why does splitting the input ``by even and odd'' work so cleanly, while splitting it into
+``first half / second half'' does not? Because the DFT couples each output to every
+input through the \emph{product} $kn$ in the exponent. Striding by $2$ in $n$ turns
+$W_N^{2}$ into $W_{N/2}$ -- a clean change of scale on the unit circle. Splitting by
+contiguous blocks does not produce that scaling; it produces a phase shift, which leads
+to a different (and also valid) factorization called decimation-in-frequency. Even/odd is
+decimation-in-time, the version drawn most often.
+\end{walkbox}
+
+\section{The butterfly}
+\label{ch09:butterfly}
+
+Equations \eqref{ch09:butterfly-lo}--\eqref{ch09:butterfly-hi} describe a tiny two-input,
+two-output computation that is the atom of every FFT. It is called a \emph{butterfly}
+because of how the data-flow diagram looks. You feed it $E[k]$ and $O[k]$; you multiply
+the odd one by the twiddle $W_N^k$; then you form a sum and a difference.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Stealth, every node/.style={font=\small}]
+% nodes
+\node (e) at (0,1.4) [circle,draw,fill=fillsig!40,minimum size=6mm] {$E[k]$};
+\node (o) at (0,-1.4)[circle,draw,fill=fillsig!40,minimum size=6mm] {$O[k]$};
+\node (xa) at (6,1.4) [circle,draw,fill=sigblue!22,minimum size=6mm] {$X[k]$};
+\node (xb) at (6,-1.4)[circle,draw,fill=sigblue!22,minimum size=6mm] {$X[k{+}\tfrac{N}{2}]$};
+% twiddle multiply node on the odd line
+\node (w) at (2.6,-1.4) [rectangle,draw,fill=quotientorange!25,minimum size=6mm] {$\times\,W_N^{k}$};
+% sum/diff nodes
+\node (plus)  at (4.4,1.4)  [circle,draw,fill=white,minimum size=5mm] {$+$};
+\node (minus) at (4.4,-1.4) [circle,draw,fill=white,minimum size=5mm] {$-$};
+% edges
+\draw[->,thick,sigblue] (e) -- (plus);
+\draw[->,thick,sigblue] (e) -- (minus);
+\draw[->,thick,quotientorange] (o) -- (w);
+\draw[->,thick,quotientorange] (w) -- (plus);
+\draw[->,thick,quotientorange] (w) -- (minus);
+\draw[->,thick,sigblue] (plus) -- (xa);
+\draw[->,thick,sigblue] (minus) -- (xb);
+\end{tikzpicture}
+\caption{The radix-2 decimation-in-time butterfly. The odd input is rotated by the
+twiddle $W_N^k$; the result is added to the even input to make the lower output and
+subtracted to make the upper output. One complex multiply, two complex adds, two outputs.
+The whole FFT is thousands of these wired together.}
+\label{ch09:fig-butterfly}
+\end{figure}
+
+\begin{focusbox}
+\textbf{Cost of one butterfly:} exactly one complex multiply ($W_N^k\,O[k]$) and two
+complex adds. There are $N/2$ butterflies at each stage and $\log_2 N$ stages, giving
+$\tfrac{N}{2}\log_2 N$ complex multiplies overall -- the $O(N\log N)$ promise made
+concrete.
+\end{focusbox}
+
+\subsection*{Stacking the stages}
+
+We do not stop after one split. Each half-length DFT is itself a DFT of a power-of-two
+size, so we split it again, and again, until the transforms have length~$1$. A length-$1$
+DFT is the identity -- a single sample is its own spectrum, since the sum in
+\eqref{ch09:dft-defn} has one term and the phasor is $W_1^0 = 1$. So the recursion
+bottoms out for free.
+
+Counting the levels: from $N$ down to $1$ by repeated halving takes $\log_2 N$ steps.
+Each level does $O(N)$ work in butterflies. That is the recurrence
+$T(N) = 2T(N/2) + O(N)$ once more, total $O(N\log N)$. Figure \ref{ch09:fig-stages}
+shows the data flow for $N=8$: three stages of butterflies turning eight inputs into
+eight outputs.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Stealth, x=1.55cm, y=0.78cm, every node/.style={font=\footnotesize}]
+% column x positions
+\def\xin{0} \def\xa{1.5} \def\xb{3.0} \def\xc{4.5} \def\xout{6.0}
+% input labels (bit-reversed order) at left
+\foreach \y/\lab in {7/0,6/4,5/2,4/6,3/1,2/5,1/3,0/7}{
+  \node[anchor=east] at (\xin,\y) {$x[\lab]$};
+  \fill[sigblue] (\xin+0.12,\y) circle (1.6pt);
+}
+% nodes at each stage (8 rows)
+\foreach \x in {\xa,\xb,\xc,\xout}{
+  \foreach \y in {0,...,7}{ \fill[gray!55] (\x,\y) circle (1.3pt); }
+}
+% Stage 1: pairs (0,1)(2,3)(4,5)(6,7) -- adjacent rows
+\foreach \p in {0,2,4,6}{
+  \pgfmathtruncatemacro{\q}{\p+1}
+  \draw[sigblue] (\xin+0.12,\p) -- (\xa,\p);
+  \draw[sigblue] (\xin+0.12,\q) -- (\xa,\q);
+  \draw[quotientorange] (\xin+0.12,\p) -- (\xa,\q);
+  \draw[quotientorange] (\xin+0.12,\q) -- (\xa,\p);
+}
+% Stage 2: pairs differ by 2: (0,2)(1,3)(4,6)(5,7)
+\foreach \p in {0,1,4,5}{
+  \pgfmathtruncatemacro{\q}{\p+2}
+  \draw[sigblue] (\xa,\p) -- (\xb,\p);
+  \draw[sigblue] (\xa,\q) -- (\xb,\q);
+  \draw[quotientorange] (\xa,\p) -- (\xb,\q);
+  \draw[quotientorange] (\xa,\q) -- (\xb,\p);
+}
+% Stage 3: pairs differ by 4: (0,4)(1,5)(2,6)(3,7)
+\foreach \p in {0,1,2,3}{
+  \pgfmathtruncatemacro{\q}{\p+4}
+  \draw[sigblue] (\xb,\p) -- (\xc,\p);
+  \draw[sigblue] (\xb,\q) -- (\xc,\q);
+  \draw[quotientorange] (\xb,\p) -- (\xc,\q);
+  \draw[quotientorange] (\xb,\q) -- (\xc,\p);
+}
+% to output
+\foreach \y/\lab in {7/0,6/1,5/2,4/3,3/4,2/5,1/6,0/7}{
+  \draw[gray!60] (\xc,\y) -- (\xout,\y);
+  \node[anchor=west] at (\xout+0.05,\y) {$X[\lab]$};
+}
+% stage labels
+\node[anchor=south] at (\xa,7.7) {stage 1};
+\node[anchor=south] at (\xb,7.7) {stage 2};
+\node[anchor=south] at (\xc,7.7) {stage 3};
+\end{tikzpicture}
+\caption{An 8-point radix-2 FFT, decimation-in-time. Inputs enter on the left in
+\emph{bit-reversed} order ($0,4,2,6,1,5,3,7$); three stages of butterflies (orange =
+cross term carrying a twiddle, blue = straight term) produce the outputs in natural
+order on the right. Each vertical pair of crossing lines is one butterfly from Figure
+\ref{ch09:fig-butterfly}.}
+\label{ch09:fig-stages}
+\end{figure}
+
+\section{Bit-reversal: why the inputs come in scrambled}
+\label{ch09:bitreversal}
+
+You may have noticed the inputs in Figure \ref{ch09:fig-stages} are not in order; they
+are $x[0], x[4], x[2], x[6], x[1], x[5], x[3], x[7]$. This is not a typo, and it is not
+optional. It falls directly out of the even/odd splitting, and understanding it removes
+all the mystery.
+
+Track what the recursion does to the indices. The first split sends even indices
+$\set{0,2,4,6}$ to one group and odd $\set{1,3,5,7}$ to the other. Within ``even'' we
+split again by even/odd \emph{of the half-index}: $\set{0,4}$ and $\set{2,6}$. One more
+split isolates each element. Follow any index through these choices and you are reading
+its binary digits from the least significant bit upward:
+
+\begin{center}
+\begin{tabular}{c c c c}
+\toprule
+index & binary & bits reversed & new position \\
+\midrule
+$0$ & $000$ & $000$ & $0$ \\
+$1$ & $001$ & $100$ & $4$ \\
+$2$ & $010$ & $010$ & $2$ \\
+$3$ & $011$ & $110$ & $6$ \\
+$4$ & $100$ & $001$ & $1$ \\
+$5$ & $101$ & $101$ & $5$ \\
+$6$ & $110$ & $011$ & $3$ \\
+$7$ & $111$ & $111$ & $7$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{happeningbox}
+\textbf{Bit-reversal in one sentence:} repeatedly sorting by ``even or odd'' is the same
+as sorting by the bits of the index from least-significant to most-significant, and that
+is the same as reversing the bits. Sample $x[n]$ must start in the slot whose index is
+$n$ with its binary digits reversed. For $n=1=001_2$ the reverse is $100_2 = 4$, so
+$x[1]$ goes to slot $4$ -- exactly what the diagram shows.
+\end{happeningbox}
+
+This gives the standard \emph{in-place} FFT a clean shape: first permute the array by
+bit-reversal, then run $\log_2 N$ stages of butterflies that read and write the same
+array. No extra storage for the data, and the outputs emerge in natural frequency order.
+(Some libraries instead take natural-order input and produce bit-reversed output; the
+permutation has to live somewhere.)
+
+\begin{trapbox}
+Bit-reversal only produces a clean reshuffle when $N$ is a power of two. For other sizes,
+$N$ is factored differently (a length-$12$ transform might split as $3\times 4$), the
+``digit-reversal'' is in a mixed radix, and the butterflies are larger. Good libraries
+(FFTW, the FFT in NumPy/SciPy, KissFFT, CMSIS-DSP) handle all this; you almost never
+write bit-reversal yourself. But knowing it exists explains why FFT speed and even
+\emph{accuracy} can depend sharply on whether $N$ is $1024$ versus $1023$ or $1000$.
+\end{trapbox}
+
+\begin{historybox}
+The 1965 paper by James \textbf{Cooley} (IBM) and John \textbf{Tukey} (Princeton/Bell
+Labs), ``An algorithm for the machine calculation of complex Fourier series,'' set off the
+explosion -- partly because it arrived just as digital computers became widespread, and
+partly, in the Cold War context, because fast spectra mattered for detecting nuclear
+tests from seismic data. But the core idea is far older. Carl Friedrich \textbf{Gauss}
+wrote down an equivalent doubling trick around \textbf{1805} -- before Fourier's own 1807
+work on the series that bear his name -- to interpolate the orbits of the asteroids Pallas
+and Juno. Gauss's note was in neglected Latin and unpublished in his lifetime; the method
+was reinvented in pieces by Runge, Danielson, Lanczos and others over the next 150 years.
+The lesson the field took to heart: the FFT was ``the most important numerical algorithm
+of our lifetime'' (Gilbert Strang), and it had been hiding in plain sight for a century
+and a half. See Cooley \& Tukey, \emph{Math.\ Comp.}\ \textbf{19} (1965), and Heideman,
+Johnson \& Burrus, ``Gauss and the history of the FFT'' (1984).
+\end{historybox}
+
+\section{It computes the same numbers -- a small proof and a check}
+\label{ch09:exact}
+
+The FFT is \emph{exact}: up to floating-point rounding it returns the identical $X[k]$ as
+\eqref{ch09:dft-defn}. We already proved the inductive step -- \eqref{ch09:split-2} and
+the butterfly \eqref{ch09:butterfly-lo}--\eqref{ch09:butterfly-hi} are algebraic
+identities, not approximations -- and the base case (length-$1$ DFT is the identity) is
+immediate. By induction on $\log_2 N$, the recursion computes the DFT for every
+power-of-two $N$. Let us verify by hand on the smallest interesting case.
+
+\begin{example}[A 4-point FFT by hand]
+\label{ch09:ex-n4}
+Take $x = (1,\,2,\,0,\,1)$, so $N=4$ and $W_4 = e^{-\jj\pi/2} = -\jj$. The powers we need
+are $W_4^0=1$, $W_4^1=-\jj$.
+
+\emph{Split.} Even samples $e=(x[0],x[2])=(1,0)$; odd samples $o=(x[1],x[3])=(2,1)$.
+
+\emph{Two length-2 DFTs} (a length-2 DFT is just sum and difference, since $W_2 = -1$):
+\[
+E = (\,e[0]+e[1],\ e[0]-e[1]\,) = (1,\,1), \qquad
+O = (\,o[0]+o[1],\ o[0]-o[1]\,) = (3,\,1).
+\]
+\emph{Combine with butterflies}, using $W_4^0=1$, $W_4^1=-\jj$, for $k=0,1$:
+\begin{align*}
+X[0] &= E[0] + W_4^0 O[0] = 1 + 3 = 4, &
+X[2] &= E[0] - W_4^0 O[0] = 1 - 3 = -2,\\
+X[1] &= E[1] + W_4^1 O[1] = 1 + (-\jj)(1) = 1 - \jj, &
+X[3] &= E[1] - W_4^1 O[1] = 1 + \jj .
+\end{align*}
+So $X = (4,\ 1-\jj,\ -2,\ 1+\jj)$. Check against the direct sum: $X[0]=\sum x[n]=4$;
+good. And $X[3]=\overline{X[1]}$ as it must for a real input (next section). Plugging into
+\eqref{ch09:dft-defn} directly gives the same four numbers, with a fraction of the
+arithmetic of the brute-force $4^2=16$ multiplies.
+\end{example}
+
+\section{Using a real FFT: reading the output}
+\label{ch09:reading}
+
+Knowing how the FFT works is half the battle; reading its output correctly is the other
+half, and it trips up nearly everyone at first. Suppose you sample a real signal at rate
+$f_s$ (samples per second) and take an $N$-point FFT. Here is what the $N$ output numbers
+mean.
+
+\begin{focusbox}
+\textbf{Frequency of bin $k$.} Output $X[k]$ measures the component at frequency
+\begin{equation}
+\label{ch09:bin-freq}
+f_k \;=\; k\,\frac{f_s}{N} \quad\text{Hz}, \qquad k = 0, 1, \dots, N-1 .
+\end{equation}
+The spacing between bins is $\Delta f = f_s/N$, the \emph{frequency resolution}. Bin $0$
+is DC (the average / zero frequency); bin $1$ is one cycle per window; and so on.
+\end{focusbox}
+
+\begin{trapbox}
+\textbf{The top half is negative frequencies.} For $k > N/2$, bin $k$ represents the
+frequency $f_k - f_s$, i.e.\ a \emph{negative} frequency $-(N-k)f_s/N$. Equivalently,
+$X[N-k] = \overline{X[k]}$ for a real input -- the spectrum is conjugate-symmetric, so
+the upper half is a mirror image of the lower half carrying no new information. Bin
+$N/2$ is the Nyquist frequency $f_s/2$. If you plot all $N$ magnitudes you will see a
+mirror; only bins $0$ through $N/2$ are independent for real data.
+\end{trapbox}
+
+Because of that symmetry, real-input FFTs have a dedicated, cheaper routine
+(\texttt{numpy.fft.rfft}) that returns only the $\floor{N/2} + 1$ non-redundant bins,
+$k = 0 \dots N/2$. Use it for sensor data -- it is faster and removes the temptation to
+double-count energy. Figure \ref{ch09:fig-spectrum} shows a worked magnitude spectrum.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=5.6cm,
+  xlabel={frequency (Hz)}, ylabel={magnitude $\abs{X[k]}$ (a.u.)},
+  xmin=0, xmax=64, ymin=0, ymax=1.15,
+  ytick={0,0.5,1.0},
+  xtick={0,8,12,24,32,50,64},
+  grid=both, grid style={gray!16},
+  axis lines=box,
+  ybar, bar width=2pt,
+]
+% f_s = 128 Hz, N = 128, so bin spacing = 1 Hz; plot only 0..64 (rfft range).
+\addplot+[draw=sigblue, fill=fillsig] coordinates {
+ (0,0.30)(1,0.03)(2,0.02)(3,0.04)(4,0.02)(5,0.03)(6,0.02)(7,0.03)
+ (8,0.04)(9,0.05)(10,0.06)(11,0.18)(12,1.00)(13,0.20)(14,0.05)(15,0.03)
+ (16,0.02)(17,0.03)(18,0.02)(19,0.03)(20,0.02)(21,0.03)(22,0.04)(23,0.12)
+ (24,0.50)(25,0.13)(26,0.04)(27,0.03)(28,0.02)(29,0.03)(30,0.02)(31,0.03)
+ (32,0.02)(33,0.03)(34,0.02)(35,0.03)(36,0.02)(37,0.03)(38,0.02)(39,0.03)
+ (40,0.02)(41,0.03)(42,0.02)(43,0.03)(44,0.02)(45,0.03)(46,0.02)(47,0.03)
+ (48,0.02)(49,0.03)(50,0.07)(51,0.03)(52,0.02)(53,0.03)(54,0.02)(55,0.03)
+ (56,0.02)(57,0.03)(58,0.02)(59,0.03)(60,0.02)(61,0.03)(62,0.02)(63,0.02)(64,0.02)
+};
+\end{axis}
+\end{tikzpicture}
+\caption{Magnitude spectrum (\texttt{rfft}) of a $1\,$s record sampled at $f_s=128$ Hz,
+$N=128$, so each bin is $1$ Hz wide. Two real tones appear as peaks at $12$ Hz
+(amplitude $1$) and $24$ Hz (amplitude $0.5$); the bar at $0$ Hz is a DC offset, and the
+small clutter is broadband noise. Only bins $0$ to $N/2 = 64$ are shown because the rest
+are the conjugate mirror.}
+\label{ch09:fig-spectrum}
+\end{figure}
+
+\subsection*{Amplitude calibration}
+
+A raw FFT bin is \emph{not} the amplitude of the sinusoid. For a real cosine of
+amplitude $A$ that lands exactly on bin $k$ (with $0 < k < N/2$), the FFT puts magnitude
+$A\,N/2$ in bin $k$ (and the same in its mirror $N-k$). To recover $A$ from a one-sided
+spectrum, scale by $2/N$:
+\begin{equation}
+\label{ch09:amp-cal}
+A \;\approx\; \frac{2}{N}\,\bigl|X[k]\bigr| \quad (0 < k < N/2),
+\qquad
+A_{\text{DC}} = \frac{1}{N}\,\abs{X[0]},
+\qquad
+A_{\text{Nyq}} = \frac{1}{N}\,\abs{X[N/2]} .
+\end{equation}
+The DC and Nyquist bins use $1/N$ rather than $2/N$ because they have no separate mirror
+partner. If you forget the $2/N$ you will report amplitudes off by a factor of $N/2$ --
+the single most common FFT-reading mistake.
+
+\section{Zero-padding and the difference between resolution and interpolation}
+\label{ch09:zeropad}
+
+A frequent move is \emph{zero-padding}: appending zeros to your signal before the FFT,
+usually to reach a power-of-two length or to get more output points. It is useful, but it
+is widely misunderstood, so let us be precise about what it does and does not buy.
+
+\begin{whybox}
+Zero-padding $x$ from length $N$ to length $M > N$ does \textbf{not} add information --
+the zeros carry none. What it does is evaluate the \emph{same} underlying
+continuous-frequency spectrum (the DTFT of your finite record) at more, finely spaced
+points. The true frequency resolution -- your ability to \emph{separate} two nearby
+tones -- is fixed by the duration of the real (nonzero) data, $\Delta f \approx f_s/N$.
+Zero-padding gives a smoother, denser plot (interpolation), not sharper peaks. Two tones
+unresolved at length $N$ stay unresolved no matter how many zeros you add.
+\end{whybox}
+
+\begin{intuitionbox}
+Think of the finite record as the true infinite spectrum convolved with a
+$\sinc$-shaped window response whose width is set by the record length. Zero-padding
+samples that fixed sinc shape more densely. You see the shape better -- handy for
+locating a peak precisely or for making a pretty curve -- but you cannot make the sinc
+itself narrower by padding. To narrow it you must collect more \emph{real} data (longer
+$N$) or trade resolution for a cleaner window (Chapter on windowing).
+\end{intuitionbox}
+
+\begin{trapbox}
+\textbf{Two real, distinct uses of zero-padding, often confused:}
+\begin{enumerate}
+\item \emph{Spectral interpolation / nicer plots:} pad to $2N$, $4N$, $\dots$ to draw a
+denser magnitude curve or to pin down a peak frequency between bins.
+\item \emph{Linear convolution via the FFT:} to convolve two sequences correctly with
+the FFT you must zero-pad \emph{both} to at least the sum of their lengths minus one,
+otherwise the circular convolution the DFT computes will wrap around and corrupt the
+result. (We return to this in the convolution chapter.)
+\end{enumerate}
+Reaching a power-of-two length for speed is a happy by-product of (1), not a third
+purpose.
+\end{trapbox}
+
+\section{A short NumPy example}
+\label{ch09:numpy}
+
+Talk is cheap; here is a complete, correct script that synthesizes two tones, transforms
+them, and reads amplitudes back using the calibration of \eqref{ch09:amp-cal}.
+
+\begin{lstlisting}[language=Python, caption={Computing and reading a real FFT.}, label={ch09:lst-numpy}]
+import numpy as np
+
+fs = 128.0          # sampling rate, Hz
+N  = 128            # number of samples (power of two -> fast)
+t  = np.arange(N) / fs
+
+# Signal: 1.0 amplitude at 12 Hz + 0.5 amplitude at 24 Hz + DC offset
+x = 0.3 + 1.0*np.cos(2*np.pi*12*t) + 0.5*np.cos(2*np.pi*24*t)
+
+X     = np.fft.rfft(x)                 # only non-redundant bins: 0..N/2
+freqs = np.fft.rfftfreq(N, d=1/fs)     # frequency of each bin, in Hz
+
+# Amplitude calibration: 2/N for interior bins, 1/N for DC and Nyquist
+amp = (2.0/N) * np.abs(X)
+amp[0] /= 2.0                          # DC bin has no mirror
+if N % 2 == 0:
+    amp[-1] /= 2.0                     # Nyquist bin has no mirror
+
+# Report the strongest few bins
+peaks = np.argsort(amp)[::-1][:3]
+for k in sorted(peaks):
+    print(f"{freqs[k]:6.1f} Hz   amplitude ~ {amp[k]:.3f}")
+
+# Verify the FFT matches the brute-force DFT exactly (to rounding)
+n = np.arange(N)
+F = np.exp(-2j*np.pi*np.outer(n, n)/N)      # the DFT matrix
+X_full = np.fft.fft(x)
+assert np.allclose(X_full, F @ x)           # same numbers, ~N^2 vs N log N work
+print("FFT matches direct DFT:", np.allclose(X_full, F @ x))
+\end{lstlisting}
+
+Running it prints frequencies near $0.0$, $12.0$, and $24.0$ Hz with amplitudes near
+$0.3$, $1.0$, and $0.5$ -- the very signal we put in -- and confirms the FFT equals the
+dense DFT matrix product. Two small but vital habits live in that listing: use
+\texttt{rfftfreq} so you never hand-compute bin frequencies, and never trust a bin
+magnitude as an amplitude until you have applied the $2/N$ scale.
+
+\begin{labbox}
+Modify the listing to time both methods on $N = 4096$:
+\begin{lstlisting}[language=Python]
+import time
+x = np.random.randn(4096)
+n = np.arange(4096); F = np.exp(-2j*np.pi*np.outer(n,n)/4096)
+t0=time.perf_counter(); _=F@x;            t_dft=time.perf_counter()-t0
+t0=time.perf_counter(); _=np.fft.fft(x);  t_fft=time.perf_counter()-t0
+print(f"DFT {t_dft*1e3:.1f} ms   FFT {t_fft*1e3:.3f} ms   "
+      f"speedup {t_dft/t_fft:.0f}x")
+\end{lstlisting}
+You should see the FFT beat the matrix multiply by two to three orders of magnitude --
+and that is against NumPy's heavily optimized BLAS, which makes the matrix multiply far
+faster than a textbook triple loop would be. Against naive C the gap is larger still.
+\end{labbox}
+
+\section{The inverse FFT comes for free}
+\label{ch09:ifft}
+
+The inverse DFT,
+\begin{equation}
+\label{ch09:idft}
+x[n] = \frac{1}{N}\sum_{k=0}^{N-1} X[k]\,W_N^{-kn},
+\end{equation}
+differs from the forward transform only by a sign in the exponent and a $1/N$ scale. So
+the \emph{same} butterfly machinery computes it -- conjugate the inputs, run a forward
+FFT, conjugate the outputs, and divide by $N$; or simply use the library's
+\texttt{ifft}. The practical consequence is large: any operation easy in the frequency
+domain (filtering, convolution, correlation) becomes a round trip -- FFT, multiply,
+inverse FFT -- each leg $O(N\log N)$. This ``transform, operate, transform back'' pattern
+is the workhorse of the rest of the book.
+
+\begin{applicationbox}
+\textbf{Fast convolution.} Filtering a length-$N$ signal with a length-$M$ kernel costs
+$O(NM)$ by direct convolution. Pad both to $N+M-1$, FFT each, multiply the spectra
+pointwise, and inverse-FFT: total $O((N+M)\log(N+M))$. For long filters this is
+dramatically faster, and it is how audio reverb plugins convolve a signal with a
+multi-second impulse response in real time. The convolution theorem (later chapter) is
+what licenses the pointwise multiply.
+\end{applicationbox}
+
+\section{Toward the wrist tracker}
+\label{ch09:wrist}
+
+\begin{goalbox}
+Our gesture controller will carry an inertial measurement unit (IMU: accelerometer plus
+gyroscope) on the forearm, and we want to react to motion in real time -- ideally with
+latency low enough to feel instant while playing. A tremor, a tap, a wrist flick, the
+rhythmic shake of a shaker gesture: these have signatures in the \emph{frequency} content
+of the IMU streams, not just their raw values. The plan is to buffer a short window of
+samples, FFT it, and read features off the spectrum (dominant frequency, band energies).
+
+Make it concrete. Sample the IMU at $f_s = 200$ Hz and use a window of $N = 256$ samples.
+Then:
+\begin{itemize}
+\item Window duration $= N/f_s = 256/200 = 1.28$ s of history per FFT.
+\item Bin spacing $\Delta f = f_s/N = 200/256 \approx 0.78$ Hz -- fine enough to tell a
+$3$ Hz tremor from a $5$ Hz one.
+\item Useful band: $0$ to Nyquist $= f_s/2 = 100$ Hz, far above human limb motion (mostly
+under $20$ Hz), so we have generous headroom and can even downsample.
+\item Cost: $\tfrac{N}{2}\log_2 N = 128 \times 8 = 1024$ butterflies -- a few thousand
+floating-point operations, trivial for an FFT a few hundred times per second even on a
+Cortex-M microcontroller. The naive DFT at $N^2 = 65536$ would be far heavier and might
+miss the real-time budget.
+\end{itemize}
+If $1.28$ s of latency is too sluggish (it is, for percussive triggers), shrink the
+window or slide it with overlap; that is the short-time Fourier transform of the next
+chapter. The FFT is what makes any of this affordable on a wrist-worn battery device.
+\end{goalbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=4.6cm,
+  xlabel={time (s)}, ylabel={accel.\ (a.u.)},
+  domain=0:1.28, samples=180,
+  xmin=0, xmax=1.28, ymin=-2.2, ymax=2.2,
+  xtick={0,0.32,0.64,0.96,1.28},
+  grid=both, grid style={gray!16},
+  axis lines=box,
+]
+% a 4 Hz shaker gesture plus a small higher-frequency wobble
+\addplot[sigblue, very thick] {1.4*sin(deg(2*pi*4*x)) + 0.35*sin(deg(2*pi*9*x))};
+\end{axis}
+\end{tikzpicture}
+\caption{A simulated forearm accelerometer trace during a rhythmic shake: a strong $4$ Hz
+oscillation with a weaker $9$ Hz wobble, over one $N=256$ window at $f_s=200$ Hz
+($1.28$ s). The FFT of this block turns the tangle of wiggles into two clean peaks, from
+which the controller reads the dominant gesture rate.}
+\label{ch09:fig-imu}
+\end{figure}
+
+The frequency picture is what makes this tractable: Figure \ref{ch09:fig-imu} shows a raw
+IMU trace whose rhythm is obvious to a spectrum but awkward to read off the time series.
+
+\begin{goalbox}
+\textbf{Hard limits -- read this twice.} An FFT of a wrist or forearm IMU tells you
+about the \emph{gross motion of the whole limb}: is it shaking, at what rate, how
+vigorously, and coarse posture changes. It \emph{cannot} recover individual finger joint
+angles. The kinematic information about finger flexion simply is not present in the
+arm-mounted accelerometer/gyro signal in any reliable form; no transform conjures
+information the sensor never captured. To sense fingers you need a different modality:
+surface electromyography (sEMG) or force myography (FMG) over the forearm muscles can
+discriminate a handful of discrete finger/grip gestures (commercial armbands such as the
+former Myo, and the research behind Meta's wrist sEMG work, demonstrate this), and
+\emph{continuous} finger pose realistically needs sensors on the fingers themselves
+(instrumented gloves or rings). So: FFT on the IMU is excellent for rhythm, taps, flicks,
+and activity state -- treat finger-level control as a separate, harder problem requiring
+EMG/FMG or finger-mounted sensing, and say so plainly in any demo.
+\end{goalbox}
+
+\begin{buildbox}
+On an Arduino-class board, a fixed-point or float radix-2 FFT is cheap if you respect a
+few rules.
+\begin{itemize}
+\item \textbf{Pick a power-of-two window} ($128$, $256$, $512$). Non-power-of-two sizes
+drag in slower mixed-radix code or padding.
+\item \textbf{Use a vendor library, not your own bit-reversal.} On ARM Cortex-M, ARM's
+\texttt{CMSIS-DSP} provides \texttt{arm\_rfft\_fast\_f32} -- a tuned real FFT with the
+twiddle tables baked in. On an ESP32, the ESP-DSP library has equivalents.
+\item \textbf{Remove DC first.} Subtract the running mean of the accelerometer before the
+FFT, or bin $0$ will dominate and swamp the motion bands you care about.
+\item \textbf{Window the block} (Hann) before transforming to reduce spectral leakage
+from the abrupt block edges; this matters more than zero-padding for clean peaks.
+\item \textbf{Budget the memory.} A $256$-point float FFT needs roughly $256$ complex
+words of scratch plus a twiddle table -- a few kilobytes, fine on most M-class parts.
+\end{itemize}
+A practical loop: fill a $256$-sample ring buffer at $200$ Hz, every $64$ new samples copy
+it out, remove mean, apply Hann, \texttt{arm\_rfft\_fast\_f32}, take magnitude, then
+classify from band energies. That overlap gives a fresh spectrum every $64/200 = 0.32$ s
+while keeping the $0.78$ Hz resolution of a $256$-point window.
+\end{buildbox}
+
+\section{Practical notes and gotchas}
+\label{ch09:practical}
+
+A short field guide to the mistakes people actually make.
+
+\begin{itemize}
+\item \textbf{Spectral leakage.} A tone whose frequency falls \emph{between} bins does
+not sit in one bin; its energy smears across neighbors (the sinc skirts of the window).
+Apply a window function (Hann, Hamming, Blackman) before the FFT to suppress the side
+lobes -- at the cost of slightly wider main lobes. This is a resolution-versus-leakage
+trade, covered fully in the windowing chapter.
+\item \textbf{Power spectrum scaling.} For energy/power, square the magnitude and apply
+the right normalization for your window; do not compare raw $\abs{X[k]}^2$ across
+different window functions or lengths without renormalizing.
+\item \textbf{Real vs.\ complex transform.} For real sensor data use \texttt{rfft}; it is
+about twice as fast and returns exactly the non-redundant half. Only use the full complex
+\texttt{fft} when your data is genuinely complex (e.g.\ IQ radio samples).
+\item \textbf{In-place and ordering.} If you call a low-level FFT, know whether it expects
+or returns bit-reversed order, and whether it overwrites the input. High-level libraries
+hide this; embedded ones often do not.
+\item \textbf{Numerical accuracy.} The FFT is not only faster than the naive DFT, it is
+usually \emph{more accurate}: $O(\log N)$ rounding steps accumulate per output instead of
+$O(N)$ in the long naive sum. Speed and accuracy point the same way here.
+\end{itemize}
+
+\begin{recoverybox}
+The whole chapter in five beats: (1) the DFT is an $N\times N$ matrix multiply, $O(N^2)$.
+(2) The twiddle factor's half-turn symmetry means a size-$N$ DFT contains two size-$N/2$
+DFTs. (3) Splitting input by even/odd and recombining with a butterfly turns that into
+$O(N\log N)$. (4) The recursion's index shuffle is bit-reversal. (5) To \emph{use} an
+FFT: bin $k$ sits at $kf_s/N$ Hz, the top half mirrors the bottom for real data, scale by
+$2/N$ for amplitude, and zero-padding interpolates the plot without adding resolution.
+\end{recoverybox}
+
+\section{Exercises}
+\label{ch09:exercises}
+
+\begin{exercise}
+\label{ch09:ex-count}
+For $N = 4096$, compute the exact number of complex multiplications used by (a) the naive
+DFT ($N^2$) and (b) the radix-2 FFT ($\tfrac{N}{2}\log_2 N$). What is the ratio? If one
+complex multiply takes $5$ ns, estimate the wall-clock time of each.
+\end{exercise}
+
+\begin{exercise}
+\label{ch09:ex-byhand}
+Compute the $4$-point DFT of $x = (0,1,2,3)$ by hand using the radix-2 split of Section
+\ref{ch09:split} (find $E$, $O$, then the butterflies). Verify $X[0]$ equals the sum of
+the samples and check conjugate symmetry $X[3]=\overline{X[1]}$.
+\end{exercise}
+
+\begin{exercise}
+\label{ch09:ex-bitrev}
+Write out the bit-reversal permutation for $N = 16$ (a $4$-bit index). Which input index
+ends up in slot $9$? Confirm your answer by reversing the bits of $9 = 1001_2$.
+\end{exercise}
+
+\begin{exercise}
+\label{ch09:ex-symmetry}
+Prove that if $x[n]$ is real then $X[N-k] = \overline{X[k]}$. Start from the DFT
+definition \eqref{ch09:dft-defn} and use $W_N^{(N-k)n} = \overline{W_N^{kn}}$. What does
+this say about how many of the $N$ outputs are independent?
+\end{exercise}
+
+\begin{exercise}
+\label{ch09:ex-binfreq}
+You sample at $f_s = 8$ kHz and take a $1024$-point FFT. (a) What frequency does bin $200$
+represent? (b) What is the bin spacing $\Delta f$? (c) Which bin is closest to a $1$ kHz
+tone, and what is the residual error in Hz?
+\end{exercise}
+
+\begin{exercise}
+\label{ch09:ex-amp}
+A real cosine of amplitude $3.0$ at exactly $50$ Hz is sampled at $f_s = 200$ Hz, $N =
+200$. (a) Which bin does it land in? (b) What magnitude $\abs{X[k]}$ do you expect in that
+bin before calibration? (c) Apply \eqref{ch09:amp-cal} to recover the amplitude.
+\end{exercise}
+
+\begin{exercise}
+\label{ch09:ex-zeropad}
+You have $N = 100$ samples of a signal sampled at $f_s = 1000$ Hz containing two tones at
+$210$ Hz and $215$ Hz. (a) What is $\Delta f$? Are the tones resolved? (b) If you
+zero-pad to $1000$ points, does the FFT now separate them into two distinct peaks?
+Explain in terms of resolution versus interpolation. (c) What \emph{would} let you
+resolve them?
+\end{exercise}
+
+\begin{exercise}
+\label{ch09:ex-recurrence}
+The FFT satisfies $T(N) = 2T(N/2) + cN$ for some constant $c$ (the $cN$ is the butterfly
+combine step). Solve this recurrence by unrolling it $\log_2 N$ times and show the
+solution is $T(N) = cN\log_2 N + T(1)\cdot N$. Identify which term dominates for large
+$N$.
+\end{exercise}
+
+\begin{exercise}
+\label{ch09:ex-numpy}
+Adapt the listing in Section \ref{ch09:numpy} to a noisy signal: add
+\texttt{0.2*np.random.randn(N)} to \texttt{x}. Does the peak detection still find the two
+tones? Now reduce the tone amplitudes until a peak disappears into the noise floor. What
+does this tell you about detecting weak gestures in a noisy IMU stream?
+\end{exercise}
+
+\begin{exercise}
+\label{ch09:ex-wrist}
+For the wrist tracker, you want at least $0.5$ Hz frequency resolution and you sample the
+IMU at $f_s = 200$ Hz. (a) What is the minimum window length $N$ (round up to a power of
+two)? (b) How many seconds of latency does that window impose? (c) If that latency is too
+high for triggering a drum hit, name two changes (from this chapter and the next) that
+reduce perceived latency, and state what each costs.
+\end{exercise}
+
+\begin{exercise}
+\label{ch09:ex-limits}
+In two or three sentences, explain to a teammate why running an FFT on the forearm IMU
+\emph{cannot} give per-finger joint angles, and what sensing modality you would add if
+the application genuinely needed finger-level control. Be specific about the limitation,
+not vague.
+\end{exercise}
