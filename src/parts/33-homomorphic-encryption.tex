@@ -1,0 +1,496 @@
+\chapter{Homomorphic Encryption}
+
+Everything you have built so far treats a ciphertext as opaque. You encrypt, you ship the bytes somewhere, and the only useful thing anyone without the key can do with them is store them and hand them back unchanged. Decrypt, compute, re-encrypt: that is the standard pattern, and it has a glaring weakness. The moment you want to \emph{do} something with the data --- add two salaries, search a database, run a spam filter, train a model --- you have to decrypt first. The data sits in the clear on whatever machine does the work, and that machine, and its operator, and anyone who breaks into it, sees your secrets.
+
+Homomorphic encryption breaks that pattern. It lets a party who does \emph{not} hold the key take ciphertexts and combine them so that the result, when finally decrypted by the key holder, equals the answer to a computation on the original plaintexts. The cloud computes on data it cannot read. That sentence sounded like science fiction until 2009, and the journey from ``a little arithmetic'' to ``arbitrary computation'' is one of the great stories in modern cryptography. This chapter walks that road: the partially homomorphic schemes you already half-know (RSA and ElGamal multiply, Paillier adds), then the conceptual leap to \emph{fully} homomorphic encryption, Gentry's bootstrapping idea, what it costs, and where it is actually used.
+
+\chapterline
+
+\section{Computing on ciphertext: the threat model}
+\label{ch33:threat-model}
+
+Picture the usual cast, but with a new job for Eve. Alice has private data --- medical records, a tax return, a genome. She wants Bob, who runs a powerful server in the cloud, to compute some function $f$ of her data: a risk score, a search result, a prediction. Alice does not trust Bob with the cleartext. The classical answer is ``send it over TLS and hope Bob behaves,'' but Bob still sees the plaintext the instant it arrives. We want something stronger.
+
+\begin{focusbox}
+The goal of homomorphic encryption: Alice encrypts her data, sends only ciphertexts to Bob, Bob computes on the ciphertexts \emph{without ever decrypting}, and returns a ciphertext of the answer. Alice decrypts and gets $f(\text{data})$. Bob learns nothing about the data or, ideally, the answer.
+\end{focusbox}
+
+Make the contract precise. A public-key encryption scheme $(\Gen, \Enc, \Dec)$ is \emph{homomorphic} for an operation $\circ$ on plaintexts if there is a corresponding operation $\star$ on ciphertexts such that for all messages $m_1, m_2$,
+\[
+  \Dec_{sk}\bigl(\Enc_{pk}(m_1) \star \Enc_{pk}(m_2)\bigr) \;=\; m_1 \circ m_2 .
+\]
+The party doing $\star$ needs only the public key (or not even that), never $sk$. If $\circ$ is multiplication we call the scheme \emph{multiplicatively homomorphic}; if it is addition, \emph{additively homomorphic}. If a single scheme supports \emph{both} addition and multiplication of plaintexts --- which is enough to build any circuit --- it is \emph{fully homomorphic}.
+
+\begin{intuitionbox}
+Think of a locked glovebox with built-in gloves, the kind used to handle dangerous chemicals. You can reach in with the gloves and rearrange what is inside without opening the box and without touching it directly. The contents stay sealed; you manipulate them through the barrier. Homomorphic encryption is the cryptographic glovebox: Bob's hands (his computation) reach into the sealed ciphertext and rearrange the plaintext indirectly, but the box never opens for him.
+\end{intuitionbox}
+
+What is the threat model? In the baseline we assume Bob is curious but procedure-following: he runs the agreed computation correctly but will happily read anything he can. Security means semantic security / IND-CPA, exactly as in Chapter~19 and Chapter~20 --- ciphertexts must leak nothing about plaintexts to a $\PPT$ adversary, even one who can request encryptions of chosen messages. Note one immediate consequence: \textbf{a homomorphic scheme can never be IND-CCA secure}, because the homomorphic operation \emph{is} a way to maul ciphertexts. If you can turn $\Enc(m)$ into $\Enc(2m)$, you have a decryption-oracle lever. Malleability is a feature here, not a bug, and it costs us the strongest security notion. We will return to this tension.
+
+\begin{connectionbox}
+Everything in this chapter is built from the number theory of Chapters~3--6 and the public-key hardness assumptions of Chapters~18--21: factoring, discrete log, and --- for the fully homomorphic schemes --- lattice problems that also power the post-quantum cryptography of Chapter~35. The ``noise budget'' bookkeeping later in the chapter is, at heart, a probability calculation; the companion probability book's tail-bound chapter is the right place to sharpen the intuition for why noise growth is the central enemy.
+\end{connectionbox}
+
+\section{Partially homomorphic: schemes you already know}
+\label{ch33:partial}
+
+You have already built two homomorphic schemes without anyone calling them that. Let us name the structure.
+
+\subsection{Textbook RSA multiplies}
+\label{ch33:rsa-mult}
+
+Recall plain RSA from Chapter~19: public key $(n,e)$, and $\Enc(m) = m^e \bmod n$. Multiply two ciphertexts:
+\[
+  \Enc(m_1)\cdot \Enc(m_2) \;=\; m_1^e\, m_2^e \;=\; (m_1 m_2)^e \;=\; \Enc(m_1 m_2) \pmod n .
+\]
+The product of the ciphertexts is a valid ciphertext of the product of the plaintexts. RSA is multiplicatively homomorphic, for free, because exponentiation distributes over multiplication.
+
+\begin{example}[RSA homomorphism by hand]
+\label{ch33:rsa-example}
+Take the small RSA key $p=11$, $q=13$, so $n=143$ and $\varphi(n)=120$. Pick $e=7$ (coprime to $120$). The inverse $d = 7^{-1} \bmod 120 = 103$, since $7\cdot 103 = 721 = 6\cdot 120 + 1$.
+
+Encrypt $m_1 = 5$: $5^2=25$, $5^4 = 625 \equiv 53$, $5^6 = 5^4\cdot 5^2 \equiv 53\cdot 25 = 1325 \equiv 38$, so $5^7 \equiv 38\cdot 5 = 190 \equiv 47 \pmod{143}$. Thus $\Enc(5) = 47$.
+
+Encrypt $m_2 = 4$: $4^2=16$, $4^4 = 256 \equiv 113$, $4^6 = 113\cdot 16 = 1808 \equiv 92$, so $4^7 \equiv 92\cdot 4 = 368 \equiv 82 \pmod{143}$. Thus $\Enc(4) = 82$.
+
+Multiply the ciphertexts: $47 \cdot 82 = 3854 = 26\cdot 143 + 136 \equiv 136 \pmod{143}$.
+
+By the homomorphism this must equal $\Enc(20)$. Check directly: $20^2 = 400 \equiv 114$, $20^4 \equiv 114^2 = 12996 \equiv 126$, $20^6 = 126\cdot 114 = 14364 \equiv 64$, $20^7 \equiv 64\cdot 20 = 1280 \equiv 136 \pmod{143}$. The two agree: $\Enc(5)\cdot\Enc(4) \equiv \Enc(20) \pmod{143}$.
+\end{example}
+
+\begin{trapbox}
+Arithmetic mod $143$ by hand is error-prone, and the moral is exactly that the \emph{algebraic identity is the ground truth}, while your hand computation is the thing to reconcile to it. If a product of ciphertexts does not match the direct encryption of the product, recheck the small powers, not the theorem. The structural fact --- $(m_1 m_2)^e = m_1^e m_2^e$ --- cannot fail.
+\end{trapbox}
+
+Textbook RSA is multiplicatively homomorphic, full stop. But it is also deterministic, hence \emph{not} IND-CPA secure (equal plaintexts give equal ciphertexts), which is why nobody deploys textbook RSA --- and the homomorphism is precisely why padded RSA (OAEP) deliberately destroys it, scrambling $m$ before exponentiation so that no algebraic relation between plaintexts survives in the ciphertexts.
+
+\subsection{ElGamal multiplies, with randomness}
+\label{ch33:elgamal-mult}
+
+ElGamal (Chapter~20) fixes RSA's determinism and stays multiplicative. In a group $\G$ of prime order $q$ with generator $g$, secret key $x$, public key $h = g^x$, encryption of $m\in\G$ picks fresh randomness $r$ and outputs the pair
+\[
+  \Enc(m) = (g^r,\; m\cdot h^r).
+\]
+Multiply two ciphertexts componentwise:
+\[
+  (g^{r_1}, m_1 h^{r_1}) \star (g^{r_2}, m_2 h^{r_2}) = (g^{r_1+r_2},\; m_1 m_2\, h^{r_1+r_2}) = \Enc(m_1 m_2;\, r_1+r_2).
+\]
+A clean, randomized, multiplicatively homomorphic, IND-CPA-secure scheme (under the Decisional Diffie-Hellman assumption). This is genuinely useful: it underlies the homomorphic tallying in many cryptographic voting systems, where you want to combine encrypted votes without decrypting individual ballots.
+
+\begin{trapbox}
+ElGamal multiplies plaintexts, but for voting you want to \emph{add} vote counts, not multiply them. The standard fix is \emph{exponential ElGamal}: encode the message in the exponent, encrypting $g^m$ instead of $m$. Then $\Enc(g^{m_1})\star\Enc(g^{m_2}) = \Enc(g^{m_1+m_2})$, turning multiplication of ciphertexts into addition of plaintexts. The catch: to recover $m_1+m_2$ you must take a discrete log of $g^{m_1+m_2}$, which is only feasible when the total is small (e.g. vote counts up to a few million). Cute trick, real limitation.
+\end{trapbox}
+
+So we have multiplicative schemes in abundance. The harder and historically more useful direction is a clean \emph{additive} scheme with an efficient decryption that does not choke on large sums. That is Paillier.
+
+\section{Paillier: additive homomorphism done right}
+\label{ch33:paillier}
+
+\begin{historybox}
+Pascal Paillier published his cryptosystem in 1999, building on a line of ``higher-residue'' schemes (Goldwasser--Micali, Benaloh, Naccache--Stern) that encrypted a few bits at a time. Paillier's insight was to work modulo $n^2$ instead of $n$, which opens up an entire extra ``slot'' in the exponent where plaintexts can live additively. It remains the workhorse additively-homomorphic scheme in deployed systems two decades later --- private aggregation, federated analytics, threshold ECDSA wallets --- because it is simple, efficient, and IND-CPA secure under a clean assumption.
+\end{historybox}
+
+\subsection{The construction}
+\label{ch33:paillier-construction}
+
+Key generation looks like RSA at first. Pick two large primes $p,q$, set $n = pq$. Define $\lambda = \lcm(p-1, q-1)$ (Carmichael's function of $n$, the exponent of the unit group). The plaintext space is $\Zn{n}$ and ciphertexts live in $\Zns{n^2}$. Choose $g\in\Zns{n^2}$; the simple and standard choice is $g = n+1$, which we will use throughout because it makes everything explicit.
+
+\textbf{Encryption.} To encrypt $m\in\Zn{n}$, pick fresh random $r\getsr \Zns{n}$ and output
+\[
+  c = g^{m}\, r^{n} \bmod n^2 .
+\]
+With $g = n+1$, the term $g^m = (1+n)^m$ has a clean closed form. By the binomial theorem modulo $n^2$, every term with $n^2$ or higher vanishes, leaving
+\[
+  (1+n)^m = 1 + mn + \binom{m}{2}n^2 + \cdots \equiv 1 + mn \pmod{n^2}.
+\]
+So encryption is $c = (1+mn)\,r^n \bmod n^2$. The plaintext sits in the ``$mn$'' digit; the $r^n$ factor is a random $n$-th residue that masks it (its IND-CPA security rests on the Decisional Composite Residuosity assumption: telling $n$-th residues mod $n^2$ from non-residues is hard without the factorization of $n$).
+
+\textbf{Decryption.} Define the function $L(x) = (x-1)/n$, ordinary integer division (valid whenever $x\equiv 1 \pmod n$). Then
+\[
+  m = \frac{L\bigl(c^{\lambda}\bmod n^2\bigr)}{L\bigl(g^{\lambda}\bmod n^2\bigr)} \bmod n .
+\]
+
+\begin{whybox}
+Why does decryption recover $m$? Two facts. First, by Carmichael's theorem, $r^{n\lambda}\equiv 1 \pmod{n^2}$ for any $r$ coprime to $n$ (the group $\Zns{n^2}$ has exponent $n\lambda$). So raising the ciphertext to $\lambda$ kills the random factor:
+\[
+  c^{\lambda} = (1+n)^{m\lambda}\, r^{n\lambda} \equiv (1+n)^{m\lambda} \equiv 1 + m\lambda n \pmod{n^2},
+\]
+using the same binomial collapse as before. Thus $L(c^\lambda) = m\lambda \bmod n$. Second, $g^\lambda = (1+n)^\lambda \equiv 1 + \lambda n$, so $L(g^\lambda) = \lambda \bmod n$. Dividing, $m\lambda / \lambda \equiv m \pmod n$. The $\lambda$ cancels, $m$ survives.
+\end{whybox}
+
+\subsection{Why it is additive}
+\label{ch33:paillier-additive}
+
+Now the payoff. Multiply two ciphertexts:
+\[
+  c_1 c_2 = (1+n)^{m_1} r_1^n \cdot (1+n)^{m_2} r_2^n = (1+n)^{m_1+m_2}\,(r_1 r_2)^n \bmod n^2 .
+\]
+That is exactly a Paillier encryption of $m_1 + m_2 \bmod n$ with randomness $r_1 r_2$. \textbf{Multiplying ciphertexts adds plaintexts.} Two more operations fall out immediately:
+\begin{itemize}
+  \item \emph{Add a known constant} $k$: multiply $c$ by $g^k = (1+n)^k$, giving $\Enc(m+k)$.
+  \item \emph{Multiply the plaintext by a known constant} $k$: raise the ciphertext to the $k$-th power, $c^k = (1+n)^{km}(r^k)^n = \Enc(km)$.
+\end{itemize}
+So Paillier lets a server compute any \emph{affine} function $\sum a_i m_i + b$ of encrypted inputs $m_i$ using public constants $a_i, b$ --- the heart of private summation and weighted averages. It cannot multiply two \emph{encrypted} values together; that is the line between partially and fully homomorphic.
+
+\begin{example}[Paillier addition by hand]
+\label{ch33:paillier-example}
+Take $p=5$, $q=7$, so $n=35$ and $n^2 = 1225$. Then $\lambda = \lcm(4,6) = 12$. Use $g = n+1 = 36$.
+
+Encrypt $m_1 = 3$ with $r_1 = 4$: $c_1 = (1+3\cdot 35)\,4^{35} \bmod 1225 = 106 \cdot (4^{35}\bmod 1225) \bmod 1225$. Compute $4^{35}\bmod 1225$ by repeated squaring: $4^2=16$, $4^4 = 256$, $4^8 = 65536 \equiv 611$, $4^{16}\equiv 611^2 = 373321 \equiv 921$, $4^{32}\equiv 921^2 = 848241 \equiv 541$. Then $4^{35} = 4^{32}\cdot 4^2\cdot 4 \equiv 541\cdot 16\cdot 4 = 541\cdot 64 = 34624 \equiv 34624 - 28\cdot 1225 = 324$. So $c_1 = 106\cdot 324 = 34344 \equiv 34344 - 28\cdot 1225 = 44$.
+
+Encrypt $m_2 = 6$ with $r_2 = 2$: $c_2 = (1+6\cdot 35)\,2^{35}\bmod 1225 = 211\cdot(2^{35}\bmod 1225)$. Note $2^{35} = 4^{17}\cdot 2$; we have $4^{16}\equiv 921$, so $4^{17} = 921\cdot 4 = 3684 \equiv 9$, and $2^{35} = 9\cdot 2 = 18$. So $c_2 = 211\cdot 18 = 3798 \equiv 3798 - 3\cdot 1225 = 123$.
+
+\textbf{Homomorphic add:} $c_1 c_2 = 44\cdot 123 = 5412 \equiv 5412 - 4\cdot 1225 = 512 \pmod{1225}$. This should decrypt to $m_1 + m_2 = 9$.
+
+\textbf{Decrypt} $c = 512$. We need $L(c^{12}\bmod 1225)/L(g^{12}\bmod 1225) \bmod 35$. First $g^{12} = 36^{12} = (1+35)^{12}\equiv 1 + 12\cdot 35 = 421 \pmod{1225}$, so $L(g^{12}) = (421-1)/35 = 12$. Next $c^{12}\bmod 1225$ should equal $1 + 9\cdot 12\cdot 35 \bmod 1225 = 1 + 3780 \bmod 1225$; since $3780 = 3\cdot 1225 + 105$, we get $c^{12}\equiv 106$, so $L(c^{12}) = (106-1)/35 = 3$. Finally $m = 3 / 12 \bmod 35$. We need $12^{-1}\bmod 35$: $12\cdot 3 = 36\equiv 1$, so $12^{-1} = 3$, and $m = 3\cdot 3 = 9 \bmod 35$. We recover $9 = 3+6$. The addition went through entirely under encryption.
+\end{example}
+
+\begin{labbox}
+Redo Example~\ref{ch33:paillier-example} with $m_1 = 10$, $m_2 = 30$. Note that $m_1 + m_2 = 40 > n = 35$, so the result wraps: you should decrypt to $40 \bmod 35 = 5$. This wraparound is the analogue of integer overflow and is the reason real deployments choose $n$ far larger than any sum that can occur. Confirm the wrap by hand; it is the single most common ``bug'' beginners hit with Paillier.
+\end{labbox}
+
+\subsection{A toy implementation}
+\label{ch33:paillier-code}
+
+\begin{implementbox}
+A minimal Paillier in Python, with $g=n+1$. \textbf{Learning only.} Real Paillier needs cryptographically strong primes, constant-time modular arithmetic, rejection of $r$ not coprime to $n$, and careful encoding of signed and fixed-point numbers. Do not put this anywhere near production.
+\begin{lstlisting}[language=Python]
+from math import gcd
+from random import randrange
+
+def L(x, n):           # x is congruent to 1 mod n
+    return (x - 1) // n
+
+def keygen(p, q):      # pass in your own toy primes
+    n = p * q
+    lam = (p - 1) * (q - 1) // gcd(p - 1, q - 1)   # lcm
+    g = n + 1
+    # with g = n+1, L(g^lam mod n^2) = lam, so mu = lam^{-1} mod n
+    mu = pow(lam % n, -1, n)
+    return (n, g), (lam, mu)
+
+def encrypt(pub, m):
+    n, g = pub
+    n2 = n * n
+    while True:
+        r = randrange(1, n)
+        if gcd(r, n) == 1:
+            break
+    return (pow(g, m, n2) * pow(r, n, n2)) % n2
+
+def decrypt(pub, priv, c):
+    n, g = pub
+    lam, mu = priv
+    n2 = n * n
+    return (L(pow(c, lam, n2), n) * mu) % n
+
+def add_enc(pub, c1, c2):          # homomorphic addition
+    n, _ = pub
+    return (c1 * c2) % (n * n)
+
+def scale_enc(pub, c, k):          # multiply plaintext by public k
+    n, _ = pub
+    return pow(c, k, n * n)
+
+# Demo
+pub, priv = keygen(1009, 1013)
+ca = encrypt(pub, 150)             # encrypted salary A
+cb = encrypt(pub, 275)             # encrypted salary B
+total = add_enc(pub, ca, cb)       # server never sees plaintexts
+print(decrypt(pub, priv, total))   # -> 425
+print(decrypt(pub, priv, scale_enc(pub, ca, 3)))  # -> 450
+\end{lstlisting}
+The server runs \texttt{add\_enc} and \texttt{scale\_enc} knowing only \texttt{pub}. Decryption stays with whoever holds \texttt{priv}.
+\end{implementbox}
+
+\begin{applicationbox}
+Paillier is in real systems right now. Threshold-ECDSA wallets (used by custodians to split a signing key across servers so no single machine holds it) use Paillier to let parties combine secret shares additively during signing. Private-set and private-sum protocols for advertising attribution --- ``how many people who saw this ad later bought the product?'' --- aggregate encrypted counts so neither the advertiser nor the publisher sees individual records. Some smart-meter and federated-analytics pipelines sum encrypted readings across thousands of homes, decrypting only the aggregate. In every case the structure is the same: many parties contribute encrypted addends, a server multiplies the ciphertexts, exactly one party holds the key and sees only the total.
+\end{applicationbox}
+
+\section{The leap to fully homomorphic encryption}
+\label{ch33:fhe-leap}
+
+Paillier adds. RSA and ElGamal multiply. For decades the open question --- posed by Rivest, Adleman, and Dertouzos in 1978, the year after RSA --- was whether a single scheme could do \emph{both}, addition and multiplication, on encrypted data. That matters because addition and multiplication over $\F_2$ (XOR and AND) are a universal gate set: with both, you can evaluate \emph{any} Boolean circuit, hence any computable function, on ciphertexts. A scheme with both is \emph{fully homomorphic} (FHE), and a scheme limited to circuits of bounded depth is \emph{somewhat homomorphic} (SHE).
+
+For thirty-one years nobody knew if FHE existed. Plausibility arguments cut both ways: the malleability that makes homomorphism possible seemed to fight against the rigidity that makes encryption secure. Then in 2009 Craig Gentry, in his Stanford PhD thesis, gave the first construction. It reshaped the field.
+
+\begin{historybox}
+Gentry's 2009 thesis is one of those rare results that everyone in the area can date precisely, like Shor's algorithm or the discovery of public-key crypto. The construction used ideal lattices and was, by his own description, ``barely'' feasible: evaluating a single bit operation could take many minutes, and the key sizes were enormous. What mattered was not the speed but the existence proof plus one idea --- bootstrapping --- that turned a depth-limited gadget into an unlimited one. Within a few years the ideal-lattice machinery was replaced by cleaner constructions based on Learning With Errors (the same lattice assumption behind post-quantum cryptography in Chapter~35), and performance improved by many orders of magnitude. Gentry shared the 2022 ACM Prize in Computing partly for this work.
+\end{historybox}
+
+\subsection{Noise: the enemy and the engine}
+\label{ch33:noise}
+
+Modern FHE schemes encrypt by hiding the plaintext under a small amount of random \emph{noise}, then relying on a lattice problem to keep the noise indistinguishable from random. The cleanest mental model is a symmetric Learning-With-Errors (LWE) encryption. Fix a modulus $q$ and a secret vector $\mathbf{s}\in\Z_q^k$. To encrypt a bit $m\in\{0,1\}$, sample a random vector $\mathbf{a}\in\Z_q^k$ and a \emph{small} noise term $e$, and output
+\[
+  (\mathbf{a},\; b) \quad\text{where}\quad b = \langle \mathbf{a},\mathbf{s}\rangle + e + m\cdot \floor{q/2} \pmod q.
+\]
+The message bit is parked near $0$ or near $q/2$. Decryption computes $b - \langle\mathbf{a},\mathbf{s}\rangle = e + m\floor{q/2}$, and rounds: close to $0$ means $m=0$, close to $q/2$ means $m=1$. As long as $\abs{e} < q/4$, the rounding is correct.
+
+\begin{intuitionbox}
+Picture the integers mod $q$ arranged on a clock face. The plaintext bit chooses one of two ``poles'' --- twelve o'clock for $0$, six o'clock for $1$. Encryption nudges the hand a little off the pole by the noise $e$; decryption asks ``which pole is the hand nearer?'' A small nudge is harmless. The danger is that arithmetic on ciphertexts makes the nudge grow, and if it ever crosses the quarter-hour line between the poles, decryption flips to the wrong answer. The entire art of FHE is managing that nudge.
+\end{intuitionbox}
+
+Now watch what homomorphic operations do to the noise.
+\begin{itemize}
+  \item \textbf{Addition} of two ciphertexts adds their noise: $e_1 + e_2$. The noise grows, but slowly (roughly $\sqrt{2}\times$ in standard deviation per addition).
+  \item \textbf{Multiplication} of two ciphertexts \emph{multiplies} the noise, roughly $e_1\cdot e_2$ scaled by the message magnitude. This is the killer: noise grows multiplicatively with each multiplication, so after only a handful of multiplications in series the noise blows past $q/4$ and decryption fails.
+\end{itemize}
+
+This is why a raw LWE/SHE scheme can evaluate only \emph{bounded-depth} circuits. Each multiplication burns ``noise budget.'' You start with budget $\log(q/4) - \log(\text{initial noise})$ and spend a chunk per multiplicative level. Run out, and the ciphertext becomes garbage.
+
+Figure~\ref{ch33:fig-noise} draws the two growth regimes against the $q/4$ wall: additions creep upward, multiplications double the exponent each time and slam into the wall after a few levels.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[x=11mm,y=5.2mm]
+  % axes
+  \draw[->,thick] (0,0) -- (6.6,0) node[right,font=\small]{operations};
+  \draw[->,thick] (0,0) -- (0,7.3) node[above,font=\small]{noise (log scale)};
+  % the q/4 wall
+  \draw[trapred,thick,dashed] (0,6) -- (6.3,6);
+  \node[trapred,font=\small\bfseries,anchor=west] at (4.3,6.55) {$q/4$ wall: decryption fails above};
+  % multiplication: doubling exponent, hits wall
+  \draw[structurepurple,very thick] (0,0.5) -- (1,1) -- (2,2) -- (3,4) -- (3.6,6.6);
+  \filldraw[structurepurple] (0,0.5) circle (1.6pt) (1,1) circle (1.6pt) (2,2) circle (1.6pt) (3,4) circle (1.6pt);
+  \node[structurepurple,font=\small,anchor=west] at (3.0,4.5) {multiply};
+  % addition: gentle creep
+  \draw[targetgreen,very thick] (0,0.5) -- (1,0.8) -- (2,1.0) -- (3,1.2) -- (4,1.35) -- (5,1.5) -- (6,1.6);
+  \filldraw[targetgreen] (1,0.8) circle (1.6pt) (3,1.2) circle (1.6pt) (5,1.5) circle (1.6pt);
+  \node[targetgreen,font=\small,anchor=west] at (5.1,1.7) {add};
+  \node[font=\small,anchor=west] at (0.1,0.5) {fresh};
+\end{tikzpicture}
+\caption{Noise growth under homomorphic operations. Each multiplication roughly doubles the noise exponent and crosses the $q/4$ wall after only a few levels; additions accumulate slowly. Multiplicative depth, not gate count, is what FHE charges for.}
+\label{ch33:fig-noise}
+\end{figure}
+
+\begin{example}[A symmetric LWE encryption by hand]
+\label{ch33:lwe-example}
+Work in tiny dimensions so the arithmetic stays visible. Fix $q = 64$ (so $\floor{q/2}=32$ and the decryption threshold is $q/4 = 16$), dimension $k = 3$, and secret key $\mathbf{s} = (2, 5, 1)\in\Z_{64}^3$.
+
+\textbf{Encrypt $m=1$.} Sample $\mathbf{a} = (9, 3, 14)$ and a small noise $e = -2$. Then
+\[
+  \langle\mathbf{a},\mathbf{s}\rangle = 9\cdot 2 + 3\cdot 5 + 14\cdot 1 = 18 + 15 + 14 = 47,
+\]
+and
+\[
+  b = 47 + (-2) + 1\cdot 32 = 77 \equiv 13 \pmod{64}.
+\]
+The ciphertext is $\bigl((9,3,14),\,13\bigr)$.
+
+\textbf{Decrypt.} The key holder recomputes $b - \langle\mathbf{a},\mathbf{s}\rangle = 13 - 47 = -34 \equiv 30 \pmod{64}$. Is $30$ nearer $0$ or nearer $32$? It is within $2$ of $32$, so round to $32 \Rightarrow m = 1$. Correct, and notice the leftover $30 = 32 - 2$ is exactly $m\floor{q/2}+e$, exposing the noise $e=-2$.
+
+\textbf{Add two ciphertexts.} Encrypt $m'=0$ as $\mathbf{a}' = (1, 1, 8)$, $e' = 3$: $\langle\mathbf{a}',\mathbf{s}\rangle = 2 + 5 + 8 = 15$, so $b' = 15 + 3 + 0 = 18$. Adding componentwise, $\mathbf{a}+\mathbf{a}' = (10,4,22)$ and $b+b' = 13+18 = 31$. Decryption gives $31 - \langle(10,4,22),\mathbf{s}\rangle = 31 - (20+20+22) = 31 - 62 = -31 \equiv 33 \pmod{64}$. That rounds to $32 \Rightarrow 1 = 1 + 0$, and the noise is now $e+e' = -2+3 = 1$. Addition added the noises, exactly as advertised, and the sum is still comfortably under $16$.
+\end{example}
+
+\begin{labbox}
+Continue Example~\ref{ch33:lwe-example} by encrypting $m=1$ with a deliberately large noise $e = 15$ (still under $q/4=16$, so a single ciphertext decrypts fine). Now add it to itself: the noise becomes $30 > 16$, and decryption flips. Compute the resulting $b - \langle\mathbf{a},\mathbf{s}\rangle$ and confirm it lands on the wrong side of the $0$/$32$ divide. This is the noise wall in miniature.
+\end{labbox}
+
+\begin{connectionbox}
+The noise here is the same Learning-With-Errors hardness that anchors lattice-based post-quantum KEMs and signatures in Chapter~35. The security claim is that $(\mathbf{a}, \langle\mathbf{a},\mathbf{s}\rangle + e)$ is computationally indistinguishable from uniform random --- finding $\mathbf{s}$ amounts to solving a noisy linear system, which reduces to worst-case lattice problems believed hard even for quantum computers. So FHE and post-quantum encryption are cousins drawing water from the same well.
+\end{connectionbox}
+
+\subsection{Bootstrapping: the idea that unlocked everything}
+\label{ch33:bootstrapping}
+
+Here is the bind. We can do a few multiplications before noise kills us. We want unlimited multiplications. How do you reset the noise without the secret key --- since the whole point is that the evaluator does not have it?
+
+Gentry's answer is a piece of recursion that feels like a trick the first time, and like an inevitability the second. The noise is small enough that only the key holder can read past it, but the operation that removes noise \emph{is} decryption. So: run decryption \emph{homomorphically}.
+
+\begin{whybox}
+Suppose I give the evaluator an encryption of the secret key under the public key --- call it $\Enc(sk)$. Now the evaluator holds a noisy ciphertext $c$ whose noise is dangerously large but not yet fatal. The evaluator takes the decryption \emph{circuit} $\Dec(\cdot, c)$, viewed as a function of the key, and evaluates it homomorphically using $\Enc(sk)$ in place of the actual key. The result is an encryption of $\Dec_{sk}(c) = m$ --- that is, a \emph{fresh} encryption of the same plaintext $m$. Crucially, the noise in this fresh ciphertext is whatever the decryption circuit's own evaluation produces, \emph{independent of how noisy $c$ was}. We have refreshed the ciphertext: same message, reset noise budget, and the evaluator never saw $sk$ in the clear.
+\end{whybox}
+
+\begin{intuitionbox}
+The analogy that sticks: imagine a sealed glovebox whose batteries (noise budget) drain as you work inside it. You cannot open it to swap batteries --- that would expose the contents. But suppose you can pass a \emph{second}, fresh glovebox into the first one through the gloves, transfer the contents across while everything stays sealed, and discard the drained box. The fresh box starts with full batteries. Bootstrapping is exactly that nested-glovebox move: re-encrypt the message inside the encryption, using an encrypted copy of the key, so the message hops into a low-noise container without ever surfacing.
+\end{intuitionbox}
+
+For this to work, the scheme must be able to evaluate its \emph{own decryption circuit} (plus at least one more gate) before noise runs out. A scheme with that property is called \emph{bootstrappable}. Gentry's contribution was twofold: show that an SHE scheme can be ``squashed'' so its decryption circuit is shallow enough to fit in the noise budget, and prove that any bootstrappable SHE scheme yields a full FHE scheme by interleaving bootstrapping with computation.
+
+\begin{focusbox}
+The leap in one line: \emph{bootstrapping is homomorphic self-decryption.} You evaluate the decryption procedure on encrypted inputs --- using an encryption of the secret key as a gadget --- to replace a noisy ciphertext with a clean one carrying the same plaintext. Repeat as often as needed, and the computation can run forever. This is what converts ``somewhat'' into ``fully.''
+\end{focusbox}
+
+There is a subtlety worth flagging. Bootstrapping requires publishing $\Enc(sk)$ under $pk$ --- an encryption of the secret key under its own public key. Standard IND-CPA security says nothing about whether a scheme stays secure when the adversary sees an encryption of the key itself. The extra assumption that it does is called \emph{circular security} (or key-dependent-message security). No one has broken the natural FHE schemes' circular security, but it is an assumption beyond plain LWE, and removing it cleanly is still open. Mention it in an interview; it signals you understand the foundations.
+
+\subsection{Message flow and the cost of depth}
+\label{ch33:flow}
+
+The diagram below shows where each piece sits. Alice keeps $sk$; she ships ciphertexts and (for bootstrapping) the evaluation key $\Enc_{pk}(sk)$ to Bob, who computes and bootstraps as needed, returning only ciphertext.
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=8mm,
+  box/.style={draw, rounded corners, align=center, minimum height=8mm, inner sep=4pt, font=\small},
+  alice/.style={box, draw=aliceblue, fill=aliceblue!8},
+  bob/.style={box, draw=bobgreen, fill=bobgreen!8},
+  arr/.style={-{Stealth[length=2.2mm]}, thick}
+]
+  \node[alice] (gen) {Alice: $\Gen \to (pk,sk)$\\ encrypts data, builds $\Enc_{pk}(sk)$};
+  \node[bob, right=34mm of gen] (eval) {Bob: homomorphic\\ eval of circuit $f$};
+  \node[bob, below=10mm of eval] (boot) {noise high?\\ bootstrap with $\Enc_{pk}(sk)$};
+  \node[alice, below=10mm of gen] (dec) {Alice: $\Dec_{sk} \to f(\text{data})$};
+
+  \draw[arr] (gen) -- node[above, font=\scriptsize]{$c_i,\ \Enc_{pk}(sk)$} (eval);
+  \draw[arr] (eval) -- (boot);
+  \draw[arr] (boot.west) to[out=180,in=0] node[below, font=\scriptsize, pos=0.5]{refreshed $c$} (eval.west);
+  \draw[arr] (eval.south west) to[out=225,in=20] node[above, font=\scriptsize]{result ciphertext} (dec.east);
+\end{tikzpicture}
+\end{center}
+
+\begin{example}[How many multiplications fit?]
+\label{ch33:budget-example}
+Toy numbers. Take modulus $q = 2^{40}$ and a fresh ciphertext with noise bounded by $B = 2^{8}$. Decryption succeeds while noise $< q/4 = 2^{38}$. Suppose each multiplication squares the noise bound (the worst-case model): after one multiply, $2^{16}$; after two, $2^{32}$; after three, $2^{64}$ --- already past $2^{38}$. So this parameter set supports a multiplicative depth of \emph{two} before failure. To go deeper you either raise $q$ (bigger ciphertexts, slower arithmetic) or bootstrap to reset the noise to $\approx 2^8$ whenever it climbs toward $2^{38}$. Real schemes use far larger $q$ (hundreds to thousands of bits) and cleverer multiplication that grows noise additively in the exponent rather than by squaring, but the squaring model captures why \emph{depth}, not total gate count, is the thing FHE charges you for.
+\end{example}
+
+\begin{trapbox}
+The cost metric people misjudge: it is the \emph{multiplicative depth} of your circuit, not its size. A million additions are nearly free; a chain of twenty dependent multiplications is brutal. When you design an algorithm for FHE you restructure it to minimize multiplicative depth --- replacing deep products with parallel ones, swapping comparisons for low-degree polynomial approximations, batching many plaintexts into one ciphertext (``SIMD slots'' via the Chinese Remainder Theorem) so one homomorphic multiply does thousands of useful ones at once. Naively porting code to FHE and expecting it to be merely slow, rather than astronomically slow, is the classic beginner mistake.
+\end{trapbox}
+
+\subsection{What a real homomorphic multiply actually does}
+\label{ch33:relin}
+
+The squaring model of Example~\ref{ch33:budget-example} hides two mechanical costs that dominate real FHE engineering, and you should know their names so the libraries' documentation reads as English.
+
+When you multiply two LWE-style ciphertexts, the natural product is a ciphertext that decrypts under $\mathbf{s}\otimes\mathbf{s}$ --- a \emph{quadratic} key, not the original linear one. Left alone, every multiply doubles the ciphertext dimension, and after a few products the object is unusable. \emph{Relinearization} (also called key-switching) fixes this: using a published \emph{evaluation key} --- encryptions of the products $s_i s_j$ under the original key --- the evaluator rewrites the quadratic ciphertext back into an ordinary linear one of the original size. It is the homomorphic analogue of ``simplify the expression back to standard form'' after multiplying out.
+
+The second cost is \emph{modulus switching} (in the BGV/CKKS line): after a multiply, you rescale the ciphertext from modulus $q$ down to a smaller $q'$, which divides the noise by roughly $q/q'$ at the same time. You pre-load a ladder of moduli $q_0 > q_1 > \cdots$, and each multiplicative level steps down one rung. The number of rungs is the leveled budget; when you run out of rungs you must bootstrap or stop. This is why CKKS parameters are quoted as a number of ``levels'' --- each is one rung, one available multiply.
+
+\begin{whybox}
+Relinearization and modulus switching are why the ``additive in the exponent'' remark in Example~\ref{ch33:budget-example} is true. With modulus switching, a multiply does not square the absolute noise; it adds a roughly fixed quantum to the noise \emph{relative to the shrinking modulus}. So the usable depth is set by how many times you can divide $q$ before it gets too small to hold a plaintext --- a count of rungs, i.e. a sum, not a product. That linear-in-depth budget is what makes leveled FHE practical for fixed-depth circuits without ever bootstrapping.
+\end{whybox}
+
+\begin{trapbox}
+Encoding bites before noise does. FHE plaintexts live in $\Zn{t}$ (BGV/BFV) or are approximate reals (CKKS), and you must \emph{encode} signed numbers, fixed-point fractions, and vectors into that space yourself. Forget that subtraction is addition of the negation mod $t$, pick a plaintext modulus $t$ too small for your intermediate values, or mismatch the CKKS scaling factor across two operands, and you get silently wrong answers that look like noise failures but are really arithmetic-encoding bugs. Always test the plaintext arithmetic in the clear at the same modulus and scale \emph{before} blaming the noise budget.
+\end{trapbox}
+
+\section{What it costs and where it is heading}
+\label{ch33:cost}
+
+Let us be plain about performance, because hype outran reality for years. A single homomorphic multiplication on modern LWE-based schemes (BGV, BFV, CKKS for approximate/real-number arithmetic, TFHE for fast Boolean gates) costs microseconds to milliseconds depending on the scheme and parameters. Bootstrapping is the expensive step: in TFHE it is roughly milliseconds per gate; in the BGV/CKKS family, refreshing a packed ciphertext can take seconds. Compared with native arithmetic, expect a slowdown of $10^3$ to $10^6$, shrinking every year. Ciphertext expansion is large too --- a single bit can become kilobytes of ciphertext --- which dominates bandwidth and storage.
+
+\begin{focusbox}
+A quick taxonomy of the deployed schemes, so the acronyms stop being noise:
+\begin{itemize}
+  \item \textbf{BGV / BFV} --- exact integer arithmetic mod a plaintext prime, with CRT batching for SIMD parallelism. Good for exact computations over moderate-size integers.
+  \item \textbf{CKKS} --- \emph{approximate} arithmetic on real and complex numbers; decryption returns the answer plus a tiny rounding error. The scheme of choice for encrypted machine learning, where approximate is fine.
+  \item \textbf{TFHE} --- very fast bootstrapping per Boolean gate, so it shines on circuits with comparisons, branches, and arbitrary logic rather than bulk arithmetic.
+\end{itemize}
+\end{focusbox}
+
+A compact way to hold the families in mind: match the scheme to the \emph{shape} of the computation, not the other way around.
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Scheme} & \textbf{Plaintext} & \textbf{Strength} & \textbf{Typical use} \\
+\midrule
+BGV / BFV & exact integers mod $t$ & SIMD batching, exact & encrypted statistics, counting \\
+CKKS & approximate reals/complex & vectorized real math & encrypted ML inference \\
+TFHE & bits, fast bootstrap & cheap arbitrary logic & comparisons, branching, decision trees \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{example}[The bootstrap break-even]
+\label{ch33:bootstrap-economics}
+Why ``leveled when you can, bootstrap when you must'' is not a slogan but arithmetic. Suppose your CKKS parameters give a leveled budget of $L = 12$ multiplicative levels per fresh ciphertext, and a single bootstrap costs the equivalent of $T = 15$ homomorphic multiplies. A circuit of multiplicative depth $d$:
+\begin{itemize}
+  \item If $d \le 12$, run it leveled: cost $\approx d$ multiplies, \emph{zero} bootstraps. A depth-10 circuit costs about $10$ multiplies.
+  \item If $d = 30$, you cannot fit it in one budget. You bootstrap whenever the budget is spent: after each block of $\approx L=12$ levels, refresh. Two bootstraps cover depth $30$ (levels $1$--$12$, refresh, $13$--$24$, refresh, $25$--$30$), so cost $\approx 30 + 2\cdot 15 = 60$ multiply-equivalents --- the bootstraps double the bill.
+\end{itemize}
+The takeaway: every level you shave off the circuit either avoids a multiply or, near a budget boundary, avoids an entire bootstrap. That is why depth-optimization (Section~\ref{ch33:flow}'s trap) pays off super-linearly, and why fixing the depth in advance to stay leveled is the single biggest performance lever available.
+\end{example}
+
+\begin{applicationbox}
+Where FHE actually shows up today:
+\begin{itemize}
+  \item \textbf{Encrypted machine-learning inference.} A client encrypts an image or a medical record; the server runs a neural network homomorphically (using CKKS, with polynomial approximations of the activation functions) and returns an encrypted prediction the client alone decrypts. The server never sees the input or output. Microsoft SEAL, OpenFHE, and Zama's Concrete are the open libraries that make this buildable.
+  \item \textbf{Private database queries (PIR).} Retrieve record $i$ from a server without the server learning $i$, by encoding the query as encrypted selection coefficients and homomorphically summing.
+  \item \textbf{Encrypted analytics and regulated data.} Hospitals and banks compute statistics across encrypted datasets that law forbids them to pool in the clear.
+  \item \textbf{Blockchain and confidential smart contracts.} ``Encrypted state machines'' that execute contract logic over encrypted inputs, an active area for confidential DeFi.
+\end{itemize}
+The practical pattern is to use FHE for the sensitive inner kernel and ordinary crypto for the rest, and to lean on \emph{leveled} FHE (enough noise budget for a known-depth circuit, \emph{no} bootstrapping) whenever the computation's depth is fixed in advance --- that avoids the single most expensive operation entirely.
+\end{applicationbox}
+
+\begin{attackbox}
+FHE's IND-CPA security does not protect against a \emph{cheating} server or against revealing decryptions, and both gaps bite in practice.
+
+\emph{Malleability / no integrity.} Because homomorphism is malleability, an FHE ciphertext carries no guarantee the server computed the agreed function. A cheating server can return an encryption of \emph{anything} it can compute, including a function chosen to leak the key. Defenses pair FHE with verifiable computation or zero-knowledge proofs (Chapter~31) so the client can check the result was computed correctly.
+
+\emph{Reaction / decryption-leakage attacks on approximate schemes.} CKKS returns an \emph{approximate} plaintext, and the rounding error depends on the ciphertext's noise, which depends on the secret. Li and Micciancio (2021) showed that if an attacker sees the decrypted approximate results of chosen computations, the small errors leak enough to recover the secret key --- a passive attack that broke deployed CKKS configurations until libraries added noise-flooding countermeasures. The lesson: ``IND-CPA'' assumes the adversary never sees decryptions; the moment a protocol reveals even approximate plaintexts, you have stepped outside the model and need extra defenses.
+\end{attackbox}
+
+\begin{focusbox}
+The frontier, briefly. Hardware acceleration (FPGA and ASIC bootstrapping, GPU CKKS) is closing the speed gap fast; several efforts target sub-millisecond bootstrapping in silicon. Scheme switching --- moving a ciphertext between CKKS, BFV, and TFHE to use each where it is strongest --- lets one pipeline do bulk arithmetic and fast logic. And FHE increasingly composes with the rest of the toolbox: with MPC (Chapter~34) to split trust across servers, with zero-knowledge proofs for integrity, with post-quantum KEMs for transport. The realistic near-term picture is not ``encrypt the whole cloud'' but targeted private kernels --- inference on a model, a join over two encrypted tables, a private aggregate --- where the privacy gain justifies the cost.
+\end{focusbox}
+
+\section{Putting the pieces together}
+\label{ch33:summary}
+
+The arc of this chapter is a ladder of capability. At the bottom, textbook RSA and ElGamal give you multiplication of encrypted values almost for free, because exponentiation respects multiplication --- useful but limited, and in RSA's case not even semantically secure. Paillier climbs a rung: a clean, randomized, IND-CPA-secure scheme that \emph{adds} encrypted values and scales them by public constants, which is exactly what private aggregation needs and why it is in production systems today. Each of these is \emph{partially} homomorphic --- one operation only.
+
+The top rung, fully homomorphic encryption, supports both addition and multiplication, hence arbitrary circuits. Its engine is noise: a small random perturbation that hides the plaintext under a lattice assumption, grows slowly under addition and explosively under multiplication, and would cap the computation at a shallow depth --- except for bootstrapping, Gentry's homomorphic self-decryption, which refreshes a noisy ciphertext into a clean one using an encrypted copy of the key. That single recursive idea is what turns a depth-limited gadget into unlimited computation on encrypted data.
+
+What you should carry forward: the homomorphic property is the \emph{same thing} as malleability, so these schemes trade away IND-CCA security and integrity by design --- which is why real deployments bolt on verifiable computation or zero-knowledge proofs, lean on leveled (bootstrap-free) FHE when depth is known, and minimize multiplicative depth above all else. Homomorphic encryption is no longer a curiosity. It is a maturing, deployable tool for the precise problem that ordinary encryption cannot touch: computing on data you are not allowed to see.
+
+\section{Exercises}
+\label{ch33:exercises}
+
+\begin{exercise}[RSA homomorphism]
+Using the toy RSA key $n=143$, $e=7$ from Example~\ref{ch33:rsa-example}, encrypt $m_1 = 6$ and $m_2 = 9$, multiply the ciphertexts mod $143$, and verify the product decrypts to $54 \bmod 143$. Show every modular reduction, and recall that the algebraic identity is the ground truth against which to check your arithmetic.
+\end{exercise}
+
+\begin{exercise}[Exponential ElGamal]
+In a group of prime order $q$ with generator $g$, exponential ElGamal encrypts $m$ as $\Enc(m) = (g^r, g^m h^r)$. Show that componentwise multiplication of two ciphertexts yields an encryption of $m_1 + m_2$. Explain why recovering $m_1 + m_2$ requires a discrete-log computation, and why this is fine for tallying small vote counts but not for general arithmetic.
+\end{exercise}
+
+\begin{exercise}[Paillier by hand]
+Using $p=5$, $q=7$, $n=35$, $g=36$ from Example~\ref{ch33:paillier-example}, encrypt $m_1 = 2$ (with $r_1 = 3$) and $m_2 = 8$ (with $r_2 = 6$). Homomorphically add the ciphertexts and decrypt, confirming you get $10 \bmod 35$. Then add the public constant $20$ to the encrypted result (without re-encrypting the inputs) and confirm you get $30$.
+\end{exercise}
+
+\begin{exercise}[Paillier wraparound]
+Complete the lab following Example~\ref{ch33:paillier-example}: with the same key, encrypt $m_1 = 10$ and $m_2 = 30$, add homomorphically, and show the decryption yields $5$, not $40$. Explain in one sentence why a real deployment chooses $n$ much larger than any possible sum.
+\end{exercise}
+
+\begin{exercise}[Scalar multiply]
+Prove that for Paillier, $c^k \bmod n^2$ decrypts to $km \bmod n$ when $c$ encrypts $m$ and $k$ is a public integer. Then show how to compute the encrypted weighted sum $a_1 m_1 + a_2 m_2 + b$ from $\Enc(m_1)$, $\Enc(m_2)$ and public constants $a_1, a_2, b$, using only ciphertext multiplication and exponentiation.
+\end{exercise}
+
+\begin{exercise}[Why no IND-CCA]
+Argue that no additively or multiplicatively homomorphic scheme can be IND-CCA secure. Concretely, given a challenge ciphertext $c^* = \Enc(m_b)$ in the IND-CCA game, describe how to maul it into a \emph{different} ciphertext whose decryption (obtained from the decryption oracle) reveals $m_b$. Do this for both Paillier (additive) and ElGamal (multiplicative).
+\end{exercise}
+
+\begin{exercise}[LWE decryption correctness]
+For the symmetric LWE encryption of Section~\ref{ch33:noise}, with ciphertext $(\mathbf{a}, b)$ and $b = \langle\mathbf{a},\mathbf{s}\rangle + e + m\floor{q/2}$, show that decryption recovers $m$ correctly precisely when $\abs{e} < q/4$. What goes wrong as $\abs{e}$ approaches $q/2$?
+\end{exercise}
+
+\begin{exercise}[Noise budget]
+Repeat Example~\ref{ch33:budget-example} with $q = 2^{60}$ and fresh noise bound $B = 2^{10}$, where each multiplication squares the noise bound and decryption needs noise $< q/4$. How many sequential multiplications can you perform before a bootstrap is required? How does the answer change if additions (which only add noise bounds) are interleaved?
+\end{exercise}
+
+\begin{exercise}[Bootstrapping in words]
+Explain bootstrapping to a smart friend who knows what encryption and decryption are but has never seen FHE, in under 150 words, without using the word ``lattice.'' Your explanation must make clear (a) what problem bootstrapping solves, (b) what gadget the evaluator is given, and (c) why the evaluator never learns the secret key.
+\end{exercise}
+
+\begin{exercise}[Circular security]
+Bootstrapping requires publishing $\Enc_{pk}(sk)$. Explain why IND-CPA security does not automatically guarantee this is safe, give the name of the extra assumption required, and describe a hypothetical (contrived) scheme that is IND-CPA secure but becomes completely broken once an encryption of its own secret key is released.
+\end{exercise}
+
+\begin{exercise}[Design for depth]
+You must compute, under FHE, the dot product of two length-$1000$ encrypted vectors followed by a single sigmoid-like nonlinearity. Describe the multiplicative depth of a naive implementation versus a depth-optimized one (hint: the products in a dot product are independent; the sum is additive; approximate the nonlinearity with a low-degree polynomial). Which scheme from the taxonomy in Section~\ref{ch33:cost} would you choose, and why?
+\end{exercise}
+
+\begin{exercise}[LWE by hand]
+Using the parameters of Example~\ref{ch33:lwe-example} ($q=64$, $\mathbf{s}=(2,5,1)$), encrypt $m=0$ with $\mathbf{a}=(7,2,11)$ and noise $e=4$, and encrypt $m=1$ with $\mathbf{a}'=(3,6,0)$ and noise $e'=-3$. Add the two ciphertexts, decrypt the sum, and confirm both the recovered bit and the resulting noise $e+e'$. Then state the largest $\abs{e+e'}$ that would still decrypt correctly.
+\end{exercise}
+
+\begin{exercise}[Relinearization, in words]
+After multiplying two LWE-style ciphertexts, the product decrypts under a \emph{quadratic} key $\mathbf{s}\otimes\mathbf{s}$ rather than $\mathbf{s}$. Explain in your own words (a) why the dimension grows without relinearization, (b) what the evaluation key contains, and (c) why publishing that evaluation key, like publishing $\Enc_{pk}(sk)$ for bootstrapping, is a key-dependent-message assumption rather than something plain IND-CPA gives you for free.
+\end{exercise}
+
+\begin{exercise}[Bootstrap break-even]
+Redo Example~\ref{ch33:bootstrap-economics} with a leveled budget of $L=20$ levels and a bootstrap cost of $T=40$ multiply-equivalents. For circuit depths $d = 15$, $d = 20$, and $d = 50$, compute the number of bootstraps required and the total multiply-equivalent cost. At what depth does the first bootstrap become unavoidable, and how many multiplies would you need to remove from a depth-$21$ circuit to make it leveled?
+\end{exercise}

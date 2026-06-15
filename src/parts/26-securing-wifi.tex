@@ -1,0 +1,1013 @@
+\chapter{Securing WiFi: WPA2 and WPA3}
+
+WiFi is the place where most people's encrypted lives begin each morning. The
+laptop wakes, sees a familiar network name, and -- without anyone typing a
+password -- rejoins it and starts streaming bytes. Underneath that quiet
+reconnection is one of the most widely deployed cryptographic protocols on the
+planet, run billions of times a day, by coffee shops and airports and the cheap
+router behind your television. It is also a protocol that has been broken, in
+public and embarrassingly, more than once. WEP was a catastrophe. WPA2 stood for
+thirteen years and then KRACK forced a global patch. WPA3 is the current answer,
+and it carries its own scars.
+
+This chapter is about the radio link: the single hop between your device and the
+access point. That hop is special. Unlike a TCP connection across the Internet,
+the WiFi link is broadcast. Every frame you send is, physically, audible to
+anyone within range who cares to listen, whether or not they are ``on'' the
+network. That changes the threat model in concrete ways, and it is why WiFi
+encryption matters even when the site you are visiting already uses TLS.
+
+We will build the WPA2 four-way handshake from the ground up -- where the keys
+come from, what each of the four messages does, and why the design is shaped the
+way it is. Then we will break it: WEP first (a clinic in how \emph{not} to use a
+stream cipher), then KRACK against WPA2 (a clinic in how a single reused nonce can
+unravel a careful protocol). Finally WPA3 and its Dragonfly/SAE handshake, which
+replaces the weak link -- the password -- with a password-authenticated key
+exchange. Throughout, we keep asking the practical question that actually decides
+whether you should worry: what can an attacker on the same network, or just
+within radio range, really do?
+
+\chapterline
+
+\section{The shape of the problem}
+
+\begin{intuitionbox}
+Alice has a laptop. Bob runs the access point (AP) -- the box that bridges the
+WiFi radio to the wired Internet. Eve is sitting two tables over with a $\$30$
+USB WiFi adapter in monitor mode, recording every frame in the air. The network
+is named \texttt{CoffeeHouse} and is protected by a password that Alice typed in
+once, months ago.
+
+Three things must happen for the link to be secure against Eve:
+\begin{enumerate}
+  \item \textbf{Confidentiality.} Eve must not be able to read the contents of
+        Alice's frames.
+  \item \textbf{Integrity.} Eve must not be able to modify a frame -- flip a bit
+        in a packet, redirect a DNS lookup -- without detection.
+  \item \textbf{Authentication.} Alice must be talking to the real Bob, not to
+        Eve impersonating the AP; and Bob must be talking to a device that knows
+        the password.
+\end{enumerate}
+Notice what is \emph{not} on the list: hiding \emph{that} Alice is using the
+network, or hiding which AP she joins, or hiding how much she sends. WiFi headers
+are sent in the clear. The link layer protects payloads, not metadata.
+\end{intuitionbox}
+
+The shared secret everyone starts from is the network password, which in WPA2
+``Personal'' mode is called the \emph{passphrase} -- the thing on the sticker
+under the router or written on the cafe chalkboard. In enterprise mode (WPA2-
+Enterprise, used on corporate and university networks) the password is replaced
+by an 802.1X/EAP exchange against a RADIUS server, and each user gets a fresh key
+from that exchange. We focus on Personal mode, because it is where the
+interesting cryptography lives and where the famous attacks land. The enterprise
+key hierarchy is the same below the top; only the source of the master key
+differs.
+
+\begin{focusbox}
+The vocabulary salad is the hardest part of WiFi security, so fix it now.
+\begin{itemize}
+  \item \textbf{WEP} (1997): the original, fatally broken scheme. RC4 plus a
+        24-bit IV.
+  \item \textbf{WPA} (2003): a stopgap. Same RC4 hardware, but wrapped in TKIP
+        to fix WEP's worst sins. Also broken now; treat as dead.
+  \item \textbf{WPA2} (2004): the long-lived standard. AES in CCM mode (``CCMP'')
+        for confidentiality and integrity, with the four-way handshake to derive
+        keys. This is what ``WiFi encryption'' meant for over a decade.
+  \item \textbf{WPA3} (2018): replaces the password-based handshake with SAE
+        (``Dragonfly''), a password-authenticated key exchange, and adds
+        forward secrecy. CCMP becomes GCMP-256 in the high-security tier.
+  \item \textbf{IEEE 802.11i}: the standards document that defines WPA2's
+        cryptography. ``RSN'' (Robust Security Network) is the same thing in the
+        spec's language.
+\end{itemize}
+\end{focusbox}
+
+\section{WEP, and how to break a stream cipher by reusing it}
+
+Before WPA2 there was WEP, Wired Equivalent Privacy, and it is worth dissecting
+because every mistake in it is a textbook lesson. WEP took RC4 -- a fine stream
+cipher for its day -- and used it in just about the worst way one can.
+
+Recall how a stream cipher works. It stretches a key into a long pseudorandom
+keystream $Z$, and encrypts by XOR: $c = m \xor Z$. The iron rule of stream
+ciphers, the one you must never break, is: \emph{never reuse a keystream}. If two
+messages $m_1$ and $m_2$ are encrypted under the same keystream $Z$, then
+\[
+  c_1 \xor c_2 \;=\; (m_1 \xor Z) \xor (m_2 \xor Z) \;=\; m_1 \xor m_2,
+\]
+and the keystream cancels. The attacker now has the XOR of two plaintexts, which
+-- with English text, known headers, or any structure -- is often enough to
+recover both.
+
+So the entire security of a stream-cipher system reduces to: \emph{is the
+keystream ever reused?} WEP guaranteed that it would be.
+
+\begin{whybox}
+WEP's per-frame key was $K = \text{IV} \concat k$, where $k$ is the long-term
+shared WEP key (the password, essentially) and IV is a 24-bit initialization
+vector sent in the clear with each frame. RC4 was keyed with $K$ to produce the
+keystream for that frame.
+
+The IV is 24 bits, so there are only $2^{24} \approx 16.7$ million possible
+values. On a busy network sending, say, $1000$ frames per second, you exhaust the
+entire IV space in about $2^{24}/1000 \approx 16{,}777$ seconds, under five
+hours. After that, IVs \emph{must} repeat, and every repeat is a keystream reuse,
+because the long-term $k$ never changes. By the birthday bound (see the companion
+probability volume), collisions start appearing far sooner -- after roughly
+$\sqrt{2^{24}} = 2^{12} = 4096$ frames you expect your first repeated IV. A few
+seconds of traffic.
+\end{whybox}
+
+\begin{attackbox}
+\textbf{WEP is broken three ways over, and any one would be fatal.}
+
+\emph{Keystream reuse.} As above, repeated IVs give $m_1 \xor m_2$. Many WiFi
+frames have predictable structure (ARP packets are a fixed size with known
+fields; IP headers are guessable), so the attacker often knows or can guess
+$m_1$, recovering $m_2$ outright -- and recovering the keystream for that IV,
+which then decrypts every future frame using the same IV.
+
+\emph{No real integrity.} WEP ``protects'' integrity with a CRC-32 checksum,
+which is \emph{linear}: $\mathrm{CRC}(x \xor \delta) = \mathrm{CRC}(x) \xor
+\mathrm{CRC}(\delta)$. Because encryption is also linear (XOR), an attacker can
+flip any bit of the ciphertext and compute exactly how to fix the checksum so the
+frame still verifies. CRC is an error-detecting code, not a MAC. It assumes no
+adversary. WEP put it in adversarial hands.
+
+\emph{The RC4 key-schedule weakness (FMS).} In 2001, Fluhrer, Mantin, and Shamir
+showed that RC4's key schedule leaks information about the key when the first few
+keystream bytes are known and the key has a particular structure -- exactly the
+structure WEP's $\text{IV} \concat k$ provides, with the attacker-visible IV as
+the variable prefix. Each captured frame leaks a tiny bias about $k$. Collect
+enough ``weak IV'' frames and you solve for $k$ directly. Later tools (KoreK,
+then the PTW attack of 2007) drove the requirement down to tens of thousands of
+frames -- a minute or two of traffic, less if you inject packets to force more.
+The recovered key is the \emph{actual} WEP key, decrypting everything past and
+future.
+\end{attackbox}
+
+The lesson is not ``RC4 is bad'' -- RC4's biases were a real flaw, but WEP would
+have fallen to keystream reuse and the CRC malleability even with a perfect
+cipher. The lesson is that a cipher is only as good as the construction around it.
+WEP got the IV size wrong, got the integrity primitive wrong (a checksum where a
+MAC was needed), and rekeyed never. WPA2 fixes all three: a long never-repeating
+counter, a real MAC, and fresh session keys per association.
+
+\begin{historybox}
+WEP shipped in 1997 inside the original 802.11 standard, designed by a committee
+optimizing for cheap hardware and an export regime that capped key sizes. The 24-
+bit IV and 40-bit key were partly artifacts of 1990s U.S. crypto export limits.
+By 2001 the FMS paper was public; by the mid-2000s, point-and-click tools
+(\texttt{aircrack-ng}) cracked WEP in minutes. The 2007 breach of TJX (millions
+of credit cards) was traced to a store WiFi network still running WEP. The
+standard formally deprecated it, and modern devices have removed WEP support
+entirely. If you ever see WEP offered, treat the network as plaintext.
+\end{historybox}
+
+\section{WPA2: the key hierarchy}
+
+WPA2 starts from the same place -- a shared passphrase -- but never uses it
+directly to encrypt anything. Instead it derives a hierarchy of keys, with the
+passphrase at the root and short-lived per-frame protection at the leaves. The
+guiding principle: the long-term secret should touch the air as little as
+possible, and every session should use independent keys so that breaking one
+tells you nothing about another.
+
+\subsection{From passphrase to PMK}
+
+The passphrase is first stretched into a 256-bit \emph{Pairwise Master Key}
+(PMK). In WPA2-Personal the stretching function is PBKDF2 (Password-Based Key
+Derivation Function 2) with HMAC-SHA1, $4096$ iterations, salted by the network
+name (SSID):
+\[
+  \text{PMK} \;=\; \mathrm{PBKDF2}\bigl(\text{passphrase},\ \text{SSID},\
+  4096,\ 256\ \text{bits}\bigr).
+\]
+
+\begin{whybox}
+Two design choices in that line are doing real work.
+
+The \textbf{4096 iterations} make each password guess expensive. An attacker who
+captures a handshake and wants to brute-force the passphrase must run PBKDF2 --
+$4096$ HMAC-SHA1 calls -- per candidate. Without it, a GPU could test billions of
+guesses per second; with it, the rate drops by three to four orders of magnitude.
+This is the same key-stretching idea you saw for password hashing. It does not
+make a weak passphrase safe, only slower to crack.
+
+The \textbf{SSID as salt} means the same passphrase on two networks with
+different names yields different PMKs. This blocks precomputation across networks
+-- almost. The catch is that the salt is the \emph{network name}, not a random
+value, and popular names (\texttt{linksys}, \texttt{xfinitywifi}, the default
+names of common routers) are predictable. Attackers precompute giant tables
+(``rainbow tables'') of PMKs for common SSID-plus-passphrase pairs. If your SSID
+is a default and your passphrase is in a wordlist, the PMK is effectively
+already computed.
+\end{whybox}
+
+\begin{connectionbox}
+PBKDF2's cost is exactly the modular-exponentiation-versus-hashing tradeoff the
+algorithms volume analyzes for password storage: you deliberately pick a slow
+function so the legitimate party pays once at login but the attacker pays per
+guess. The birthday-bound reasoning behind WEP's IV collisions, and behind the
+nonce-reuse risks we will meet in GCMP, is the same $\sqrt{N}$ collision law
+derived in the probability volume's chapter on the birthday problem.
+\end{connectionbox}
+
+\subsection{From PMK to PTK: the four-way handshake}
+
+The PMK is a long-term per-network secret -- everyone who knows the passphrase can
+compute the same PMK. (Pause on that: in WPA2-Personal, your neighbor on the same
+cafe network has the \emph{same PMK as you}. We will return to what that means for
+attacks.) The PMK is never used to encrypt traffic directly. Instead, each time a
+device associates, a fresh \emph{Pairwise Transient Key} (PTK) is derived for that
+session, mixing in random nonces from both sides so that every association gets
+independent keys.
+
+The PTK is computed by a PRF (in WPA2, an HMAC-SHA1-based key-derivation
+function) from five inputs:
+\[
+  \text{PTK} \;=\; \mathrm{PRF}\bigl(\text{PMK};\ \text{Anonce} \concat
+  \text{Snonce} \concat \mathrm{AA} \concat \mathrm{SA}\bigr),
+\]
+where Anonce is a random nonce chosen by the AP (the authenticator), Snonce is a
+random nonce chosen by the station (your device), AA is the AP's MAC address, and
+SA is the station's MAC address. The two MAC addresses are sorted into a fixed
+order, as are the two nonces, so both sides feed the PRF identical input and get
+identical output.
+
+The PTK is then sliced into several sub-keys:
+\begin{itemize}
+  \item \textbf{KCK} (Key Confirmation Key, 128 bits): used to MAC the handshake
+        messages themselves, proving each side derived the same PTK.
+  \item \textbf{KEK} (Key Encryption Key, 128 bits): used to encrypt the group
+        key when it is handed to the station.
+  \item \textbf{TK} (Temporal Key, 128 bits): the actual key that protects data
+        frames with AES-CCMP.
+\end{itemize}
+
+\begin{intuitionbox}
+Why nonces from \emph{both} sides? If only the AP contributed a nonce, then two
+sessions where the AP happened to reuse a nonce would derive the same PTK -- and a
+device that always sends the same Snonce would help that along. Mixing two
+independent random values means the PTK is fresh as long as \emph{either} side
+picks a fresh nonce, and the MAC addresses bind the key to this specific pair of
+devices. The handshake is a Diffie-Hellman in spirit -- both parties contribute
+randomness -- except the shared secret is the pre-existing PMK rather than a fresh
+DH exchange. That distinction is the seed of every WPA2 weakness: there is no
+forward secrecy, because the PMK is fixed. Compromise the passphrase later and you
+can recompute every PTK from recorded nonces, decrypting traffic you captured
+years ago. WPA3 fixes exactly this.
+\end{intuitionbox}
+
+Here is the four-way handshake, message by message. It is called ``four-way''
+because four EAPOL (Extensible Authentication Protocol over LAN) frames cross the
+link.
+
+\begin{center}
+\begin{tikzpicture}[
+  font=\small,
+  node distance=0.5cm,
+  msg/.style={->,>=Stealth,thick},
+  every node/.style={align=center}]
+
+  \node (sta) at (0,0) {\textbf{Station (Alice)}\\\footnotesize has PMK};
+  \node (ap)  at (8,0) {\textbf{AP (Bob)}\\\footnotesize has PMK};
+
+  \draw[very thick] (sta) -- (0,-7.5);
+  \draw[very thick] (ap)  -- (8,-7.5);
+
+  % M1
+  \draw[msg] (8,-1.0) -- node[above,pos=0.5]{\footnotesize M1: Anonce}
+                          node[below,pos=0.5]{\footnotesize (unprotected)} (0,-1.4);
+  \node[left=0.1cm of {(0,-1.6)},text width=3.2cm,font=\scriptsize]
+       at (0,-1.9) {Now compute PTK\\from Anonce, Snonce};
+
+  % M2
+  \draw[msg] (0,-2.7) -- node[above,pos=0.5]{\footnotesize M2: Snonce + MIC} (8,-2.3);
+  \node[right=0.1cm,text width=3.4cm,font=\scriptsize]
+       at (8,-2.9) {AP computes PTK,\\checks MIC: station\\knows the PMK};
+
+  % M3
+  \draw[msg] (8,-4.0) -- node[above,pos=0.5]{\footnotesize M3: GTK + MIC} (0,-3.6);
+  \node[left=0.1cm,text width=3.4cm,font=\scriptsize]
+       at (0,-4.4) {Station checks MIC:\\AP knows the PMK.\\Installs PTK};
+
+  % M4
+  \draw[msg] (0,-5.4) -- node[above,pos=0.5]{\footnotesize M4: ack + MIC} (8,-5.0);
+  \node[right=0.1cm,text width=3.4cm,font=\scriptsize]
+       at (8,-5.6) {AP installs PTK.\\Both ready};
+
+  \draw[->,>=Stealth,very thick,bobgreen] (0,-6.6) -- node[above]{\footnotesize encrypted data (AES-CCMP under TK)} (8,-6.6);
+  \draw[->,>=Stealth,very thick,bobgreen] (8,-7.1) -- (0,-7.1);
+
+\end{tikzpicture}
+\end{center}
+
+\begin{enumerate}
+  \item[\textbf{M1}] The AP sends its random \textbf{Anonce} to the station. This
+        message is unauthenticated -- the station cannot yet tell a real AP from a
+        forgery, because no key exists yet. (Remember this for KRACK.)
+  \item[\textbf{M2}] The station picks its \textbf{Snonce}, now has both nonces
+        and both MACs, and computes the PTK. It sends Snonce back, with a
+        \textbf{MIC} (Message Integrity Code) computed under the KCK. The AP can
+        now also compute the PTK; if the MIC verifies, the AP knows the station
+        derived the same PTK, hence knows the PMK, hence knows the passphrase.
+  \item[\textbf{M3}] The AP sends the \textbf{GTK} (Group Temporal Key, the key
+        for broadcast/multicast frames), encrypted under the KEK, with its own
+        MIC under the KCK. The station verifies the MIC: now \emph{it} knows the
+        AP knew the PMK. Mutual authentication is complete. The station installs
+        the PTK for use.
+  \item[\textbf{M4}] The station sends an acknowledgment (with a MIC). On receipt
+        the AP installs the PTK. Both sides switch to encrypted data frames.
+\end{enumerate}
+
+\begin{focusbox}
+The four-way handshake authenticates by \emph{proof of knowledge of the PMK},
+never by sending the PMK or passphrase. Each side proves it can compute the
+correct MIC under a key (KCK) that only a holder of the PMK could derive, given
+the public nonces. This is a challenge-response: the nonces are the challenges,
+the MICs are the responses. Nothing secret crosses the air -- which is exactly why
+an eavesdropper who records the whole handshake \emph{still} cannot read the
+traffic, unless they also know the passphrase.
+\end{focusbox}
+
+\subsection{Protecting data: AES-CCMP}
+
+Once the TK is installed, each data frame is protected with CCMP: AES in
+\textbf{Counter mode} for confidentiality, with \textbf{CBC-MAC} for integrity --
+the ``CCM'' authenticated-encryption mode. This is the piece WEP got so wrong, and
+WPA2 gets right.
+
+\begin{whybox}
+CCMP solves WEP's three failures cleanly:
+\begin{itemize}
+  \item \textbf{No keystream reuse.} The AES-CTR counter includes a 48-bit
+        \emph{packet number} (PN) that increments on every frame and never
+        repeats for the life of the TK. $2^{48}$ frames is astronomically more
+        than any session will send, and a fresh TK each association resets it. The
+        PN is also checked for monotonic increase, blocking replay.
+  \item \textbf{Real integrity.} CBC-MAC under AES is a genuine MAC, not a linear
+        checksum. An attacker who flips a ciphertext bit cannot repair the MIC
+        without the key. Forgery probability is roughly $2^{-64}$ per try.
+  \item \textbf{Authenticated headers.} The MIC covers not just the payload but
+        the frame header fields that matter (addresses, QoS), so an attacker
+        cannot redirect a frame by editing its header.
+\end{itemize}
+The PN is the hero here. It is WEP's 24-bit IV done right: long enough never to
+repeat, included in the authenticated data, and checked for replay.
+\end{whybox}
+
+\begin{connectionbox}
+CCM is the ``encrypt-then-MAC-ish'' authenticated encryption mode studied in the
+chapter on AEAD. Counter mode turns the block cipher AES into a stream cipher (so
+the no-reuse rule applies, hence the careful PN), while CBC-MAC supplies the
+integrity that CTR mode alone lacks. WPA3's high tier swaps CCM for GCM (GCMP-256),
+the same AES-GCM you meet in TLS 1.3 -- faster, but with an even sharper nonce-
+reuse cliff, which is why the 256-bit version and careful PN handling matter.
+\end{connectionbox}
+
+\section{A worked miniature handshake}
+
+Let us trace the key derivation with tiny stand-in numbers, so the data flow is
+concrete. Real WPA2 uses 256-bit PMKs and HMAC-SHA1; we will use a toy hash so
+you can follow the arithmetic. This is a \emph{model}, not the real algorithm --
+the point is the shape of the dependency graph, not the bytes.
+
+\begin{example}
+\label{ch26:toy-handshake}
+Let our toy ``PRF'' be $\mathrm{prf}(K, x) = (K \cdot x + 7) \bmod 101$, working
+mod the prime $101$. Suppose:
+\begin{itemize}
+  \item Passphrase-derived $\text{PMK} = 42$ (in reality, $256$ bits from PBKDF2).
+  \item AP nonce $\text{Anonce} = 13$, station nonce $\text{Snonce} = 28$.
+  \item We combine nonces by addition for the toy: $x = \text{Anonce} +
+        \text{Snonce} = 41$.
+\end{itemize}
+Then the toy PTK is
+\[
+  \text{PTK} = \mathrm{prf}(42, 41) = (42 \cdot 41 + 7) \bmod 101
+             = (1722 + 7) \bmod 101 = 1729 \bmod 101.
+\]
+Now $1729 = 17 \cdot 101 + 12$, so $\text{PTK} = 12$.
+
+Slice it (toy-style) into a confirmation key and a data key: say
+$\text{KCK} = \text{PTK} \bmod 10 = 2$ and $\text{TK} = \lfloor \text{PTK}/10
+\rfloor = 1$ together with the nonces. The station's M2 MIC is
+$\mathrm{prf}(\text{KCK}, \text{Snonce}) = (2 \cdot 28 + 7) \bmod 101 = 63$. The AP
+recomputes the same PTK (it has PMK and both nonces), derives the same KCK $= 2$,
+recomputes $\mathrm{prf}(2, 28) = 63$, and sees the MIC matches -- so the station
+proved knowledge of the PMK without revealing it.
+\end{example}
+
+Trace what an eavesdropper sees: Anonce $= 13$, Snonce $= 28$, the MIC $= 63$, the
+MAC addresses. To forge M2 or read traffic, Eve needs the PTK, which needs the
+PMK $= 42$, which she does not have. Her only avenue is to guess the passphrase
+offline: pick a candidate, run PBKDF2 to a candidate PMK, derive a candidate PTK
+and KCK, and check whether $\mathrm{prf}(\text{KCK}, 28)$ equals the captured MIC
+$63$. That check is the entire WPA2-Personal offline attack, and the next section
+makes it real.
+
+\begin{trapbox}
+Do not read Example~\ref{ch26:toy-handshake} as the real PRF. Real WPA2 uses
+HMAC-SHA1 over a precisely ordered concatenation of sorted MAC addresses and
+sorted nonces, expanded to produce $384$ or $512$ bits of PTK. The toy linear
+function $K x + 7$ is invertible and would let an attacker solve for $K$ from one
+(input, output) pair -- a catastrophe a real PRF prevents. The toy is for tracing
+data flow only.
+\end{trapbox}
+
+\section{The offline dictionary attack on WPA2-Personal}
+
+WPA2-Personal's authentication boils down to: ``prove you know the PMK by
+producing the right MIC.'' Everything an attacker needs to \emph{check} a
+passphrase guess is in the four-way handshake, which is sent in the clear. So
+WPA2-Personal is vulnerable to an \emph{offline} dictionary attack, and there is
+no fixing it within the protocol -- it is inherent to deriving keys from a low-
+entropy password without a PAKE. (WPA3 is precisely the fix.)
+
+\begin{attackbox}
+\textbf{Capture-and-crack against WPA2-Personal.}
+
+\emph{Step 1: capture a handshake.} Eve puts her adapter in monitor mode and
+waits for any device to associate, recording M1 through M4. She does not need to
+wait long -- she can \emph{force} it. A WiFi \textbf{deauthentication} frame is a
+management frame that, in plain WPA2, is unauthenticated: the AP can tell a client
+``you are disconnected,'' and clients obey. Eve spoofs a deauth from the AP's MAC
+to Alice. Alice drops off and immediately reconnects, performing a fresh four-way
+handshake that Eve records. One spoofed frame, one captured handshake.
+
+\emph{Step 2: crack offline.} From the handshake Eve has Anonce, Snonce, both
+MACs, and the M2 MIC. For each candidate passphrase $p$ in a wordlist:
+\[
+  \text{PMK} \gets \mathrm{PBKDF2}(p,\ \text{SSID},\ 4096),\quad
+  \text{PTK} \gets \mathrm{PRF}(\text{PMK}, \ldots),\quad
+  \text{check } \mathrm{MIC}(\text{KCK}, \text{M2}) \stackrel{?}{=} \text{captured}.
+\]
+A match means $p$ is the passphrase. This is entirely offline -- no further
+contact with the network, no rate limiting, as many guesses as Eve's hardware
+allows.
+
+\emph{What decides success.} The PBKDF2 cost ($4096$ iterations) is the only
+brake, and modern GPUs push WPA2 candidate rates into the hundreds of thousands
+to millions per second per card. A passphrase from a wordlist, a common pattern
+(\texttt{Summer2024!}), a phone number, or anything under roughly $10$--$12$
+random characters of entropy is realistically crackable. A long random passphrase
+(say $16$+ random characters, or a five-word diceware phrase) is not. The math is
+unforgiving: security here is entirely the entropy of the human-chosen password.
+\end{attackbox}
+
+\begin{focusbox}
+This is the single most important practical fact about WPA2-Personal: \textbf{the
+encryption is only as strong as the passphrase}, because anyone within radio range
+can capture a handshake and grind it offline forever. AES-128 contributes nothing
+if the passphrase is \texttt{password123}. Use long, random passphrases, and
+prefer WPA3 (which defeats this attack entirely) where available.
+\end{focusbox}
+
+\begin{implementbox}
+A learning-only sketch of the WPA2-Personal offline check. It computes the PMK and
+the MIC over a captured handshake and tests passphrases from a wordlist. It is
+deliberately incomplete and slow; real tools like \texttt{hashcat} do this on GPUs.
+\textbf{Use this only to understand the attack on networks you own. Cracking
+others' WiFi is illegal in most jurisdictions.}
+
+\begin{lstlisting}[language=Python]
+import hashlib, hmac
+
+def pmk(passphrase, ssid):
+    # PBKDF2-HMAC-SHA1, 4096 iters, 32-byte PMK -- the WPA2-Personal stretch.
+    return hashlib.pbkdf2_hmac("sha1", passphrase.encode(),
+                               ssid.encode(), 4096, 32)
+
+def prf512(pmk, A, B):
+    # 802.11i PRF: HMAC-SHA1 expansion to 64 bytes. "A" is a label string,
+    # "B" = min(macA,macB)||max(macA,macB)||min(n1,n2)||max(n1,n2).
+    out = b""
+    i = 0
+    while len(out) < 64:
+        out += hmac.new(pmk, A + b"\x00" + B + bytes([i]),
+                        hashlib.sha1).digest()
+        i += 1
+    return out[:64]  # PTK = KCK(16) || KEK(16) || TK(16) || extra
+
+def ptk(pmk_bytes, ap_mac, sta_mac, anonce, snonce):
+    B = min(ap_mac, sta_mac) + max(ap_mac, sta_mac) \
+        + min(anonce, snonce) + max(anonce, snonce)
+    return prf512(pmk_bytes, b"Pairwise key expansion", B)
+
+def mic_matches(passphrase, ssid, ap_mac, sta_mac,
+                anonce, snonce, eapol_m2, captured_mic):
+    p = ptk(pmk(passphrase, ssid), ap_mac, sta_mac, anonce, snonce)
+    kck = p[:16]
+    # WPA2 (CCMP) uses HMAC-SHA1 for the MIC, truncated to 16 bytes.
+    mic = hmac.new(kck, eapol_m2, hashlib.sha1).digest()[:16]
+    return mic == captured_mic
+
+# for guess in open("wordlist.txt"):
+#     if mic_matches(guess.strip(), ssid, ap_mac, sta_mac,
+#                    anonce, snonce, eapol_m2, captured_mic):
+#         print("passphrase:", guess); break
+\end{lstlisting}
+The real attack also handles the EAPOL frame's MIC field being zeroed before the
+computation, and the choice of HMAC-SHA1 versus AES-CMAC depending on the cipher
+suite. The structure above is the whole idea.
+\end{implementbox}
+
+\section{KRACK: breaking WPA2 without the password}
+
+For thirteen years, the four-way handshake's cryptography held: if your passphrase
+was strong, your traffic was safe. Then in 2017 Mathy Vanhoef published KRACK --
+the Key Reinstallation Attack -- which broke WPA2 \emph{without knowing the
+passphrase at all}. KRACK is a beautiful and humbling result, because the flaw was
+not in the cipher or the key derivation. It was in the \emph{state machine} --
+specifically, in what happens when a handshake message is retransmitted.
+
+\begin{intuitionbox}
+Recall message M3: the AP sends the GTK and a MIC, and on receiving it the station
+\emph{installs the PTK}, which resets the CCMP packet number (the nonce counter)
+to its starting value and begins encrypting data frames. Message M4 acknowledges
+this.
+
+But networks are lossy. M4 might not arrive. The standard says: if the AP does not
+get M4, it \emph{retransmits M3}. And the standard says the station, on receiving
+a retransmitted M3, should \emph{reinstall} the same PTK -- and in doing so,
+\textbf{reset the packet number counter back to its starting value.}
+
+There it is. Reinstalling the key resets the nonce. And we know the iron rule:
+reset the nonce in a counter-mode cipher and you reuse keystream. KRACK forces
+exactly this reset, on demand, by replaying M3.
+\end{intuitionbox}
+
+\begin{attackbox}
+\textbf{KRACK against the four-way handshake.}
+
+Eve sits as a man-in-the-middle at the radio layer, relaying frames between Alice
+and the AP (she can do this with a cloned AP on a different channel -- a ``channel-
+based MitM'' -- without knowing any key, because management and handshake frames
+are unprotected).
+
+\begin{enumerate}
+  \item The handshake proceeds normally up to M3. Eve \emph{blocks} M4 from
+        reaching the AP (she is in the middle).
+  \item The AP, not hearing M4, retransmits M3. Eve forwards this retransmitted M3
+        to Alice.
+  \item Alice, following the standard, \textbf{reinstalls} the PTK and \textbf{
+        resets her packet number to its initial value} -- even though she has
+        already sent data frames with that key.
+  \item Now Alice encrypts her next data frame with the \emph{same} PN (nonce) she
+        used right after the first install. Two plaintexts, one keystream:
+        $c_1 \xor c_2 = m_1 \xor m_2$. The keystream is recovered for those PNs,
+        and with known plaintext (TCP/IP headers, retransmissions Eve can force)
+        Eve decrypts the frames.
+\end{enumerate}
+
+On some implementations the damage was worse than keystream reuse. Android $6.0$
+and certain \texttt{wpa\_supplicant} versions, on reinstall, set the key to
+\emph{all zeros}, so Eve did not even need the password-derived keystream -- the
+traffic was encrypted under a known, all-zero key. That turned KRACK from
+``decrypt some frames'' into ``decrypt everything trivially.''
+\end{attackbox}
+
+\begin{whybox}
+Why did such a careful protocol have this hole? Because the cryptographic
+\emph{messages} were authenticated (the MICs are correct, the PTK is right -- Eve
+never forges anything), but the \emph{state machine around them} did not treat
+``reinstall the same key'' as the dangerous operation it is. The protocol proof for
+the four-way handshake, done years earlier, modeled the key agreement -- and it was
+correct! The flaw lived in a layer the proof did not cover: the retransmission and
+reinstall behavior mandated by the standard's prose, not its key-exchange core.
+
+The fix is small and was deployed via software patches in late 2017: do not reset
+the packet number on a key reinstall, or refuse to reinstall an already-installed
+key. No new key material, no protocol redesign -- just ``never let a nonce go
+backwards.'' KRACK did not retire WPA2; a patched WPA2 stack is not vulnerable.
+But it forced an Internet-wide update and underlined that nonce discipline is
+everything in counter-mode AEAD.
+\end{whybox}
+
+\begin{connectionbox}
+KRACK is the WiFi instance of a general law you will see again in TLS, IPsec, and
+QUIC: \emph{nonce reuse in an AEAD mode is catastrophic}. The chapter on AES-GCM
+shows that reusing a GCM nonce leaks not only plaintext (via keystream cancelling)
+but the authentication key itself, enabling forgeries. CCM is gentler -- nonce
+reuse there ``only'' leaks plaintext, not the MAC key -- but the lesson is
+identical: the counter must never repeat or reverse. KRACK is what happens when a
+state machine quietly violates that invariant.
+\end{connectionbox}
+
+\section{WPA3 and the SAE/Dragonfly handshake}
+
+WPA2-Personal has one unfixable wound: the offline dictionary attack. Because
+authentication is ``prove you know the PMK,'' and the PMK comes deterministically
+from the passphrase, anyone who captures a handshake can grind passphrases
+offline forever. No amount of patching changes that; it is baked into deriving
+keys from a password the simple way.
+
+WPA3-Personal removes the wound by replacing the four-way handshake's front end
+with a \textbf{Password-Authenticated Key Exchange} (PAKE), specifically
+\textbf{SAE} -- Simultaneous Authentication of Equals, also called Dragonfly. A
+PAKE lets two parties who share a (possibly weak) password agree on a strong,
+random shared key such that:
+\begin{itemize}
+  \item An eavesdropper learns \emph{nothing} that helps an offline guess.
+  \item An active attacker gets at most \emph{one} password guess per live
+        interaction -- they must talk to the AP for each guess, and the AP can
+        rate-limit. Offline grinding is impossible.
+  \item The resulting session key has \textbf{forward secrecy}: it is a fresh
+        Diffie-Hellman secret, so compromising the password \emph{later} does not
+        decrypt traffic recorded earlier.
+\end{itemize}
+
+\begin{intuitionbox}
+The trick of a PAKE is to fold the password into a Diffie-Hellman exchange so that
+the DH messages look like random group elements to anyone who does not know the
+password, and so that the exchange only completes if both sides used the same
+password. You get the best of both: the strong randomness and forward secrecy of
+Diffie-Hellman, plus authentication from the shared password -- without ever
+sending anything an eavesdropper can test offline. The phrase ``of equals'' means
+there is no client/server asymmetry: AP and station run identical roles, either
+can initiate, and either can be the first to commit.
+\end{intuitionbox}
+
+\subsection{How SAE works}
+
+SAE runs in a cyclic group $\G$ of prime order $q$ -- a large prime-field group or,
+in practice, an elliptic curve like NIST P-256 -- with generator $g$. Both sides
+share the password $\pi$. The exchange has two phases: \emph{commit} and
+\emph{confirm}.
+
+\textbf{Setup -- hashing the password to the group.} First both sides derive a
+group element from the password, the ``password element'' $P = \mathrm{H2C}(\pi,
+\ldots)$ (hash-to-curve / hash-to-group), mixing in the two MAC addresses so $P$ is
+specific to this pair of devices. The key property: $P$ is a uniform-looking
+group element, and recovering $\pi$ from $P$ is as hard as the discrete log -- you
+cannot ``read off'' the password from $P$.
+
+\textbf{Commit phase.} Each party (say Alice) picks two random scalars $r_A,
+m_A \in \Z_q$, sets her private scalar $s_A = (r_A + m_A) \bmod q$, and computes
+the ``element''
+\[
+  E_A = -\,m_A \cdot P \qquad (\text{in the group, } P^{-m_A}\text{ multiplicatively}),
+\]
+then sends the pair $(s_A,\ E_A)$. Bob does the same, sending $(s_B,\ E_B)$.
+
+\textbf{Deriving the shared secret.} Alice computes
+\[
+  K = r_A \cdot \bigl(s_B \cdot P + E_B\bigr).
+\]
+Substituting $s_B \cdot P + E_B = (r_B + m_B)P - m_B P = r_B \cdot P$, this is
+$K = r_A \cdot r_B \cdot P$. Bob, symmetrically, computes $K = r_B \cdot r_A \cdot
+P$ -- the \emph{same} element. That shared $K = r_A r_B P$ is a Diffie-Hellman
+secret in the group generated by $P$: each side contributed a fresh random scalar
+($r_A$, $r_B$), giving forward secrecy, and $P$ ties the whole thing to the
+password.
+
+\textbf{Confirm phase.} Each side hashes $K$ (plus the transcript) into a key
+$\kappa$ and sends a confirmation MAC. If both used the same password, the same
+$P$, hence the same $K$, the confirmations verify and the exchange succeeds,
+producing the PMK for the (unchanged) four-way handshake that follows. If the
+passwords differ, $P$ differs, $K$ differs, and confirmation fails -- with no
+information leaked about \emph{which} password was wrong.
+
+\begin{center}
+\begin{tikzpicture}[
+  font=\small,
+  msg/.style={->,>=Stealth,thick},
+  every node/.style={align=center}]
+
+  \node (a) at (0,0) {\textbf{Alice}\\\footnotesize knows $\pi$, has $P$};
+  \node (b) at (8.5,0) {\textbf{Bob}\\\footnotesize knows $\pi$, has $P$};
+
+  \draw[very thick] (0,-0.5) -- (0,-5.4);
+  \draw[very thick] (8.5,-0.5) -- (8.5,-5.4);
+
+  % commit both directions
+  \draw[msg] (0,-1.2) -- node[above,pos=0.5]{\footnotesize commit: $(s_A,\,E_A)$} (8.5,-1.2);
+  \draw[msg] (8.5,-1.9) -- node[above,pos=0.5]{\footnotesize commit: $(s_B,\,E_B)$} (0,-1.9);
+
+  \node[left=0.05cm,text width=3.4cm,font=\scriptsize] at (0,-2.7)
+       {compute\\$K=r_A(s_B P + E_B)$\\$=r_A r_B P$};
+  \node[right=0.05cm,text width=3.4cm,font=\scriptsize] at (8.5,-2.7)
+       {compute\\$K=r_B(s_A P + E_A)$\\$=r_A r_B P$};
+
+  % confirm both directions
+  \draw[msg] (0,-3.7) -- node[above,pos=0.5]{\footnotesize confirm: MAC$_\kappa$(transcript)} (8.5,-3.7);
+  \draw[msg] (8.5,-4.4) -- node[above,pos=0.5]{\footnotesize confirm: MAC$_\kappa$(transcript)} (0,-4.4);
+
+  \draw[->,>=Stealth,very thick,bobgreen] (0,-5.1) -- node[above]{\footnotesize agree on PMK $\to$ four-way handshake} (8.5,-5.1);
+
+\end{tikzpicture}
+
+\textit{\footnotesize SAE commit-confirm flow. The roles are symmetric (``of
+equals''): both sides commit, both derive the same $K = r_A r_B P$, both confirm.
+An eavesdropper sees only $(s,E)$ pairs and MACs, none of which is
+offline-testable against a password guess.}
+\end{center}
+
+\begin{whybox}
+Why can't Eve grind offline? Everything she sees on the wire -- $s_A, E_A, s_B,
+E_B$, the confirmation MACs -- is a function of the random scalars $r, m$ and the
+password element $P$. To test a password guess $\pi'$, she would compute the
+corresponding $P'$ and try to reproduce the transcript, but the transcript also
+depends on the secret scalars $r_A, r_B, m_A, m_B$, which she does not have and
+which are freshly random each run. There is no equation she can write down that
+involves only the password and public values -- the discrete-log hardness of the
+group blocks it. So a password guess can only be tested by \emph{running} the
+protocol against a live party who knows the real $P$: one guess per online
+attempt, rate-limitable. That is the entire point of a PAKE, and it is why WPA3
+defeats the capture-and-crack attack that dooms weak WPA2 passphrases.
+\end{whybox}
+
+\begin{example}
+\label{ch26:toy-sae}
+A toy SAE in $\Zns{23}$, a cyclic group of order $q = 22$ with generator $g = 5$.
+Suppose the password element is $P = g^{7} \bmod 23$. Compute $5^7 = 78125$; since
+$5^{22} \equiv 1$, reduce: $5^2 = 25 \equiv 2$, $5^4 \equiv 4$, $5^7 = 5^4 \cdot
+5^2 \cdot 5 \equiv 4 \cdot 2 \cdot 5 = 40 \equiv 17 \pmod{23}$. So $P = 17$.
+
+Alice picks $r_A = 3$, $m_A = 5$, so $s_A = 8$ and $E_A = P^{-m_A} = 17^{-5}$.
+Bob picks $r_B = 4$, $m_B = 6$, so $s_B = 10$ and $E_B = 17^{-6}$.
+
+Alice's shared secret (writing the group multiplicatively):
+\[
+  K = \bigl(P^{s_B} \cdot E_B\bigr)^{r_A}
+    = \bigl(P^{r_B + m_B} \cdot P^{-m_B}\bigr)^{r_A}
+    = P^{r_B \, r_A} = 17^{12} \bmod 23.
+\]
+Compute $17 \equiv -6$, so $17^2 \equiv 36 \equiv 13$; $17^4 \equiv 13^2 = 169
+\equiv 8$; $17^8 \equiv 64 \equiv 18$; thus $17^{12} = 17^8 \cdot 17^4 \equiv 18
+\cdot 8 = 144 \equiv 6 \pmod{23}$. So $K = 6$. Bob computes $K = P^{r_A r_B} =
+17^{12} = 6$ too. They agree on $K = 6$ without either sending a password-derived
+value an eavesdropper could test.
+\end{example}
+
+\begin{trapbox}
+Example~\ref{ch26:toy-sae} uses a $23$-element group so the arithmetic fits on a
+page; the discrete log there is trivial to brute-force. Real SAE uses P-256 or a
+$3072$-bit prime field, where discrete log is infeasible. Also, real hash-to-curve
+(deriving $P$ from the password) is the subtle part -- and is exactly where the
+first WPA3 attack landed, next.
+\end{trapbox}
+
+\subsection{Dragonblood: WPA3's early scars}
+
+\begin{attackbox}
+\textbf{Dragonblood (Vanhoef and Ronen, 2019).} WPA3's first year brought side-
+channel attacks on the hash-to-group step. The original SAE used a ``hunting and
+pecking'' loop to map the password to a curve point: try $\mathrm{H}(\pi,
+\text{counter})$, check if it is a valid x-coordinate, increment the counter if
+not. The number of iterations, and the cache-access pattern inside, \emph{depended
+on the password}. By measuring timing or cache behavior of an AP, an attacker
+learned how many iterations a given password needed -- a partial fingerprint --
+and could prune the password space, restoring a form of offline attack. There were
+also downgrade attacks forcing WPA3-capable devices back to WPA2 (and thus back to
+the crackable handshake), and denial-of-service via the computationally heavy SAE
+commit.
+
+The fixes: a constant-time hash-to-curve (the ``hash-to-element'' / SSWU method,
+borrowing from the broader hash-to-curve standardization effort) that runs in
+fixed time regardless of password, plus transition-mode hardening against
+downgrade. WPA3 with these fixes -- ``WPA3 with H2E'' -- is the current
+recommendation.
+\end{attackbox}
+
+The Dragonblood story is the same moral as KRACK: the core cryptographic idea
+(a PAKE for WiFi) was sound, and the wound was in the \emph{implementation around
+it} -- a password-dependent loop that leaked through a side channel. Constant-time
+code is not optional polish; in cryptography it is part of correctness.
+
+\section{The practical attacker: deauth, evil twins, and what's actually at risk}
+
+Strip away the protocols and ask the operational question: you are sitting in a
+cafe on \texttt{CoffeeHouse}-WiFi (WPA2-Personal). Who can do what?
+
+\begin{focusbox}
+\textbf{What an attacker within radio range (not on the network) can do.}
+\begin{itemize}
+  \item \textbf{See all metadata.} Frame headers -- your device's MAC address (
+        unless MAC randomization is on), the AP you joined, the sizes and timing
+        of your frames, which networks your device probes for -- are all in the
+        clear. Traffic analysis is wide open.
+  \item \textbf{Deauthenticate you.} In plain WPA2, management frames are
+        unauthenticated, so a spoofed deauth knocks you off at will (denial of
+        service, or to force a handshake for cracking, or to push you toward an
+        evil twin). \textbf{802.11w / Protected Management Frames (PMF)} fixes
+        this by MAC-ing management frames; PMF is \emph{mandatory} in WPA3 and
+        optional in WPA2. With PMF on, deauth spoofing stops working.
+  \item \textbf{Capture a handshake and crack a weak passphrase} offline, as in
+        the attack box above. Strong passphrase or WPA3: no.
+\end{itemize}
+
+\textbf{What an attacker on the same network (knows the passphrase) can do.}
+\begin{itemize}
+  \item In \textbf{WPA2-Personal}, everyone shares the same PMK. But each device's
+        PTK is fresh (different nonces), so your neighbor cannot \emph{directly}
+        decrypt your unicast frames from a passive capture -- almost. The catch:
+        if they capture your four-way handshake (its nonces are public) and they
+        know the PMK (they do -- same passphrase!), they can derive \emph{your}
+        PTK and decrypt your traffic. So on WPA2-Personal, \textbf{anyone who knows
+        the WiFi password and can capture your handshake can read your link-layer
+        traffic.} The cafe's other customers are not isolated from you. (Forcing a
+        deauth gives them your handshake on demand.)
+  \item They can run ARP spoofing / become a man-in-the-middle for your local
+        traffic, redirect DNS, etc. -- standard LAN attacks.
+  \item \textbf{WPA3} and WPA2-Enterprise close this: SAE gives each device an
+        independent PMK that other password-holders cannot derive, so same-network
+        users \emph{cannot} decrypt each other's traffic.
+\end{itemize}
+\end{focusbox}
+
+\begin{attackbox}
+\textbf{The evil twin.} Eve sets up her own AP broadcasting the SSID
+\texttt{CoffeeHouse} -- same name, stronger signal (she is closer, or boosts
+power). She deauths Alice from the real AP. Alice's device, seeing a familiar
+network name with a strong signal, may reconnect to Eve's AP. If Eve's AP is open
+(no password) or Eve knows/guessed the passphrase, Alice now routes all her
+traffic through Eve.
+
+What saves Alice: WPA2/WPA3 \emph{mutual} authentication. In the four-way
+handshake, the AP must prove it knows the PMK (message M3's MIC). Eve's evil twin,
+\emph{without the passphrase}, cannot produce a valid M3, so a WPA2 client will
+not complete the handshake -- the evil twin fails against a password-protected
+network it cannot authenticate to. This is why evil-twin attacks target
+\textbf{open} networks, captive portals, or networks whose passphrase the attacker
+already knows, and why they often pair with phishing (``enter the WiFi password to
+continue'') to get the missing secret. WPA3's mandatory PMF and SAE raise the bar
+further by killing the deauth that bootstraps the attack.
+\end{attackbox}
+
+\begin{intuitionbox}
+The reassuring takeaway: even on a hostile WiFi network, your \emph{application}
+security can hold. WiFi protects the link; TLS protects the connection end to end.
+When you load \texttt{https://bank.com}, the TLS handshake authenticates the bank
+with a certificate that Eve's evil twin cannot forge, and encrypts everything
+above the link layer. An attacker who fully owns the WiFi sees TLS ciphertext and
+SNI/metadata -- annoying, but not your password or your balance. This is the
+layered-defense principle: WiFi crypto and TLS guard different layers, and you
+want both. The danger zone is unencrypted application traffic (plain HTTP, some
+IoT protocols, DNS without DoH) on a hostile link -- there, link-layer compromise
+is full compromise.
+\end{intuitionbox}
+
+\begin{applicationbox}
+\textbf{In deployment, what to actually do.}
+\begin{itemize}
+  \item \textbf{Home / small office.} Use WPA3-Personal if all your devices
+        support it; otherwise WPA2/WPA3 ``transition mode'' with a \emph{long
+        random} passphrase (the passphrase is your real security on WPA2). Enable
+        PMF. Never WEP or WPA (TKIP); disable them on the router.
+  \item \textbf{Enterprise / campus.} WPA2/WPA3-Enterprise with 802.1X/EAP-TLS or
+        PEAP against RADIUS. Each user authenticates individually, gets an
+        independent PMK, and there is no shared passphrase to crack or to let
+        users decrypt each other. Validate the RADIUS server certificate on
+        clients, or evil-twin RADIUS impersonation re-opens the door.
+  \item \textbf{Public WiFi (you, the user).} Assume the link is hostile. Rely on
+        TLS/HTTPS everywhere, prefer a VPN, keep your OS patched (KRACK and
+        Dragonblood fixes ship in updates), and enable MAC randomization to blunt
+        tracking. ``WPA2 with a password'' on a cafe network does \emph{not} hide
+        your traffic from other patrons who know that same password.
+  \item \textbf{Open networks (Opportunistic Wireless Encryption, OWE).} WPA3
+        adds OWE / ``Enhanced Open,'' which runs an unauthenticated Diffie-Hellman
+        on open networks so at least passive eavesdropping is blocked even with no
+        password. It does not stop an active evil twin, but it ends the era of
+        fully-plaintext coffee-shop WiFi.
+\end{itemize}
+\end{applicationbox}
+
+\section{Putting the layers together}
+
+Step back and see the stack the way a cryptographer designs it. At the root is a
+password, low entropy and human-chosen -- the weakest link, and the one every
+attack aims at. WPA2 stretches it (PBKDF2) and proves knowledge of it (four-way
+handshake MICs), but cannot escape that a captured handshake makes the password
+grindable offline. WPA3 breaks that chain with a PAKE (SAE), so the password is no
+longer offline-testable and each session gets a forward-secret key. On top of
+either sits the data-frame protection -- AES-CCMP (WPA2) or AES-GCMP (WPA3) --
+whose entire safety rests on a never-repeating packet number, the invariant KRACK
+showed is easy to violate by accident.
+
+\begin{center}
+\begin{tikzpicture}[font=\small, node distance=0.35cm,
+  layer/.style={draw,thick,rounded corners,minimum width=10.5cm,
+                minimum height=0.95cm,align=center}]
+  \node[layer,fill=red!8]    (pw)  {Passphrase (low entropy) -- the attacker's target};
+  \node[layer,fill=orange!10,below=of pw] (pmk)
+       {WPA2: PBKDF2 $\to$ shared PMK \quad / \quad WPA3: SAE PAKE $\to$ per-session PMK (forward-secret)};
+  \node[layer,fill=yellow!12,below=of pmk] (hs)
+       {Four-way handshake: nonces $\to$ PTK (KCK $\|$ KEK $\|$ TK), mutual MIC proof};
+  \node[layer,fill=green!12,below=of hs] (data)
+       {Data frames: AES-CCMP (WPA2) / AES-GCMP-256 (WPA3), packet number = nonce};
+  \node[layer,fill=blue!10,below=of data] (mgmt)
+       {Management frames: PMF (802.11w) -- mandatory in WPA3, blocks deauth spoofing};
+
+  \draw[->,>=Stealth,thick] (pw) -- (pmk);
+  \draw[->,>=Stealth,thick] (pmk) -- (hs);
+  \draw[->,>=Stealth,thick] (hs) -- (data);
+\end{tikzpicture}
+\end{center}
+
+Every famous WiFi break maps onto one of these layers. WEP failed at the data
+layer (keystream reuse, linear checksum) and the key layer (FMS). The offline
+dictionary attack lives at the password layer and is intrinsic to WPA2-Personal.
+KRACK struck the handshake/data boundary by resetting a nonce. Dragonblood hit
+WPA3's password-to-group mapping through a side channel. The protocols got better
+by hardening each layer in turn -- and the meta-lesson, repeated at every layer, is
+that a sound cryptographic core can still be undone by the plumbing around it: a
+checksum that should be a MAC, a counter that resets, a loop whose length leaks the
+secret. Cryptographic engineering is getting all of that right at once, billions of
+times a day, on a $\$30$ router.
+
+\section{Exercises}
+
+\begin{exercise}
+\textbf{(WEP keystream reuse.)} Two WEP frames are captured with the same IV. Their
+ciphertexts are $c_1$ and $c_2$. You know that $m_1$ is an ARP request whose first
+$8$ bytes are the constant \texttt{AA AA 03 00 00 00 08 06}. Show exactly how to
+recover the first $8$ bytes of $m_2$, and explain why no part of the WEP key is
+needed.
+\end{exercise}
+
+\begin{exercise}
+\textbf{(CRC malleability.)} WEP's integrity check is CRC-32, which is linear:
+$\mathrm{CRC}(x \xor \delta) = \mathrm{CRC}(x) \xor \mathrm{CRC}(\delta)$.
+Encryption is $c = (m \concat \mathrm{CRC}(m)) \xor Z$. Given a ciphertext $c$ for
+an unknown $m$, describe how to produce a valid ciphertext $c'$ that decrypts to
+$m \xor \delta$ for a chosen $\delta$, \emph{without} knowing $m$ or the keystream
+$Z$. Why does this break integrity?
+\end{exercise}
+
+\begin{exercise}
+\textbf{(PBKDF2 cost.)} A GPU rig tests $2 \times 10^{6}$ WPA2 passphrase
+candidates per second. (a) How long to exhaust all $8$-character lowercase-letter
+passphrases ($26^8$)? (b) All $8$-character passphrases over a $72$-character
+alphabet ($72^8$)? (c) A five-word diceware passphrase ($7776^5$ possibilities)?
+Comment on which are realistically crackable.
+\end{exercise}
+
+\begin{exercise}
+\textbf{(Toy handshake.)} Using the toy PRF $\mathrm{prf}(K,x) = (Kx + 7) \bmod
+101$ from Example~\ref{ch26:toy-handshake}, let $\text{PMK} = 30$, $\text{Anonce}
+= 20$, $\text{Snonce} = 15$ (combine by addition). Compute the toy PTK, then
+$\text{KCK} = \text{PTK} \bmod 10$, then the M2 MIC $\mathrm{prf}(\text{KCK},
+\text{Snonce})$. Now show that, because this toy PRF is linear, an attacker who
+sees one (input, output) pair under KCK can solve for KCK -- and explain in one
+sentence why HMAC-SHA1 does not have this defect.
+\end{exercise}
+
+\begin{exercise}
+\textbf{(KRACK invariant.)} State the single invariant whose violation enables
+KRACK. Then explain why the official patch -- ``do not reset the packet number on
+key reinstall'' -- restores it, and why this required no change to the key-
+derivation math or the cipher.
+\end{exercise}
+
+\begin{exercise}
+\textbf{(Nonce reuse, two modes.)} CCMP uses AES-CCM; WPA3's high tier uses AES-
+GCM. Reusing a nonce is bad in both, but worse in one. Explain what an attacker
+gains from nonce reuse in CTR-based confidentiality (both modes), and what
+\emph{additional} catastrophe GCM suffers that CCM does not. (Hint: GCM's
+authenticator is a polynomial evaluation whose key the nonce reuse can expose.)
+\end{exercise}
+
+\begin{exercise}
+\textbf{(SAE arithmetic.)} Work a toy SAE in $\Zns{23}$ ($g = 5$, $q = 22$) with
+password element $P = g^{9} \bmod 23$. Let Alice use $r_A = 5, m_A = 4$ and Bob
+use $r_B = 6, m_B = 3$. Compute $s_A, s_B$, the shared secret $K = P^{r_A r_B}
+\bmod 23$, and verify both sides reach the same $K$. Then argue informally why an
+eavesdropper who sees $s_A, s_B, E_A, E_B$ cannot recover $P$ (and hence the
+password) when the group is large.
+\end{exercise}
+
+\begin{exercise}
+\textbf{(Evil twin reasoning.)} Explain precisely why a WPA2-Personal evil twin
+\emph{without} the passphrase cannot complete the four-way handshake with a victim
+client, identifying which message it fails to produce and why. Then explain why an
+\emph{open} (passwordless) network gives a victim no such protection, and what OWE
+(Enhanced Open) does and does not fix.
+\end{exercise}
+
+\begin{exercise}
+\textbf{(Same-network decryption.)} On a WPA2-Personal cafe network, you and a
+stranger both know the passphrase. The stranger captures your four-way handshake.
+Walk through exactly what they can derive (PMK, then PTK, then TK) and conclude
+whether they can decrypt your unicast traffic. Then explain why the same attack
+fails on WPA3-Personal even though, in a sense, ``everyone still knows the
+password.''
+\end{exercise}
+
+\begin{exercise}
+\textbf{(Forward secrecy.)} Define forward secrecy. Explain why WPA2-Personal lacks
+it (what an attacker who records traffic today and learns the passphrase next year
+can do), and why WPA3's SAE provides it. Identify the specific ephemeral values in
+SAE that make recorded sessions undecryptable even after password compromise.
+\end{exercise}
+
+\begin{exercise}
+\textbf{(Layered defense.)} You connect to a fully attacker-controlled WiFi AP
+(the attacker owns the link entirely). For each of the following, state whether the
+attacker can read or tamper with the content, and why: (a) an \texttt{https://}
+page load to a site with a valid certificate; (b) a plain \texttt{http://} page
+load; (c) a DNS lookup over plain UDP; (d) a DNS lookup over DoH (DNS-over-HTTPS).
+Use the result to justify the advice ``assume public WiFi is hostile and rely on
+TLS.''
+\end{exercise}

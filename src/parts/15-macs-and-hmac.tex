@@ -1,0 +1,622 @@
+\chapter{Message Authentication Codes and HMAC}
+
+Up to now the books in this series have spent most of their energy on one question: how do you keep Eve from \emph{reading} a message? The one-time pad, stream ciphers, AES, the modes of operation -- all of them are machines for confidentiality. But confidentiality is only half of what ``security'' means in practice, and on many days it is the less important half.
+
+Picture Alice wiring money. She sends her bank the message
+\[
+\texttt{"Pay Bob \$100"}.
+\]
+Suppose Eve cannot read it -- it is encrypted under a strong cipher. Has Eve been defeated? Not at all. If Eve can \emph{change} the ciphertext as it flies past, she may be able to turn it into an encryption of \texttt{"Pay Eve \$9999"}, or simply replay last week's \texttt{"Pay Eve \$100"} ten thousand times. Encryption said nothing about whether the message arrived intact, or whether it really came from Alice. That second guarantee -- this message is exactly what the sender sent, and it really was that sender -- is \emph{integrity} and \emph{authenticity}. The tool that delivers it is the \emph{message authentication code}, or MAC.
+
+This chapter builds MACs from the ground up: what they promise, what ``secure'' means for them, how to construct them from block ciphers (CBC-MAC) and from hash functions (HMAC), why the famous length-extension weakness of plain hashing forces HMAC's nested shape, how to combine a MAC with encryption without shooting yourself in the foot, and the small but deadly matter of comparing tags in constant time. We work tiny numbers by hand, break a few broken designs, and look at where HMAC lives in TLS, IPsec, and your phone.
+
+\chapterline
+
+\section{Confidentiality Is Not Integrity}
+\label{ch15:conf-vs-integrity}
+
+The two goals are genuinely different, and it helps to nail down the distinction before building anything.
+
+\begin{itemize}
+  \item \textbf{Confidentiality} hides the \emph{content}. After seeing the ciphertext, Eve learns nothing useful about the plaintext. This is what encryption gives you.
+  \item \textbf{Integrity} guarantees the message was not \emph{altered} in transit. If even one bit flips, the receiver notices and rejects.
+  \item \textbf{Authenticity} guarantees the message came from who it claims to come from -- someone holding the secret key.
+\end{itemize}
+
+In the symmetric-key world, integrity and authenticity come bundled together: a MAC delivers both. If a tag verifies under the shared key, the receiver knows simultaneously that the bits are unchanged and that whoever produced them held the key. (In the public-key world these split apart again into digital signatures, Chapter~22.)
+
+\begin{intuitionbox}
+A MAC is a \emph{tamper-evident seal} for digital data. Think of a wax seal on a letter, or the foil under a bottle cap. Anyone can see the message; only the holder of the secret signet ring can stamp a valid seal; and a stamp made for one letter cannot be peeled off and stuck onto another. The MAC is that seal, computed with a key only Alice and Bob share. Eve can rewrite the letter all she likes, but she cannot forge the stamp, so Bob throws her version away.
+\end{intuitionbox}
+
+A point that surprises newcomers: \emph{encryption alone provides no integrity}. It is tempting to reason ``the ciphertext is gibberish to Eve, so she cannot meaningfully modify it.'' That reasoning is wrong, and the next box shows exactly how wrong.
+
+\begin{attackbox}
+\textbf{Malleability of stream ciphers.} A stream cipher (Chapter~10) encrypts by XOR: $c = m \xor k$, where $k$ is the keystream. Suppose Alice encrypts the 11-byte ASCII message \texttt{"Pay Eve \$10"} and Eve, who cannot read the keystream, nonetheless \emph{knows the format} of these wire-transfer messages. She wants to change the amount.
+
+The last two bytes of plaintext are \texttt{'1'} (0x31) and \texttt{'0'} (0x30). Eve wants \texttt{'9'} (0x39) and \texttt{'9'} (0x39). She does not touch the key; she XORs into the ciphertext bytes the difference between what is there and what she wants:
+\[
+\Delta = \texttt{0x31}\xor\texttt{0x39} = \texttt{0x08},\qquad \Delta' = \texttt{0x30}\xor\texttt{0x39} = \texttt{0x09}.
+\]
+She replaces $c_{10}$ with $c_{10}\xor\texttt{0x08}$ and $c_{11}$ with $c_{11}\xor\texttt{0x09}$. When Bob decrypts:
+\[
+(c_{10}\xor\texttt{0x08})\xor k_{10} = (m_{10}\xor k_{10}\xor\texttt{0x08})\xor k_{10} = m_{10}\xor\texttt{0x08} = \texttt{'1'}\xor\texttt{0x08} = \texttt{'9'}.
+\]
+The keystream cancels regardless of its value. Eve never learned a single keystream byte, never decrypted anything, yet flipped the payment from \$10 to \$99. Confidentiality was perfect. Integrity was nonexistent. \emph{This is why we need MACs.}
+\end{attackbox}
+
+\section{What a MAC Is, Formally}
+\label{ch15:mac-syntax}
+
+\begin{definition}[Message authentication code]
+\label{ch15:def-mac}
+A MAC is a triple of algorithms $(\Gen,\MAC,\Vrfy)$:
+\begin{itemize}
+  \item $\Gen(1^n)$ outputs a secret key $k$, typically $k\getsr\{0,1\}^n$.
+  \item $\MAC_k(m)$ takes the key and a message $m\in\{0,1\}^*$ and outputs a \emph{tag} $t$. We write $t \gets \MAC_k(m)$.
+  \item $\Vrfy_k(m,t)$ outputs $1$ (accept) or $0$ (reject).
+\end{itemize}
+Correctness: for every key and message, $\Vrfy_k(m,\MAC_k(m)) = 1$.
+\end{definition}
+
+When $\MAC$ is deterministic -- which the constructions in this chapter all are -- verification is the obvious thing: recompute the tag and compare. $\Vrfy_k(m,t)$ recomputes $t' = \MAC_k(m)$ and accepts iff $t' = t$. (We will see in Section~\ref{ch15:constant-time} that ``compare'' hides a trap.)
+
+Alice and Bob share $k$ ahead of time. To send $m$, Alice transmits $(m, t)$ with $t=\MAC_k(m)$. Bob runs $\Vrfy_k(m,t)$; if it returns $1$ he trusts the message, otherwise he discards it. The tag travels \emph{in the clear} alongside the message -- a MAC is not encryption and does not try to hide anything. Its only job is to be unforgeable.
+
+\begin{focusbox}
+A MAC tag is short -- 128 or 256 bits is typical -- no matter how long the message is. That is the same compression you saw in hash functions (Chapter~14): a fingerprint. The difference is the key. A hash $\Hash(m)$ is public; anyone can compute it, so anyone can forge a ``valid'' hash for a forged message. A MAC $\MAC_k(m)$ folds in a secret, so only key-holders can produce valid tags. A MAC is, very roughly, a \emph{keyed} fingerprint.
+\end{focusbox}
+
+\section{What ``Secure'' Means: Unforgeability}
+\label{ch15:unforgeability}
+
+Now define the threat. We must be careful, because the obvious-sounding definitions are too weak.
+
+The right notion is \textbf{existential unforgeability under an adaptive chosen-message attack}, abbreviated EUF-CMA. The names of the pieces tell the story:
+\begin{itemize}
+  \item \emph{Chosen-message attack:} the adversary may ask for tags on any messages she likes. We model this by giving her a \emph{MAC oracle} -- a black box that, on input $m$, returns $\MAC_k(m)$ -- without revealing $k$. ``Adaptive'' means she picks each query after seeing previous answers.
+  \item \emph{Existential forgery:} she wins by producing \emph{any} new valid message--tag pair $(m^*,t^*)$ -- ``existential'' because it can be any message she manages to forge, not a specific target. The only restriction: $m^*$ must be a message she never queried.
+\end{itemize}
+
+\begin{formalbox}
+\textbf{The forgery game $\mathsf{MacForge}_{\Adv,\Pi}(n)$.} For a MAC scheme $\Pi=(\Gen,\MAC,\Vrfy)$ and adversary $\Adv$:
+\begin{enumerate}
+  \item Run $k\gets\Gen(1^n)$.
+  \item $\Adv$ is given oracle access to $\MAC_k(\cdot)$. Let $Q$ be the set of messages she queries.
+  \item $\Adv$ outputs $(m^*,t^*)$.
+  \item The game outputs $1$ (adversary wins) iff $\Vrfy_k(m^*,t^*)=1$ \emph{and} $m^*\notin Q$.
+\end{enumerate}
+$\Pi$ is \textbf{EUF-CMA secure} if for every $\PPT$ adversary $\Adv$,
+\[
+  \Pr\!\big[\mathsf{MacForge}_{\Adv,\Pi}(n)=1\big] \;\le\; \negl(n).
+\]
+\end{formalbox}
+
+Why such a strong definition? Because the real world is hostile in exactly these ways.
+
+\begin{whybox}
+\textbf{Why adaptive chosen-message?} In practice the attacker often \emph{can} get the system to MAC messages of her choosing. A login server returns a MAC'd session cookie for any username she registers; a payment terminal MACs whatever transaction she types in. If a MAC were secure only against attackers who passively eavesdrop, it would fail the moment the attacker could nudge the system into signing things. We assume the worst: she gets tags on everything she asks for.
+
+\textbf{Why existential (any new message)?} A MAC's job is to make \emph{every} forgery hard, not just forgeries of ``important-looking'' messages. If an attacker could forge a tag for even one nonsense message she never queried, the scheme is broken -- because that nonsense might be a control command, a length field, or a building block for a bigger attack. Demanding that no new valid pair exists is the cleanest, strongest bar, and it is the one cryptographers hold MACs to.
+\end{whybox}
+
+\begin{trapbox}
+EUF-CMA does \emph{not} promise protection against \textbf{replay}. If Alice sends $(m,t)$ and Eve records it, Eve can resend the same pair later; the tag still verifies because $m$ is unchanged. The MAC did its job -- the message is authentic and intact -- it is just \emph{old}. Defeating replay is a separate, protocol-level concern: include a counter, a timestamp, or a nonce \emph{inside} the MAC'd message, so each authenticated message is unique. TLS, IPsec, and Signal all do exactly this. Never assume ``it has a MAC'' means ``it cannot be replayed.''
+\end{trapbox}
+
+\subsection{A pseudorandom function is already a MAC}
+\label{ch15:prf-is-mac}
+
+Here is the cleanest theoretical fact in the whole subject. Recall a pseudorandom function (PRF) is a keyed function $F_k$ that no efficient adversary can distinguish from a truly random function, even after querying it on chosen inputs. If you have a good PRF, you already have a good MAC:
+\[
+  \MAC_k(m) = F_k(m),\qquad \Vrfy_k(m,t) = [\,F_k(m)\stackrel{?}{=}t\,].
+\]
+
+\begin{whybox}
+Suppose $F_k$ were a \emph{truly} random function with $\ell$-bit outputs. The adversary queries it on messages $m_1,\dots,m_q$ and learns those outputs. Now she must guess $t^* = F(m^*)$ for a \emph{fresh} $m^*$. But a random function's value on a point she has never seen is uniformly random and independent of everything she has seen. Her best guess is a blind one: she wins with probability exactly $2^{-\ell}$, negligible for $\ell$ like 128.
+
+A real PRF is computationally indistinguishable from this ideal, so the adversary's forgery probability against $F_k$ can exceed $2^{-\ell}$ only by a negligible amount -- otherwise her forgeries would themselves be a distinguisher. Hence \emph{any secure PRF is a secure fixed-length MAC.} AES, viewed as a PRF, is a MAC for 128-bit messages. The engineering problem is extending this to messages of \emph{arbitrary} length without losing security -- which is what CBC-MAC and HMAC solve.
+\end{whybox}
+
+\section{CBC-MAC: A MAC From a Block Cipher}
+\label{ch15:cbc-mac}
+
+We have a block cipher $E_k$ (think AES) that maps one block to one block and behaves like a PRF. How do we authenticate a message of many blocks? The idea: chain the blocks through the cipher exactly like CBC-mode encryption (Chapter~13), but throw away every intermediate ciphertext and keep only the last block. That final block depends on every input block, so it is a fingerprint of the whole message.
+
+\begin{focusbox}
+\textbf{Raw CBC-MAC.} Split the message into blocks $m_1,m_2,\dots,m_\ell$ (each one cipher-block wide). Set $t_0 = 0$ (the all-zero block -- note: \emph{no random IV}, unlike CBC encryption). For $i=1,\dots,\ell$:
+\[
+  t_i = E_k\!\big(t_{i-1}\xor m_i\big).
+\]
+Output the tag $t = t_\ell$.
+\end{focusbox}
+
+\begin{center}
+\begin{tikzpicture}[
+  font=\small,
+  blk/.style={draw, rounded corners, minimum width=1.2cm, minimum height=0.8cm},
+  enc/.style={draw, fill=sourceblue!18, minimum width=1.1cm, minimum height=0.8cm},
+  xo/.style={draw, circle, inner sep=0pt, minimum size=0.5cm},
+  >=Latex
+]
+  \node[blk] (m1) at (0,2.2) {$m_1$};
+  \node[blk] (m2) at (3,2.2) {$m_2$};
+  \node[blk] (m3) at (6,2.2) {$m_3$};
+
+  \node[xo] (x1) at (0,1.2) {$\xor$};
+  \node[xo] (x2) at (3,1.2) {$\xor$};
+  \node[xo] (x3) at (6,1.2) {$\xor$};
+
+  \node[enc] (e1) at (0,0.2) {$E_k$};
+  \node[enc] (e2) at (3,0.2) {$E_k$};
+  \node[enc] (e3) at (6,0.2) {$E_k$};
+
+  \node (zero) at (-2.4,1.2) {$0^n$};
+  \node (out) at (8.4,0.2) {$t = t_3$};
+
+  \draw[->] (m1)--(x1); \draw[->] (m2)--(x2); \draw[->] (m3)--(x3);
+  \draw[->] (x1)--(e1); \draw[->] (x2)--(e2); \draw[->] (x3)--(e3);
+  \draw[->] (zero)--(x1);
+  \draw[->] (e1) -| (1.5,1.2) -- (x2);
+  \draw[->] (e2) -| (4.5,1.2) -- (x3);
+  \draw[->] (e3)--(out);
+
+  \node[gray] at (1.5,1.45) {$t_1$};
+  \node[gray] at (4.5,1.45) {$t_2$};
+\end{tikzpicture}
+\end{center}
+
+\begin{theorem}[Security of raw CBC-MAC, informal]
+\label{ch15:cbcmac-thm}
+If $E_k$ is a secure PRF and we restrict ourselves to messages of a single \emph{fixed} length $\ell$ blocks, then raw CBC-MAC is an EUF-CMA-secure MAC.
+\end{theorem}
+
+The phrase ``fixed length'' is not a footnote -- it is load-bearing. The moment you let messages vary in length, raw CBC-MAC shatters.
+
+\subsection{Working it by hand with a 4-bit toy cipher}
+\label{ch15:cbcmac-toy}
+
+Let us trace CBC-MAC on numbers small enough to do in your head. Take a block size of $4$ bits, so blocks are integers $0$--$15$. We need a ``cipher'' $E_k$; for illustration use the fixed permutation of the nibbles
+\[
+  E(x) = (7x + 3) \bmod 16,
+\]
+which is a bijection on $\{0,\dots,15\}$ because $\gcd(7,16)=1$. (A real cipher is far from affine; this is only to make the chaining visible.) Authenticate the two-block message $m_1 = 5$, $m_2 = 9$.
+
+\begin{walkbox}
+$t_0 = 0$.
+
+Block 1: $t_0\xor m_1 = 0\xor 5 = 5$. Then $t_1 = E(5) = (35+3)\bmod 16 = 38\bmod 16 = 6$.
+
+Block 2: $t_1\xor m_2 = 6\xor 9$. In binary $0110\xor 1001 = 1111 = 15$. Then $t_2 = E(15) = (105+3)\bmod 16 = 108\bmod 16 = 12$.
+
+Tag $= t_2 = 12$.
+\end{walkbox}
+
+Flip a single bit of the message and watch the tag change completely. Take $m_1 = 4$ instead of $5$ (one bit different), $m_2=9$ unchanged. Now $t_0\xor m_1 = 4$, $t_1 = E(4) = 31\bmod 16 = 15$; then $15\xor 9 = 0110 = 6$, $t_2 = E(6) = 45\bmod 16 = 13$. The tag jumped from $12$ to $13$, and with a real cipher the change would be unpredictable and total. That avalanche is what makes the tag a fingerprint.
+
+\subsection{The length-extension forgery on raw CBC-MAC}
+\label{ch15:cbcmac-attack}
+
+\begin{attackbox}
+\textbf{Forging variable-length CBC-MAC.} Suppose the system uses raw CBC-MAC on messages of \emph{any} length, with the fixed $0$ start. The attacker requests the tag on a one-block message $m$ and gets back
+\[
+  t = E_k(m).
+\]
+Now she claims a valid tag for the \emph{two-block} message $M = m \,\|\, (m \xor t)$ -- and the tag is the very same $t$ she already holds. Check it by running CBC-MAC on $M$:
+\[
+  t_1 = E_k(0\xor m) = E_k(m) = t,
+\]
+\[
+  t_2 = E_k(t_1 \xor (m\xor t)) = E_k(t \xor m \xor t) = E_k(m) = t.
+\]
+The second block's XOR cancels $t_1$ back down to $m$, so $t_2 = t$. She has produced a valid tag for a message she never queried. \textbf{Existential forgery, broken.}
+
+The root cause: with a fixed start and no length binding, the attacker can splice the known output of one computation into the input of the next. This is the same length-extension flavor of weakness we will see haunt plain hash MACs in Section~\ref{ch15:length-extension}.
+\end{attackbox}
+
+\subsection{Fixing CBC-MAC}
+\label{ch15:cbcmac-fix}
+
+There are two standard repairs, both of which break the splicing trick by making the computation depend on the length.
+
+\begin{itemize}
+  \item \textbf{Prepend the length.} Make the \emph{first} block encode the message length in blocks, then run CBC-MAC over $\langle\ell\rangle \,\|\, m_1\,\|\,\cdots\,\|\,m_\ell$. Now a message of a different length starts from a different first block, so spliced tags do not line up. (Appending the length does \emph{not} work -- the attacker controls the last block and can compensate.)
+  \item \textbf{Encrypt the final block under a second key (EMAC / ECBC-MAC).} Compute raw CBC-MAC to get $t_\ell$, then output $t = E_{k_2}(t_\ell)$ with an independent key $k_2$. The extra encryption hides the intermediate chaining value the attacker needs, so she can no longer use a returned tag as an internal state. This is the basis of standardized schemes like CMAC (NIST SP 800-38B), which folds the two keys into one and adds clean handling of partial final blocks.
+\end{itemize}
+
+\begin{applicationbox}
+You meet CBC-MAC's descendants more often than the raw version. \textbf{CMAC} (also called OMAC) is the modern, length-safe block-cipher MAC; it underlies the integrity check in some IPsec and storage-encryption deployments. \textbf{CCM mode} (used in WPA2 Wi-Fi as AES-CCMP, Chapter~26) is literally ``CTR encryption + CBC-MAC for authentication,'' combined carefully so the two parts share a cipher key safely. So while you should never reach for raw CBC-MAC yourself, its chaining idea is quietly protecting your Wi-Fi traffic right now.
+\end{applicationbox}
+
+\section{Why You Cannot Just MAC With a Hash}
+\label{ch15:length-extension}
+
+Hash functions (Chapter~14) already compress arbitrary messages to short digests and are built to be collision-resistant. The naive instinct is to make a MAC by hashing the key together with the message:
+\[
+  \MAC_k(m) \stackrel{?}{=} \Hash(k \concat m).
+\]
+This is called the \emph{secret-prefix} MAC, and for the hash functions everyone actually uses -- MD5, SHA-1, SHA-256, all built on the Merkle--Damg\aa{}rd construction -- it is \textbf{broken}. The reason is \emph{length extension}.
+
+\begin{intuitionbox}
+A Merkle--Damg\aa{}rd hash processes the message block by block, carrying a running ``state.'' Crucially, \textbf{the final state it outputs as the digest is the very same internal state it would feed into the next block.} So if you know $\Hash(x)$, you know exactly where the machine was after eating $x$ -- and you can pick up where it left off and keep feeding it more data, computing $\Hash(x\concat\texttt{pad}\concat y)$ for your own $y$ \emph{without knowing $x$}. The digest leaks the engine's resume point.
+\end{intuitionbox}
+
+\begin{attackbox}
+\textbf{Length-extension forgery on secret-prefix MAC.} The server authenticates with $t = \Hash(k\concat m)$ using SHA-256. An attacker observes a valid pair $(m, t)$ for some message $m$ -- say
+\[
+m = \texttt{"amount=100\&to=alice"},
+\]
+and she also knows (or guesses) the key length $\abs{k}$.
+
+A Merkle--Damg\aa{}rd hash internally pads its input to a block boundary with a known $\texttt{pad}$ (a $1$ bit, zeros, then the bit-length). So $t$ is actually the hash state after consuming
+\[
+k \concat m \concat \texttt{pad}_1,
+\]
+where $\texttt{pad}_1$ is the padding for that length. The attacker \emph{sets her hash's internal state to $t$} and feeds in any suffix $y$ she likes, for example
+\[
+y = \texttt{"\&to=eve\&admin=true"}.
+\]
+Out comes a valid tag $t'$ for the extended message
+\[
+m' = m \concat \texttt{pad}_1 \concat y,
+\]
+because $t' = \Hash(k\concat m')$ is exactly what the machine computes -- and she produced it \emph{without ever knowing $k$}. She has forged a tag on a message the server will parse as authentic. Game over for secret-prefix MAC.
+\end{attackbox}
+
+\begin{trapbox}
+This is not a museum piece. The classic ``Flickr API signature'' break and a string of web-API authentication bugs in the 2000s were exactly length-extension attacks on $\Hash(\text{secret}\concat\text{message})$. Whenever you see homegrown authentication that hashes a secret in front of the data with SHA-1 or SHA-256, assume it is forgeable. Use HMAC.
+\end{trapbox}
+
+\subsection{The length extension, worked on a toy hash}
+\label{ch15:lenext-toy}
+
+The attack feels like sleight of hand until you watch the state move. Build a cartoon Merkle--Damg\aa{}rd hash whose ``state'' is one number mod $251$ and whose compression function folds in one message byte at a time:
+\[
+  s_0 = 0,\qquad s_{i} = C(s_{i-1}, x_i) = \big(31\,s_{i-1} + x_i\big)\bmod 251.
+\]
+After the last byte, the hash outputs the final state as the digest -- and that is the whole vulnerability: \emph{the digest is the live state}, ready to absorb more bytes. To keep the arithmetic tiny we use a one-byte ``padding'' rule: a real Merkle--Damg\aa{}rd hash appends a $\texttt{0x80}$ byte and a length encoding, so we append the single pad byte $P=128$ and pretend that finishes the block.
+
+Let the secret be $k=[9]$ (one byte the attacker never learns) and the visible message be $m=[2,5]$.
+
+\begin{walkbox}
+\textbf{The legitimate tag.} The server computes $t=\Hash(k\concat m)$ over the padded stream $[9,2,5,P]$ with $P=128$:
+\begin{align*}
+ s_1 &= (31\cdot 0 + 9)\bmod 251 = 9,\\
+ s_2 &= (31\cdot 9 + 2)\bmod 251 = 281\bmod 251 = 30,\\
+ s_3 &= (31\cdot 30 + 5)\bmod 251 = 935\bmod 251 = 935 - 753 = 182,\\
+ s_4 &= (31\cdot 182 + 128)\bmod 251 = 5770\bmod 251.
+\end{align*}
+For the last step, $251\cdot 22 = 5522$ and $5770-5522 = 248$. So $t = s_4 = 248$. The attacker sees the pair $(m,t)=([2,5],\,248)$ and knows $\abs{k}=1$.
+\end{walkbox}
+
+\begin{walkbox}
+\textbf{The forgery, without $k$.} The attacker wants a tag for a message that continues past the padding. She picks a suffix byte $y=[7]$ and \emph{sets her hash state to the published digest}, $s\leftarrow t = 248$, then resumes the same recurrence:
+\[
+  s' = (31\cdot 248 + 7)\bmod 251 = 7695\bmod 251.
+\]
+Since $251\cdot 30 = 7530$, we get $s' = 7695 - 7530 = 165$. She then appends \emph{her own} padding byte $P=128$ to close the block:
+\[
+  t' = (31\cdot 165 + 128)\bmod 251 = 5243\bmod 251.
+\]
+Since $251\cdot 20 = 5020$, $t' = 5243 - 5020 = 223$. She claims that $t'=223$ is a valid tag for the forged message
+\[
+  m' = m \concat [P] \concat y = [2,5,128,7].
+\]
+\end{walkbox}
+
+\begin{walkbox}
+\textbf{Does the server agree?} The server, holding $k=[9]$, computes $\Hash(k\concat m')$ over $[9,2,5,128,7]$ plus its own final pad $[128]$. The first four absorptions are identical to the legitimate run, landing at $s_4 = 248$ -- exactly the digest the attacker resumed from. Continuing:
+\[
+  s_5 = (31\cdot 248 + 7)\bmod 251 = 165,\qquad s_6 = (31\cdot 165 + 128)\bmod 251 = 223.
+\]
+The server's tag is $223$, matching the attacker's $t'$. The forgery verifies, and she never touched $k$. The leak was structural: publishing $s_4$ handed her the engine's resume point.
+\end{walkbox}
+
+Notice precisely what HMAC removes. If this same toy hash were wrapped as $\Hash\big((k_0\xor\texttt{opad})\concat \Hash((k_0\xor\texttt{ipad})\concat m)\big)$, the value the attacker observes is the \emph{outer} state, while the resumable inner state $s_4$ stays sealed inside, never published. With nothing to resume from, the splice in the second walk-box has no foothold.
+
+\subsection{Does secret-suffix help? Partly, and not enough}
+
+You might try $\Hash(m\concat k)$ instead. Length extension no longer applies (the secret is at the end). But now the security leans entirely on collision resistance of $\Hash$: if an attacker finds any two messages $m_1\ne m_2$ with $\Hash(m_1)=\Hash(m_2)$ -- which the birthday bound (Chapter~7) makes cheaper than you would hope, and which is feasible for MD5 and SHA-1 today -- then $\Hash(m_1\concat k)=\Hash(m_2\concat k)$, so the tag for $m_1$ is also valid for $m_2$. That is a forgery. We want a construction that survives even when the underlying hash has weaknesses. That is HMAC.
+
+\section{HMAC: The Right Way to MAC With a Hash}
+\label{ch15:hmac}
+
+HMAC (Hash-based MAC) wraps an ordinary hash in a specific nested pattern that kills length extension and provably reduces security to mild assumptions about the hash's compression function. It was designed by Bellare, Canetti, and Krawczyk in 1996, standardized as RFC 2104 and FIPS 198, and it is everywhere.
+
+\begin{historybox}
+Before HMAC, every protocol designer improvised their own ``hash the key with the message'' scheme, and most of them were breakable by length extension or collisions, as above. Bellare, Canetti, and Krawczyk's contribution was twofold: a \emph{fixed, simple} recipe that anyone could implement on top of an unmodified hash library, and a \emph{proof} that the recipe is a secure MAC as long as the hash's underlying compression function is a decent PRF -- a far weaker assumption than full collision resistance. That proof is why HMAC-SHA-1 stayed trustworthy for authentication years after SHA-1's collision resistance fell apart: the attacks that broke SHA-1 signatures do not touch HMAC-SHA-1.
+\end{historybox}
+
+\begin{focusbox}
+\textbf{The HMAC construction.} Let $\Hash$ be a hash with block size $B$ bytes (for SHA-256, $B=64$) and output size $L$ bytes. Define two fixed pad constants, each $B$ bytes:
+\[
+  \texttt{ipad} = \texttt{0x36}\ \text{repeated},\qquad \texttt{opad} = \texttt{0x5c}\ \text{repeated}.
+\]
+Process the key $k$ into a $B$-byte block $k_0$: if $k$ is longer than $B$ bytes, replace it with $\Hash(k)$; then right-pad with zero bytes to length $B$. Then
+\[
+  \mathrm{HMAC}_k(m) \;=\; \Hash\!\Big(\,(k_0\xor\texttt{opad})\;\concat\;\Hash\big((k_0\xor\texttt{ipad})\concat m\big)\Big).
+\]
+\end{focusbox}
+
+Read that from the inside out. The \emph{inner} hash $\Hash\big((k_0\xor\texttt{ipad})\concat m\big)$ is essentially a secret-prefix MAC of $m$ -- and we just said that is length-extension-vulnerable. The \emph{outer} hash then hashes the key again over that inner digest. The outer wrapping is the whole point: it takes the leaky inner digest and runs it through one more keyed compression, so what the attacker sees is no longer a usable ``resume point.''
+
+\begin{center}
+\begin{tikzpicture}[
+  font=\small, >=Latex,
+  box/.style={draw, rounded corners, fill=structurepurple!12, minimum height=0.85cm, inner sep=5pt},
+  hh/.style={draw, fill=sourceblue!18, minimum width=1.5cm, minimum height=0.85cm}
+]
+  \node[box] (ki) at (0,0) {$k_0\xor\texttt{ipad}$};
+  \node[box] (m) at (2.8,0) {$m$};
+  \node[hh] (h1) at (1.4,-1.3) {$\Hash$};
+  \node (inner) at (1.4,-2.5) {inner digest ($L$ bytes)};
+
+  \node[box] (ko) at (5.9,-2.5) {$k_0\xor\texttt{opad}$};
+  \node[hh] (h2) at (5.9,-3.9) {$\Hash$};
+  \node (tag) at (5.9,-5.1) {$\mathrm{HMAC}_k(m)$};
+
+  \draw[->] (ki)--(1.1,-0.9); \draw[->] (m)--(1.7,-0.9);
+  \draw[->] (h1)--(inner);
+  \draw[->] (inner) -- (4.2,-2.5) -- (5.6,-3.45);
+  \draw[->] (ko)--(6.2,-3.45);
+  \draw[->] (h2)--(tag);
+\end{tikzpicture}
+\end{center}
+
+\begin{whybox}
+\textbf{Why the nesting defeats length extension.} The dangerous object is the inner digest $h = \Hash\big((k_0\xor\texttt{ipad})\concat m\big)$, because an attacker who saw \emph{it} could extend it. But the attacker never sees $h$. What she sees is the \emph{outer} value $\Hash\big((k_0\xor\texttt{opad})\concat h\big)$. To length-extend \emph{that}, she would need to know its preimage state -- but that requires knowing $h$ and the secret $k_0\xor\texttt{opad}$, which she does not. The inner digest is sealed inside the outer hash, away from her hands.
+
+\textbf{Why the security proof needs so little.} Bellare--Canetti--Krawczyk show HMAC is a secure MAC provided the hash's \emph{compression function} is a PRF when keyed through its chaining input -- and provided the inner hash is weakly collision-resistant for the queried messages. Both are much milder than demanding the full hash be collision-resistant. That gap is exactly why HMAC-SHA-1 remained safe for MACs after SHA-1 collisions became practical: those collisions attack the full hash, not the keyed compression function HMAC relies on.
+
+\textbf{Why two different pads?} \texttt{ipad} and \texttt{opad} differ in many bit positions (0x36 vs 0x5c), so $k_0\xor\texttt{ipad}$ and $k_0\xor\texttt{opad}$ behave like two effectively independent keys derived from one $k$. The proof wants the inner and outer hashes keyed differently; the two constants buy that for free, with no extra key material.
+\end{whybox}
+
+\subsection{A tiny HMAC by hand}
+\label{ch15:hmac-toy}
+
+The real HMAC uses 64-byte blocks; that is too big to trace on paper. So shrink everything to a cartoon ``hash'' over single bytes to expose the \emph{shape}, not the cryptography. Let block size $B=1$ byte, and let the toy hash be $h(x) = \big(\sum_i x_i \cdot 31^{i} \big) \bmod 251$ over the byte sequence $x$ (251 is prime). Take pads $\texttt{ipad}=\texttt{0x36}=54$, $\texttt{opad}=\texttt{0x5c}=92$, key $k = 10$ (already one byte, so $k_0=10$), message $m = [7]$ (one byte).
+
+\begin{walkbox}
+$k_0\xor\texttt{ipad} = 10\xor 54$. In binary $00001010\xor 00110110 = 00111100 = 60$.
+
+Inner input: $[\,60,\;7\,]$. Inner digest:
+\[
+ h = (60\cdot 31^{0} + 7\cdot 31^{1})\bmod 251 = (60 + 217)\bmod 251 = 277\bmod 251 = 26.
+\]
+
+$k_0\xor\texttt{opad} = 10\xor 92$: $00001010\xor 01011100 = 01010110 = 86$.
+
+Outer input: $[\,86,\;26\,]$. Tag:
+\[
+ \mathrm{HMAC} = (86 + 26\cdot 31)\bmod 251 = (86 + 806)\bmod 251 = 892 \bmod 251 = 892 - 753 = 139.
+\]
+\end{walkbox}
+
+So $\mathrm{HMAC}_{10}([7]) = 139$ under our toy hash. The numbers are meaningless cryptographically -- the point is the choreography: XOR the key with \texttt{ipad}, hash with the message, XOR the key with \texttt{opad}, hash again over the inner result. Change $k$, the inner key $60$ changes, the inner digest changes, the tag changes. Change $m$, the inner digest changes, the tag changes. An attacker who lacks $k$ cannot reproduce either keyed step.
+
+\begin{implementbox}
+A spelled-out HMAC over a real hash is short. This builds HMAC on Python's \texttt{hashlib} from the block-level operations, so you can see every step. \textbf{Learning only -- never ship this. Use \texttt{hmac.new(key, msg, hashlib.sha256)} from the standard library, which is constant-time-verified and audited.}
+\begin{lstlisting}[language=Python]
+import hashlib
+
+def hmac_sha256(key: bytes, msg: bytes) -> bytes:
+    B = 64                      # SHA-256 block size in bytes
+    if len(key) > B:            # long keys get hashed down first
+        key = hashlib.sha256(key).digest()
+    k0 = key + b"\x00" * (B - len(key))   # right-pad to B bytes
+
+    ipad = bytes(b ^ 0x36 for b in k0)
+    opad = bytes(b ^ 0x5c for b in k0)
+
+    inner = hashlib.sha256(ipad + msg).digest()
+    return hashlib.sha256(opad + inner).digest()
+
+# Sanity check against the standard library
+import hmac
+key, msg = b"my secret key", b"transfer 100 to bob"
+mine = hmac_sha256(key, msg)
+ref  = hmac.new(key, msg, hashlib.sha256).digest()
+assert mine == ref, "mismatch!"
+print(mine.hex())
+\end{lstlisting}
+Notice there is no length field anywhere in our code -- HMAC needs none, because the nesting, not a length prefix, is what stops extension.
+\end{implementbox}
+
+\begin{connectionbox}
+The forgery probability for a PRF-based MAC bottoms out at $2^{-\ell}$ for an $\ell$-bit tag (Section~\ref{ch15:prf-is-mac}), which is just the chance of guessing one fixed random value -- a direct payoff of the uniform-and-independent reasoning from the probability companion. The collision-based attacks on secret-suffix MACs ride the \emph{birthday bound}: a hash with $L$-bit output starts colliding after about $2^{L/2}$ messages, so its collision-based forgery resistance is only $2^{L/2}$, not $2^{L}$. HMAC's proof sidesteps this by not requiring full collision resistance, which is why its effective security tracks the $2^{\ell}$ guessing bound rather than the weaker birthday bound. The cost of one HMAC is two compression-function passes plus the message, i.e.\ essentially the cost of one hash -- see the modular-exponentiation and hashing cost analyses in the algorithms companion.
+\end{connectionbox}
+
+\section{Combining Encryption and Authentication}
+\label{ch15:combining}
+
+Most real traffic needs \emph{both} confidentiality and integrity. You have a cipher and you have a MAC; how do you bolt them together? There are three obvious orders (Figure~\ref{ch15:fig-compose}), and the choice is not cosmetic -- two of them have led to real, exploited vulnerabilities. Let $\Enc$ be a CPA-secure cipher with key $k_E$ and $\MAC$ a secure MAC with an \emph{independent} key $k_M$.
+
+\begin{itemize}
+  \item \textbf{Encrypt-and-MAC (E\&M):} send $c = \Enc_{k_E}(m)$ and $t = \MAC_{k_M}(m)$. The tag is computed over the \emph{plaintext} and sent alongside the ciphertext.
+  \item \textbf{MAC-then-Encrypt (MtE):} compute $t = \MAC_{k_M}(m)$, then send $c = \Enc_{k_E}(m\concat t)$. The tag is buried inside the ciphertext.
+  \item \textbf{Encrypt-then-MAC (EtM):} compute $c = \Enc_{k_E}(m)$, then $t = \MAC_{k_M}(c)$, and send $(c,t)$. The tag is computed over the \emph{ciphertext}.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\small, >=Latex,
+  op/.style={draw, rounded corners, minimum width=1.0cm, minimum height=0.7cm},
+  enc/.style={op, fill=sourceblue!16},
+  mac/.style={op, fill=structurepurple!16},
+  send/.style={draw, rounded corners, fill=targetgreen!14, minimum height=0.7cm, inner sep=4pt},
+  lbl/.style={font=\footnotesize\bfseries}
+]
+  % E&M
+  \node[lbl] at (-2.2,2.3) {E\&M};
+  \node (mEM) at (0,2.3) {$m$};
+  \node[enc] (eEM) at (1.5,2.3) {$\Enc$};
+  \node[mac] (cEM) at (1.5,1.55) {$\MAC$};
+  \node[send] (sEM) at (4.0,2.3) {send $(c,\,t)$};
+  \draw[->] (mEM)--(eEM); \draw[->] (mEM) |- (cEM);
+  \draw[->] (eEM)--(sEM);
+  \draw[->] (cEM) -| (4.0,1.9);
+
+  % MtE
+  \node[lbl] at (-2.2,0.6) {MtE};
+  \node (mMt) at (0,0.6) {$m$};
+  \node[mac] (tMt) at (1.5,0.6) {$\MAC$};
+  \node[enc] (eMt) at (3.0,0.6) {$\Enc$};
+  \node[send] (sMt) at (5.2,0.6) {send $c$};
+  \draw[->] (mMt)--(tMt); \draw[->] (tMt)--node[above,font=\tiny]{$m\concat t$}(eMt);
+  \draw[->] (eMt)--(sMt);
+
+  % EtM
+  \node[lbl] at (-2.2,-1.1) {EtM};
+  \node (mEt) at (0,-1.1) {$m$};
+  \node[enc] (eEt) at (1.5,-1.1) {$\Enc$};
+  \node[mac] (tEt) at (3.0,-1.1) {$\MAC$};
+  \node[send] (sEt) at (5.4,-1.1) {send $(c,\,t)$};
+  \draw[->] (mEt)--(eEt); \draw[->] (eEt)--node[above,font=\tiny]{$c$}(tEt);
+  \draw[->] (eEt) |- (sEt);
+  \draw[->] (tEt) -| (5.4,-1.5);
+\end{tikzpicture}
+\caption{The three ways to compose a cipher with a MAC. Only Encrypt-then-MAC (bottom) authenticates the ciphertext, so the receiver can reject a forged packet before decrypting.}
+\label{ch15:fig-compose}
+\end{figure}
+
+\begin{focusbox}
+The verdict, which the rest of this section earns: \textbf{Encrypt-then-MAC is the one to use.} It is the only one of the three that is provably secure for \emph{any} CPA-secure cipher and \emph{any} secure MAC, with no extra assumptions. The other two can be secure with specific primitives, but they are fragile and have failed catastrophically in deployed protocols.
+\end{focusbox}
+
+\subsection{Why Encrypt-then-MAC wins}
+
+\begin{whybox}
+With EtM, the receiver \textbf{checks the MAC on the ciphertext \emph{before decrypting anything}}. If the tag does not verify, he discards the packet and never touches the decryption logic. This has two consequences:
+\begin{enumerate}
+  \item \emph{Integrity of ciphertexts.} An attacker cannot produce any $(c,t)$ that verifies unless $c$ is one the sender actually transmitted -- forging $t$ for a tampered $c$ means forging the MAC, which is hard. So every ciphertext the decryptor ever processes is a genuine one.
+  \item \emph{No decryption oracle.} Because invalid ciphertexts are rejected at the MAC check, the attacker learns nothing from how decryption \emph{would} have behaved -- no padding errors, no parse failures, no timing differences in the cipher. This is precisely what kills the padding-oracle attacks below.
+\end{enumerate}
+The clean theorem: EtM applied to a CPA-secure cipher and an EUF-CMA MAC yields an \emph{authenticated encryption} scheme secure against chosen-ciphertext attacks. The MAC's strength carries the whole construction, regardless of the cipher's quirks.
+\end{whybox}
+
+\subsection{Why the other orders are dangerous}
+
+\begin{attackbox}
+\textbf{MAC-then-Encrypt and the padding oracle.} In MtE, the receiver must \emph{decrypt first} to recover $m\concat t$, then check the tag. With CBC-mode encryption, decryption involves removing padding (Chapter~13) \emph{before} the MAC is even examined. That ordering opens a side channel.
+
+A \emph{padding oracle} is any observable difference -- an error message, a connection reset, a timing gap -- between ``decryption produced valid padding'' and ``invalid padding.'' Because MtE decrypts and unpads before MACing, a tampered ciphertext can trigger the padding check, and the attacker can watch which response she gets. By submitting carefully mauled ciphertexts and observing valid-vs-invalid padding one byte at a time, she decrypts the entire message \emph{without the key}, at a cost of roughly $128$ tries per byte.
+
+This is not hypothetical. \textbf{TLS used MAC-then-Encrypt with CBC}, and the result was a parade of attacks: the original 2002 Vaudenay padding oracle, then Lucky~13 (2013), which read the padding-check \emph{timing} even after implementers tried to hide the explicit error. Each one let an active attacker recover plaintext such as session cookies. The fixes were painful retrofits. EtM would have made all of them impossible, because the MAC over the ciphertext would have rejected every mauled packet before any padding logic ran.
+\end{attackbox}
+
+\begin{attackbox}
+\textbf{Encrypt-and-MAC leaks through the tag.} E\&M computes $t=\MAC_{k_M}(m)$ over the \emph{plaintext} and sends it in the clear. But a MAC is only required to be \emph{unforgeable}; it is \textbf{not} required to hide its input. A perfectly good MAC may be deterministic, so equal plaintexts produce equal tags. An eavesdropper who sees two sessions with the same tag learns the two underlying plaintexts were identical -- a confidentiality leak the cipher was supposed to prevent. Worse, some MACs reveal partial structure of the message. So E\&M can break CPA-security outright, depending on the MAC. (\textbf{SSH} historically used a variant of E\&M and had to add countermeasures.) The tag, sitting in the clear over the plaintext, is the leak.
+\end{attackbox}
+
+\begin{trapbox}
+Two non-negotiable rules whenever you compose encryption and a MAC:
+\begin{enumerate}
+  \item \textbf{Use independent keys} $k_E\ne k_M$. Reusing one key across the cipher and the MAC can let the two interact in unexpected, exploitable ways; the security proofs all assume separate keys (derive them from a master key with a KDF or HKDF).
+  \item \textbf{Prefer Encrypt-then-MAC}, and verify the tag in constant time \emph{before} decrypting. Reject early; never let an unauthenticated ciphertext reach your decryption or parsing code.
+\end{enumerate}
+Better still, do not hand-compose at all: use a vetted \emph{authenticated encryption} mode (AES-GCM, ChaCha20-Poly1305 -- Chapter~16) that bakes EtM-style security in and is hard to misuse.
+\end{trapbox}
+
+\begin{applicationbox}
+Modern protocols converged on the lesson. \textbf{TLS 1.3} (2018) threw out CBC-with-MtE entirely and mandates AEAD ciphers (AES-GCM, ChaCha20-Poly1305) that authenticate the ciphertext. \textbf{IPsec} ESP uses Encrypt-then-MAC (or AEAD), and \textbf{HMAC-SHA-256} is a standard integrity choice there. \textbf{Signal} authenticates ciphertexts with HMAC-SHA-256 in its message encryption. The 2014 ``Encrypt-then-MAC for TLS'' extension (RFC 7366) was a direct retrofit of EtM onto TLS~1.2 to escape Lucky~13. The order of operations in this section is, quite literally, why your browser's padlock is trustworthy today and was shakier a decade ago.
+\end{applicationbox}
+
+\section{Verifying Tags in Constant Time}
+\label{ch15:constant-time}
+
+One last trap, small in code and large in consequence. Verification compares the received tag $t$ against the recomputed tag $t'$. The natural way to compare two byte strings -- and the way nearly every programming language compares them by default -- stops at the \emph{first} differing byte:
+\begin{lstlisting}[language=Python]
+def insecure_verify(t_received, t_computed):
+    return t_received == t_computed   # short-circuits on first mismatch
+\end{lstlisting}
+That early exit is a \emph{timing side channel}. Comparing tags that differ in byte~0 returns slightly faster than tags that match through byte~5. An attacker who can measure response time can recover the correct tag one byte at a time.
+
+\begin{attackbox}
+\textbf{Timing a tag, byte by byte.} The attacker wants to forge a tag for a chosen message $m$. She submits $(m, g)$ for a guess $g$ and times the rejection.
+\begin{enumerate}
+  \item Fix all bytes of $g$ to zero, then sweep the first byte $g_0$ through all $256$ values. For the correct $g_0$, the comparison proceeds to byte~$1$ before failing -- measurably \emph{slower}. She keeps the value that took longest.
+  \item With byte~0 locked in, sweep byte~1 the same way, finding the value that pushes the comparison to byte~2.
+  \item Repeat down the tag. Each byte costs about $256$ timed queries (averaged over noise), so a $32$-byte tag falls in roughly $32\times 256\approx 8000$ probes instead of the $2^{256}$ a blind search would need.
+\end{enumerate}
+The catastrophe: a perfectly unforgeable MAC, with a perfectly correct construction, is defeated by the \texttt{==} operator. The flaw is in the \emph{comparison}, not the cryptography. Real instances of this class -- KeyCzar (2009), various API-signature checks -- have been found and fixed.
+\end{attackbox}
+
+The defense is a \emph{constant-time comparison}: always examine every byte, and let the running time depend only on the \emph{length} of the tags, never on \emph{where} they differ. Accumulate the differences with XOR and OR, then test the accumulator once at the end.
+
+\begin{implementbox}
+\textbf{Learning only -- in production call \texttt{hmac.compare\_digest} (Python) or \texttt{CRYPTO\_memcmp} (OpenSSL), which are written and audited for this.}
+\begin{lstlisting}[language=Python]
+def constant_time_equal(a: bytes, b: bytes) -> bool:
+    # Assumes a and b have the same, non-secret length.
+    if len(a) != len(b):
+        return False
+    acc = 0
+    for x, y in zip(a, b):
+        acc |= x ^ y          # any differing bit sets a 1 in acc, forever
+    return acc == 0           # one branch, after touching every byte
+
+# The real thing:
+import hmac
+assert hmac.compare_digest(b"abc", b"abc")
+\end{lstlisting}
+The loop runs the same number of iterations and does the same work whether the tags match or differ in byte~0 or byte~31. There is exactly one branch, at the very end, on the fully-mixed accumulator -- no information about \emph{where} a mismatch occurred leaks out.
+\end{implementbox}
+
+\begin{connectionbox}
+This is a first taste of \emph{side-channel attacks} (Chapter~37): the secret leaks not through the math but through \emph{how long} or \emph{how much power} the computation takes. The discipline it teaches -- make running time independent of secret data -- recurs throughout real crypto engineering: constant-time modular exponentiation for RSA, constant-time table lookups in AES software, constant-time conditional swaps in elliptic-curve ladders. The probability companion's view of an attacker accumulating a statistical signal over many noisy timing samples is exactly the model that makes the byte-by-byte attack work despite measurement noise.
+\end{connectionbox}
+
+\section{Putting It Together}
+\label{ch15:summary}
+
+A MAC is the symmetric-key tool for integrity and authenticity: a keyed fingerprint $\MAC_k(m)$ that travels in the clear and lets a key-holder detect any tampering. The bar it must clear is EUF-CMA -- no efficient adversary, even one who collects tags on messages of her choosing, can produce a valid tag for a fresh message except with negligible probability. Any secure PRF is already such a MAC for fixed-length inputs; the work is extending to arbitrary lengths.
+
+Two constructions do the extending. CBC-MAC chains a block cipher and is secure for fixed-length messages, but raw CBC-MAC is forgeable across lengths by splicing, so real systems use length-prefixed or final-encrypted variants like CMAC. HMAC nests a hash twice -- $\Hash((k_0\xor\texttt{opad})\concat\Hash((k_0\xor\texttt{ipad})\concat m))$ -- which defeats the length-extension attack that destroys the naive $\Hash(k\concat m)$ MAC, and which provably needs only mild assumptions on the hash. When you need secrecy too, compose with \emph{Encrypt-then-MAC} and independent keys, never MAC-then-Encrypt (padding oracles, Lucky~13) or Encrypt-and-MAC (tag leakage). And whatever you build, compare tags in constant time, or the \texttt{==} operator will hand an attacker your tag one byte at a time. The next chapter folds all of this into a single primitive -- authenticated encryption -- so you never have to compose by hand again.
+
+\section*{Exercises}
+\addcontentsline{toc}{section}{Exercises}
+
+\begin{exercise}[Malleability, concretely]
+Alice encrypts the 8-byte ASCII message \texttt{"send \$05"} with a stream cipher, producing ciphertext $c$. Eve knows the format and wants the bank to read \texttt{"send \$98"}. The last two plaintext bytes are \texttt{'0'} (0x30) and \texttt{'5'} (0x35); she wants \texttt{'9'} (0x39) and \texttt{'8'} (0x38). Compute the two XOR masks Eve must apply to the last two ciphertext bytes, and explain in one sentence why she needs no knowledge of the keystream.
+\end{exercise}
+
+\begin{exercise}[Trace CBC-MAC]
+Using the toy cipher $E(x)=(7x+3)\bmod 16$ from Section~\ref{ch15:cbcmac-toy} and start value $t_0=0$, compute the raw CBC-MAC tag of the three-block message $m_1=2,\;m_2=11,\;m_3=4$. Show $t_1,t_2,t_3$.
+\end{exercise}
+
+\begin{exercise}[Break variable-length CBC-MAC]
+You can query a raw CBC-MAC oracle (fixed $0$ start, the cipher from Section~\ref{ch15:cbcmac-toy}, no length binding). Query the one-block message $m=6$ to get its tag $t$. Using the splicing attack of Section~\ref{ch15:cbcmac-attack}, write down a two-block message you have never queried whose tag is also $t$, and verify by tracing CBC-MAC on it.
+\end{exercise}
+
+\begin{exercise}[Length extension on paper]
+Explain, in terms of Merkle--Damg\aa{}rd internal state, why an attacker who knows $\Hash(k\concat m)$ and $\abs{k}$ can compute a valid secret-prefix tag for a longer message but \emph{cannot} do so against HMAC. Identify the single structural feature of HMAC that blocks her.
+\end{exercise}
+
+\begin{exercise}[Toy HMAC]
+With the toy hash $h(x)=\big(\sum_i x_i\cdot 31^{i}\big)\bmod 251$, block size $B=1$, $\texttt{ipad}=54$, $\texttt{opad}=92$ from Section~\ref{ch15:hmac-toy}, compute $\mathrm{HMAC}_k(m)$ for key $k=20$ and one-byte message $m=[3]$. Show the inner key, the inner digest, the outer key, and the final tag.
+\end{exercise}
+
+\begin{exercise}[Why two pads?]
+Suppose someone defines a ``simplified HMAC'' that uses the \emph{same} pad for inner and outer: $\Hash((k_0\xor\texttt{p})\concat\Hash((k_0\xor\texttt{p})\concat m))$. Argue why having the inner and outer hashes keyed by the \emph{same} value is undesirable, and what property of $\texttt{ipad}\ne\texttt{opad}$ the standard relies on.
+\end{exercise}
+
+\begin{exercise}[Order matters]
+For each of MAC-then-Encrypt, Encrypt-and-MAC, and Encrypt-then-MAC, state in one sentence the concrete failure mode discussed in this chapter (padding oracle / tag leakage / none), and name the real protocol associated with each lesson.
+\end{exercise}
+
+\begin{exercise}[Replay is not forgery]
+Eve records a valid pair $(m,t)$ from a session and resends it an hour later; the receiver accepts it again. Explain why this does \emph{not} contradict EUF-CMA security, and describe a concrete change to what gets MAC'd that defeats the replay.
+\end{exercise}
+
+\begin{exercise}[Timing attack budget]
+A server uses a non-constant-time \texttt{==} to compare $16$-byte HMAC tags. Estimate the number of timed queries an attacker needs to recover a full valid tag for a chosen message via the byte-by-byte attack of Section~\ref{ch15:constant-time}, and compare it to the $2^{128}$ cost of a blind forgery. By what factor does the timing leak reduce the work?
+\end{exercise}
+
+\begin{exercise}[Constant-time proof obligation]
+The \texttt{constant\_time\_equal} routine in Section~\ref{ch15:constant-time} early-returns \texttt{False} when the two inputs have different lengths. Explain why this length check does \emph{not} leak secret information in the HMAC verification setting (hint: who controls the tag length, and is it secret?), and give one situation where leaking a length \emph{would} be dangerous.
+\end{exercise}
+
+\begin{exercise}[PRF implies MAC]
+Let $F_k$ be a secure PRF with $128$-bit outputs, used directly as a fixed-length MAC $\MAC_k(m)=F_k(m)$. An adversary makes $q$ oracle queries on distinct messages, then outputs a forgery $(m^*,t^*)$ with $m^*$ fresh. Bound her success probability, and explain why it does not grow with $q$ (beyond the PRF's own distinguishing advantage).
+\end{exercise}

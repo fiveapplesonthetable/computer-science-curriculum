@@ -1,0 +1,594 @@
+\chapter{Common Pitfalls}
+
+Almost nobody who loses a cryptographic battle loses it on the mathematics. AES has stood for two decades. RSA-2048 will not be factored by anyone reading this. The discrete logarithm in a 256-bit elliptic curve group is as hard today as it was when the curve was standardized. And yet systems built on exactly these primitives get broken constantly -- WiFi networks read off the air, session cookies forged, firmware decrypted, password databases cracked wholesale. The break almost never touches the prime. It happens in the joints: the nonce that was reused, the IV that was predictable, the comparison that returned early, the key that was hardcoded in the binary, the checksum mistaken for a MAC, the same key pressed into two jobs it was never meant to share.
+
+This is the chapter that takes everything we have built and shows you the precise places where it leaks. Think of it as a field guide to crypto failure. Each pitfall here has broken a real, shipped, name-brand system, and each one has the same shape: a sound primitive used outside the contract it was designed under. The primitive promises ``I am secure \emph{provided} you give me a fresh nonce / a uniform key / a constant-time comparison / a separate key per purpose.'' The pitfall is breaking that provided-clause and assuming the promise still holds. It does not.
+
+We will work most of these with small numbers, because the failures are not subtle once you watch them happen. Reusing a stream-cipher keystream once turns two ciphertexts into a crossword puzzle you can solve by hand. Encrypting a structured document in ECB mode leaves the structure visible in the ciphertext. Comparing a MAC tag byte-by-byte with early exit leaks the correct tag one byte at a time. None of these need deep theory to exploit -- they need only that you stop assuming and start looking. By the end you should have an instinct that fires whenever you see a counter that might repeat, a random value that might be predictable, or a primitive doing two jobs at once.
+
+\chapterline
+
+\section{The Shape of Every Pitfall}
+\label{ch38:shape}
+
+Before the catalog, the pattern. Every cryptographic primitive comes with a contract -- a precise statement of what it guarantees and what it demands in return. The one-time pad guarantees perfect secrecy and demands a uniform key as long as the message, used once. AES-GCM guarantees confidentiality and integrity and demands a nonce that never repeats under a given key. A MAC guarantees that a tag cannot be forged and demands that the verifier compare tags without leaking timing. HMAC guarantees collision-resistant authentication and demands that you not reuse the same key for unrelated purposes.
+
+\begin{intuitionbox}
+A cryptographic primitive is a contract, not a spell. Saying ``it's AES-encrypted'' is like saying ``it's bolted down'' -- the bolt only holds if it went through the hole and into the frame. The math gives you a guarantee with a precondition attached, and the entire discipline of using crypto safely is keeping the preconditions true. Eve does not attack the guarantee. She attacks the precondition you forgot was there.
+\end{intuitionbox}
+
+Why does this pattern dominate real-world failures? Because the preconditions are invisible at the call site. The function is named \texttt{encrypt(key, nonce, message)} and it returns a ciphertext whether or not the nonce is fresh. Nothing crashes. Nothing warns. The contract violation is silent, and the system ships, and it looks perfect in testing because testing never reuses a nonce on purpose. The failure surfaces only when an adversary -- who reads the spec more carefully than the implementer did -- goes looking for exactly the violated clause.
+
+\begin{focusbox}
+The recurring lesson of this chapter: \textbf{cryptographic correctness is not testable by example.} A function that returns plausible ciphertext for every input you try can still be catastrophically broken, because the break lives in a relationship \emph{between} inputs (two messages under one nonce), or in a property you cannot observe from the output (constant-time behavior), or in a misuse that only an adversary triggers (chosen-ciphertext queries). You cannot unit-test your way to a secure system. You verify the contract is honored, every clause, every call.
+\end{focusbox}
+
+We now walk the catalog. The ordering is rough: we start with the misuses that leak plaintext directly, move through integrity and key-management failures, and end with the meta-pitfall of building your own primitives.
+
+\section{Nonce and IV Reuse}
+\label{ch38:nonce-reuse}
+
+A nonce -- ``number used once'' -- is the freshness input that lets a deterministic cipher produce different ciphertexts for the same plaintext. An IV (initialization vector) plays the same role for block-cipher modes. The contract is in the name: used once. Break it and the consequences range from ``leaks whether two messages are equal'' to ``recover the plaintext'' to ``recover the authentication key and forge arbitrary messages.'' This is, by volume of real-world damage, the single most destructive pitfall in the book.
+
+\subsection{The two-time pad}
+\label{ch38:two-time-pad}
+
+Start with the cleanest case, a stream cipher. Recall the structure: from a key $K$ and a nonce $N$ the cipher generates a keystream $\mathrm{KS}(K,N)$ and encrypts by XOR, $c = m \xor \mathrm{KS}(K,N)$. The keystream is as long as the message and looks uniformly random to anyone without $K$. One message, one fresh $N$: this is as good as a one-time pad. Reuse $N$ for two messages and you have committed the original sin, the \emph{two-time pad}.
+
+Suppose two plaintexts $m_1$ and $m_2$ are encrypted under the same key and the same nonce:
+\[
+c_1 = m_1 \xor \mathrm{KS}(K,N), \qquad c_2 = m_2 \xor \mathrm{KS}(K,N).
+\]
+The attacker does not know $K$ and cannot compute $\mathrm{KS}$. But she does not need to. XOR the two ciphertexts:
+\[
+c_1 \xor c_2 = (m_1 \xor \mathrm{KS}) \xor (m_2 \xor \mathrm{KS}) = m_1 \xor m_2.
+\]
+The keystream cancels. The attacker now holds $m_1 \xor m_2$, the XOR of two plaintexts, with the key removed entirely. Everything that follows is linguistics and arithmetic, not cryptography.
+
+\begin{walkbox}
+Why is $m_1 \xor m_2$ already a disaster, when it is not either plaintext? Because natural-language plaintext is enormously redundant. ASCII text uses a few dozen of the 256 byte values; spaces are everywhere; letters cluster. XOR a space (\texttt{0x20}) with a lowercase letter and you get its uppercase counterpart, which is itself a printable letter -- a tell-tale signature that one of the two bytes was a space. ``Crib-dragging'' a guessed word across $m_1 \xor m_2$ and checking whether the other stream stays readable peels both messages apart. Hold the idea: $m_1 \xor m_2$ leaks because plaintext is not random, and XOR preserves that structure.
+\end{walkbox}
+
+\begin{example}[Cracking a two-time pad by hand]
+\label{ch38:ex-two-time}
+Take a tiny keystream $\mathrm{KS} = $ the bytes \texttt{6A 1F 22 0C} (in hex), and two 4-byte plaintexts in ASCII:
+\[
+m_1 = \texttt{"HOME"}=\texttt{48 4F 4D 45}, \qquad m_2 = \texttt{"WORK"}=\texttt{57 4F 52 4B}.
+\]
+Encrypt both with the \emph{same} keystream:
+\[
+c_1 = m_1 \xor \mathrm{KS} = \texttt{22 50 6F 49}, \qquad
+c_2 = m_2 \xor \mathrm{KS} = \texttt{3D 50 70 47}.
+\]
+Eve sees $c_1, c_2$, not the keystream. She computes
+\[
+c_1 \xor c_2 = \texttt{1F 00 1F 0E}.
+\]
+The second byte is \texttt{00}: the two plaintexts share that byte exactly (both \texttt{O}). Now Eve guesses that $m_1$ starts with \texttt{H} (\texttt{0x48}). Then byte 0 of $m_2$ is $\texttt{0x48} \xor \texttt{0x1F} = \texttt{0x57} = $ \texttt{W} -- a printable letter, the guess survives. She guesses $m_1[3]=\texttt{E}$ (\texttt{0x45}); then $m_2[3] = \texttt{0x45}\xor\texttt{0x0E}=\texttt{0x4B}=\texttt{K}$. Both words fall out together. No key was ever recovered; the keystream's secrecy became irrelevant the moment it was reused.
+\end{example}
+
+\begin{attackbox}
+\textbf{MS-PPTP and WEP, the same bug twice.} Microsoft's PPTP VPN encrypted both directions of a session with RC4 under keys derived from the user's password, and in early versions effectively reused keystream across the two directions, yielding $m_1 \xor m_2$ for client and server traffic. WEP (early WiFi, the WiFi chapter) used a 24-bit IV prepended to a fixed key as RC4's seed. With only $2^{24}$ IVs and a busy access point cycling through them in hours, IV collisions are guaranteed by the birthday bound -- and each collision is a two-time pad. Attackers collected colliding packets, XORed them, and read traffic off the air. The cipher (RC4) was not broken here; the \emph{nonce discipline} was.
+\end{attackbox}
+
+\subsection{CTR mode is a stream cipher, so the same rule binds}
+\label{ch38:ctr-nonce}
+
+CTR mode turns a block cipher into a stream cipher: the keystream block at position $i$ is $E_K(N \concat i)$, the encryption of the nonce concatenated with a counter. It inherits the stream-cipher contract exactly. Reuse the pair $(K, N)$ for two messages and the counter blocks line up identically, so $c_1 \xor c_2 = m_1 \xor m_2$ block for block. There is nothing special about CTR's protection here; it is a one-time pad whose pad is $E_K(N\concat i)$, and one-time means one time.
+
+\subsection{The GCM catastrophe: from confidentiality loss to forgery}
+\label{ch38:gcm-nonce}
+
+AES-GCM raises the stakes. GCM is CTR mode for confidentiality plus a polynomial MAC called GHASH for integrity, sharing one key. The MAC works in the field $\F_{2^{128}}$: it evaluates a polynomial whose coefficients are the ciphertext blocks at a secret point $H = E_K(0^{128})$, then masks the result with $E_K(N \concat 1)$ to produce the tag. The authentication key $H$ is fixed by $K$; the per-message mask depends on the nonce.
+
+Reuse a nonce in GCM and two separate things break. First, confidentiality: it is still CTR mode, so $c_1 \xor c_2 = m_1 \xor m_2$, the two-time pad. Second, and far worse, \emph{integrity collapses}. With two messages encrypted under the same $(K,N)$, the per-message mask $E_K(N\concat 1)$ is identical for both. Subtracting the two tag equations cancels the mask and leaves the attacker a polynomial equation in the single unknown $H$ over $\F_{2^{128}}$. Solving it (finding the roots of a known polynomial over a finite field is easy) recovers $H$. With $H$ in hand the attacker can compute the GHASH of \emph{any} ciphertext she likes and re-mask it -- she can forge valid tags for messages of her choosing. One repeated nonce in GCM does not merely leak two plaintexts; it hands the attacker the integrity key for the whole session.
+
+\begin{whybox}
+Why does GCM punish nonce reuse so much harder than a plain stream cipher? Because GCM's integrity rests on the secrecy of a single fixed value $H$, and the only thing hiding $H$ in the tag equation is the per-nonce mask. A fresh nonce gives a fresh, independent mask each time, so each tag is a one-time-pad-protected evaluation and reveals nothing about $H$. Reuse the nonce and two tags share one mask; the difference of the two equations is mask-free and exposes $H$. The structure that makes GCM fast (one fixed multiplier $H$, a cheap per-nonce mask) is exactly the structure that makes nonce reuse fatal. This is worked in full in the authenticated-encryption chapter; the takeaway for the field guide is blunt: \emph{a GCM nonce must never repeat under a key, not once, not ever.}
+\end{whybox}
+
+\begin{focusbox}
+GCM nonces are 96 bits. If you generate them randomly, the birthday bound says a collision becomes likely after about $2^{48}$ messages -- which sounds enormous until you picture a busy server. The safe pattern is a \emph{deterministic counter} nonce (message 1, 2, 3, \dots), never random, never reset, and a hard stop before the counter could wrap or the key could be copied to a second machine that counts independently. Virtual-machine snapshots and process forks are the classic way a counter silently rewinds and starts repeating -- more on that under randomness below.
+\end{focusbox}
+
+\begin{implementbox}
+A misuse-resistant alternative exists: \emph{nonce-misuse-resistant} AEAD such as AES-GCM-SIV. It derives the per-message values from a hash of the nonce \emph{and} the plaintext, so repeating a nonce on two different messages degrades gracefully (it leaks only whether the messages were equal) instead of catastrophically. Here is the shape of the defensive idea, not the real construction:
+\begin{lstlisting}[language=Python]
+# LEARNING ONLY -- not GCM-SIV, not secure, do not deploy.
+# Illustrates: derive the "nonce" from the message so identical
+# (nonce, message) pairs are the only thing that ever collides.
+import hashlib
+
+def synthetic_iv(key, nonce, message):
+    # A real SIV uses a PRF/MAC keyed separately; this is a toy.
+    h = hashlib.sha256(key + nonce + message).digest()
+    return h[:12]            # 96-bit synthetic IV bound to the plaintext
+
+# Two DIFFERENT messages under the same nonce now get DIFFERENT IVs,
+# so the keystream differs and there is no two-time pad.
+\end{lstlisting}
+The lesson is the design principle: if you cannot guarantee nonce uniqueness operationally, choose a primitive whose failure mode under reuse is mild. Reach for a vetted GCM-SIV library, never this snippet.
+\end{implementbox}
+
+\subsection{Predictable IVs: the CBC case and BEAST}
+\label{ch38:predictable-iv}
+
+CBC mode demands a different property than CTR: its IV must be \emph{unpredictable}, not merely unique. CBC encrypts block $i$ as $c_i = E_K(m_i \xor c_{i-1})$, with $c_0 = \mathrm{IV}$. Figure~\ref{ch38:fig-cbc} shows the chaining: each plaintext block is masked by the previous ciphertext block before encryption, and the IV is the mask for the first block. The first block is $E_K(m_1 \xor \mathrm{IV})$. If the attacker can \emph{predict} the IV that will be used for a message before that message is encrypted, and she can also influence the plaintext (a chosen-plaintext setting common on the web), she can choose $m_1$ to cancel her knowledge and test guesses about secret data. \begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  blk/.style={draw, minimum height=7mm, minimum width=13mm, align=center},
+  enc/.style={draw, fill=blue!6, minimum height=7mm, minimum width=11mm, align=center},
+  xo/.style={draw, circle, inner sep=1pt, fill=white},
+  ar/.style={-{Stealth[length=2mm]}, thick}
+]
+\foreach \i/\x in {1/0, 2/3.2, 3/6.4} {
+  \node[blk, fill=green!8] (m\i) at (\x,0) {$m_{\i}$};
+  \node[xo] (x\i) at (\x,1.1) {$\oplus$};
+  \node[enc] (e\i) at (\x,2.4) {$E_K$};
+  \node[blk] (c\i) at (\x,3.7) {$c_{\i}$};
+  \draw[ar] (m\i) -- (x\i);
+  \draw[ar] (x\i) -- (e\i);
+  \draw[ar] (e\i) -- (c\i);
+}
+\node[blk, fill=red!8] (iv) at (-3.0,1.1) {IV};
+\draw[ar] (iv) -- (x1);
+\draw[ar] (c1) -- ($(c1)+(0,0.5)$) -| (x2);
+\draw[ar] (c2) -- ($(c2)+(0,0.5)$) -| (x3);
+\end{tikzpicture}
+\caption{CBC encryption. Each plaintext block is XORed with the previous ciphertext block before the cipher is applied; the IV seeds the first block. If an attacker can \emph{predict} the IV (or, as in BEAST, the chained block reused from the previous record) and also choose plaintext, she can cancel the mask and probe secret bytes -- which is why a CBC IV must be unpredictable, not merely unique.}
+\label{ch38:fig-cbc}
+\end{figure}
+
+This is the BEAST attack on TLS 1.0, which used the \emph{last ciphertext block of the previous record} as the IV of the next -- a value the attacker sees on the wire and can therefore predict. The fix in TLS 1.1+ was to make each record's IV explicit and random. The general rule: a unique-but-predictable IV is fine for CTR and fatal for CBC.
+
+\begin{trapbox}
+``Unique'' and ``unpredictable'' are different requirements, and the right one depends on the mode. CTR/GCM: unique is enough, predictable is fine (a counter is ideal). CBC: must be unpredictable (random), because a predictable IV plus chosen plaintext leaks. Using a counter as a CBC IV is a real bug even though the counter never repeats. Read the mode's contract; do not assume one freshness rule fits all.
+\end{trapbox}
+
+\section{ECB Mode: Encryption That Preserves Pictures}
+\label{ch38:ecb}
+
+Electronic Codebook mode is the naive way to encrypt a long message with a block cipher: split into blocks, encrypt each independently under the same key, concatenate. $c_i = E_K(m_i)$. It is deterministic and stateless, which is precisely why it is broken. Because $E_K$ is a fixed permutation, \emph{equal plaintext blocks produce equal ciphertext blocks}. Every repetition in the plaintext shows through as a repetition in the ciphertext. ECB does not hide patterns; it relabels them.
+
+\begin{intuitionbox}
+ECB is a substitution cipher whose alphabet is the set of all $2^{128}$ blocks instead of the 26 letters. We learned in the history chapter that monoalphabetic substitution falls to frequency analysis because it preserves the structure of the message. ECB has exactly the same flaw at block granularity. The alphabet is too big to frequency-analyze a block at a time, but any plaintext with repeated blocks -- a bitmap, a fixed-format record, a database with repeated fields -- broadcasts its repetition straight into the ciphertext.
+\end{intuitionbox}
+
+The famous demonstration is the ECB penguin: encrypt a bitmap image of the Linux mascot in ECB and the outline of the penguin remains plainly visible, because large monochrome regions are runs of identical blocks that encrypt to identical ciphertext. The colors scramble; the shape survives. Confidentiality that leaks the shape of the secret is not confidentiality.
+
+\begin{example}[ECB leaks a fixed-format record]
+\label{ch38:ex-ecb}
+Use a toy 4-bit block cipher (block = one hex digit) with the permutation $E_K$ that maps
+\[
+\texttt{1}\!\to\!\texttt{7},\quad \texttt{4}\!\to\!\texttt{2},\quad \texttt{5}\!\to\!\texttt{E},\quad \texttt{A}\!\to\!\texttt{9}
+\]
+(only these entries matter here). Encrypt the record \texttt{4A4A1554} block by block:
+\[
+\texttt{4}\,\texttt{A}\,\texttt{4}\,\texttt{A}\,\texttt{1}\,\texttt{5}\,\texttt{5}\,\texttt{4}
+\;\xrightarrow{\;E_K\;}\;
+\texttt{2}\,\texttt{9}\,\texttt{2}\,\texttt{9}\,\texttt{7}\,\texttt{E}\,\texttt{E}\,\texttt{2}.
+\]
+Look at the ciphertext \texttt{2929 7EE2} without knowing the key. You can immediately read off: positions 0 and 2 are equal, positions 1 and 3 are equal, positions 5 and 6 are equal, and position 7 equals position 0. The plaintext's repetition pattern is fully exposed. If this record were ``\texttt{FIELDA FIELDA \dots}'' you would know two fields are identical -- maybe two transactions with the same amount, or two users with the same password block. The cipher did its one-block job perfectly and leaked anyway.
+\end{example}
+
+\begin{attackbox}
+\textbf{ECB cut-and-paste.} Determinism plus block independence lets an attacker \emph{rearrange} ciphertext. Suppose a cookie is \texttt{user=alice\&role=user} encrypted in ECB with 8-byte blocks aligned so that \texttt{role=user} and a forged \texttt{role=admin} fall on block boundaries. An attacker who can get the system to encrypt a chosen username can harvest the ciphertext block for \texttt{admin}, then splice it over the \texttt{user} block in her own cookie. Because each block decrypts independently, the spliced ciphertext decrypts to a valid \texttt{role=admin} token. No key needed -- ECB's block independence is the whole vulnerability.
+\end{attackbox}
+
+\begin{focusbox}
+The fix is never ``encrypt harder.'' It is to use a mode that randomizes -- CBC with a random IV, or better, an AEAD like GCM or ChaCha20-Poly1305 that gives you confidentiality \emph{and} integrity. ECB has exactly one defensible use in modern practice: encrypting a single block of already-random data (e.g., wrapping a random key), where there is no structure to leak and only one block to repeat. For anything with length or structure, ECB is a bug.
+\end{focusbox}
+
+\section{Getting Encrypt-and-Authenticate Backwards}
+\label{ch38:mac-then-encrypt}
+
+We devoted a whole chapter to authenticated encryption; here is the pitfall distilled. There are three ways to combine an encryption scheme with a MAC, and two of them are landmines (Figure~\ref{ch38:fig-etm-mte}):
+
+\begin{itemize}
+\item \textbf{Encrypt-then-MAC} (EtM): compute $c = \Enc_K(m)$, then $t = \MAC_{K'}(c)$, send $c \concat t$. Verify the tag \emph{before} decrypting. This is the provably sound order.
+\item \textbf{MAC-then-Encrypt} (MtE): compute $t = \MAC_{K'}(m)$, then $c = \Enc_K(m \concat t)$. Used by old TLS. Fragile.
+\item \textbf{Encrypt-and-MAC} (E\&M): send $\Enc_K(m) \concat \MAC_{K'}(m)$. Used by SSH. The MAC is computed over plaintext, so it can leak plaintext equality and is not generically secure.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  font=\small,
+  box/.style={draw, rounded corners, minimum height=7mm, minimum width=15mm, align=center},
+  ar/.style={-{Stealth[length=2mm]}, thick},
+  >=Stealth
+]
+% Encrypt-then-MAC (sender)
+\node at (-3.2,2.0) {\textbf{Encrypt-then-MAC (sound)}};
+\node[box, fill=blue!6] (etm-m) at (-6.0,1.0) {$m$};
+\node[box, fill=blue!6] (etm-e) at (-4.0,1.0) {$\Enc_K$};
+\node[box, fill=blue!6] (etm-c) at (-2.0,1.0) {$c$};
+\node[box, fill=green!8] (etm-t) at (-0.2,1.0) {$\MAC_{K'}(c)$};
+\draw[ar] (etm-m) -- (etm-e);
+\draw[ar] (etm-e) -- (etm-c);
+\draw[ar] (etm-c) -- (etm-t);
+\node[align=left, font=\footnotesize] at (-3.2,0.2)
+  {Receiver checks the tag against $c$ \emph{first};\\ a forged $c$ is dropped before any decryption.};
+% MAC-then-Encrypt (sender)
+\node at (3.4,2.0) {\textbf{MAC-then-Encrypt (fragile)}};
+\node[box, fill=green!8] (mte-m) at (0.8,1.0) {$m$};
+\node[box, fill=green!8] (mte-t) at (2.6,1.0) {$m\concat t$};
+\node[box, fill=blue!6] (mte-e) at (4.6,1.0) {$\Enc_K$};
+\node[box, fill=blue!6] (mte-c) at (6.4,1.0) {$c$};
+\draw[ar] (mte-m) -- (mte-t);
+\draw[ar] (mte-t) -- (mte-e);
+\draw[ar] (mte-e) -- (mte-c);
+\node[align=left, font=\footnotesize] at (3.6,0.2)
+  {Receiver must \emph{decrypt and unpad} $c$\\ before the tag is checked: padding-oracle territory.};
+\end{tikzpicture}}
+\caption{The order decides what the receiver must do to a forged ciphertext. Encrypt-then-MAC verifies the tag over the ciphertext bytes the attacker controls, rejecting forgeries before decryption. MAC-then-Encrypt forces decryption and unpadding first, which is the foothold the padding oracle exploits.}
+\label{ch38:fig-etm-mte}
+\end{figure}
+
+The deep reason EtM wins: it lets the receiver \emph{reject forged ciphertexts before touching the decryption logic}. The tag is checked against bytes the attacker fully controls (the ciphertext), and only if it verifies does any plaintext-dependent processing happen. In MtE and E\&M the receiver must decrypt (or process plaintext) before or while checking integrity, which opens the door to attacks that learn from \emph{how} decryption fails.
+
+\begin{attackbox}
+\textbf{The padding oracle.} CBC mode needs the plaintext padded to a block boundary, typically PKCS\#7: if you need $p$ bytes of padding, every padding byte equals $p$. On receipt the decryptor strips and \emph{checks} the padding. In a MAC-then-Encrypt design (TLS $\le$ 1.0), the decryptor unpads \emph{before} verifying the MAC. If it reveals -- via an error message, or merely by responding faster or slower -- whether the padding was well-formed, it has handed the attacker an oracle: ``does this ciphertext decrypt to valid padding?'' By flipping bytes in the preceding ciphertext block (CBC malleability) and watching the oracle, the attacker recovers the plaintext one byte at a time, about 128 tries per byte, with no key. This is Vaudenay's padding-oracle attack; its TLS incarnations are POODLE and Lucky Thirteen (where the ``oracle'' was a timing difference of microseconds). EtM closes it: a forged ciphertext fails the MAC and is dropped before any padding is ever examined.
+\end{attackbox}
+
+\begin{example}[One byte from a padding oracle]
+\label{ch38:ex-padding-num}
+Take a CBC ciphertext as two blocks $c_0 c_1$ with a one-byte block for clarity (block size 1, so each ``block'' is a single byte). Decryption gives $m_1 = D_K(c_1) \xor c_0$. The attacker does not know $D_K(c_1)$; call it the unknown intermediate $z = D_K(c_1)$, so the genuine plaintext byte is $m_1 = z \xor c_0$. She does not need $K$; she needs $z$. She replaces $c_0$ with a guess $g$ and submits $g\,c_1$. The oracle decrypts to $z \xor g$ and reports whether that is valid PKCS\#7 padding -- for a one-byte block, valid padding means the byte equals \texttt{0x01}. So the oracle says ``valid'' exactly when $z \xor g = \texttt{0x01}$, i.e.\ when $g = z \xor \texttt{0x01}$. She walks $g$ from \texttt{0x00} to \texttt{0xFF}; the single value that returns ``valid'' reveals $z = g \xor \texttt{0x01}$. With $z$ known she recovers the real byte $m_1 = z \xor c_0$ using the \emph{original} $c_0$. Concretely, suppose the true intermediate is $z = \texttt{0x6D}$. The guess $g = \texttt{0x6C}$ gives $z\xor g = \texttt{0x01}$: valid. So $z = \texttt{0x6C}\xor\texttt{0x01} = \texttt{0x6D}$, and if the genuine $c_0 = \texttt{0x28}$ then $m_1 = \texttt{0x6D}\xor\texttt{0x28} = \texttt{0x45} = \texttt{E}$. At most 256 queries spent one byte; no key was ever touched. Real blocks are 16 bytes, so the attacker peels byte 16 first (forcing padding \texttt{0x01}), then byte 15 (forcing the last two bytes to \texttt{0x02 0x02}), and so on up the block -- $256$ guesses per byte, $\le 16\times256 = 4096$ per block.
+\end{example}
+
+\begin{whybox}
+Why does \emph{order} carry so much weight? Because integrity must guard the decryptor's inputs, and the decryptor's inputs are ciphertext bytes. EtM checks the tag against exactly those bytes, so a tampered ciphertext is rejected with no information leaked beyond ``invalid.'' MtE checks the tag against the plaintext, which the receiver can only see after running the very decryption-and-unpadding code the attacker is trying to probe. The attacker gets to make the receiver process her chosen ciphertext and learn from the outcome. The cleanest defense is not to assemble these parts at all: use a single AEAD primitive that bakes EtM in and gives you one function with the right order already inside it.
+\end{whybox}
+
+\begin{trapbox}
+Even ``Encrypt-then-MAC'' has a sub-pitfall: \textbf{MAC the entire ciphertext, including the IV/nonce and any associated header.} If the IV is sent in the clear but excluded from the MAC, an attacker can tamper with it and, for CBC, scramble the first plaintext block in a controlled way while the tag still verifies. AEAD constructions handle this for you by taking ``associated data'' that is authenticated but not encrypted. Roll your own EtM and it is easy to leave the IV unauthenticated.
+\end{trapbox}
+
+\section{Weak, Predictable, and Duplicated Randomness}
+\label{ch38:randomness}
+
+The randomness chapter argued the stakes; here is the pitfall in operational form. Three failure modes recur: a generator with too little entropy (predictable output), a generator seeded identically on two machines (duplicated output), and a per-message secret reused because a counter rewound (repeated output). All three convert a sound algorithm into a public decryption procedure.
+
+\subsection{Predictable seeds}
+\label{ch38:predictable-seed}
+
+The textbook blunder is seeding a cryptographic generator from the wall clock, the process ID, or a non-cryptographic PRNG. If a session key is drawn from a generator seeded with the current time in seconds, the keyspace an attacker faces is not $2^{128}$ -- it is the number of seconds in the plausible window. A key generated ``in the last day'' has at most $\log_2(86400) \approx 16.4$ bits of real entropy regardless of how many bits it occupies. The attacker enumerates the seeds, not the keys.
+
+\begin{example}[A 128-bit key worth 17 bits]
+\label{ch38:ex-time-seed}
+Suppose \texttt{key = SHA256(str(int(time.time())))[:16]} and the attacker knows the key was made sometime yesterday. There are $86{,}400$ seconds in a day. She computes $\Hash$ of each of the $86{,}400$ candidate timestamps, derives each candidate key, and trial-decrypts. On a laptop this is well under a second. The key ``has 128 bits'' in the sense that it is 16 bytes long, and roughly 17 bits in the only sense that matters -- how many guesses break it.
+\end{example}
+
+\begin{attackbox}
+\textbf{Debian OpenSSL, 2006--2008.} A well-meaning patch removed a line that mixed uninitialized memory into the OpenSSL entropy pool, on the theory that reading uninitialized memory is undefined behavior (it is). The side effect: the only remaining entropy fed to the generator was the process ID, about 15 bits. Every key generated on a patched Debian or Ubuntu system for nearly two years -- SSH host keys, TLS certificates, OpenVPN keys -- came from one of roughly $2^{15}$ possible streams. Attackers precomputed the entire set of possible keys. A 2048-bit RSA key with 15 bits of seed entropy is a 15-bit key. The math was untouched; the entropy was gone.
+\end{attackbox}
+
+\subsection{Duplicated randomness across devices}
+\label{ch38:duplicated-random}
+
+Embedded devices -- routers, IoT cameras, set-top boxes -- often generate their TLS or SSH keys on first boot, before any entropy has accumulated: no disk, no user input, no network traffic yet, just a freshly reset clock. Thousands of identical units run the same firmware and reach the key-generation step in nearly the same low-entropy state, so they generate \emph{the same keys}, or keys sharing a prime factor.
+
+\begin{whybox}
+Shared RSA factors are an especially cruel form of this. If two devices' RSA moduli $N_1 = p\cdot q_1$ and $N_2 = p \cdot q_2$ happen to share one prime $p$ (because the weak generator produced $p$ on both), then anyone who collects both public keys computes $\gcd(N_1, N_2) = p$ in microseconds and factors \emph{both} moduli. A 2012 internet-wide scan did exactly this: it collected millions of public RSA keys, ran pairwise GCDs, and recovered the private keys of a small but real fraction of TLS and SSH hosts -- not by factoring anything hard, but because their ``random'' primes were not random across the population. The hardness of factoring a single modulus is irrelevant when two moduli share a factor by accident.
+\end{whybox}
+
+\begin{connectionbox}
+The birthday bound from the companion probability book governs when duplicated randomness becomes likely. Draw $n$ values from a space of size $M$ and a collision appears around $n \approx \sqrt{M}$. For a 24-bit WEP IV ($M = 2^{24}$) that is about $2^{12} = 4096$ packets -- minutes of traffic. For 96-bit random GCM nonces ($M = 2^{96}$) it is about $2^{48}$ messages. The same $\sqrt{M}$ law tells you both why WEP collapses instantly and why random GCM nonces are merely risky rather than instantly fatal. Sizing a nonce or a key is always a birthday-bound calculation.
+\end{connectionbox}
+
+\subsection{The forked-counter trap}
+\label{ch38:fork-trap}
+
+A deterministic counter nonce is the safe way to feed GCM -- until the process that owns the counter is duplicated. Fork a process, snapshot a virtual machine, restore from backup, or load-balance the same key across two servers, and you now have two independent copies of the counter, both starting from the same value, both about to emit nonce 1, 2, 3 again. Identical nonces, same key, different messages: the GCM catastrophe of section~\ref{ch38:gcm-nonce}, triggered by an operations decision that had nothing to do with cryptography.
+
+\begin{focusbox}
+The defensive rules: (1) seed CSPRNGs from the operating system's entropy source (\texttt{getrandom}, \texttt{/dev/urandom}, \texttt{CryptGenRandom}), never from time or PID; (2) on embedded devices, block key generation until the entropy pool is initialized, or provision keys at the factory from a good source; (3) never let a nonce counter be copied -- bind it to a unique per-instance identifier, or switch to a misuse-resistant mode if duplication is possible; (4) reseed after a fork (modern libraries detect forks for you). The unifying instinct: ask ``what is the smallest set this secret could actually be drawn from?'' and make sure that set is astronomically large.
+\end{focusbox}
+
+\section{The Signature Nonce: One Number Leaks the Private Key}
+\label{ch38:ecdsa-nonce}
+
+The nonce-reuse pitfall has a second, sharper edge in (EC)DSA signatures, and it deserves its own section because the consequence is total: a single repeated nonce -- or even a slightly biased one -- recovers the long-term \emph{private signing key}, not just one message. DSA and ECDSA sign a message hash $h$ with private key $d$ by choosing a per-signature secret nonce $k$ and computing
+\[
+r = (k\cdot G)_x \bmod n, \qquad s = k^{-1}(h + d\cdot r) \bmod n,
+\]
+where $G$ is the curve's base point and $n$ its order. The nonce $k$ must be uniformly random and \emph{never reused}. The verifier never sees $k$; it is as secret as $d$ itself, and for the same reason.
+
+\begin{whybox}
+Why is a reused $k$ instantly fatal? Suppose two messages with hashes $h_1, h_2$ are signed under the same key $d$ and the \emph{same} nonce $k$. Then both signatures share the same $r$ (because $r$ depends only on $k$), and
+\[
+s_1 = k^{-1}(h_1 + d r), \qquad s_2 = k^{-1}(h_2 + d r) \pmod n.
+\]
+Subtract: $s_1 - s_2 = k^{-1}(h_1 - h_2)$, an equation with one unknown $k$. Solve it: $k = (h_1 - h_2)(s_1 - s_2)^{-1} \bmod n$. Now plug $k$ back into either signature equation and solve for the private key: $d = (s_1 k - h_1)\, r^{-1} \bmod n$. Two signatures, a handful of modular operations, and the attacker holds $d$ -- she can now forge a signature on \emph{anything}. The math of ECDSA was never touched; the freshness of one number was.
+\end{whybox}
+
+\begin{example}[Recovering a private key from two signatures]
+\label{ch38:ex-ecdsa}
+Work over the toy order $n = 101$ (a prime, so every nonzero element is invertible mod $101$). The signer's secret is $d = 7$ and -- through a bug -- it reuses $k = 5$ for two messages with hashes $h_1 = 13$ and $h_2 = 27$. The shared $r$ is some fixed value from $k$; take $r = 9$. Then
+\[
+s_1 = 5^{-1}(13 + 7\cdot 9) \bmod 101, \qquad s_2 = 5^{-1}(27 + 7\cdot 9)\bmod 101.
+\]
+Since $5^{-1} \equiv 81 \pmod{101}$ (because $5\cdot 81 = 405 = 4\cdot101+1$), we get $s_1 = 81\cdot 76 \bmod 101$. Now $81\cdot76 = 6156 = 60\cdot101 + 96$, so $s_1 = 96$. And $s_2 = 81\cdot 90 \bmod 101$; $81\cdot90 = 7290 = 72\cdot101 + 18$, so $s_2 = 18$. The attacker sees $(r,s_1)=(9,96)$ and $(r,s_2)=(9,18)$ -- the repeated $r$ is the tell. She recovers $k$:
+\[
+k = (h_1 - h_2)(s_1 - s_2)^{-1} = (13-27)(96-18)^{-1} = (-14)\cdot 78^{-1} \bmod 101.
+\]
+Compute $78^{-1}\equiv 79 \pmod{101}$ (check $78\cdot79 = 6162 = 61\cdot101 + 1$). Then $k = (-14)\cdot 79 = -1106 \equiv -1106 + 11\cdot101 = 5 \pmod{101}$, matching the reused nonce. Now recover the private key from $d = (s_1 k - h_1)\, r^{-1}$:
+\[
+d = (96\cdot 5 - 13)\cdot 9^{-1} = 467\cdot 9^{-1} \equiv 63 \cdot 45 \pmod{101},
+\]
+using $467 \equiv 63$ and $9^{-1}\equiv 45 \pmod{101}$ (since $9\cdot45 = 405 \equiv 1$). Finally $63\cdot 45 = 2835 = 28\cdot101 + 7$, so $d = 7$ -- the signer's secret, pulled out by hand from two signatures. The procedure is entirely mechanical: a repeated $r$ in two ECDSA signatures means the private key is a few modular inversions away.
+\end{example}
+
+\begin{attackbox}
+\textbf{PS3, Android Bitcoin wallets, and beyond.} Sony signed PlayStation 3 firmware with ECDSA but used a \emph{constant} nonce $k$ for every signature. Two signed binaries were enough for the \texttt{fail0verflow} group to recover Sony's master private signing key in 2010, after which anyone could sign code the console would accept -- a fleet-wide, unpatchable break. The same bug drained real money: in 2013 a flaw in Android's \texttt{SecureRandom} made some Bitcoin wallets reuse ECDSA nonces across transactions; attackers scanned the public blockchain for two signatures sharing an $r$, recovered the private keys, and swept the coins. The blockchain made every signature public, so the attack was a database query plus the arithmetic above. The defense is \emph{deterministic} nonces (RFC 6979), which derive $k$ as a PRF of the message and the private key -- unique per message by construction, never dependent on a possibly-broken RNG.
+\end{attackbox}
+
+\begin{trapbox}
+It is worse than ``do not repeat $k$.'' Even a \emph{biased} nonce -- a few predictable top bits, a $k$ drawn from a slightly-too-small range -- leaks the key, given enough signatures, via lattice (hidden-number-problem) attacks. So ``I made $k$ random but only 250 bits instead of 256'' is still a break. This is why RFC 6979 deterministic nonces (or modern designs like Ed25519, which derives the nonce by hashing the message with a secret prefix) are the standard: they remove the RNG from the signing path entirely, so there is no bias and no reuse to get wrong.
+\end{trapbox}
+
+\section{Hardcoded and Reused Keys}
+\label{ch38:hardcoded-keys}
+
+A key embedded in source code, firmware, or a binary is not secret. It is shipped to every customer, every attacker, every malware analyst with a hex editor. ``Security'' that depends on no one disassembling your firmware is not security; it is a delay. Kerckhoffs's principle, restated for the modern device: assume the adversary holds your firmware, because she does.
+
+\begin{attackbox}
+\textbf{One key to rule the fleet.} A line of home routers ships with a single firmware image containing a hardcoded AES key used to encrypt the remote-management channel. The key is the same on every unit. An attacker buys one router for \$30, dumps the flash, extracts the key with \texttt{strings} and a little patience, and now decrypts and forges management traffic for \emph{every} router of that model on the internet. The pattern repeats across IoT cameras (hardcoded credentials), point-of-sale terminals (a global master key), and game consoles (a signing key extracted from one unit breaks the platform). One extraction, fleet-wide compromise.
+\end{attackbox}
+
+\begin{trapbox}
+Closely related: \textbf{default keys and credentials} that nobody changes, and \textbf{secrets committed to version control}. An API key, a private key, or a database password pushed to a public Git repository is harvested by automated scanners within minutes of the commit landing -- and rewriting history does not help, because the bad commit was already cloned. Treat any secret that has touched a repository, a log file, a chat message, or a screenshot as burned: rotate it, do not hide it.
+\end{trapbox}
+
+\begin{implementbox}
+The fix is to derive or provision keys, never to embed them. Per-device keys from a hardware secure element, keys fetched from a key-management service at runtime, or keys derived from a user secret via a slow KDF -- anything but a constant in the binary. The shape of provisioning:
+\begin{lstlisting}[language=Python]
+# LEARNING ONLY -- illustrative, not production key management.
+import os, hashlib
+
+# BAD: same key in every shipped unit.
+SECRET_KEY = b"hardcoded_master_key_1234567890!"   # never do this
+
+# BETTER: a unique per-device key the manufacturer does not retain,
+# stored in a secure element, or derived at provisioning time.
+def provision_device_key(device_serial: bytes) -> bytes:
+    # A real system uses an HSM-held root + a proper KDF (HKDF).
+    root = os.environ["PROVISIONING_ROOT_KEY"].encode()  # never in the image
+    return hashlib.sha256(root + device_serial).digest()
+\end{lstlisting}
+The principle is the lesson, not the code: the value that protects unit $N$ must not protect unit $M$, and no secret that breaks the fleet should live where the fleet can be disassembled.
+\end{implementbox}
+
+\section{Reusing One Key for Two Purposes}
+\label{ch38:key-reuse}
+
+Keys are typed, even when the API does not say so. A key for encryption is not a key for authentication; a signing key is not a decryption key; a key for ``messages from A to B'' is not a key for ``messages from B to A.'' Using one key in two roles can let the two roles interfere, and the interference is often exploitable.
+
+\begin{whybox}
+The classic abstract example: the same RSA key pair used both to \emph{sign} and to \emph{decrypt}. RSA signing computes $s = m^d \bmod N$; RSA decryption computes $m = c^d \bmod N$ -- the \emph{same} private operation $x \mapsto x^d$. So an attacker who wants the decryption of a ciphertext $c$ can ask the victim to \emph{sign} the value $c$ (perhaps disguised as an ``innocuous'' document), and the resulting ``signature'' $c^d \bmod N$ \emph{is} the decryption she wanted. The signing oracle and the decryption oracle are the same oracle when the key is shared. The fix is domain separation: separate key pairs for separate functions, and padding schemes (PSS for signing, OAEP for encryption) that make the two operations incompatible even if a key leaks between them.
+\end{whybox}
+
+The same disease appears in symmetric systems. If you derive one key and use it both as the AES key and the HMAC key in a hand-rolled encrypt-then-MAC, structural relationships between the two algorithms can leak. If both directions of a connection share one key and one nonce space, a message Alice sent can be \emph{reflected} back to her as if Bob had sent it -- a reflection attack -- because nothing in the key distinguishes the two endpoints.
+
+\begin{attackbox}
+\textbf{Reflection across a shared key.} Two parties authenticate each other with a challenge-response over a single shared symmetric key: ``I send you a random $r$, you return $\MAC_K(r)$ to prove you know $K$.'' If both sides use the same $K$ and the same construction, Eve can open two connections to the server, take the server's challenge $r$ from connection 1, send it as \emph{her} challenge on connection 2, get the server to compute $\MAC_K(r)$ for her, and replay it back on connection 1 -- authenticating as a legitimate party without knowing $K$. The bug is not the MAC; it is that one key served two directions with no separation, so the server became an oracle against itself.
+\end{attackbox}
+
+\begin{focusbox}
+The discipline is \textbf{key separation via a KDF}. From one master secret, derive distinct sub-keys with a labeled key-derivation function: $k_{\text{enc}} = \mathrm{HKDF}(\text{master}, \texttt{"encryption"})$, $k_{\text{mac}} = \mathrm{HKDF}(\text{master}, \texttt{"authentication"})$, and separate keys per direction, per purpose, per protocol version. The labels guarantee the sub-keys are independent: knowledge of one tells you nothing about another. TLS 1.3 takes this to its conclusion, deriving a whole tree of purpose-specific keys from the handshake secret, each with its own label. One secret in, many independent keys out, no two roles ever sharing material.
+\end{focusbox}
+
+\section{Broken Primitives: MD5, SHA-1, DES, RC4}
+\label{ch38:broken-primitives}
+
+Primitives have lifespans. A hash or cipher that was respectable in 1995 can be a liability in 2025 because attacks improve and hardware gets faster. Continuing to use a primitive after it is broken is a pitfall of inertia, and the broken ones still appear in real systems through copied code, legacy compatibility, and ``it still passes the tests.''
+
+\begin{historybox}
+\textbf{A rough timeline of the fallen.}
+\emph{MD5} (1992): collisions found in 2004; by 2008 researchers forged a rogue certificate-authority certificate using an MD5 collision, and the Flame malware (2012) used an MD5 collision to forge a Microsoft code-signing certificate. \emph{SHA-1} (1995): theoretically weakened by 2005, with the first concrete collision (SHAttered) demonstrated by Google and CWI in 2017, then a \emph{chosen-prefix} collision in 2020 that broke the PGP web of trust's use of it. \emph{DES} (1977): its 56-bit key was brute-forced in public by 1998 (the EFF ``Deep Crack'' machine, under a day); 3DES patched the key length but is now retired for its 64-bit block. \emph{RC4} (1987, leaked 1994): biases in its keystream made it broken in WEP, then in TLS (the 2013 ``RC4 NOMORE'' and related attacks), and it is now prohibited.
+\end{historybox}
+
+\subsection{What ``broken'' means, precisely}
+\label{ch38:broken-meaning}
+
+``Broken'' is not binary, and the distinctions matter for risk. For a hash, the three properties degrade independently:
+
+\begin{itemize}
+\item \textbf{Collision resistance} (hard to find any $x \neq y$ with $\Hash(x)=\Hash(y)$) is the weakest to defend and the first to fall. MD5 and SHA-1 are collision-broken. This breaks \emph{signatures} and \emph{certificates}, where an attacker who controls both colliding inputs can get one signed and present the other.
+\item \textbf{Second-preimage resistance} (given $x$, hard to find $y\neq x$ with the same hash) is stronger; MD5/SHA-1 are not practically second-preimage-broken, so an attacker cannot yet match a hash of a \emph{given} file she did not choose.
+\item \textbf{Preimage resistance} (given $h$, hard to find any $x$ with $\Hash(x)=h$) is the strongest. Even MD5 is not practically preimage-broken.
+\end{itemize}
+
+\begin{trapbox}
+This gradation explains a subtle real-world rule. Using MD5 to verify a download against a hash \emph{you computed yourself from the genuine file} relies on second-preimage resistance, which MD5 still has -- so it is weak but not instantly exploitable. Using MD5 in a \emph{signature or certificate}, where an attacker can craft two colliding inputs, relies on collision resistance, which MD5 lacks -- so it is catastrophically broken. Same algorithm, opposite verdicts, because the threat model invokes different properties. ``Is MD5 broken?'' has no answer without ``for what?'' Still: do not use MD5 or SHA-1 for anything new. The collision break already destroys their most common security use, and migration is cheap.
+\end{trapbox}
+
+\begin{example}[Why a hash collision forges a certificate]
+\label{ch38:ex-collision-cert}
+A certificate authority signs the hash of a certificate's contents: $\Sign_{\text{CA}}(\Hash(\text{cert}))$. Suppose an attacker uses an MD5 collision to build two certificates $C_{\text{benign}}$ and $C_{\text{evil}}$ with $\Hash(C_{\text{benign}}) = \Hash(C_{\text{evil}})$ -- the benign one a plausible request for \texttt{shop.example.com}, the evil one a certificate granting her a sub-CA that can sign \emph{any} domain. She submits $C_{\text{benign}}$; the CA validates it and signs its hash. Because the hashes are equal, that same signature is also a valid signature on $C_{\text{evil}}$. She lifts the signature onto the evil certificate and now holds a CA-signed credential for the entire internet. This is essentially the 2008 rogue-CA demonstration. Collision resistance was the only thing standing between a routine signature and a master key, and MD5 did not have it.
+\end{example}
+
+\begin{focusbox}
+The current safe defaults: hashing -- SHA-256, SHA-3, or BLAKE2/3; symmetric encryption -- AES (128 or 256) or ChaCha20, always inside an AEAD; key sizes -- 128-bit symmetric minimum, RSA $\ge$ 2048 (3072 for long-term), elliptic curves over $\ge$ 256-bit fields. The meta-rule: track the deprecation announcements (NIST, the TLS working group, your library's changelog) and treat ``this primitive is being phased out'' as a maintenance ticket, not a someday. Crypto agility -- the ability to swap a primitive without re-architecting -- is itself a design goal.
+\end{focusbox}
+
+\section{Insecure Comparison: Leaking Secrets Through Time}
+\label{ch38:timing}
+
+Verifying a MAC, a password hash, or an API token means comparing a computed value against a provided one. The obvious comparison -- walk both byte arrays, return \texttt{false} at the first mismatch -- is a security bug, because the time it takes leaks how many leading bytes matched. An attacker who can measure response time (even noisily, by averaging many requests) recovers the secret one byte at a time.
+
+\begin{intuitionbox}
+Picture guessing a combination lock that clicks louder the moment you hit a correct digit in sequence. You do not need to try all $10^4$ combinations; you try the first digit's ten values listening for the click, fix it, move to the second, and so on -- $10 \times 4 = 40$ tries instead of $10^4$. Early-exit comparison is that louder click. It converts a brute-force search over the whole secret (exponential) into a digit-at-a-time search (linear). The leak is not in \emph{what} the function returns -- always just true or false -- but in \emph{how long} it takes to say it.
+\end{intuitionbox}
+
+\begin{attackbox}
+\textbf{Byte-at-a-time tag recovery.} A server checks an HMAC tag on incoming requests with a standard \texttt{==} (early-exit) comparison. The attacker wants a valid tag for a forged message. She fixes byte 0 of her guessed tag to \texttt{0x00}, sends the request, times the response; tries \texttt{0x01}, times it; \dots through \texttt{0xFF}. For exactly one value, the server compares one byte further before failing, so the response is measurably slower. That value is the correct byte 0. She locks it in and repeats for byte 1, then byte 2. A 16-byte tag falls in about $16 \times 256 = 4096$ measured requests (times averaging for noise) instead of $2^{128}$. The MAC is cryptographically perfect; the \emph{comparison} leaked it. This was a real vulnerability in several web frameworks' signed-cookie verification.
+\end{attackbox}
+
+\begin{whybox}
+The fix is \textbf{constant-time comparison}: a routine whose running time depends only on the \emph{length} of the inputs, never on their contents. The standard trick is to OR together the XOR of every byte pair and check the accumulator once at the end -- every byte is always examined, so there is no early exit to time.
+\[
+\text{diff} = \bigvee_{i=0}^{n-1} (a_i \xor b_i), \qquad \text{equal} \iff \text{diff} = 0.
+\]
+Each $a_i \xor b_i$ is zero exactly when the bytes match; OR-ing accumulates ``any mismatch anywhere'' into a single value examined only after the full pass. The loop runs the same number of steps regardless of where (or whether) a mismatch occurs.
+\end{whybox}
+
+\begin{implementbox}
+\begin{lstlisting}[language=Python]
+# LEARNING ONLY. Use hmac.compare_digest or your library's
+# constant-time equal in real code -- a Python loop is not
+# truly constant-time at the hardware level.
+
+def insecure_equal(a, b):          # DO NOT USE -- early exit leaks timing
+    if len(a) != len(b):
+        return False
+    for x, y in zip(a, b):
+        if x != y:
+            return False           # returns sooner the earlier the mismatch
+    return True
+
+def constant_time_equal(a, b):     # examine every byte, decide once
+    if len(a) != len(b):
+        return False               # length leak is usually acceptable
+    diff = 0
+    for x, y in zip(a, b):
+        diff |= x ^ y              # accumulate; never branch on content
+    return diff == 0
+
+# In real Python:  import hmac;  hmac.compare_digest(tag, expected)
+\end{lstlisting}
+The warning is double here: not only is the insecure version a bug, the ``constant-time'' version in interpreted Python still is not perfectly constant-time -- branch prediction, caching, and the interpreter leak. Use the platform primitive (\texttt{hmac.compare\_digest}, \texttt{CRYPTO\_memcmp}, \texttt{subtle.ConstantTimeCompare}). The toy code shows the \emph{idea}; the library gives you the guarantee.
+\end{implementbox}
+
+\begin{connectionbox}
+Timing leaks are the gateway to the broader subject of side channels -- power analysis, cache-timing on table lookups, branch prediction -- covered in the side-channel chapter. The unifying observation: a cryptographic function is not just its input-output map. Its \emph{physical execution} -- time, power, electromagnetic emission, cache state -- is also an output, and one the security proof never accounted for. Constant-time programming is the discipline of making sure those extra outputs carry no secret-dependent information.
+\end{connectionbox}
+
+\section{Rolling Your Own Crypto}
+\label{ch38:roll-your-own}
+
+The meta-pitfall, the one that produces all the others: building cryptographic primitives or protocols yourself instead of using vetted, standard constructions. This is not gatekeeping. It is an observation about how this field validates security. A cipher is not secure because its designer cannot break it; it is ``secure'' only after the global community of cryptanalysts has attacked it for years and failed. A scheme you invented last week has had exactly one person try to break it -- you -- and you are the worst possible attacker, because you are invested in its working.
+
+\begin{intuitionbox}
+``I can't break it'' and ``it can't be broken'' are wildly different claims. The gap between them is the entire history of cryptanalysis. Every broken cipher in this chapter looked unbreakable to its designer. Schneier's law: anyone can invent a cipher they personally cannot break. Security is a \emph{negative} property -- the absence of any working attack -- and you cannot establish a negative by failing to find a positive. Only sustained adversarial scrutiny by people who \emph{want} you to fail can build confidence, and only the standard primitives have received it.
+\end{intuitionbox}
+
+The danger is sharpest because home-grown crypto often \emph{looks} fine. It encrypts; the ciphertext looks random; it decrypts back correctly; the tests pass. None of that is evidence of security, because, as we established at the top of the chapter, cryptographic correctness is not testable by example. The XOR-with-a-repeating-key ``cipher,'' ECB ``encryption,'' a hand-rolled MAC that is really just a hash of key-then-message (vulnerable to length-extension), a custom key-exchange missing authentication -- each passes every functional test and falls to a standard attack.
+
+\begin{attackbox}
+\textbf{Length extension on a home-rolled MAC.} A tempting ``MAC'' is $t = \Hash(K \concat m)$ with a Merkle--Damg{\aa}rd hash like SHA-256. It looks like it authenticates $m$ with $K$. But Merkle--Damg{\aa}rd hashes process message blocks sequentially and expose their internal state as the output. Given $t$ and the length of $K \concat m$, an attacker can set the hash's internal state to $t$ and \emph{continue} hashing with an appended suffix $s$, producing a valid tag $t' = \Hash(K \concat m \concat \text{pad} \concat s)$ for the extended message -- without knowing $K$. The fix is the standard construction HMAC, $\Hash((K \xor \text{opad}) \concat \Hash((K \xor \text{ipad}) \concat m))$, whose nesting defeats length extension. Someone rolling their own MAC reaches for the obvious $\Hash(K\concat m)$ and ships a forgeable design; using HMAC means never meeting this attack.
+\end{attackbox}
+
+\begin{historybox}
+The graveyard of home-grown crypto is large and well-documented. WEP's RC4-plus-CRC integrity (forgeable, the WiFi chapter). Telegram's bespoke MTProto protocol drew repeated criticism for deviating from standard AEAD and authentication patterns. Countless ``encryption'' features in commercial products turned out to be XOR with a fixed key, or AES in ECB, or a Caesar cipher with extra steps. The pattern is not that the designers were unintelligent -- many were skilled engineers -- but that they treated a cryptographic protocol as ordinary software, where ``it works in testing'' means ``it works.'' In crypto it does not.
+\end{historybox}
+
+\begin{focusbox}
+The constructive version of ``don't roll your own'' is not ``don't use cryptography.'' It is \textbf{use the right level of abstraction}: a vetted high-level library (libsodium / NaCl, the platform's authenticated-encryption API, a maintained TLS stack) that exposes ``seal this message to this recipient'' rather than ``here is a block cipher, good luck.'' These libraries make the secure choice the default and the insecure choice hard to express -- no ECB, no nonce reuse, no key reuse, no insecure comparison, because the API does not let you. The next chapter, on implementing crypto safely, is about choosing and using those tools. Rolling your own is the pitfall; reaching for the well-worn library is the cure for nearly every pitfall in this chapter at once.
+\end{focusbox}
+
+\begin{applicationbox}
+\textbf{How the survivors avoid these traps.} TLS 1.3 is, in large part, a list of these pitfalls with the lessons applied: it removed CBC and the MAC-then-Encrypt modes (padding oracles gone), removed RC4 and export ciphers (broken primitives gone), mandates AEAD with carefully managed nonces (no two-time pads), derives a tree of purpose-separated keys via HKDF (no key reuse), and uses constant-time implementations in its reference libraries (no timing leaks). The Signal protocol layers a fresh key per message via its ratchet (forward secrecy and no key reuse), authenticates everything, and ships as a single audited library. WireGuard deliberately offers \emph{no} algorithm choices -- one AEAD, one hash, one curve -- so there is no broken option to misconfigure. Each is a case study in turning ``common pitfall'' into ``impossible by construction.''
+\end{applicationbox}
+
+\section{A Field Checklist}
+\label{ch38:checklist}
+
+Carry this list to any cryptographic code review. Each item is a pitfall from this chapter phrased as a question that has a right answer.
+
+\begin{itemize}
+\item \textbf{Nonces/IVs}: is every nonce unique under its key? For CBC, is the IV unpredictable (random)? Can a counter be duplicated by a fork, snapshot, or restore? Could random 96-bit nonces collide at this message volume?
+\item \textbf{Mode}: is ECB used anywhere on structured or multi-block data? Is encryption randomized (IND-CPA)? Is an AEAD used rather than encryption alone?
+\item \textbf{Integrity ordering}: is it Encrypt-then-MAC (or a single AEAD)? Does the MAC cover the IV and associated header? Is the tag checked before any decryption or unpadding?
+\item \textbf{Randomness}: does every key, nonce, and salt come from the OS CSPRNG? Is anything seeded from time, PID, or a non-crypto PRNG? Do embedded devices block until entropy is ready?
+\item \textbf{Key management}: are any keys hardcoded, defaulted, or committed to a repo? Is each key used for exactly one purpose, derived via a labeled KDF? Separate keys per direction?
+\item \textbf{Primitives}: any MD5, SHA-1, DES/3DES, or RC4? Are key sizes at current minimums? Is there a migration path (crypto agility)?
+\item \textbf{Comparisons}: are all secret comparisons (tags, tokens, hashes) constant-time via the platform primitive?
+\item \textbf{Provenance}: is every primitive a standard, vetted construction from a maintained library, or did someone roll their own?
+\end{itemize}
+
+\begin{recoverybox}
+Notice the through-line. Every question above is a precondition from some primitive's contract, made checkable. You do not need to be a cryptanalyst to catch most real-world breaks -- you need to read each primitive's contract and verify, clause by clause, that the code keeps its end of the bargain. The mathematicians secured the primitives. Keeping the preconditions true is your job, and it is where systems actually live or die.
+\end{recoverybox}
+
+\section*{Exercises}
+\addcontentsline{toc}{section}{Exercises}
+
+\begin{exercise}[Crack a two-time pad]
+\label{ch38:ex-crib}
+Two ASCII plaintexts of equal length are encrypted with the same stream-cipher keystream. You intercept
+\[
+c_1 = \texttt{0x37 0x1D 0x0A 0x1B 0x09}, \qquad c_2 = \texttt{0x2B 0x1D 0x16 0x06 0x09}.
+\]
+(a) Compute $c_1 \xor c_2$. (b) Which byte positions are identical between $m_1$ and $m_2$, and how do you know without the key? (c) If you learn $m_1 = \texttt{"HELLO"}$, recover $m_2$ and the keystream. (Hint: \texttt{H}=\texttt{0x48}.)
+\end{exercise}
+
+\begin{exercise}[GCM nonce reuse]
+\label{ch38:ex-gcm}
+Explain in your own words why a single nonce repetition in AES-GCM lets an attacker forge tags on \emph{new} messages, whereas a single nonce repetition in a plain CTR-mode stream cipher (no MAC) only leaks $m_1 \xor m_2$. Your answer should identify the value $H$, say why two same-nonce tags expose it, and state why a fresh nonce per message keeps $H$ hidden.
+\end{exercise}
+
+\begin{exercise}[Read the ECB pattern]
+\label{ch38:ex-ecb-read}
+A toy 4-bit block cipher in ECB mode produces the ciphertext \texttt{2929 7EE2} (one hex digit per block). Without the key, state everything you can deduce about the plaintext's structure. Then explain why CBC mode with a random IV would leak none of it, and write the CBC encryption of a 2-block message $m_1 m_2$ symbolically.
+\end{exercise}
+
+\begin{exercise}[Padding oracle reasoning]
+\label{ch38:ex-padding}
+A CBC-mode service decrypts a ciphertext, strips PKCS\#7 padding, and returns ``bad padding'' or ``bad MAC'' as distinct errors, checking padding \emph{before} the MAC. (a) Explain how an attacker uses the two distinct responses to recover one plaintext byte. (b) Roughly how many oracle queries to recover a 16-byte block? (c) Which combination order (EtM/MtE/E\&M) does this service use, and which order would close the hole, and why?
+\end{exercise}
+
+\begin{exercise}[Shared RSA factors]
+\label{ch38:ex-gcd}
+A weak generator produces two RSA moduli that happen to share a prime: $N_1 = 1{,}593{,}211 = p \cdot q_1$ and $N_2 = 1{,}597{,}247 = p \cdot q_2$, where $p = 1009$ (so $q_1 = 1579$ and $q_2 = 1583$). (a) Run the Euclidean algorithm on $(N_1, N_2)$ to recover $p$ without knowing it in advance. (b) Divide to get $q_1$ and $q_2$, factoring both moduli. (c) Explain why this attack costs essentially nothing across millions of collected public keys, and exactly what property of the random generator caused it.
+\end{exercise}
+
+\begin{exercise}[Entropy of a time-seeded key]
+\label{ch38:ex-entropy}
+A service generates a session key as \texttt{SHA256(str(unix\_seconds))} truncated to 128 bits. (a) An attacker knows the key was created within a known 10-minute window. How many candidate keys must she try? (b) Express that as bits of effective entropy, $\log_2$ of the count. (c) The key is 128 bits long; why is its security nowhere near $2^{128}$? (d) Give a one-line fix.
+\end{exercise}
+
+\begin{exercise}[Constant-time comparison]
+\label{ch38:ex-ct}
+(a) Trace the running time of an early-exit byte comparison for the inputs (\texttt{AB CD}, \texttt{AB CE}) versus (\texttt{AB CD}, \texttt{FF FF}): which returns sooner, and what does that leak? (b) Write out the value of the accumulator $\text{diff} = \bigvee_i (a_i \xor b_i)$ for the comparison of \texttt{12 34} against \texttt{12 35}. (c) Explain why a byte-at-a-time timing attack needs about $n \cdot 256$ queries for an $n$-byte secret, not $256^n$.
+\end{exercise}
+
+\begin{exercise}[Length extension]
+\label{ch38:ex-lenext}
+A system authenticates messages with $t = \Hash(K \concat m)$ using a Merkle--Damg{\aa}rd hash. (a) Explain why an attacker who knows $t$, $m$, and $\abs{K}$ can compute a valid tag for $m \concat \text{pad} \concat s$ for any suffix $s$, without knowing $K$. (b) What internal property of the hash makes this possible? (c) State the HMAC construction and explain in one sentence why its nesting blocks the attack.
+\end{exercise}
+
+\begin{exercise}[Key reuse across purposes]
+\label{ch38:ex-keyreuse}
+A protocol uses one RSA key pair for both signing documents and decrypting messages, with no padding (textbook RSA), so both operations are $x \mapsto x^d \bmod N$. (a) Show how an attacker who can submit documents for signing can use the signing service to decrypt an intercepted ciphertext $c$. (b) Why does adding distinct, incompatible padding (PSS for signatures, OAEP for encryption) break the attack even if the same modulus is shared? (c) State the general principle this illustrates.
+\end{exercise}
+
+\begin{exercise}[Audit a snippet]
+\label{ch38:ex-audit}
+You find this pseudocode in a code review:
+\begin{quote}
+\texttt{key = MD5(password)} \\
+\texttt{iv = 0} \quad (a constant) \\
+\texttt{ct = AES\_CBC(key, iv, plaintext)} \\
+\texttt{tag = MD5(key + ct)} \\
+\texttt{send(ct, tag)}; \quad verify with \texttt{tag == MD5(key + ct)} using \texttt{==}.
+\end{quote}
+List every pitfall from this chapter that appears (there are at least six), and for each give a one-line fix.
+\end{exercise}
+
+\begin{exercise}[Recover an ECDSA key from a reused nonce]
+\label{ch38:ex-ecdsa-ex}
+A signer uses ECDSA over the toy order $n = 101$ and reuses one nonce $k$ for two messages, producing $(r, s_1) = (9, 96)$ and $(r, s_2) = (9, 18)$ for hashes $h_1 = 13$ and $h_2 = 27$. (a) From the two signatures alone, what one feature tells you the nonce was reused? (b) Recover $k$ using $k = (h_1 - h_2)(s_1 - s_2)^{-1} \bmod n$. (c) Recover the private key $d = (s_1 k - h_1)\,r^{-1} \bmod n$. (d) State why a single bias in $k$ (not even a full repeat) can still leak $d$, and name the deterministic-nonce fix.
+\end{exercise}
+
+\begin{exercise}[Walk a padding oracle one byte]
+\label{ch38:ex-padding-num-ex}
+A CBC service with one-byte blocks decrypts $g\,c_1$ to $D_K(c_1)\xor g$ and reports ``valid padding'' exactly when that byte equals \texttt{0x01}. The unknown intermediate is $z = D_K(c_1)$, and the genuine $c_0 = \texttt{0x28}$. (a) As the attacker sweeps $g$ from \texttt{0x00} to \texttt{0xFF}, which equation must hold for the oracle to say ``valid''? (b) If the oracle fires at $g = \texttt{0x6C}$, what is $z$? (c) Recover the genuine plaintext byte $m_1 = z \xor c_0$ and give its ASCII character. (d) For a real 16-byte block, why are at most $16\times 256$ queries needed, not $256^{16}$?
+\end{exercise}
+
+\begin{exercise}[Prove determinism is insecure]
+\label{ch38:ex-det}
+Prove that any \emph{deterministic} encryption scheme fails the IND-CPA game (the adversary wins with probability 1). Then explain how this single theorem condemns ECB, textbook RSA, and any cipher used with a fixed IV, in one stroke.
+\end{exercise}
