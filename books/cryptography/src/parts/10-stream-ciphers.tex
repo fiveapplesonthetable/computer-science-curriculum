@@ -1,0 +1,563 @@
+\chapter{Stream Ciphers}
+
+The one-time pad gave us a perfect cipher and then immediately took it away. Perfect secrecy is real, but it demands a key as long as the message, used exactly once, drawn from true randomness. Nobody can ship that. Alice cannot hand Bob a terabyte of shared key every time she wants to send him a terabyte of video. The pad is a proof of what is possible, not a product.
+
+This chapter is about the compromise that actually runs the internet. We keep the structure of the one-time pad -- exclusive-or the message with a long random-looking string -- but we manufacture that string from a short key using a deterministic algorithm. The string only \emph{looks} random; it is in fact computed. We trade Shannon's unconditional secrecy for a guarantee that holds against any adversary who runs in reasonable time. That trade is the birth of the \emph{stream cipher}, and the object that makes it work is the \emph{pseudorandom generator}.
+
+We will build the idea from the pad, state precisely what we want from a pseudorandom generator, then meet two real stream ciphers: RC4 (everywhere for two decades, now broken and retired) and ChaCha20 (the modern default in TLS, WireGuard, and Linux). Along the way we will watch keystream reuse turn a strong cipher into a toy -- the WEP catastrophe is the canonical lesson -- and we will pull apart a tiny linear-feedback shift register to see exactly why linearity is poison for a keystream.
+
+\section{From the one-time pad to a generator}
+\label{ch10:from-otp}
+
+Recall the one-time pad. Plaintext $m$ and key $k$ are bitstrings of the same length $\ell$. Encryption and decryption are both exclusive-or:
+\[
+  c = m \xor k, \qquad m = c \xor k .
+\]
+The magic is that if $k$ is uniformly random and used once, then $c$ is uniformly random and independent of $m$: the ciphertext leaks nothing. The curse is that $k$ is as long as $m$.
+
+\begin{intuitionbox}
+Here is the one move that this whole chapter rests on. What if we did not need a \emph{truly} random $k$ of length $\ell$? What if a key that merely \emph{looks} random to any efficient adversary were good enough? Then we could keep a short secret seed -- say 256 bits -- and stretch it into a keystream of length $\ell$ with a public algorithm $G$. Alice and Bob both know the seed, so they both compute the same long string $G(\text{seed})$ and xor it in. Eve knows the algorithm $G$ but not the seed, and if $G$ is well built she cannot tell its output from coin flips.
+\end{intuitionbox}
+
+The deterministic function that does the stretching is the pseudorandom generator.
+
+\begin{definition}[Pseudorandom generator, PRG]
+\label{ch10:def-prg}
+A \emph{pseudorandom generator} is a deterministic, efficiently computable function
+\[
+  G : \set{0,1}^{s} \to \set{0,1}^{\ell(s)}, \qquad \ell(s) > s,
+\]
+that maps a short \emph{seed} of $s$ bits to a longer \emph{output} of $\ell(s)$ bits. The quantity $\ell(s) - s$ is the \emph{stretch}.
+\end{definition}
+
+A stream cipher is then nothing more than the one-time pad with the pad replaced by PRG output.
+
+\begin{definition}[Stream cipher from a PRG]
+\label{ch10:def-stream}
+Let $G:\set{0,1}^s \to \set{0,1}^{\ell}$ be a PRG. Define
+\[
+  \Enc_k(m) = m \xor G(k), \qquad \Dec_k(c) = c \xor G(k),
+\]
+for $m \in \set{0,1}^{\ell}$ and key $k \in \set{0,1}^s$. The string $G(k)$ is called the \emph{keystream}.
+\end{definition}
+
+Correctness is immediate, exactly as for the pad: $\Dec_k(\Enc_k(m)) = (m \xor G(k)) \xor G(k) = m$, because $x \xor x = 0$.
+
+\begin{focusbox}
+Notice what changed and what did not. The \emph{operation} on the data is identical to the pad -- a bitwise xor with a pad. The \emph{source} of the pad changed from a true-random tape to a deterministic expansion of a short seed. Everything subtle about stream ciphers lives in that one substitution: how good is $G$, and what happens if you ever reuse $G(k)$.
+\end{focusbox}
+
+\subsection{Why this cannot be perfectly secret}
+\label{ch10:not-perfect}
+
+Before we ask what security we \emph{do} get, let us be clear about what we lost. A stream cipher with a 256-bit key and a 1-gigabyte message cannot be perfectly secret, and no cleverness will save it. The reason is a counting argument that does not care about the design of $G$ at all.
+
+\begin{whybox}
+Shannon's theorem says perfect secrecy requires the key space to be at least as large as the message space. Here there are at most $2^{256}$ keys but $2^{8 \cdot 10^9}$ possible gigabyte messages. So the encryption map cannot reach every message from a given ciphertext: most messages are simply \emph{impossible} decryptions of a fixed $c$. An unbounded adversary who sees $c$ could, in principle, try all $2^{256}$ seeds, generate each keystream, xor, and look at which plaintexts result -- only $2^{256}$ of the $2^{8\cdot 10^9}$ candidates survive. That leaks information. Perfect secrecy is gone the instant the key is shorter than the message.
+\end{whybox}
+
+So we are not aiming for perfect secrecy. We are aiming for \emph{computational} secrecy: secure against adversaries that run in feasible time. The whole edifice stands on one assumption -- that good pseudorandom generators exist -- which we will now make precise.
+
+\section{What we demand of a PRG}
+\label{ch10:prg-security}
+
+The intuitive requirement is ``the output looks random.'' Cryptography makes that a game. We put a distinguisher $D$ in a room. With probability one half we feed it a true random string of length $\ell$; with probability one half we feed it $G(k)$ for a uniformly random seed $k$. The distinguisher prints a guess: ``random'' or ``pseudorandom.'' If $D$ can do appreciably better than a coin flip, it has \emph{distinguished} $G$ from random, and $G$ has failed.
+
+\begin{definition}[PRG security]
+\label{ch10:def-prg-secure}
+A PRG $G:\set{0,1}^s \to \set{0,1}^{\ell}$ is \emph{secure} if for every $\PPT$ distinguisher $D$,
+\[
+  \Adv_{\mathrm{prg}}(D)
+  \;=\;
+  \abs[\big]{\,
+    \Pr_{k \getsr \set{0,1}^s}\!\big[D(G(k)) = 1\big]
+    \;-\;
+    \Pr_{r \getsr \set{0,1}^{\ell}}\!\big[D(r) = 1\big]
+  \,}
+  \;\le\; \negl(s).
+\]
+\end{definition}
+
+Read it slowly. The left probability is over a random seed; the right is over a truly random string. Their difference is the distinguisher's edge. ``$\negl$'' means the edge shrinks faster than any inverse polynomial as the seed grows: doubling the seed should crush any feasible attack.
+
+\begin{trapbox}
+A PRG is \emph{not} merely an algorithm whose output passes statistical tests like Diehard or the NIST suite. Those test for specific biases -- a skewed bit frequency, a short period, correlated bytes. A cryptographic PRG must defeat \emph{every} efficient test, including ones nobody has invented yet, and including tests that know the algorithm $G$ and are searching for its fingerprint. Passing chi-squared is necessary, never sufficient. Many catastrophically broken generators sail through statistical test suites.
+\end{trapbox}
+
+\subsection{Next-bit unpredictability}
+\label{ch10:next-bit}
+
+There is an equivalent and more operational way to think about PRG security, due to Yao and to Blum and Micali. Instead of asking ``can you tell the whole output from random,'' ask ``given a prefix of the output, can you predict the very next bit?''
+
+\begin{definition}[Next-bit test]
+\label{ch10:def-nextbit}
+$G$ passes the \emph{next-bit test} if for every $\PPT$ predictor $A$ and every position $i$, given the first $i$ output bits $g_1 g_2 \cdots g_i$, the probability that $A$ correctly outputs $g_{i+1}$ is at most $\tfrac12 + \negl(s)$.
+\end{definition}
+
+\begin{theorem}[Yao]
+\label{ch10:thm-yao}
+A PRG is secure (Definition~\ref{ch10:def-prg-secure}) if and only if it passes the next-bit test.
+\end{theorem}
+
+The ``only if'' direction is easy: a successful next-bit predictor is itself a distinguisher (a random string has unpredictable next bits, so beating one half on prediction means you can tell $G$ apart). The ``if'' direction -- that defeating every next-bit predictor implies defeating every distinguisher -- is the substantive half, proved by a \emph{hybrid argument}.
+
+\begin{whybox}
+The hybrid argument is worth seeing once, because the same skeleton appears all over cryptography. Build a ladder of distributions $H_0, H_1, \dots, H_\ell$. Hybrid $H_j$ outputs the first $j$ bits from a truly random string and the remaining $\ell - j$ bits from $G$. Then $H_0$ is pure $G$ output and $H_\ell$ is pure random. If some distinguisher $D$ separates $H_0$ from $H_\ell$ with advantage $\eps$, then because there are $\ell$ steps in the ladder, \emph{some} adjacent pair $H_j, H_{j+1}$ must be separated with advantage at least $\eps/\ell$. But those two hybrids differ in exactly one bit -- position $j{+}1$ is real-random in one and PRG-generated in the other. A distinguisher that notices the difference is, after a little massaging, predicting that one bit better than chance. So a whole-string distinguisher with edge $\eps$ yields a next-bit predictor with edge about $\eps/\ell$. Contrapositive: kill all next-bit predictors and you have killed all distinguishers, up to a factor of $\ell$.
+\end{whybox}
+
+\begin{connectionbox}
+The hybrid argument is a probabilistic telescoping sum: $\Pr[D(H_0)] - \Pr[D(H_\ell)] = \sum_{j} \big(\Pr[D(H_j)] - \Pr[D(H_{j+1})]\big)$, and if a sum of $\ell$ terms exceeds $\eps$, one term exceeds $\eps/\ell$ by pigeonhole. The companion probability volume develops this averaging-over-a-telescope pattern; it is the same move behind union bounds and the triangle inequality for statistical distance.
+\end{connectionbox}
+
+\subsection{Security of the stream cipher, granted a good PRG}
+\label{ch10:cipher-security}
+
+With a secure PRG in hand, the stream cipher inherits the right notion of secrecy for a single message: semantic security, equivalently ciphertext indistinguishability against an eavesdropper.
+
+\begin{theorem}[Stream-cipher security]
+\label{ch10:thm-stream-secure}
+If $G$ is a secure PRG, then the stream cipher of Definition~\ref{ch10:def-stream} is semantically secure against a passive eavesdropper for a \emph{single} encryption.
+\end{theorem}
+
+\begin{whybox}
+The proof is a one-line reduction. Suppose an adversary $\mathcal{A}$ breaks the cipher -- distinguishes $\Enc_k(m_0)$ from $\Enc_k(m_1)$ for chosen $m_0, m_1$. Build a PRG distinguisher $D$: on input a string $p$ (either $G(k)$ or random), pick a random bit $b$, hand $\mathcal{A}$ the ciphertext $m_b \xor p$, and output $1$ iff $\mathcal{A}$ guesses $b$. If $p = G(k)$, then $\mathcal{A}$ sees a real stream-cipher ciphertext and wins with whatever edge it had. If $p$ is truly random, then $m_b \xor p$ is a one-time-pad ciphertext, perfectly hiding $b$, so $\mathcal{A}$ is guessing -- edge zero. Thus $D$'s advantage equals $\mathcal{A}$'s. If $G$ is secure, $D$'s advantage is negligible, so $\mathcal{A}$'s is too. The cipher is as secure as the generator.
+\end{whybox}
+
+Read the two crucial words in Theorem~\ref{ch10:thm-stream-secure}: \emph{single} encryption. Reuse the same keystream on a second message and the proof collapses, because the reduction relied on $p$ padding exactly one ciphertext. The next section is the price of forgetting this.
+
+\section{Keystream reuse: the two-time pad disaster}
+\label{ch10:reuse}
+
+Encrypt two messages with the \emph{same} keystream $z = G(k)$:
+\[
+  c_1 = m_1 \xor z, \qquad c_2 = m_2 \xor z.
+\]
+Eve xors the two ciphertexts. The keystream cancels:
+\[
+  c_1 \xor c_2 = (m_1 \xor z) \xor (m_2 \xor z) = m_1 \xor m_2 .
+\]
+The key is gone, and Eve holds the xor of two plaintexts. This is the same trap as reusing a one-time pad -- the ``two-time pad'' -- and it is just as fatal here, because nothing about $G$ helps once the keystream cancels. Figure~\ref{ch10:fig-twotime} shows the cancellation.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small, node distance=5mm, >=Stealth]
+  \node (m1) {$m_1$};
+  \node[draw, circle, inner sep=1.5pt, right=of m1] (x1) {$\xor$};
+  \node[right=of x1] (z1) {$z$};
+  \node[right=8mm of z1] (c1) {$=\;c_1$};
+
+  \node[below=8mm of m1] (m2) {$m_2$};
+  \node[draw, circle, inner sep=1.5pt, right=of m2] (x2) {$\xor$};
+  \node[right=of x2] (z2) {$z$};
+  \node[right=8mm of z2] (c2) {$=\;c_2$};
+
+  \draw (m1) -- (x1); \draw (z1) -- (x1);
+  \draw (m2) -- (x2); \draw (z2) -- (x2);
+
+  \node[right=22mm of c1] (cc) {$c_1 \xor c_2$};
+  \node[right=6mm of cc] (eq) {$=\;m_1 \xor m_2$};
+  \draw[->] (c1.east) -- ++(8mm,0) |- (cc.west);
+  \draw[->] (c2.east) -- ++(8mm,0) |- (cc.west);
+  \node[below=1mm of eq, evered, font=\scriptsize] {keystream $z$ cancels};
+\end{tikzpicture}
+\caption{Keystream reuse. Both ciphertexts carry the same pad $z$, so xoring them deletes $z$ and leaves $m_1 \xor m_2$ -- the secret is now independent of the cipher's strength.}
+\label{ch10:fig-twotime}
+\end{figure}
+
+\begin{intuitionbox}
+$m_1 \xor m_2$ does not look like much, but English (or HTTP, or a JPEG header) is extremely redundant. Where one message has a space character (\texttt{0x20}) and the other has a lowercase letter, the xor flips the case bit and reveals structure. Knowing or guessing a stretch of $m_1$ instantly hands you the same stretch of $m_2$, since $m_2 = (m_1 \xor m_2) \xor m_1$. This is the classic ``crib-dragging'' attack: slide a likely word like \texttt{" the "} along $m_1 \xor m_2$; wherever it produces sensible text in the other message, you have peeled off both. With three or more ciphertexts under one keystream, recovery is usually total.
+\end{intuitionbox}
+
+\begin{example}[A four-bit two-time pad by hand]
+\label{ch10:ex-twotime}
+Take a toy keystream $z = 1011$ and two messages $m_1 = 1100$, $m_2 = 0110$.
+\[
+  c_1 = 1100 \xor 1011 = 0111, \qquad c_2 = 0110 \xor 1011 = 1101.
+\]
+Eve never learns $z$, but she computes
+\[
+  c_1 \xor c_2 = 0111 \xor 1101 = 1010 = m_1 \xor m_2 .
+\]
+Check: $m_1 \xor m_2 = 1100 \xor 0110 = 1010$. If Eve guesses $m_1 = 1100$ (maybe it is a known protocol header), she recovers $m_2 = 1010 \xor 1100 = 0110$ exactly. The keystream's quality was irrelevant; only its \emph{reuse} mattered.
+\end{example}
+
+\begin{attackbox}
+\label{ch10:attack-wep}
+\textbf{WEP: keystream reuse at industrial scale.} Wired Equivalent Privacy, the original 1999 Wi-Fi encryption, used RC4. RC4 takes a single key, so to encrypt many packets under one shared Wi-Fi password WEP prepended a 24-bit \emph{initialization vector} (IV) to the key, sent the IV in the clear, and ran RC4 on $\text{IV} \concat \text{key}$. The keystream for a packet is therefore determined by the IV.
+
+Twenty-four bits is only about 16.7 million IVs. On a busy access point sending thousands of packets per second, the birthday bound guarantees IV \emph{collisions} within hours, often minutes -- and many cards reset the IV to zero on reboot, colliding immediately. Two packets with the same IV use the \emph{same keystream}: a two-time pad. Wi-Fi traffic is full of known plaintext (ARP packets, IP/LLC headers like \texttt{0xAA AA 03 00 00 00}), so the attacker xors colliding packets, subtracts the known header, and reads traffic.
+
+It got worse. The structure of RC4's key schedule, combined with attacker-chosen IVs, let Fluhrer, Mantin, and Shamir (2001) recover the \emph{actual WEP key} from enough collected IVs -- not just decrypt individual packets. Tools like \texttt{aircrack-ng} cracked 104-bit WEP keys in minutes. WEP is the textbook case of a sound primitive (RC4 was fine in 1999) destroyed by a broken \emph{construction} around it: a too-short IV concatenated into the key, with no separation between IV and secret. WEP was deprecated in 2004 (WPA, then WPA2).
+\end{attackbox}
+
+\begin{focusbox}
+The lesson generalizes far beyond Wi-Fi. \textbf{Never reuse a keystream.} For a real stream cipher this means: never feed the same (key, nonce) pair twice. The key is long-lived; the \emph{nonce} (number used once) is what guarantees a fresh keystream per message. Get nonce management wrong -- a counter that resets, a random nonce that collides, a nonce reused across reboots -- and you are back to a two-time pad no matter how strong the cipher is.
+\end{focusbox}
+
+\section{RC4: simple, ubiquitous, and broken}
+\label{ch10:rc4}
+
+\begin{historybox}
+RC4 (``Rivest Cipher 4'') was designed by Ron Rivest at RSA Security in 1987 and kept as a trade secret. In 1994 its source was anonymously posted to the Cypherpunks mailing list; the leaked algorithm matched RC4's known behavior, so the cat was out of the bag, and for legal reasons the unlicensed version was often called ``ARCFOUR.'' Its appeal was extraordinary simplicity and speed in software: a few lines of C, no tables of magic constants, byte-oriented. It went on to encrypt an enormous fraction of internet traffic -- WEP, WPA-TKIP, SSL/TLS, and many others. It is also, by modern standards, thoroughly broken, and was prohibited in TLS by RFC 7465 in 2015.
+\end{historybox}
+
+RC4 keeps a secret internal state: a permutation $S$ of the 256 bytes $0\ldots255$, plus two indices $i$ and $j$. It has two phases.
+
+\textbf{Key-scheduling algorithm (KSA).} Initialize $S$ to the identity permutation $S[k] = k$, then shuffle it using the key:
+\begin{align*}
+  &\text{for } i = 0 \text{ to } 255:\ S[i] \gets i \\
+  &j \gets 0 \\
+  &\text{for } i = 0 \text{ to } 255:\\
+  &\qquad j \gets (j + S[i] + \text{key}[i \bmod \text{keylen}]) \bmod 256 \\
+  &\qquad \text{swap } S[i],\, S[j]
+\end{align*}
+
+\textbf{Pseudorandom generation (PRGA).} Emit one keystream byte per step:
+\begin{align*}
+  &i \gets 0,\ j \gets 0 \\
+  &\text{each step:}\\
+  &\qquad i \gets (i+1) \bmod 256 \\
+  &\qquad j \gets (j + S[i]) \bmod 256 \\
+  &\qquad \text{swap } S[i],\, S[j] \\
+  &\qquad \text{output } S[(S[i] + S[j]) \bmod 256]
+\end{align*}
+
+Each output byte is xored into the plaintext. That is the whole cipher.
+
+\begin{implementbox}
+\label{ch10:impl-rc4}
+\textbf{RC4 in a few lines of Python -- learning only.} This is a teaching toy. RC4 is broken; do not use it for anything real, and do not copy this into production. It is here so you can trace the bytes.
+\begin{lstlisting}[language=Python]
+def rc4(key, data):
+    # Key-scheduling algorithm (KSA): shuffle S with the key.
+    S = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + S[i] + key[i % len(key)]) % 256
+        S[i], S[j] = S[j], S[i]
+    # Pseudorandom generation (PRGA): emit keystream, xor into data.
+    out = bytearray()
+    i = j = 0
+    for byte in data:
+        i = (i + 1) % 256
+        j = (j + S[i]) % 256
+        S[i], S[j] = S[j], S[i]
+        k = S[(S[i] + S[j]) % 256]   # one keystream byte
+        out.append(byte ^ k)
+    return bytes(out)
+
+key = b"Key"
+ct = rc4(key, b"Plaintext")
+print(ct.hex())                       # bbf316e8d940af0ad3
+print(rc4(key, ct))                   # b'Plaintext'  (xor is its own inverse)
+\end{lstlisting}
+Encryption and decryption are the same function, because the cipher only ever xors keystream into its input. The published test vector for key \texttt{"Key"}, plaintext \texttt{"Plaintext"} is ciphertext \texttt{BBF316E8D940AF0AD3}; running the code reproduces it.
+\end{implementbox}
+
+\subsection{Why RC4 is broken}
+\label{ch10:rc4-breaks}
+
+RC4's downfall is that its keystream is \emph{not} indistinguishable from random -- the early bytes carry measurable biases, and the key schedule leaks key bits when an IV is glued to the key.
+
+\begin{attackbox}
+\label{ch10:attack-rc4-bias}
+\textbf{The biases that killed RC4.}
+
+\emph{Second-byte bias} (Mantin--Shamir, 2001). The second output byte of RC4 equals $0$ with probability about $2/256$, twice what a uniform byte should be. This single bias means: if the same plaintext byte (say, a fixed HTTP cookie character) is encrypted under many random keys, the attacker collects the second ciphertext byte across sessions and recovers the plaintext byte by statistics alone. Broadcast the same secret often enough and it falls out.
+
+\emph{Fluhrer--Mantin--Shamir (FMS), 2001.} When RC4's key is $\text{IV} \concat K$ with a known IV (exactly the WEP setup), certain ``weak'' IVs cause the first keystream byte to reveal information about $K$. Collect enough packets with such IVs and you solve for $K$ byte by byte. This is the attack behind practical WEP cracking.
+
+\emph{The full break of RC4 in TLS} (AlFardan et al., 2013). Mapping out the biases across the first 256 bytes (and the long-term Fluhrer--McGrew digraph biases) let researchers recover TLS-protected secrets -- like session cookies -- given on the order of $2^{30}$ encryptions of the same plaintext, achievable by a malicious web page forcing a browser to send the cookie repeatedly. This pushed the industry to ban RC4 outright.
+\end{attackbox}
+
+\begin{trapbox}
+A common ``fix'' for RC4 is to throw away the first $N$ keystream bytes (RC4-drop$N$, e.g.\ $N = 768$ or $3072$), which discards the worst early biases. It helps but does not save RC4: long-term biases remain, and the key-schedule weaknesses persist. The right response was not to patch RC4 but to replace it. When a primitive needs a growing list of caveats to stay safe, retire it.
+\end{trapbox}
+
+\section{ChaCha20: the modern stream cipher}
+\label{ch10:chacha}
+
+\begin{historybox}
+Daniel J.\ Bernstein designed Salsa20 in 2005 for the eSTREAM competition, then refined it into ChaCha20 in 2008 with better diffusion per round. ChaCha20 is now everywhere a stream cipher is wanted: TLS 1.3 (as ChaCha20-Poly1305), the WireGuard VPN, OpenSSH, the Linux kernel's \texttt{getrandom} CSPRNG, and Google's adoption on mobile (where it is faster than AES on CPUs lacking AES hardware). It is fast, constant-time by construction (no secret-dependent table lookups -- the very thing that exposes AES software to cache-timing attacks), and has resisted a decade of cryptanalysis.
+\end{historybox}
+
+Unlike RC4, ChaCha20 is built the modern way: as a keystream generator that is really a \emph{counter mode} over a fixed pseudorandom permutation-like core. It does not iterate a tiny secret state; instead, for each 64-byte block of keystream it runs a fresh computation on a public-structure input made of the key, a nonce, and a block counter.
+
+\subsection{The state and the quarter-round}
+\label{ch10:chacha-state}
+
+ChaCha20 works on a $4\times4$ matrix of sixteen 32-bit words -- 512 bits of state, laid out as in Figure~\ref{ch10:fig-state}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small]
+  \def\cs{1.5cm}
+  % constants row
+  \foreach \i/\v in {0/$c_0$,1/$c_1$,2/$c_2$,3/$c_3$}
+    \node[draw, fill=gray!12, minimum width=\cs, minimum height=0.85cm] (a\i) at (\i*\cs,0) {\v};
+  % key rows
+  \foreach \i/\v in {0/$k_0$,1/$k_1$,2/$k_2$,3/$k_3$}
+    \node[draw, fill=blue!10, minimum width=\cs, minimum height=0.85cm] (b\i) at (\i*\cs,-0.85) {\v};
+  \foreach \i/\v in {0/$k_4$,1/$k_5$,2/$k_6$,3/$k_7$}
+    \node[draw, fill=blue!10, minimum width=\cs, minimum height=0.85cm] (c\i) at (\i*\cs,-1.70) {\v};
+  % counter + nonce row
+  \node[draw, fill=orange!18, minimum width=\cs, minimum height=0.85cm] (d0) at (0,-2.55) {$b_0$};
+  \foreach \i/\v in {1/$n_0$,2/$n_1$,3/$n_2$}
+    \node[draw, fill=green!12, minimum width=\cs, minimum height=0.85cm] (d\i) at (\i*\cs,-2.55) {\v};
+  % side labels
+  \node[right=4pt of a3] {\scriptsize constants};
+  \node[right=4pt of b3] {\scriptsize key (words 0--3)};
+  \node[right=4pt of c3] {\scriptsize key (words 4--7)};
+  \node[right=4pt of d3] {\scriptsize counter $\,b_0$, nonce $n_0n_1n_2$};
+\end{tikzpicture}
+\caption{The ChaCha20 $4\times4$ state of sixteen 32-bit words. Row one is fixed constants (the ASCII of ``\texttt{expand 32-byte k}''); rows two and three are the 256-bit key; the last row is a 32-bit block counter $b_0$ then a 96-bit nonce $n_0n_1n_2$. Only the key is secret; the counter is what makes each block's keystream different.}
+\label{ch10:fig-state}
+\end{figure}
+
+\noindent Everything except the key is public and structured. Incrementing the counter $b_0$ between blocks gives each 64-byte block its own keystream.
+
+The engine is the \emph{quarter-round} on four words $a,b,c,d$, built only from addition mod $2^{32}$, xor, and bitwise rotation. The ``ARX'' name -- Add, Rotate, Xor -- describes the entire primitive:
+\begin{align*}
+  a &\mathrel{+}= b; \quad d \mathrel{\xor}= a; \quad d \lll 16 \\
+  c &\mathrel{+}= d; \quad b \mathrel{\xor}= c; \quad b \lll 12 \\
+  a &\mathrel{+}= b; \quad d \mathrel{\xor}= a; \quad d \lll 8 \\
+  c &\mathrel{+}= d; \quad b \mathrel{\xor}= c; \quad b \lll 7
+\end{align*}
+Here $\lll r$ is a left rotation by $r$ bits and ``$+$'' is addition modulo $2^{32}$.
+
+\begin{intuitionbox}
+Why these three operations? Addition mod $2^{32}$ mixes bits with \emph{carries} that propagate from low to high -- a cheap source of nonlinearity (carrying is not a linear function over $\F_2$). Xor combines words without carries. Rotation moves information \emph{across} the 32-bit word so that a change in a low bit can affect high bits and vice versa. Alone, each is weak; interleaved over many rounds they produce avalanche: flip one input bit and roughly half the output bits flip, unpredictably. No lookup tables means no data-dependent memory access, so no cache-timing side channel. That is why ChaCha is fast \emph{and} naturally constant-time.
+\end{intuitionbox}
+
+A full round applies the quarter-round to all four columns of the matrix; the next round applies it to the four diagonals. ChaCha20 does $20$ such rounds (10 column-rounds interleaved with 10 diagonal-rounds), hence the ``20.'' After the rounds, the result is added word-wise to the \emph{original} input matrix (this feed-forward prevents the round function from being inverted to recover the state). Serializing the sixteen words little-endian yields 64 keystream bytes.
+
+\subsection{From core to cipher}
+\label{ch10:chacha-cipher}
+
+To encrypt, run the core once per 64-byte block with the counter incremented each time, concatenate the blocks into a keystream, and xor with the plaintext:
+\[
+  \text{keystream} = \text{ChaChaBlock}(k, n, 0) \concat \text{ChaChaBlock}(k, n, 1) \concat \cdots
+\]
+\[
+  c = m \xor \text{keystream}.
+\]
+
+\begin{walkbox}
+How long can one (key, nonce) pair safely encrypt? The 32-bit block counter addresses $2^{32}$ blocks of 64 bytes each, so $2^{32}\cdot 64 = 2^{38}$ bytes $= 256$ GiB before the counter wraps. Reach the wrap and you would repeat keystream -- a two-time pad. In practice you change the nonce per message long before that. The 96-bit nonce gives $2^{96}$ messages per key, large enough that a properly \emph{random} nonce essentially never collides, and a per-message \emph{counter} nonce never collides by construction. Pick one discipline and never reuse a nonce under a fixed key.
+\end{walkbox}
+
+\begin{implementbox}
+\label{ch10:impl-chacha}
+\textbf{The ChaCha20 block function -- learning only.} Teaching code. It omits the constant-time care and the authentication (Poly1305) that any real deployment needs. Never ship a hand-rolled cipher; use a vetted library (libsodium, OpenSSL, your language's standard crypto).
+\begin{lstlisting}[language=Python]
+import struct
+
+def rotl(x, n):
+    return ((x << n) | (x >> (32 - n))) & 0xffffffff
+
+def quarter_round(s, a, b, c, d):
+    s[a] = (s[a] + s[b]) & 0xffffffff; s[d] = rotl(s[d] ^ s[a], 16)
+    s[c] = (s[c] + s[d]) & 0xffffffff; s[b] = rotl(s[b] ^ s[c], 12)
+    s[a] = (s[a] + s[b]) & 0xffffffff; s[d] = rotl(s[d] ^ s[a], 8)
+    s[c] = (s[c] + s[d]) & 0xffffffff; s[b] = rotl(s[b] ^ s[c], 7)
+
+def chacha20_block(key, counter, nonce):
+    const = b"expand 32-byte k"
+    state = list(struct.unpack("<4I", const))
+    state += list(struct.unpack("<8I", key))      # 256-bit key
+    state += [counter]
+    state += list(struct.unpack("<3I", nonce))    # 96-bit nonce
+    work = state[:]
+    for _ in range(10):                           # 10 double-rounds = 20 rounds
+        # column rounds
+        quarter_round(work, 0, 4, 8, 12)
+        quarter_round(work, 1, 5, 9, 13)
+        quarter_round(work, 2, 6, 10, 14)
+        quarter_round(work, 3, 7, 11, 15)
+        # diagonal rounds
+        quarter_round(work, 0, 5, 10, 15)
+        quarter_round(work, 1, 6, 11, 12)
+        quarter_round(work, 2, 7, 8, 13)
+        quarter_round(work, 3, 4, 9, 14)
+    out = [(work[i] + state[i]) & 0xffffffff for i in range(16)]  # feed-forward
+    return struct.pack("<16I", *out)              # 64 keystream bytes
+
+def chacha20(key, nonce, data, counter=0):
+    out = bytearray()
+    for blk in range(0, len(data), 64):
+        ks = chacha20_block(key, counter + blk // 64, nonce)
+        chunk = data[blk:blk+64]
+        out += bytes(x ^ y for x, y in zip(chunk, ks))
+    return bytes(out)
+\end{lstlisting}
+The feed-forward step \texttt{work[i] + state[i]} is essential: without it the 20 rounds are an invertible permutation an attacker could run backward from one keystream block to recover the key. Adding back the original state breaks that invertibility.
+\end{implementbox}
+
+\subsection{Why ChaCha20 is trusted}
+\label{ch10:chacha-why}
+
+We cannot \emph{prove} ChaCha20 is a secure PRG -- doing so would settle deep open problems in complexity. What we have is the standard cryptographic basis for confidence: a clean design that resists every known class of attack, with a large security margin.
+
+\begin{whybox}
+Two pillars hold up the confidence. \emph{Margin:} the best published cryptanalysis breaks roughly 7 of the 20 rounds (differential-linear attacks by Aumasson and others), and even those require effort far beyond brute force. Thirteen unbroken rounds of headroom is a wide cushion. \emph{Structure:} the counter-mode construction means the security question reduces to ``does the core look like a random function of (key, nonce, counter)?'' The ARX core has strong, well-understood diffusion -- each output bit depends on every input bit after a few rounds -- and crucially has \emph{no} secret-dependent branches or memory accesses, so it sidesteps the timing and cache side channels that plague table-based ciphers. The nonlinearity comes entirely from integer carries, which are cheap and analyzable.
+\end{whybox}
+
+\begin{applicationbox}
+\label{ch10:app-chacha}
+\textbf{ChaCha20 in the wild.} In TLS 1.3 the cipher suite \texttt{TLS\_CHACHA20\_POLY1305\_SHA256} pairs ChaCha20 with the Poly1305 authenticator to give \emph{authenticated} encryption (AEAD) -- confidentiality \emph{and} integrity in one pass. Browsers prefer it on devices without AES hardware acceleration, where it outruns AES-GCM. WireGuard uses ChaCha20-Poly1305 as its only data cipher (no negotiation, no downgrade attacks). OpenSSH offers \texttt{chacha20-poly1305@openssh.com}. The Linux kernel's \texttt{getrandom()} and \texttt{/dev/urandom} are built on a ChaCha-based CSPRNG. A raw stream cipher is never deployed alone for real traffic: it is always wrapped in a MAC, because confidentiality without integrity lets an attacker flip ciphertext bits -- and xor-based stream ciphers flip the \emph{exact} corresponding plaintext bits, silently. That malleability is the subject of authenticated encryption a few chapters on.
+\end{applicationbox}
+
+\begin{trapbox}
+Stream-cipher ciphertext is \emph{malleable}. Because $c = m \xor z$, an attacker who knows or guesses part of $m$ can flip chosen bits of $c$ to flip the same bits of $m$, with no key. Encrypt ``transfer \$0100'' and an attacker who knows the format can flip a byte to ``transfer \$9100'' without ever decrypting. Encryption hides content; it does \emph{not} prevent tampering. Always add a MAC (an AEAD mode like ChaCha20-Poly1305). ``Encrypt-then-MAC,'' covered later, is the discipline that closes this.
+\end{trapbox}
+
+\section{Linear feedback shift registers and the curse of linearity}
+\label{ch10:lfsr}
+
+Before software stream ciphers, hardware did the job with \emph{linear-feedback shift registers} (LFSRs): a row of bit cells that shifts every clock tick, with the incoming bit computed as an xor of selected ``tap'' positions. They are tiny, blazing fast in silicon, and produce long, statistically flat sequences. They are also, used naively, a textbook lesson in why \emph{linear} keystreams are worthless.
+
+\subsection{A tiny LFSR by hand}
+\label{ch10:lfsr-example}
+
+Take a 4-bit register with feedback bit $= s_1 \xor s_2$ (taps at the two leftmost cells). Seed it with state $(s_1 s_2 s_3 s_4) = 1001$ and output the rightmost bit each tick, then shift right and feed the new bit in on the left.
+
+\begin{center}
+\begin{tikzpicture}[font=\small, >=Stealth]
+  \foreach \i/\v in {0/1,1/0,2/0,3/1} {
+    \node[draw, minimum size=0.8cm] (c\i) at (\i*1.1,0) {\v};
+  }
+  \node[below=1pt of c0] {\scriptsize $s_1$};
+  \node[below=1pt of c1] {\scriptsize $s_2$};
+  \node[below=1pt of c2] {\scriptsize $s_3$};
+  \node[below=1pt of c3] {\scriptsize $s_4$};
+  \draw[->] (c3.east) -- ++(0.9,0) node[right] {output bit};
+  \node[draw, circle, inner sep=1pt] (x) at (1.65,1.4) {$\xor$};
+  \draw[->] (c0.north) |- (x.west);
+  \draw[->] (c1.north) |- (x.west);
+  \draw[->] (x.north) |- ++(0,0.35) -| (-0.9,0.35) -- (c0.west);
+  \node at (2.5,1.75) {\scriptsize feedback $=s_1 \xor s_2$ into left cell};
+\end{tikzpicture}
+\end{center}
+
+Let us crank it. Write the state left to right; the output is the rightmost bit; the new left bit is (old $s_1$) $\xor$ (old $s_2$). With seed $1001$:
+
+\begin{center}
+\begin{tabular}{cccc}
+\toprule
+tick & state $s_1s_2s_3s_4$ & output (right bit) & feedback $s_1\xor s_2$ \\
+\midrule
+0 & 1001 & 1 & 1 \\
+1 & 1100 & 0 & 0 \\
+2 & 0110 & 0 & 1 \\
+3 & 1011 & 1 & 1 \\
+4 & 1101 & 1 & 0 \\
+5 & 0110 & 0 & 1 \\
+6 & 1011 & \dots & \dots \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{walkbox}
+Trace tick 0 to 1 yourself. State $1001$: output the rightmost bit, $1$. Feedback $= s_1 \xor s_2 = 1 \xor 0 = 1$. Shift everyone right and drop the new feedback bit into the left cell: new state $= 1\,|\,100 = 1100$. Tick 1 to 2: output $0$, feedback $1\xor 1 = 0$, new state $0\,|\,110 = 0110$. This particular tap choice does not hit the maximal period of $2^4 - 1 = 15$; a register with a \emph{primitive} feedback polynomial would cycle through all $15$ nonzero states before repeating. The all-zero state is a fixed point and must be avoided -- an LFSR that ever reaches $0000$ stays stuck at $0000$.
+\end{walkbox}
+
+The output bit sequence here is $1,0,0,1,1,0,\dots$ -- flat-looking and balanced. Statistically it could fool a naive test. Cryptographically it is fatally weak.
+
+\subsection{Why linearity is fatal}
+\label{ch10:lfsr-weak}
+
+The register's update is a linear map over $\F_2$. Every output bit is a fixed $\F_2$-linear combination of the seed bits. That makes the keystream solvable by linear algebra the moment an attacker sees a little of it.
+
+\begin{attackbox}
+\label{ch10:attack-lfsr}
+\textbf{Breaking an LFSR with known plaintext.} Suppose Eve knows (or guesses) a stretch of plaintext, so she knows the corresponding keystream bits $z_1, z_2, \dots$ An $n$-bit LFSR has $n$ unknown seed bits. If Eve knows the taps, the state at any time is an $\F_2$-linear function of the seed, so each known keystream bit gives one \emph{linear equation} in the $n$ unknowns. Collect $n$ equations -- $n$ known keystream bits -- and solve the linear system by Gaussian elimination over $\F_2$. She recovers the seed and can generate the entire keystream forward and backward.
+
+If Eve does \emph{not} know the taps either, the Berlekamp--Massey algorithm finds the shortest LFSR that produces an observed sequence, given only about $2n$ consecutive keystream bits, in $O(n^2)$ time. The number $n$ here is the \emph{linear complexity} of the sequence. So any sequence with low linear complexity is broken with a short known-plaintext sample -- automatically, taps and seed and all.
+\end{attackbox}
+
+\begin{example}[Solving our toy LFSR]
+\label{ch10:ex-lfsr-solve-demo}
+Our register has $n = 4$ with taps $\{1,2\}$. The output at each tick is the rightmost cell $s_4$, and the state is a known linear shift of the seed. Writing the seed $(s_1,s_2,s_3,s_4)$ as unknowns, the first outputs read off shifted seed bits directly: $z_0 = s_4$, $z_1 = s_3$, $z_2 = s_2$, and $z_3 = s_1$ (each tick the bit that was at $s_3$ slides to $s_4$ and out, and so on). Four leaked outputs $z_0z_1z_2z_3$ therefore pin down all four seed bits with no work beyond reading them off; further outputs are then determined by the recurrence. Even in a less transparent tap configuration, Gaussian elimination over $\F_2$ -- which is just xor-ing rows -- recovers the seed from $n$ bits. Four leaked keystream bits, total break.
+\end{example}
+
+\begin{whybox}
+The deep reason: a secure PRG must pass the next-bit test (Theorem~\ref{ch10:thm-yao}), but for an LFSR the next bit is an \emph{exact} linear function of bits you have already seen. A predictor that solves a $4\times4$ linear system predicts the next bit with probability $1$, not $\tfrac12 + \negl$. Linearity is the opposite of unpredictability. Any keystream you can describe with a short linear recurrence has tiny linear complexity, and Berlekamp--Massey turns that into a full break. This is why ``looks random statistically'' is nowhere near ``is cryptographically pseudorandom.''
+\end{whybox}
+
+\begin{connectionbox}
+Berlekamp--Massey is the same algorithm used to decode BCH and Reed--Solomon error-correcting codes -- it finds the minimal linear recurrence behind a sequence. The companion algorithms volume develops Gaussian elimination over $\F_2$ (which is bitwise xor of rows, extremely fast) and the $O(n^2)$ recurrence-finding that makes the LFSR attack run in microseconds. The linear-complexity profile of a sequence is a coding-theory invariant repurposed as a cryptanalytic weapon.
+\end{connectionbox}
+
+\subsection{Trying to rescue LFSRs}
+\label{ch10:lfsr-rescue}
+
+Engineers did not abandon LFSRs; they tried to break the linearity by combining several of them nonlinearly -- a \emph{nonlinear combining function} mixing the outputs of several LFSRs, or \emph{irregular clocking} (one register's output decides whether another steps).
+
+\begin{historybox}
+The GSM mobile standard's voice cipher \textbf{A5/1} combines three LFSRs (of lengths 19, 22, 23 bits) with majority-vote irregular clocking. It was meant to be strong; it is not. The small total state and clocking structure allow time--memory tradeoff attacks (Biryukov--Shamir, and later rainbow-table projects) that recover the session key for a GSM call from a few seconds of known keystream using precomputed tables. \textbf{E0}, the Bluetooth stream cipher, combines four LFSRs and has likewise been broken below brute force. \textbf{Trivium}, an eSTREAM finalist, is a more careful nonlinear-feedback design that remains unbroken -- proof that shift-register ciphers \emph{can} be done well, but only with serious nonlinearity and analysis. The pattern is consistent: naive linear combinations leak; you need real nonlinearity \emph{and} enough state.
+\end{historybox}
+
+\begin{applicationbox}
+\label{ch10:app-streams}
+\textbf{Where stream ciphers actually live today.} Hardware-friendly LFSR-style ciphers persist in constrained radios: \textbf{A5/1} and \textbf{A5/3} in 2G GSM, \textbf{SNOW 3G} and \textbf{ZUC} as standardized confidentiality cores in 4G LTE and 5G (both are LFSR-based but with strong nonlinear filters and have held up). On the software side, the world moved to ChaCha20 (TLS, WireGuard, SSH, OS randomness) and to AES in counter-like modes (which turns a block cipher into a stream cipher -- the subject of the modes chapter). The throughline of this chapter is the design rule every one of these obeys: stretch a short secret into an unpredictable keystream, never reuse a (key, nonce) pair, and never rely on linearity for secrecy.
+\end{applicationbox}
+
+\section{Summary}
+\label{ch10:summary}
+
+A stream cipher is the one-time pad with the truly random pad replaced by the output of a pseudorandom generator. That swap costs us perfect secrecy (the key is shorter than the message) but buys a practical cipher that is secure against any feasible adversary -- provided the PRG is secure, meaning no efficient distinguisher beats a coin flip, equivalently no efficient predictor guesses the next bit. The proof that a good PRG yields a secure cipher is a one-line reduction; the proof that next-bit unpredictability suffices is a hybrid argument.
+
+The single most important operational rule is: \textbf{never reuse a keystream.} Reuse turns the cipher into a two-time pad whose ciphertexts xor to the xor of plaintexts, readable by crib-dragging -- the catastrophe that sank WEP through a 24-bit IV. RC4 taught the second lesson: a primitive can be fine in its day yet die to discovered biases (Mantin--Shamir, FMS, the 2013 TLS break) and must then be retired, not patched. ChaCha20 is the modern answer: an ARX counter-mode design with a wide security margin, constant-time by construction, deployed across TLS 1.3, WireGuard, SSH, and OS randomness, always wrapped in a MAC because stream ciphertext is malleable. And LFSRs are the cautionary tale that ``statistically flat'' is not ``pseudorandom'': linear keystreams fall to Gaussian elimination and Berlekamp--Massey from a handful of known bits, which is why every surviving shift-register cipher buys its security with genuine nonlinearity.
+
+\section{Exercises}
+\label{ch10:exercises}
+
+\begin{exercise}[Two-time pad recovery]
+\label{ch10:ex-twotime-recover}
+A stream cipher reuses keystream $z$ on two messages. You intercept (in hex) $c_1 = \texttt{0x3A1F}$ and $c_2 = \texttt{0x2B0E}$, and you know the first message begins with the ASCII byte \texttt{'H'} (\texttt{0x48}). Compute $c_1 \xor c_2$, then recover the first byte of $m_2$. (Hint: $m_2 = (m_1 \xor m_2) \xor m_1$.)
+\end{exercise}
+
+\begin{exercise}[RC4 key schedule by hand]
+\label{ch10:ex-rc4-ksa}
+Run the RC4 KSA on a register of size \emph{8} instead of 256 (so all arithmetic is mod 8), with key bytes $[1, 2]$. Start with $S = [0,1,2,3,4,5,6,7]$ and trace the eight swaps, writing $S$ after each step. Then run one PRGA step and give the first keystream value.
+\end{exercise}
+
+\begin{exercise}[Why dropping bytes is not enough]
+\label{ch10:ex-rc4-drop}
+Explain, using the Mantin--Shamir second-byte bias, why a long-lived secret (such as an HTTP cookie) sent at a \emph{fixed} position in many RC4-encrypted streams is recoverable even though each stream uses a different key. Why does discarding the first 256 keystream bytes (RC4-drop256) reduce but not eliminate the risk?
+\end{exercise}
+
+\begin{exercise}[ChaCha quarter-round trace]
+\label{ch10:ex-chacha-qr}
+Apply one ChaCha20 quarter-round to the four 32-bit words $a = \texttt{0x11111111}$, $b = \texttt{0x01020304}$, $c = \texttt{0x9b8d6f43}$, $d = \texttt{0x01234567}$. Carry out the eight operations in order (add mod $2^{32}$, xor, rotate) and give the final $(a,b,c,d)$. Then flip the lowest bit of the input $b$ and verify that many output bits change (avalanche).
+\end{exercise}
+
+\begin{exercise}[Nonce budget]
+\label{ch10:ex-nonce-budget}
+ChaCha20 has a 32-bit block counter and a 96-bit nonce. (a) How many bytes of keystream can one (key, nonce) pair produce before the counter wraps? (b) If you choose nonces uniformly at random, roughly how many messages can you send under one key before the probability of a nonce collision reaches $\tfrac12$? Use the birthday approximation $n \approx 2^{(b+1)/2}$ for a $b$-bit nonce, and state why a collision is a security disaster.
+\end{exercise}
+
+\begin{exercise}[Cranking an LFSR]
+\label{ch10:ex-lfsr-crank}
+Take a 4-bit LFSR with feedback bit $= s_1 \xor s_2$ (taps at the two leftmost cells), output the rightmost bit, seed $1011$. Produce the first 8 output bits and the state at each tick. Does this seed and tap choice reach the maximal period of 15? What happens if a register ever reaches the all-zero state?
+\end{exercise}
+
+\begin{exercise}[Solve an LFSR by linear algebra]
+\label{ch10:ex-lfsr-solve}
+You know an unknown 3-bit LFSR has feedback bit $= s_1 \xor s_3$, outputs the rightmost bit, and you observe the keystream bits $z_0 z_1 z_2 z_3 z_4 = 1,1,0,1,0$. Set up the linear equations over $\F_2$ relating these outputs to the unknown seed $(s_1,s_2,s_3)$ and solve for the seed by xor-elimination. Then predict $z_5$.
+\end{exercise}
+
+\begin{exercise}[Malleability]
+\label{ch10:ex-malleability}
+A bank app encrypts the message \texttt{AMOUNT=00100} with a stream cipher and sends the ciphertext. The attacker knows the plaintext format and the byte offset of the amount field. Show precisely which ciphertext bytes the attacker xors, and with what values, to change the decrypted amount to \texttt{AMOUNT=90100}, without knowing the key. What single defensive mechanism stops this attack, and why does encryption alone not?
+\end{exercise}
+
+\begin{exercise}[PRG distinguisher from a bias]
+\label{ch10:ex-prg-distinguisher}
+Suppose a candidate PRG outputs bits that are each independently $1$ with probability $0.51$ instead of $0.5$. Describe a distinguisher that, given a long output, decides ``PRG'' vs ``random'' with advantage close to $1$, and estimate how many output bits it needs. (Hint: count ones; compare to the expected number under each hypothesis, and use a concentration bound.) Conclude why even a tiny per-bit bias disqualifies a generator.
+\end{exercise}
+
+\begin{exercise}[Hybrid argument]
+\label{ch10:ex-hybrid}
+Let $G$ be a PRG with output length $\ell$. Suppose a distinguisher $D$ separates $G(k)$ from a random $\ell$-bit string with advantage $\eps$. Using the hybrids $H_j$ (first $j$ bits random, last $\ell - j$ bits from $G$), prove there exists an index $j$ such that $D$ separates $H_j$ from $H_{j+1}$ with advantage at least $\eps/\ell$, and explain how this yields a next-bit predictor with the same advantage.
+\end{exercise}

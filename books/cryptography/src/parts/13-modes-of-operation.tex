@@ -1,0 +1,513 @@
+\chapter{Modes of Operation}
+
+A block cipher is a deceptively small object. AES takes exactly $128$ bits of plaintext and a key, and returns exactly $128$ bits of ciphertext. That is $16$ bytes -- about the length of ``\texttt{attack at dawn!!}''. Real messages are not $16$ bytes long. An email is kilobytes, a disk image is gigabytes, a TLS record can be tens of kilobytes. So the very first engineering question after you have a good block cipher is: how do I encrypt a \emph{long} message with a primitive that only eats one block at a time?
+
+The naive answer -- chop the message into blocks and encrypt each one -- is also the most catastrophic wrong answer in all of applied cryptography. It has a name (ECB), a famous picture (the penguin), and it leaks structure so loudly that you can often read the plaintext straight off the ciphertext. The fix is a \emph{mode of operation}: a recipe for chaining the block cipher's invocations together with feedback, counters, and fresh randomness so that the final ciphertext reveals nothing beyond the length of the message.
+
+This chapter is about those recipes. We will build ECB, CBC, CTR, CFB, and OFB from the ground up, trace each one on tiny numbers, draw the data-flow diagram for each, and -- most importantly -- understand the threat model that separates the broken modes from the survivable ones. Along the way we meet initialization vectors and nonces and learn the brutal rules they live under (unique, sometimes unpredictable, never reused). We preview the padding-oracle attack that haunted CBC for a decade. And we will see why CTR mode, the simplest-looking of them all, became the foundation of every modern authenticated cipher in TLS, WireGuard, and Signal.
+
+\chapterline
+
+\section{The block cipher as a tool, and what it is not}
+
+Let $E\colon \set{0,1}^k \times \set{0,1}^n \to \set{0,1}^n$ be a block cipher. For a fixed key $K$ the map $E_K(\cdot) = E(K,\cdot)$ is a permutation of $\set{0,1}^n$: it is a bijection, so $E_K^{-1} = D_K$ exists and decryption recovers the block. For AES, $n = 128$; for the older DES, $n = 64$.
+
+The security goal we proved (or assumed) for the block cipher itself is that $E_K$ is a \emph{pseudorandom permutation} (PRP): to anyone who does not know $K$, the function $E_K$ is computationally indistinguishable from a permutation drawn uniformly at random from all $2^n!$ permutations of $n$-bit strings. That is a statement about \emph{one} block. It says nothing about what happens when you call $E_K$ many times on related inputs. The whole art of modes is to take a per-block guarantee and lift it to a per-message guarantee.
+
+\begin{focusbox}
+A block cipher is not an encryption scheme. It is a building block. ``Encrypt this file with AES'' is an underspecified instruction -- it is like saying ``build this house with bricks'' without saying how the bricks are stacked. The mode of operation is the mortar and the stacking pattern, and a bad pattern collapses the house no matter how good the bricks are.
+\end{focusbox}
+
+\subsection{The security target: IND-CPA}
+
+What does ``secure'' mean for a scheme that encrypts long messages? We carry over the notion from earlier chapters: \emph{indistinguishability under a chosen-plaintext attack} (IND-CPA). Picture the game between a challenger and an adversary $\Adv$.
+
+\begin{enumerate}
+\item The challenger picks a key $K \getsr \set{0,1}^k$ and a secret bit $b \getsr \set{0,1}$.
+\item $\Adv$ may submit any messages it likes and receive their encryptions (this is the ``chosen plaintext'' power -- it models the reality that attackers can often induce a victim to encrypt data they choose).
+\item At some point $\Adv$ submits two equal-length messages $m_0, m_1$. The challenger returns $\Enc_K(m_b)$.
+\item $\Adv$ may keep querying, then outputs a guess $b'$. It wins if $b' = b$.
+\end{enumerate}
+
+The scheme is IND-CPA secure if every efficient $\Adv$ wins with probability at most $\tfrac12 + \negl$. The intuition is exactly what you want from encryption: even an attacker who can get arbitrary plaintexts encrypted, and who picks the two candidate messages itself, cannot tell which of the two was encrypted any better than flipping a coin.
+
+\begin{whybox}
+IND-CPA has a startling and non-negotiable consequence: \textbf{encryption must be randomized (or stateful)}. Suppose $\Enc_K$ were a deterministic function. Then $\Adv$ asks for $\Enc_K(m_0)$ during the query phase, then submits $m_0, m_1$ as its challenge. If the challenge ciphertext equals the one it already saw, $b = 0$; otherwise $b = 1$. It wins with probability $1$. A deterministic encryption scheme \emph{cannot} be IND-CPA secure. This single observation already condemns ECB and explains why every good mode injects either a random IV or a counter.
+\end{whybox}
+
+\section{ECB: the mode you must never use}
+
+Electronic Codebook (ECB) mode is the naive recipe. Split the message into blocks $m_1, m_2, \dots, m_\ell$, each $n$ bits, and encrypt each one independently with the same key:
+\[
+c_i = E_K(m_i), \qquad i = 1, \dots, \ell.
+\]
+Decryption is just $m_i = D_K(c_i)$. The name comes from the idea that $E_K$ acts like a giant lookup table -- a ``codebook'' -- mapping each possible block to its ciphertext.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, minimum width=11mm, minimum height=8mm, font=\small},
+  enc/.style={draw, fill=sourceblue!20, minimum width=12mm, minimum height=9mm, font=\small},
+  >=Stealth, node distance=6mm
+]
+\foreach \i in {1,2,3} {
+  \node[box] (m\i) at (\i*30mm, 0) {$m_{\i}$};
+  \node[enc] (e\i) at (\i*30mm, -14mm) {$E_K$};
+  \node[box] (c\i) at (\i*30mm, -28mm) {$c_{\i}$};
+  \draw[->] (m\i) -- (e\i);
+  \draw[->] (e\i) -- (c\i);
+}
+\node[font=\small] at (4.2*30mm,-14mm) {$\cdots$};
+\end{tikzpicture}
+\caption{ECB mode: each block goes through $E_K$ with no interaction. Identical plaintext blocks produce identical ciphertext blocks.}
+\label{ch13:ecb-diagram}
+\end{figure}
+
+The disease is right there in Figure~\ref{ch13:ecb-diagram}: there is no arrow between columns. Each block is encrypted in total isolation. Because $E_K$ is deterministic, \textbf{equal plaintext blocks always produce equal ciphertext blocks}. Patterns in the plaintext survive into the ciphertext one-to-one.
+
+\begin{intuitionbox}
+Think of ECB as a substitution cipher whose alphabet is the set of all $n$-bit blocks instead of the $26$ letters. We spent a whole earlier chapter watching frequency analysis demolish substitution ciphers. ECB is the same idea scaled up: the ``alphabet'' is astronomically large, so you cannot do classical letter-frequency analysis, but \emph{any repetition in the plaintext at block granularity becomes a visible repetition in the ciphertext}. For structured data -- bitmaps, fixed-format records, repeated headers -- that is plenty.
+\end{intuitionbox}
+
+\subsection{A tiny ECB trace}
+
+Let us make this concrete with an absurdly small toy cipher so we can do it by hand. Take a block size of $n = 4$ bits, and let our ``cipher'' be a fixed permutation $E_K$ of the $16$ possible nibbles given by this table (this is just an arbitrary bijection standing in for AES):
+
+\begin{center}
+\begin{tabular}{c|cccccccccccccccc}
+$x$    & 0 & 1 & 2 & 3 & 4 & 5 & 6 & 7 & 8 & 9 & A & B & C & D & E & F\\\hline
+$E_K(x)$ & 6 & 4 & C & 5 & 0 & 7 & 2 & E & 1 & F & 3 & D & 8 & A & 9 & B
+\end{tabular}
+\end{center}
+
+Our blocks are single hex digits (nibbles). Take the plaintext stream of nibbles $m = (\mathtt{A}, \mathtt{1}, \mathtt{A}, \mathtt{1}, \mathtt{C}, \mathtt{A})$. ECB gives:
+\[
+c = \big(E_K(\mathtt{A}),\, E_K(\mathtt{1}),\, E_K(\mathtt{A}),\, E_K(\mathtt{1}),\, E_K(\mathtt{C}),\, E_K(\mathtt{A})\big) = (\mathtt{3},\mathtt{4},\mathtt{3},\mathtt{4},\mathtt{8},\mathtt{3}).
+\]
+Look at the ciphertext: \texttt{3 4 3 4 8 3}. The pattern \texttt{A,1} repeated in the plaintext shows up as \texttt{3,4} repeated in the ciphertext, and every \texttt{A} maps to \texttt{3}. An eavesdropper who never learns the key still sees exactly where the plaintext repeated itself. With a $4$-bit block this is unavoidable; with a $128$-bit block it is just as unavoidable whenever the plaintext contains $16$-byte-aligned repeats.
+
+\subsection{The penguin}
+
+\begin{attackbox}
+The canonical demonstration is the ``ECB penguin.'' Take a bitmap image of Tux the Linux penguin, encrypt the pixel data with AES in ECB mode, and re-interpret the ciphertext as an image. Large regions of the picture are a solid color -- say, the white background, where many consecutive $16$-byte blocks are byte-for-byte identical. ECB maps each of those identical blocks to the same ciphertext block, so the encrypted image still has those regions as a single uniform (different) color. The result is an image in which the penguin's outline, beak, belly, and feet are perfectly legible. The cipher did its block-level job flawlessly -- and the secret leaked anyway.
+
+The lesson generalizes far past images. Encrypt a database of fixed-width records in ECB and you reveal which records share field values. Encrypt a protocol with repeated headers and you reveal the message boundaries and repeats. ECB does not hide \emph{structure}; it only hides the contents of a single isolated block.
+\end{attackbox}
+
+Why does the penguin work mathematically? Because ECB is \emph{deterministic} and \emph{stateless across blocks}, it fails the IND-CPA game in one move. Submit $m_0 = (P, P)$ -- the same block twice -- and $m_1 = (P, Q)$ with $P \ne Q$. The challenge ciphertext for $m_0$ has its two halves equal; for $m_1$ they differ. The adversary just checks whether $c_1 = c_2$ and wins with probability $1$. No key recovery, no number theory -- the structure is naked.
+
+\begin{trapbox}
+``But my data is high-entropy / already compressed / random-looking, so ECB is fine.'' This is the single most common rationalization, and it is a trap. First, you rarely control the plaintext as tightly as you think -- protocol framing, padding, and fixed magic bytes sneak repeats in. Second, a mode is a long-lived decision, and the next engineer will feed it structured data. Third, ECB still fails IND-CPA in principle, which means a security proof for the surrounding protocol simply does not exist. There is no scenario in which choosing ECB is the right call over CTR or CBC. Treat its appearance in a code review as a bug.
+\end{trapbox}
+
+\section{CBC: chaining blocks with feedback}
+
+The fix is to make each block's encryption depend on everything before it, and to inject fresh randomness at the start so the same message encrypts differently each time. Cipher Block Chaining (CBC) does both. Choose a random $n$-bit \emph{initialization vector} $\mathit{IV}$, then:
+\[
+c_0 = \mathit{IV}, \qquad c_i = E_K(m_i \xor c_{i-1}), \quad i = 1, \dots, \ell.
+\]
+Each plaintext block is XORed with the previous ciphertext block before encryption, as Figure~\ref{ch13:cbc-diagram} shows. The IV plays the role of a ``zeroth ciphertext block.'' The ciphertext you transmit is $(\mathit{IV}, c_1, \dots, c_\ell)$ -- the IV travels in the clear, which is fine; it is not secret, it only needs to be unpredictable.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, minimum width=10mm, minimum height=8mm, font=\small},
+  enc/.style={draw, fill=sourceblue!20, minimum width=11mm, minimum height=9mm, font=\small},
+  xo/.style={draw, circle, inner sep=1pt, font=\small},
+  >=Stealth
+]
+\node[box] (iv) at (-2,-1.4) {$\mathit{IV}$};
+\foreach \i in {1,2,3} {
+  \node[box] (m\i) at (\i*2.6, 0) {$m_{\i}$};
+  \node[xo]  (x\i) at (\i*2.6, -1.4) {$\xor$};
+  \node[enc] (e\i) at (\i*2.6, -2.9) {$E_K$};
+  \node[box] (c\i) at (\i*2.6, -4.4) {$c_{\i}$};
+  \draw[->] (m\i) -- (x\i);
+  \draw[->] (x\i) -- (e\i);
+  \draw[->] (e\i) -- (c\i);
+}
+\draw[->] (iv) -- (x1);
+\draw[->] (c1) -- ++(0,-0.4) -| ($(x2)+(-1.0,0)$) -- (x2);
+\draw[->] (c2) -- ++(0,-0.4) -| ($(x3)+(-1.0,0)$) -- (x3);
+\end{tikzpicture}
+\caption{CBC encryption. Each plaintext block is XORed with the previous ciphertext block (the IV seeds the first). The chaining is what destroys the ECB pattern-leak.}
+\label{ch13:cbc-diagram}
+\end{figure}
+
+Decryption inverts the chain. Since $c_i = E_K(m_i \xor c_{i-1})$, apply $D_K$ and XOR back:
+\[
+m_i = D_K(c_i) \xor c_{i-1}, \qquad c_0 = \mathit{IV}.
+\]
+
+\begin{intuitionbox}
+The chaining means a single plaintext block's ciphertext depends on that block \emph{and every block before it} (through the cascade of XORs). So two identical plaintext blocks at different positions almost never produce the same ciphertext: the previous ciphertext block they get XORed with is different. The penguin dissolves into noise. And because the IV is fresh per message, encrypting the same file twice yields two unrelated ciphertexts -- exactly the randomization IND-CPA demands.
+\end{intuitionbox}
+
+\subsection{A tiny CBC trace}
+
+Reuse the $4$-bit toy permutation $E_K$ from the ECB section. Encrypt the nibble stream $m = (\mathtt{A}, \mathtt{1}, \mathtt{A})$, and pick the random IV to be $\mathtt{D}$ ($= 1101_2$). XOR is bitwise.
+
+\begin{itemize}
+\item $c_1 = E_K(m_1 \xor \mathit{IV}) = E_K(\mathtt{A} \xor \mathtt{D})$. Now $\mathtt{A}=1010$, $\mathtt{D}=1101$, so $\mathtt{A}\xor\mathtt{D} = 0111 = \mathtt{7}$. Then $E_K(\mathtt{7}) = \mathtt{E}$. So $c_1 = \mathtt{E}$.
+\item $c_2 = E_K(m_2 \xor c_1) = E_K(\mathtt{1} \xor \mathtt{E})$. $\mathtt{1}=0001$, $\mathtt{E}=1110$, XOR $=1111=\mathtt{F}$. $E_K(\mathtt{F}) = \mathtt{B}$. So $c_2 = \mathtt{B}$.
+\item $c_3 = E_K(m_3 \xor c_2) = E_K(\mathtt{A} \xor \mathtt{B})$. $\mathtt{A}=1010$, $\mathtt{B}=1011$, XOR $=0001=\mathtt{1}$. $E_K(\mathtt{1}) = \mathtt{4}$. So $c_3 = \mathtt{4}$.
+\end{itemize}
+Ciphertext: $(\mathit{IV}, c_1, c_2, c_3) = (\mathtt{D}, \mathtt{E}, \mathtt{B}, \mathtt{4})$. Notice that the two identical plaintext blocks $m_1 = m_3 = \mathtt{A}$ produced \emph{different} ciphertext blocks $\mathtt{E}$ and $\mathtt{4}$. The ECB pattern is gone.
+
+Let us also verify decryption of the last block to confirm the inverse formula. We need $D_K$, the inverse of the table: since $E_K(\mathtt{1})=\mathtt{4}$, we have $D_K(\mathtt{4}) = \mathtt{1}$. Then $m_3 = D_K(c_3) \xor c_2 = \mathtt{1} \xor \mathtt{B} = 0001 \xor 1011 = 1010 = \mathtt{A}$. Recovered.
+
+\subsection{Why the IV must be unpredictable}
+
+The IV's job is to randomize the first block. But CBC is fussier than ``the IV must be random.'' It must be \emph{unpredictable to the adversary at the moment of encryption}. Here is the attack when it is not.
+
+\begin{attackbox}
+\textbf{Predictable-IV attack on CBC (the BEAST family).} Suppose the attacker can predict the IV that will be used for the next message -- for instance, an implementation that sets the next IV to the last ciphertext block of the previous message (an old SSL/TLS 1.0 habit). The attacker also has chosen-plaintext power: it can ask the victim to encrypt blocks of its choice.
+
+CBC's first block is $c_1 = E_K(m_1 \xor \mathit{IV})$. The attacker wants to test a guess $g$ for some secret block $s$ that was encrypted earlier: it saw the ciphertext block $c^\star = E_K(s \xor \mathit{IV}^\star)$ under a known earlier IV $\mathit{IV}^\star$. It now gets to choose the plaintext for a fresh encryption whose IV it can predict to be $\mathit{IV}'$. It submits the plaintext block
+\[
+m_1 = g \xor \mathit{IV}^\star \xor \mathit{IV}'.
+\]
+Then the cipher computes $c_1 = E_K(m_1 \xor \mathit{IV}') = E_K(g \xor \mathit{IV}^\star)$. If the guess was right, $g = s$, so $c_1 = E_K(s \xor \mathit{IV}^\star) = c^\star$ -- an exact match with the earlier ciphertext block. The attacker confirms or refutes its guess for a secret block. Combined with byte-at-a-time alignment tricks, this recovers secrets like session cookies. This is the heart of the 2011 BEAST attack on TLS 1.0, which is exactly why TLS 1.1+ switched to fresh \emph{random} per-record IVs.
+\end{attackbox}
+
+\begin{whybox}
+The IND-CPA proof for CBC requires the IV to be a fresh uniform random value, independent of everything the adversary has seen, chosen \emph{after} the adversary commits its plaintext. A predictable IV breaks that independence and the proof evaporates -- and as the attack shows, the gap is not merely theoretical. The rule to memorize: \textbf{CBC needs IVs that are unpredictable and unique. Generate them from a CSPRNG, never from a counter, a timestamp, or the previous ciphertext.}
+\end{whybox}
+
+\subsection{Sequential, and the padding problem}
+
+CBC has two practical annoyances. First, encryption is inherently \emph{sequential}: $c_i$ needs $c_{i-1}$, so you cannot parallelize the encrypt direction across cores (decryption, happily, \emph{is} parallelizable, since $m_i = D_K(c_i)\xor c_{i-1}$ needs only ciphertext blocks you already have). Second, CBC needs the message length to be a whole number of blocks. Real messages are not, so you must \emph{pad}.
+
+The standard is PKCS\#7 padding: if you need to add $p$ bytes to reach a block boundary (with $1 \le p \le n/8$), append $p$ bytes each equal to the value $p$. To reach a $16$-byte boundary when $5$ bytes are missing you append \texttt{05 05 05 05 05}. If the message already ends on a boundary you add a \emph{full} block of padding (all bytes \texttt{10} for a $16$-byte block) so that decryption can always unambiguously strip it. On decrypt you read the last byte $p$, check that the final $p$ bytes all equal $p$, and remove them.
+
+That innocent ``check that the final $p$ bytes all equal $p$'' is where a decade of pain came from.
+
+\section{The padding-oracle attack (a preview)}
+
+We will treat authenticated encryption properly in its own chapter; here is the cautionary preview that motivates it. CBC by itself provides \emph{confidentiality} but not \emph{integrity}: an attacker can flip bits in the ciphertext and CBC will dutifully decrypt to some other plaintext without complaint. If the surrounding system then \emph{tells the attacker} whether the decrypted plaintext had valid padding, the attacker can decrypt arbitrary ciphertext without the key.
+
+\begin{attackbox}
+\textbf{The padding oracle.} A padding oracle is any service that, given a ciphertext, reveals whether decryption produced valid PKCS\#7 padding -- via an explicit error, a different HTTP status, or even a timing difference. Suppose the attacker wants to decrypt a target ciphertext block $c_i$. Recall CBC decryption: $m_i = D_K(c_i) \xor c_{i-1}$. Let $I_i = D_K(c_i)$ be the (unknown) intermediate value, so $m_i = I_i \xor c_{i-1}$.
+
+The attacker crafts a fake two-block ciphertext $(c', c_i)$ where $c'$ is a block it controls, and submits it. The oracle decrypts the last block as $m' = D_K(c_i) \xor c' = I_i \xor c'$. The attacker now tweaks the last byte of $c'$ through all $256$ values until the oracle says ``padding valid.'' Valid padding almost always means the last byte of $m'$ is \texttt{01}, i.e. the last byte of $I_i \xor c'$ is \texttt{01}. That pins down the last byte of $I_i$: it equals (last byte of $c'$) $\xor$ \texttt{01}. Knowing $I_i$, the real plaintext byte is recovered as (that byte of $I_i$) $\xor$ (corresponding byte of the real $c_{i-1}$).
+
+Then the attacker moves to the second-to-last byte: it sets the last byte of $c'$ to force the last plaintext byte to \texttt{02}, and brute-forces the second-to-last byte to find padding \texttt{02 02}. Byte by byte, $256$ tries each, it peels off the entire block -- never knowing the key. This is Vaudenay's 2002 padding-oracle attack. Its descendants (Lucky Thirteen, POODLE) repeatedly broke real TLS deployments.
+\end{attackbox}
+
+\begin{intuitionbox}
+Make the last-byte step concrete with one number. Say the unknown intermediate value's last byte is $I = \mathtt{0x7A}$ (the attacker does not know this yet). The attacker sweeps the last byte of its controlled block $c'$ through $\mathtt{0x00}, \mathtt{0x01}, \dots$ The oracle returns ``valid'' exactly when the decrypted last byte $I \xor c'_{\text{last}}$ equals $\mathtt{0x01}$, i.e.\ when $c'_{\text{last}} = \mathtt{0x7A} \xor \mathtt{0x01} = \mathtt{0x7B}$. Seeing that the guess $\mathtt{0x7B}$ is the one that validates, the attacker computes $I = \mathtt{0x7B} \xor \mathtt{0x01} = \mathtt{0x7A}$ and then the true plaintext byte $\mathtt{0x7A} \xor (\text{real } c_{i-1}\text{ byte})$. No key, one byte recovered in at most $256$ tries.
+\end{intuitionbox}
+
+\begin{whybox}
+The deep lesson: \textbf{encryption without integrity is dangerous}, because a decryption process that reacts differently to malformed input becomes an oracle. The structural fix is to \emph{authenticate} the ciphertext -- attach a MAC computed over $(\mathit{IV}, c_1, \dots, c_\ell)$ and verify it (in constant time) \emph{before} you even attempt to decrypt or unpad. If the MAC fails, you reject immediately and the decryptor never reveals anything about padding. This ``encrypt-then-MAC'' discipline, and the AEAD constructions that bake it in, are the subject of the authenticated-encryption chapter. For now, remember: a bare mode of operation is a confidentiality tool, not a complete encryption scheme.
+\end{whybox}
+
+\section{CTR: turn the block cipher into a stream cipher}
+
+Counter (CTR) mode takes a different and beautifully simple route. Instead of feeding plaintext through the cipher, it uses the cipher to manufacture a pseudorandom \emph{keystream}, then XORs that keystream into the plaintext -- exactly like a one-time pad, exactly like a stream cipher.
+
+Pick a nonce $N$ and define a sequence of counter blocks $T_1, T_2, \dots$, where $T_i$ encodes the nonce together with the block index $i$ (a common layout: the top bits are the nonce, the low bits are a counter that increments per block). The keystream is $E_K(T_i)$, and:
+\[
+c_i = m_i \xor E_K(T_i), \qquad m_i = c_i \xor E_K(T_i).
+\]
+Figure~\ref{ch13:ctr-diagram} shows the data flow. Encryption and decryption are the \emph{same} operation -- both just XOR with $E_K(T_i)$ -- because XOR is its own inverse. You never need $D_K$ at all; CTR only ever calls $E_K$ in the forward direction.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, minimum width=12mm, minimum height=8mm, font=\small},
+  enc/.style={draw, fill=sourceblue!20, minimum width=11mm, minimum height=9mm, font=\small},
+  xo/.style={draw, circle, inner sep=1pt, font=\small},
+  >=Stealth
+]
+\foreach \i in {1,2,3} {
+  \node[box] (t\i) at (\i*2.8, 0) {$N\,\|\,\i$};
+  \node[enc] (e\i) at (\i*2.8, -1.4) {$E_K$};
+  \node[xo]  (x\i) at (\i*2.8, -2.8) {$\xor$};
+  \node[box] (c\i) at (\i*2.8, -4.2) {$c_{\i}$};
+  \node[box] (m\i) at (\i*2.8+1.5, -2.8) {$m_{\i}$};
+  \draw[->] (t\i) -- (e\i);
+  \draw[->] (e\i) -- (x\i);
+  \draw[->] (m\i) -- (x\i);
+  \draw[->] (x\i) -- (c\i);
+}
+\end{tikzpicture}
+\caption{CTR mode. The cipher encrypts counter blocks $N\,\|\,i$ to make a keystream; the plaintext is XORed in. No block-to-block dependency -- fully parallel and random-access.}
+\label{ch13:ctr-diagram}
+\end{figure}
+
+\begin{intuitionbox}
+CTR is the most ``one-time-pad-like'' of all the modes. The block cipher's only job is to be a key-and-counter-driven random number generator: feed it the counters $N\|1, N\|2, \dots$ and it emits pad blocks that look uniformly random to anyone without the key (that is precisely the PRP/PRF guarantee). Then encryption is the one-time pad: $c = m \xor \text{pad}$. Everything you learned about the one-time pad's perfection -- and its fatal flaw, never reuse the pad -- carries straight over.
+\end{intuitionbox}
+
+\subsection{A tiny CTR trace}
+
+Toy permutation $E_K$ again. Let the nonce-and-counter blocks simply be the nibbles $\mathtt{9}, \mathtt{A}, \mathtt{B}$ (pretend the nonce plus counter packs into a nibble for the demo). Keystream:
+\[
+E_K(\mathtt{9}) = \mathtt{F}, \quad E_K(\mathtt{A}) = \mathtt{3}, \quad E_K(\mathtt{B}) = \mathtt{D}.
+\]
+Encrypt $m = (\mathtt{A}, \mathtt{1}, \mathtt{A})$:
+\begin{align*}
+c_1 &= m_1 \xor \mathtt{F} = \mathtt{A}\xor\mathtt{F} = 1010 \xor 1111 = 0101 = \mathtt{5},\\
+c_2 &= m_2 \xor \mathtt{3} = \mathtt{1}\xor\mathtt{3} = 0001 \xor 0011 = 0010 = \mathtt{2},\\
+c_3 &= m_3 \xor \mathtt{D} = \mathtt{A}\xor\mathtt{D} = 1010 \xor 1101 = 0111 = \mathtt{7}.
+\end{align*}
+Ciphertext $(\mathtt{5},\mathtt{2},\mathtt{7})$. To decrypt, regenerate the \emph{same} keystream $(\mathtt{F},\mathtt{3},\mathtt{D})$ and XOR: $\mathtt{5}\xor\mathtt{F} = 0101\xor1111 = 1010 = \mathtt{A}$, and so on -- back to the plaintext. Same machinery both ways.
+
+\subsection{CTR's superpowers, and its one deadly rule}
+
+\begin{focusbox}
+What CTR buys you:
+\begin{itemize}
+\item \textbf{Parallelism.} Every $E_K(T_i)$ is independent, so you can compute the whole keystream across all cores at once, in either direction. CBC cannot do this on encrypt.
+\item \textbf{Random access / seekability.} To decrypt block $4242$ you compute $E_K(N\|4242)$ directly -- no need to process blocks $1$ through $4241$. This is why full-disk and database encryption love CTR-derived constructions.
+\item \textbf{No padding.} The keystream is truncated to the message length, so CTR handles messages of any byte length with no PKCS\#7 padding, hence no padding oracle.
+\item \textbf{Decrypt uses only $E_K$.} Smaller implementations: you never ship $D_K$.
+\end{itemize}
+\end{focusbox}
+
+\begin{trapbox}
+The deadly rule: \textbf{never reuse a (key, counter) pair.} If two plaintext blocks $m$ and $m'$ are ever XORed with the \emph{same} keystream block $E_K(T)$, then
+\[
+c \xor c' = (m \xor E_K(T)) \xor (m' \xor E_K(T)) = m \xor m'.
+\]
+The keystream cancels and the attacker gets the XOR of two plaintexts -- the classic two-time-pad disaster, fully readable with a little language modeling. This happens if you reuse a nonce $N$ under the same key, or if the per-message counter ranges overlap. With a $96$-bit random nonce you are safe up to roughly the birthday bound; with a small counter you must guarantee uniqueness by construction. Nonce reuse in CTR is not a gentle degradation -- it is a total break of every block where it occurs.
+\end{trapbox}
+
+\subsection{A tiny two-time-pad disaster}
+
+It is worth seeing the nonce-reuse break on numbers rather than as an algebraic identity, because the cancellation is so total that it surprises people. Stay with the toy permutation and the keystream $(\mathtt{F},\mathtt{3},\mathtt{D})$ from the previous trace, generated from nonce-and-counter blocks $\mathtt{9},\mathtt{A},\mathtt{B}$. Now suppose a careless implementer encrypts \emph{two} messages under the \emph{same} nonce, so both reuse that identical keystream. Message one is $m = (\mathtt{A},\mathtt{1},\mathtt{A})$ as before, giving $c = (\mathtt{5},\mathtt{2},\mathtt{7})$. Message two is $m' = (\mathtt{C},\mathtt{1},\mathtt{4})$:
+\begin{align*}
+c'_1 &= \mathtt{C}\xor\mathtt{F} = 1100 \xor 1111 = 0011 = \mathtt{3},\\
+c'_2 &= \mathtt{1}\xor\mathtt{3} = 0001 \xor 0011 = 0010 = \mathtt{2},\\
+c'_3 &= \mathtt{4}\xor\mathtt{D} = 0100 \xor 1101 = 1001 = \mathtt{9}.
+\end{align*}
+The attacker has $c = (\mathtt{5},\mathtt{2},\mathtt{7})$ and $c' = (\mathtt{3},\mathtt{2},\mathtt{9})$ and never sees the key or the keystream. It XORs them position-by-position:
+\[
+c \xor c' = (\mathtt{5}\xor\mathtt{3},\; \mathtt{2}\xor\mathtt{2},\; \mathtt{7}\xor\mathtt{9}) = (\mathtt{6},\,\mathtt{0},\,\mathtt{E}).
+\]
+Check against the plaintexts directly: $m \xor m' = (\mathtt{A}\xor\mathtt{C},\,\mathtt{1}\xor\mathtt{1},\,\mathtt{A}\xor\mathtt{4}) = (\mathtt{6},\mathtt{0},\mathtt{E})$ -- identical. The keystream vanished without a trace, and the second block being $\mathtt{0}$ tells the attacker outright that $m_2 = m'_2$. On real English text, that $m \xor m'$ is enough to ``crib-drag'' both messages into the clear. One reused nonce, total break.
+
+\begin{connectionbox}
+``How big can the nonce be before collisions get likely?'' is a birthday-bound question, handled in the companion probability book. If you draw nonces uniformly from a space of size $2^t$, the chance of a collision crosses $1/2$ at roughly $2^{t/2}$ messages. For a $96$-bit nonce that is about $2^{48}$ messages under one key -- comfortable, but not infinite, which is exactly why standards cap how much data a single key may protect and then force a rekey. The cost of computing each $E_K(T_i)$, and why modular-counter increments are cheap, is the arithmetic-cost material in the algorithms companion.
+\end{connectionbox}
+
+\section{CFB and OFB: the older stream-cipher modes}
+
+Before CTR became dominant, two other modes turned a block cipher into a stream-like cipher using \emph{feedback} rather than a counter. They are worth knowing because you will meet them in legacy protocols (PGP's CFB variant, older link encryptors), and because they sharpen the intuition about what feedback does.
+
+\textbf{Output Feedback (OFB).} Generate the keystream by repeatedly encrypting, starting from the IV, feeding the cipher's \emph{output} back as its next input:
+\[
+z_0 = \mathit{IV}, \quad z_i = E_K(z_{i-1}), \quad c_i = m_i \xor z_i.
+\]
+The keystream $z_1, z_2, \dots$ depends only on the key and IV, never on the plaintext (Figure~\ref{ch13:ofb-diagram}) -- so, like CTR, it is just a pseudorandom pad XORed in, and decryption is identical to encryption. OFB is essentially CTR with a chained feedback register instead of a counter. Its drawback: keystream generation is strictly sequential (you must compute $z_{i-1}$ to get $z_i$), and a short cycle in the feedback would repeat the pad, so CTR's clean counter is simply better.
+
+\textbf{Cipher Feedback (CFB).} Here the \emph{ciphertext} feeds back into the cipher:
+\[
+c_0 = \mathit{IV}, \qquad c_i = m_i \xor E_K(c_{i-1}).
+\]
+Decryption: $m_i = c_i \xor E_K(c_{i-1})$ -- note again only $E_K$ is used, never $D_K$. CFB resembles CBC turned inside out (Figure~\ref{ch13:cfb-diagram}): CBC encrypts $m_i \xor c_{i-1}$, while CFB XORs $m_i$ with $E_K(c_{i-1})$.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, minimum width=9mm, minimum height=7mm, font=\small},
+  enc/.style={draw, fill=sourceblue!20, minimum width=10mm, minimum height=8mm, font=\small},
+  xo/.style={draw, circle, inner sep=1pt, font=\small},
+  >=Stealth
+]
+\node[box] (fiv) at (-1.4,-1.2) {$\mathit{IV}$};
+\foreach \i in {1,2,3} {
+  \node[enc] (fe\i) at (\i*1.9, -1.2) {$E_K$};
+  \node[xo]  (fx\i) at (\i*1.9, -2.6) {$\xor$};
+  \node[box] (fm\i) at (\i*1.9, -0.0) {$m_{\i}$};
+  \node[box] (fc\i) at (\i*1.9, -3.9) {$c_{\i}$};
+  \draw[->] (fe\i) -- (fx\i);
+  \draw[->] (fm\i) -- (fx\i);
+  \draw[->] (fx\i) -- (fc\i);
+}
+\draw[->] (fiv) -- (fe1);
+\draw[->] (fc1) -- ++(0.7,0) |- (fe2);
+\draw[->] (fc2) -- ++(0.7,0) |- (fe3);
+\end{tikzpicture}
+\caption{CFB: each ciphertext block feeds back as the cipher's next input (the IV seeds the first). Unlike OFB, the feedback carries the ciphertext, so the keystream depends on the message.}
+\label{ch13:cfb-diagram}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, minimum width=9mm, minimum height=7mm, font=\small},
+  enc/.style={draw, fill=sourceblue!20, minimum width=10mm, minimum height=8mm, font=\small},
+  xo/.style={draw, circle, inner sep=1pt, font=\small},
+  >=Stealth
+]
+\node[box] (oiv) at (-1.4,-1.2) {$\mathit{IV}$};
+\node[box] (oiv) at (-1.4,-1.2) {$\mathit{IV}$};
+\foreach \i in {1,2,3} {
+  \node[enc] (oe\i) at (\i*1.9, -1.2) {$E_K$};
+  \node[xo]  (ox\i) at (\i*1.9, -2.6) {$\xor$};
+  \node[box] (om\i) at (\i*1.9, -0.0) {$m_{\i}$};
+  \node[box] (oc\i) at (\i*1.9, -3.9) {$c_{\i}$};
+  \draw[->] (oe\i) -- (ox\i);
+  \draw[->] (om\i) -- (ox\i);
+  \draw[->] (ox\i) -- (oc\i);
+}
+\draw[->] (oiv) -- (oe1);
+\draw[->] (oe1) -- (oe2);
+\draw[->] (oe2) -- (oe3);
+\end{tikzpicture}
+\caption{OFB: the cipher's output is chained as its own next input, producing a plaintext-independent keystream that is XORed in.}
+\label{ch13:ofb-diagram}
+\end{figure}
+
+\begin{remark}
+A subtle but practical difference is \emph{error propagation}. In OFB and CTR, a single flipped \emph{ciphertext} bit flips exactly the one corresponding plaintext bit on decryption (XOR is bit-local) -- handy for noisy channels, dangerous because it makes silent bit-flipping easy without integrity protection. In CBC, a flipped ciphertext bit garbles the entire block it lands in \emph{and} flips the single aligned bit in the next block. None of these modes \emph{detect} the tampering -- that is the MAC's job -- but the propagation pattern is exactly what the padding-oracle and bit-flipping attacks exploit.
+\end{remark}
+
+\section{Putting the modes side by side}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+ & \textbf{ECB} & \textbf{CBC} & \textbf{CFB} & \textbf{OFB} & \textbf{CTR}\\
+\midrule
+IND-CPA secure? & no & yes$^\dagger$ & yes$^\dagger$ & yes$^\dagger$ & yes$^\dagger$\\
+Needs IV/nonce & no & yes (unpred.) & yes (unpred.) & yes (unique) & yes (unique)\\
+Uses $D_K$ to decrypt & yes & yes & no & no & no\\
+Parallel encrypt & yes & no & no & no & yes\\
+Parallel decrypt & yes & yes & yes & no & yes\\
+Random access & yes & no & no & no & yes\\
+Needs padding & yes & yes & no & no & no\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent $^\dagger$ Secure only with a correctly generated IV/nonce \emph{and} only for confidentiality -- none of these modes provides integrity on its own.
+
+\begin{intuitionbox}
+Read the table as a story. ECB is the outlier: deterministic, hence broken. The middle three (CBC, CFB, OFB) are the historical workhorses, each making the cipher randomized through feedback, each with awkward edges (sequential encryption, padding, IV fragility). CTR is the modern winner: parallel both ways, seekable, no padding, decrypt without $D_K$ -- a clean pseudorandom pad. That is why it is the engine inside today's authenticated ciphers.
+\end{intuitionbox}
+
+\section{Toy code: ECB versus CBC versus CTR}
+
+\begin{implementbox}
+The snippet below implements all three modes over a real block cipher (AES via PyCryptodome's raw single-block primitive) so you can watch ECB leak and the others not. It is deliberately minimal -- no MAC, no constant-time anything.
+
+\textbf{Learning only. Do not use this in production.} It has no integrity protection (so it is wide open to bit-flipping and padding-oracle attacks), the CBC IV handling is simplistic, and there is no rekeying or nonce-management discipline. For real work call a vetted library's AEAD interface (AES-GCM, ChaCha20-Poly1305) and never assemble a mode by hand.
+
+\begin{lstlisting}[language=Python]
+from Crypto.Cipher import AES   # raw 16-byte block primitive
+import os
+
+BS = 16  # AES block size in bytes
+
+def blocks(data):
+    return [data[i:i+BS] for i in range(0, len(data), BS)]
+
+def xor(a, b):
+    return bytes(x ^ y for x, y in zip(a, b))
+
+def ecb_encrypt(key, msg):           # NEVER use ECB for real data
+    e = AES.new(key, AES.MODE_ECB)
+    return b"".join(e.encrypt(b) for b in blocks(msg))   # msg must be block-aligned
+
+def cbc_encrypt(key, msg):           # msg must be block-aligned (pad in real code)
+    e = AES.new(key, AES.MODE_ECB)   # we drive the single-block primitive ourselves
+    iv = os.urandom(BS)              # unpredictable IV from the OS CSPRNG
+    prev, out = iv, []
+    for m in blocks(msg):
+        c = e.encrypt(xor(m, prev))  # c_i = E_K(m_i XOR c_{i-1})
+        out.append(c)
+        prev = c
+    return iv + b"".join(out)
+
+def ctr_keystream(key, nonce, nblocks):
+    e = AES.new(key, AES.MODE_ECB)
+    ks = []
+    for i in range(nblocks):
+        ctr = nonce + i.to_bytes(BS - len(nonce), "big")  # nonce || counter
+        ks.append(e.encrypt(ctr))     # keystream block = E_K(nonce || i)
+    return b"".join(ks)
+
+def ctr_encrypt(key, nonce, msg):     # nonce MUST be unique per key -- never reuse
+    ks = ctr_keystream(key, nonce, (len(msg) + BS - 1) // BS)
+    return xor(msg, ks[:len(msg)])    # decryption is the identical function
+
+key = os.urandom(16)
+# Two identical 16-byte blocks reveal ECB's pattern leak:
+plain = b"YELLOW SUBMARINE" * 2
+print("ecb:", ecb_encrypt(key, plain).hex())   # two halves IDENTICAL -> leak
+print("cbc:", cbc_encrypt(key, plain).hex())   # halves differ; fresh each run
+print("ctr:", ctr_encrypt(key, os.urandom(12), plain).hex())
+\end{lstlisting}
+
+Run it: the ECB output's two $16$-byte halves are byte-for-byte equal, while CBC and CTR show no such repeat and change on every run. That visible difference \emph{is} the IND-CPA distinction made tangible.
+\end{implementbox}
+
+\section{Where the modes actually live}
+
+\begin{applicationbox}
+\textbf{TLS.} TLS 1.0's CBC record protection, with its predictable IV, gave us BEAST; its MAC-then-encrypt-then-pad ordering gave us Lucky Thirteen and POODLE. TLS 1.2 patched around these, but TLS 1.3 cut the knot entirely: it permits \emph{only} AEAD ciphers, and the two mandatory ones -- AES-GCM and ChaCha20-Poly1305 -- are both CTR-style keystream generators wrapped in an authenticator. The mode-of-operation history of TLS is essentially the history of this chapter's attacks.
+
+\textbf{Disk and database encryption.} Full-disk encryption needs random access to any sector without decrypting the whole disk, which rules out CBC chaining and points straight at counter-based and tweakable modes (XTS, a relative of CTR built for storage). Sector-level encryption also cannot store a per-sector nonce, which is why storage uses specialized tweakable constructions rather than plain CTR.
+
+\textbf{WiFi.} WPA2's CCMP is AES in \emph{Counter mode} for confidentiality combined with CBC-MAC for integrity -- CTR doing the encrypting, exactly as in this chapter. WPA3 keeps CTR-style AEAD (GCMP). The catastrophic WEP, by contrast, used RC4 with reused IVs -- the keystream-reuse trap from the CTR section, in stream-cipher clothing.
+
+\textbf{Signal, SSH, WireGuard.} Modern secure messaging and tunnels standardize on ChaCha20-Poly1305 (a CTR-like stream cipher plus a MAC) or AES-GCM. Across the board, the winning pattern is: CTR to make the keystream, an authenticator bolted on, never a bare mode. The next chapters build exactly that.
+\end{applicationbox}
+
+\begin{historybox}
+The modes were standardized for DES in FIPS 81 (1980): ECB, CBC, CFB, OFB. CTR was described by Diffie and Hellman in 1979 but, oddly, left out of the original standard; it was only blessed by NIST in SP 800-38A in 2001, around the time AES arrived. The intervening decades of CBC-with-a-bolted-on-MAC, and the parade of attacks that followed (Vaudenay 2002, BEAST 2011, Lucky Thirteen and POODLE 2013--14), are what convinced the field that confidentiality and integrity must be designed \emph{together}. That realization is the bridge from this chapter to authenticated encryption.
+\end{historybox}
+
+\section{Summary}
+
+A block cipher encrypts one fixed-size block; a mode of operation extends it to messages of any length. ECB encrypts each block independently and is broken by construction -- deterministic, pattern-leaking, the penguin. CBC chains each block through the previous ciphertext block and seeds the chain with an unpredictable IV; it is secure for confidentiality but sequential on encrypt, needs padding, and its IV and padding behavior have repeatedly been weaponized. CTR turns the cipher into a one-time-pad keystream generator indexed by a nonce-and-counter; it is parallel, seekable, padding-free, and decrypts without the inverse cipher -- at the cost of one absolute rule, never reuse a (key, counter) pair. CFB and OFB are the older feedback-based stream modes, now largely supplanted by CTR. And \emph{none} of these modes provides integrity: a bare mode is a confidentiality primitive, and the padding-oracle attack shows how badly that bites when an attacker can tamper with ciphertext and watch the system react. The resolution -- authenticate, then (or while) you encrypt, with CTR as the workhorse underneath -- is modern AEAD, and it is where we go next.
+
+\section{Exercises}
+
+\begin{exercise}
+Using the $4$-bit toy permutation $E_K$ from the chapter (the $16$-entry table), encrypt the nibble stream $(\mathtt{2},\mathtt{6},\mathtt{2},\mathtt{6})$ in ECB mode. Identify the repeated ciphertext blocks and explain in one sentence what an eavesdropper learns.
+\end{exercise}
+
+\begin{exercise}
+With the same toy $E_K$ and IV $= \mathtt{3}$, encrypt the nibble stream $(\mathtt{2},\mathtt{6},\mathtt{2},\mathtt{6})$ in CBC mode, showing each XOR and each table lookup. Confirm that the two identical plaintext blocks no longer produce identical ciphertext blocks.
+\end{exercise}
+
+\begin{exercise}
+Prove formally that ECB is not IND-CPA secure by describing an adversary that wins the IND-CPA game with probability $1$ using a single challenge query. State exactly which two messages it submits and how it decides its guess.
+\end{exercise}
+
+\begin{exercise}
+In CTR mode, suppose an implementer reuses the same nonce $N$ (under the same key) to encrypt two messages $m$ and $m'$ of equal length, producing $c$ and $c'$. Show that an attacker who sees $c$ and $c'$ can compute $m \xor m'$, and explain why this typically lets the attacker recover both messages if they are natural-language text.
+\end{exercise}
+
+\begin{exercise}
+You are handed a CBC decryption service that returns ``ok'' if the PKCS\#7 padding of the decrypted message is valid and ``bad'' otherwise. Describe step by step how to recover the last byte of an unknown plaintext block, then sketch how the attack extends to the whole block. Approximately how many oracle queries does recovering one $16$-byte block require in the worst case?
+\end{exercise}
+
+\begin{exercise}
+Explain why CBC encryption cannot be parallelized across blocks but CBC \emph{decryption} can. Then explain why CTR mode is parallelizable in both directions. Reference the exact recurrence relations.
+\end{exercise}
+
+\begin{exercise}
+PKCS\#7 padding adds a full block of padding when the message length is already a multiple of the block size. Give a concrete example showing why omitting this rule -- i.e. adding no padding when the message is already block-aligned -- makes unpadding ambiguous, so the decryptor cannot always tell padding from data.
+\end{exercise}
+
+\begin{exercise}
+Recall OFB's keystream recurrence $z_i = E_K(z_{i-1})$ with $z_0 = \mathit{IV}$. Argue that if the sequence $z_0, z_1, z_2, \dots$ ever revisits a previous value, the keystream becomes periodic from that point, and explain why that is a confidentiality problem. Why does CTR's counter-based keystream not suffer this issue?
+\end{exercise}
+
+\begin{exercise}
+Consider CBC with a \emph{predictable} IV: before encrypting message $j$, the attacker can compute the IV that will be used. Construct the chosen-plaintext query that lets the attacker test whether an earlier secret first block equals a guessed value $g$, and explain why a freshly random per-message IV defeats the attack. (This is the BEAST setup.)
+\end{exercise}
+
+\begin{exercise}
+A bare CTR-mode ciphertext is delivered to a receiver who decrypts and acts on the plaintext with no integrity check. The attacker knows that bytes $5$--$8$ of the plaintext encode a dollar amount and knows the original value. Show how the attacker can change that amount to any chosen value by XORing a known mask into the corresponding ciphertext bytes, \emph{without} knowing the key. What single countermeasure stops this entire class of attack?
+\end{exercise}
+
+\begin{exercise}
+Modes leak the message length (CTR and CFB/OFB leak it to the byte; CBC and ECB to the block). Describe a realistic scenario -- for instance, encrypted web traffic or voice -- where leaking only the length still reveals sensitive information, and name one mitigation (hint: think about deliberately wasteful encoding).
+\end{exercise}

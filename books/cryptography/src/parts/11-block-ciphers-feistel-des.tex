@@ -1,0 +1,529 @@
+\chapter{Block Ciphers, Feistel Networks, and DES}
+
+The one-time pad gave us perfect secrecy, then immediately punished us for it: the key had to be as long as the message, used once, and shared in advance. Stream ciphers softened that blow by stretching a short key into a long pseudorandom keystream, but a stream cipher is still, morally, a pad. You XOR and you are done. If you reuse the keystream, or if an attacker can flip a ciphertext bit and watch the corresponding plaintext bit flip with it, the whole structure shows through.
+
+This chapter is about a different and, in practice, more central object: the \emph{block cipher}. A block cipher does not produce a keystream you XOR onto data. Instead, for each key it defines a scrambling of a fixed-size block of bits --- a permutation of, say, all $2^{64}$ possible 64-bit strings --- and that scrambling is invertible only if you know the key. Block ciphers are the workhorses of symmetric cryptography. AES, which the next chapter is devoted to, is a block cipher; DES, the subject of this chapter, was its predecessor and the design that taught the field how to build one. Almost every encrypted TLS connection, every WPA2 WiFi handshake, every Signal message, and every SSH session you have ever opened has a block cipher beating at its center.
+
+We will build the idea from the ground up. First, the right mental model: a block cipher is a \emph{keyed pseudorandom permutation}. Then the two design principles Shannon named in 1949 --- \emph{confusion} and \emph{diffusion} --- and how they translate into actual circuitry. Then the \emph{Feistel construction}, a beautiful trick that builds an invertible permutation out of a function that need not be invertible at all, and a proof of why it always inverts. We trace a tiny 8-bit Feistel cipher by hand. Finally we dissect DES: its structure, its famous S-boxes, the meet-in-the-middle reason double-DES buys almost nothing, and the brute-force machine that finally killed its 56-bit key.
+
+\chapterline
+
+\section{What a Block Cipher Is}
+\label{ch11:what}
+
+\begin{definition}[Block cipher]
+\label{ch11:def-blockcipher}
+A \emph{block cipher} with block length $n$ and key length $\ell$ is a function
+\[
+E : \{0,1\}^{\ell} \times \{0,1\}^{n} \;\longrightarrow\; \{0,1\}^{n}
+\]
+such that for every fixed key $k \in \{0,1\}^{\ell}$, the map $E_k(\cdot) = E(k,\cdot)$ is a \emph{bijection} (a permutation) of $\{0,1\}^{n}$. Because $E_k$ is a bijection it has an inverse $D_k = E_k^{-1}$, the decryption map, and $D_k(E_k(x)) = x$ for all $x$.
+\end{definition}
+
+Read that definition slowly, because the word ``permutation'' is doing all the work. For a fixed key, $E_k$ takes the $2^n$ possible input blocks and shuffles them among themselves. Nothing is lost and nothing collides: two distinct plaintexts always land on two distinct ciphertexts. That is forced on us --- if $E_k$ mapped two plaintexts to the same ciphertext, decryption could not recover which one we meant. Encryption that you can undo \emph{is} a permutation, full stop.
+
+\begin{intuitionbox}
+A block cipher is a giant lookup table you never write down. Imagine, for a 64-bit block, a table with $2^{64}$ rows: row $x$ holds the ciphertext $E_k(x)$. Every key $k$ selects a different table. To encrypt is to look up a row; to decrypt is to find which row holds your ciphertext. The whole art is to make a table that \emph{behaves} like a random shuffle of all $2^{64}$ strings, while being computable from a 16-byte key with a few dozen cheap operations and no actual $2^{64}$-row table anywhere in memory.
+\end{intuitionbox}
+
+\subsection{Why ``pseudorandom permutation'' is the right goal}
+
+How many permutations of $\{0,1\}^n$ are there? Exactly $(2^n)!$ --- the number of ways to order $2^n$ items. For $n = 64$ that is $(2^{64})!$, a number whose number of digits already dwarfs the number of atoms in the universe. To name one specific permutation you would need about $\log_2\!\big((2^n)!\big) \approx n\cdot 2^n$ bits; for $n=64$ that is on the order of $2^{70}$ bits, an impossibly large key.
+
+A block cipher cannot afford that. Its key is short --- 128 or 256 bits --- so it can only reach a vanishingly thin sliver of all possible permutations: at most $2^{\ell}$ of the $(2^n)!$ of them. The security goal is that this thin sliver should be \emph{indistinguishable} from the whole. An adversary who is handed a black box --- either $E_k$ for a secret random key $k$, or a permutation chosen uniformly at random from all $(2^n)!$ of them --- and who may query it on inputs of their choice, should not be able to tell which world they are in.
+
+\begin{definition}[PRP advantage]
+\label{ch11:def-prp}
+Let $E$ be a block cipher with block length $n$. For an adversary $\Adv$ define
+\[
+\mathsf{Adv}^{\mathrm{prp}}_{E}(\Adv) \;=\;
+\Big|\;
+\Pr_{k \getsr \{0,1\}^\ell}\!\big[\Adv^{E_k(\cdot)} = 1\big]
+\;-\;
+\Pr_{\pi \getsr \mathrm{Perm}(n)}\!\big[\Adv^{\pi(\cdot)} = 1\big]
+\;\Big|,
+\]
+where $\mathrm{Perm}(n)$ is the set of all permutations of $\{0,1\}^n$. We say $E$ is a \emph{secure pseudorandom permutation} (PRP) if for every efficient $\Adv$ this advantage is negligible.
+\end{definition}
+
+A \emph{strong} PRP is the same but the adversary also gets to query the inverse box ($E_k^{-1}$ or $\pi^{-1}$). Strong PRPs are what you want when an attacker can submit ciphertexts for decryption, which happens constantly in real protocols.
+
+\begin{whybox}
+Why does ``looks like a random permutation'' deliver security? Because a truly random permutation leaks nothing about its inputs. If $\pi$ is a uniformly random permutation and you have not yet queried $x$, then $\pi(x)$ is uniform over all the block values you have not yet seen as outputs --- it is as good as a fresh coin flip. So an attacker watching ciphertexts of a random permutation learns nothing beyond which plaintexts were equal (equal plaintexts give equal ciphertexts; that is the one unavoidable leak). If $E_k$ is a good PRP, the same is true of it up to a negligible slip. Every standard mode of operation --- CTR, CBC, GCM, all of Chapter 13 --- is proved secure by \emph{first} assuming the underlying cipher is a (strong) PRP, then arguing the mode on top. The block cipher is the hardness; the mode is the bookkeeping.
+\end{whybox}
+
+\begin{connectionbox}
+The PRP definition is the permutation cousin of the pseudorandom \emph{generator} and pseudorandom \emph{function} ideas from Chapter 8. The leap from PRF to PRP is small but real: a random \emph{function} can collide (two inputs to one output), a random \emph{permutation} cannot. The PRP/PRF switching lemma quantifies the gap: any adversary making $q$ queries can distinguish a random permutation from a random function with advantage at most $q^2 / 2^{n+1}$ --- a birthday bound. That $q^2/2^n$ term, straight out of the birthday calculation in the probability companion, is exactly why a 64-bit block becomes unsafe after about $2^{32}$ blocks, and why modern ciphers moved to 128-bit blocks.
+\end{connectionbox}
+
+\section{Confusion and Diffusion}
+\label{ch11:confdiff}
+
+In 1949 Claude Shannon, in the same paper that gave us perfect secrecy, named the two properties a good cipher must have. They have guided every block-cipher design since.
+
+\textbf{Confusion} makes the relationship between the key and the ciphertext as complicated as possible. Each bit of ciphertext should depend on many bits of the key in a tangled, nonlinear way, so that knowing some plaintext/ciphertext pairs gives you no clean equation to solve for the key. Confusion is the enemy of the algebraist: it stops you from writing the cipher as a tidy linear system over $\F_2$.
+
+\textbf{Diffusion} spreads the influence of each plaintext bit across the whole ciphertext. Change one bit of the input, and about half the output bits should flip --- and they should be unpredictable bits. Diffusion destroys the statistics of the plaintext: a message with lots of repeated letters comes out looking like noise, because each plaintext bit has been smeared across the entire block.
+
+\begin{intuitionbox}
+Picture kneading dough with a drop of food coloring. \emph{Diffusion} is the stretching and folding that spreads the single drop until every part of the dough is faintly tinted --- one input change touching everything. \emph{Confusion} is making the relationship between ``how much you knead'' (the key schedule) and ``where the color ends up'' so chaotic that you cannot reverse-engineer the kneading pattern from the final swirl. Real ciphers achieve diffusion with bit permutations and mixing layers, and confusion with \emph{S-boxes}: small nonlinear lookup tables. Alternating the two, round after round, is the entire recipe.
+\end{intuitionbox}
+
+\subsection{The avalanche criterion}
+
+Diffusion has a crisp test. A cipher satisfies the \emph{strict avalanche criterion} if flipping any single input bit causes each output bit to flip with probability $1/2$. Equivalently: complement one bit of the plaintext, re-encrypt, and the two ciphertexts should differ in about half their bits, with the differing positions looking random. If they differed in only one or two positions, a single plaintext bit barely moved --- diffusion failed, and an attacker could track plaintext structure straight through to the ciphertext.
+
+\begin{focusbox}
+A one-round cipher cannot avalanche: a single S-box touches only a few output bits, so a one-bit input change reaches only those. Avalanche is a \emph{multi-round} phenomenon. Round 1 spreads the change to a handful of bits; the permutation layer scatters them to different S-boxes; round 2 each of those S-boxes amplifies again; after a few rounds the change has reached every output bit. DES needs about 5 of its 16 rounds before full avalanche kicks in. The extra rounds beyond that are the safety margin against cryptanalysis.
+\end{focusbox}
+
+\section{The Feistel Construction}
+\label{ch11:feistel}
+
+Here is the problem a block-cipher designer faces. We want $E_k$ to be a permutation --- invertible --- but we also want it built from a wild, nonlinear, hard-to-invert mixing function, because nonlinearity is where confusion lives. Those goals fight each other. Nonlinear functions are exactly the ones that are hard to invert; making your mixing function invertible tends to make it tame.
+
+Horst Feistel, at IBM in the early 1970s, found the escape. His construction builds a guaranteed-invertible permutation out of \emph{any} function $f$ whatsoever --- $f$ can be wildly nonlinear, non-injective, a pure one-way mess --- and inversion never requires inverting $f$. You get to use the nastiest mixing function you can dream up, and the structure hands you decryption for free.
+
+\subsection{One Feistel round}
+
+Split the $n$-bit block into two halves $L$ and $R$ of $n/2$ bits each. A single round, parameterized by a \emph{round key} $k_i$ and a \emph{round function} $f$, maps $(L_{i-1}, R_{i-1})$ to $(L_i, R_i)$ by
+\[
+L_i = R_{i-1}, \qquad R_i = L_{i-1} \;\xor\; f(k_i, R_{i-1}).
+\]
+In words: the new left half is just the old right half; the new right half is the old left half XORed with $f$ applied to the old right half. Then you swap, and run another round.
+
+\begin{center}
+\begin{tikzpicture}[
+  >=Stealth, node distance=8mm,
+  box/.style={draw, rounded corners=2pt, minimum width=12mm, minimum height=7mm},
+  op/.style={draw, circle, inner sep=1pt, minimum size=5mm},
+  every node/.style={font=\small}
+]
+  \node (Lin) at (0,0) {$L_{i-1}$};
+  \node (Rin) at (4,0) {$R_{i-1}$};
+  \node[box, fill=structurepurple!15] (f) at (2.2,-1.6) {$f(k_i,\cdot)$};
+  \node[op] (xor) at (0,-2.9) {$\xor$};
+  \draw[->] (Rin) -- ++(0,-0.7) coordinate (rsplit);
+  \draw[->] (rsplit) -| (f.north);
+  \draw[->] (Lin) -- (xor.north);
+  \draw[->] (f.west) -- (xor.east);
+  \node (Lout) at (0,-4.3) {$L_i$};
+  \node (Rout) at (4,-4.3) {$R_i$};
+  \draw[->] (rsplit) .. controls (4,-2.2) and (0.0,-3.6) .. (Lout.north);
+  \draw[->] (xor.south) .. controls (0,-3.6) and (4,-3.6) .. (Rout.north);
+  \node[evered] at (5.9,-2.2) {round $i$};
+\end{tikzpicture}
+\end{center}
+
+The lines cross: the right half slides over to become the next left half, and the XORed combination becomes the next right half. That crossing is the swap.
+
+\begin{whybox}[Why a Feistel round always inverts]
+Suppose you are handed the output $(L_i, R_i)$ and the round key $k_i$, and you want the input $(L_{i-1}, R_{i-1})$. Look at the round equations. From $L_i = R_{i-1}$ you immediately recover
+\[
+R_{i-1} = L_i.
+\]
+Now you know $R_{i-1}$, so you can compute $f(k_i, R_{i-1})$ --- the \emph{same} forward direction of $f$, never an inverse. Then from $R_i = L_{i-1} \xor f(k_i, R_{i-1})$, XOR both sides:
+\[
+L_{i-1} = R_i \;\xor\; f(k_i, R_{i-1}) = R_i \;\xor\; f(k_i, L_i).
+\]
+Done. You recovered $(L_{i-1},R_{i-1})$ using only forward evaluations of $f$ and XOR --- both of which you can always do. \emph{This is the magic.} The function $f$ never has to be invertible, injective, or anything nice. XOR is its own inverse ($a \xor b \xor b = a$), and that single fact carries decryption. To decrypt the whole cipher, run the rounds in reverse, feeding the round keys in reverse order.
+\end{whybox}
+
+\begin{formalbox}
+\label{ch11:feistel-formal}
+Let $\rho_{k}(L,R) = (R,\; L \xor f(k,R))$ be one Feistel round (before the final swap). Its inverse is $\rho_k^{-1}(A,B) = (B \xor f(k,A),\; A)$. Check: $\rho_k^{-1}(\rho_k(L,R)) = \rho_k^{-1}(R, L\xor f(k,R)) = \big((L\xor f(k,R)) \xor f(k,R),\; R\big) = (L,R)$, using $x \xor y \xor y = x$. So each round is a bijection, and a composition of bijections is a bijection. An $r$-round Feistel network is therefore a permutation \emph{regardless of $f$} --- which is precisely Definition~\ref{ch11:def-blockcipher}'s requirement.
+\end{formalbox}
+
+\subsection{How secure is a Feistel network? The Luby--Rackoff theorem}
+
+The construction guarantees invertibility for free, but does it give you a \emph{secure} PRP? That depends on $f$ and on how many rounds you run. Michael Luby and Charles Rackoff proved a landmark result in 1988.
+
+\begin{theorem}[Luby--Rackoff, informal]
+\label{ch11:luby-rackoff}
+If the round function $f$ is a secure pseudorandom function and the round keys are independent, then:
+\begin{itemize}
+  \item \textbf{Three rounds} give a secure PRP (secure against chosen-plaintext attacks).
+  \item \textbf{Four rounds} give a secure \emph{strong} PRP (secure even when the adversary may also query the decryption box).
+\end{itemize}
+\end{theorem}
+
+This is a remarkable bridge: it reduces ``build a secure block cipher'' to ``build a secure pseudorandom function on half-blocks,'' and the Feistel scaffolding upgrades the function to a permutation with security to spare. One and two rounds are insecure --- two rounds let an attacker who controls inputs detect structure --- but at three the wall goes up.
+
+\begin{trapbox}
+Real ciphers like DES use \emph{far} more than four rounds (DES uses 16), and for good reason. The Luby--Rackoff theorem assumes $f$ is an \emph{ideal} pseudorandom function with a fully independent random key each round. The DES round function is a fixed, public, decidedly non-ideal function, and its round keys come from a simple key schedule, not independent randomness. The extra rounds are the price of using a real, cheap, structured $f$ instead of the theorem's idealized one. Never read ``three rounds suffice'' as engineering advice --- it is an existence proof about idealized components.
+\end{trapbox}
+
+\section{A Toy Feistel Cipher, Worked by Hand}
+\label{ch11:toy}
+
+Let us actually run one. We build an 8-bit block cipher: $n = 8$, so each half is 4 bits. We will do 3 rounds. The point is to see every bit move, not to be secure --- this cipher is breakable in seconds.
+
+\textbf{Round function.} Our $f$ takes a 4-bit round key $k_i$ and a 4-bit half $R$, and returns 4 bits. Define
+\[
+f(k_i, R) \;=\; S\big[R \xor k_i\big] \lll 1,
+\]
+where $S$ is the tiny S-box below (a fixed nonlinear lookup), and $\lll 1$ means rotate the 4-bit result left by one position. The S-box maps each 4-bit value (a nibble, $0$--$15$) to another:
+
+\begin{center}
+\begin{tabular}{c|cccccccccccccccc}
+\toprule
+$x$ & 0 & 1 & 2 & 3 & 4 & 5 & 6 & 7 & 8 & 9 & A & B & C & D & E & F\\
+\midrule
+$S[x]$ & E & 4 & D & 1 & 2 & F & B & 8 & 3 & A & 6 & C & 5 & 9 & 0 & 7\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+(This happens to be the first row of DES's S-box $S_1$ --- a real nonlinear table, reused here as a toy.)
+
+\textbf{Keys.} Hand each round a 4-bit key: $k_1 = \texttt{1010}_2 = \mathrm{A}$, $k_2 = \texttt{0011}_2 = 3$, $k_3 = \texttt{1100}_2 = \mathrm{C}$.
+
+\textbf{Plaintext.} Encrypt the byte $P = \texttt{0110 1011}_2$. Split into $L_0 = \texttt{0110} = 6$ and $R_0 = \texttt{1011} = \mathrm{B}$.
+
+\paragraph{Round 1.} $L_1 = R_0 = \mathrm{B}$. Compute $f(k_1, R_0)$:
+\[
+R_0 \xor k_1 = \texttt{1011} \xor \texttt{1010} = \texttt{0001} = 1,\quad
+S[1] = 4 = \texttt{0100},\quad
+\texttt{0100}\lll 1 = \texttt{1000} = 8.
+\]
+So $R_1 = L_0 \xor 8 = \texttt{0110}\xor\texttt{1000} = \texttt{1110} = \mathrm{E}$. State: $(L_1,R_1) = (\mathrm{B},\mathrm{E})$.
+
+\paragraph{Round 2.} $L_2 = R_1 = \mathrm{E}$. Compute $f(k_2, R_1)$:
+\[
+R_1 \xor k_2 = \texttt{1110}\xor\texttt{0011} = \texttt{1101} = \mathrm{D},\quad
+S[\mathrm{D}] = 9 = \texttt{1001},\quad
+\texttt{1001}\lll 1 = \texttt{0011} = 3.
+\]
+So $R_2 = L_1 \xor 3 = \texttt{1011}\xor\texttt{0011} = \texttt{1000} = 8$. State: $(L_2,R_2) = (\mathrm{E},8)$.
+
+\paragraph{Round 3.} $L_3 = R_2 = 8$. Compute $f(k_3, R_2)$:
+\[
+R_2 \xor k_3 = \texttt{1000}\xor\texttt{1100} = \texttt{0100} = 4,\quad
+S[4] = 2 = \texttt{0010},\quad
+\texttt{0010}\lll 1 = \texttt{0100} = 4.
+\]
+So $R_3 = L_2 \xor 4 = \texttt{1110}\xor\texttt{0100} = \texttt{1010} = \mathrm{A}$. State: $(L_3,R_3) = (8,\mathrm{A})$.
+
+\textbf{Ciphertext} $C = L_3 \concat R_3 = \texttt{1000 1010}_2 = \texttt{8A}_{16}$.
+
+\begin{center}
+\begin{tikzpicture}[>=Stealth, font=\small, node distance=5mm]
+  \def\rowsep{1.25}
+  \foreach \i/\L/\R in {0/6/B, 1/B/E, 2/E/8, 3/8/A} {
+    \node (L\i) at (0, -\i*\rowsep) {$L_{\i}=\L$};
+    \node (R\i) at (3.2, -\i*\rowsep) {$R_{\i}=\R$};
+  }
+  \foreach \i [evaluate=\i as \j using int(\i-1)] in {1,2,3} {
+    \draw[->] (R\j) -- (L\i);
+    \draw[->, evered] (R\j) .. controls +(1.0,-0.4) and +(0.6,0.4) .. (R\i.north);
+    \draw[->] (L\j) .. controls +(-0.6,-0.5) and +(-0.6,0.5) .. (R\i.west);
+  }
+  \node[evered, font=\footnotesize] at (5.0,-0.6) {$\xor f(k_1,\cdot)$};
+  \node[evered, font=\footnotesize] at (5.0,-1.85) {$\xor f(k_2,\cdot)$};
+  \node[evered, font=\footnotesize] at (5.0,-3.1) {$\xor f(k_3,\cdot)$};
+\end{tikzpicture}
+\end{center}
+
+\begin{walkbox}
+Decrypt $C = \texttt{8A}$ back to $P$ using only \emph{forward} evaluations of $f$, and confirm you land on $\texttt{6B}$. Start from $(L_3,R_3) = (8,\mathrm{A})$ and undo round 3 first: recover $R_2 = L_3 = 8$, then $L_2 = R_3 \xor f(k_3, R_2)$. You already computed $f(k_3, 8) = 4$ above, so $L_2 = \mathrm{A}\xor 4 = \texttt{1010}\xor\texttt{0100} = \texttt{1110} = \mathrm{E}$. Keep going. Notice you never inverted $S$ or the rotation --- the whole descent rides on XOR being its own inverse.
+\end{walkbox}
+
+\begin{implementbox}
+A complete toy Feistel cipher in Python. It mirrors the worked example exactly, so you can check the trace.
+
+\begin{lstlisting}[language=Python]
+# TOY CIPHER -- FOR LEARNING ONLY. 8-bit block, trivially breakable.
+# Never use anything in this book for real encryption.
+
+SBOX = [0xE,0x4,0xD,0x1,0x2,0xF,0xB,0x8,
+        0x3,0xA,0x6,0xC,0x5,0x9,0x0,0x7]   # first row of DES S1
+
+def rotl4(x, n=1):                  # rotate a 4-bit nibble left
+    return ((x << n) | (x >> (4 - n))) & 0xF
+
+def f(ki, R):                       # round function: nonlinear + diffusing
+    return rotl4(SBOX[(R ^ ki) & 0xF])
+
+ROUND_KEYS = [0xA, 0x3, 0xC]        # k1, k2, k3
+
+def encrypt(P):
+    L, R = (P >> 4) & 0xF, P & 0xF  # split byte into two nibbles
+    for ki in ROUND_KEYS:
+        L, R = R, L ^ f(ki, R)      # one Feistel round (with swap)
+    return (L << 4) | R
+
+def decrypt(C):
+    L, R = (C >> 4) & 0xF, C & 0xF
+    for ki in reversed(ROUND_KEYS): # same keys, reverse order
+        R, L = L, R ^ f(ki, L)      # undo one round
+    return (L << 4) | R
+
+P = 0x6B
+C = encrypt(P)
+assert C == 0x8A and decrypt(C) == P
+print(hex(P), "->", hex(C), "->", hex(decrypt(C)))   # 0x6b -> 0x8a -> 0x6b
+\end{lstlisting}
+
+\textbf{Warning.} This is a teaching toy. The block is 8 bits, so a single chosen-plaintext run over all 256 inputs rebuilds the entire code book. Real ciphers use 128-bit blocks and dozens of rounds with vetted components.
+\end{implementbox}
+
+\begin{labbox}
+Verify the avalanche idea on the toy. Encrypt $P = \texttt{6B}$ (you got $\texttt{8A}$) and then encrypt $P' = \texttt{6A}$, which differs in a single bit. How many ciphertext bits change? With only 3 rounds and a 4-bit round function you will see partial, not full, avalanche --- exactly the lesson of the focus box: diffusion needs rounds. Bump \texttt{ROUND\_KEYS} to 8 or 16 rounds (repeat the three keys cyclically) and watch the difference spread toward half the bits.
+\end{labbox}
+
+\subsection{Watching the avalanche fail (and then start)}
+
+Let us not leave the avalanche claim as an exercise; let us trace it. Take $P = \texttt{6B}$, whose ciphertext we already know is $\texttt{8A} = \texttt{1000\,1010}_2$, and flip its lowest bit to get $P' = \texttt{6A} = \texttt{0110\,1010}_2$. We re-run the three rounds on $P'$.
+
+Split $P'$ into $L_0' = \texttt{0110} = 6$ and $R_0' = \texttt{1010} = \mathrm{A}$ (only $R_0$ changed, by one bit).
+
+\paragraph{Round 1.} $L_1' = R_0' = \mathrm{A}$. Then $R_0'\xor k_1 = \texttt{1010}\xor\texttt{1010} = \texttt{0000} = 0$, $S[0] = \mathrm{E} = \texttt{1110}$, and $\texttt{1110}\lll 1 = \texttt{1101} = \mathrm{D}$. So $R_1' = L_0' \xor \mathrm{D} = \texttt{0110}\xor\texttt{1101} = \texttt{1011} = \mathrm{B}$. State $(\mathrm{A},\mathrm{B})$ --- compare the original $(\mathrm{B},\mathrm{E})$. Already two nibbles differ, because the S-box turned a one-bit input change into a multi-bit output change.
+
+\paragraph{Round 2.} $L_2' = R_1' = \mathrm{B}$. Then $R_1'\xor k_2 = \texttt{1011}\xor\texttt{0011} = \texttt{1000} = 8$, $S[8] = 3 = \texttt{0011}$, $\texttt{0011}\lll 1 = \texttt{0110} = 6$. So $R_2' = L_1' \xor 6 = \texttt{1010}\xor\texttt{0110} = \texttt{1100} = \mathrm{C}$. State $(\mathrm{B},\mathrm{C})$ vs. original $(\mathrm{E},8)$.
+
+\paragraph{Round 3.} $L_3' = R_2' = \mathrm{C}$. Then $R_2'\xor k_3 = \texttt{1100}\xor\texttt{1100} = \texttt{0000} = 0$, $S[0] = \mathrm{E} = \texttt{1110}$, $\texttt{1110}\lll1 = \texttt{1101} = \mathrm{D}$. So $R_3' = L_2' \xor \mathrm{D} = \texttt{1011}\xor\texttt{1101} = \texttt{0110} = 6$. Ciphertext $C' = \texttt{1100\,0110}_2 = \texttt{C6}_{16}$.
+
+Now count: $C = \texttt{1000\,1010}$ versus $C' = \texttt{1100\,0110}$. XOR them: $\texttt{0100\,1100}$, which has \emph{three} bits set. So one flipped input bit produced three flipped output bits out of eight. Full avalanche would be four. Three out of eight after only three rounds, from a single S-box and rotation, is the construction visibly straining toward half --- and the labbox above lets you push it the rest of the way by adding rounds. The lesson is concrete: diffusion is cumulative, and the round count is the budget you spend to buy it.
+
+\section{DES: The Data Encryption Standard}
+\label{ch11:des}
+
+\begin{historybox}
+In the early 1970s the US National Bureau of Standards put out a call for a public encryption standard --- something unheard of, since serious cryptography had lived inside intelligence agencies. IBM responded with a Feistel cipher descended from its earlier ``Lucifer'' design, led by Horst Feistel and Walter Tuchman. The National Security Agency reviewed it before adoption, and made two changes that drew suspicion for decades: they \emph{shrank the key} from Lucifer's 128 bits down to 56, and they \emph{altered the S-boxes} without public explanation. The shortened key looked like a deliberate ceiling on security. The S-box tweak looked like a possible backdoor. The cipher was published as FIPS 46 in 1977 under the name DES.
+
+The verdict of history is split and instructive. The S-box change turned out to be \emph{protective}: in 1990 Eli Biham and Adi Shamir publicly discovered \emph{differential cryptanalysis}, and the DES S-boxes proved to be nearly optimally hardened against it --- IBM and the NSA had known about the attack 15 years early and quietly defended against it. The key-length cut, though, was exactly the weakness it appeared to be. A 56-bit key was within reach of a determined attacker even in 1977, and certainly by the late 1990s, when it was broken in public.
+\end{historybox}
+
+\subsection{The shape of DES}
+
+DES is a 16-round Feistel cipher with a 64-bit block and a 56-bit key. (The key is supplied as 64 bits, but 8 of those are parity bits and carry no entropy --- hence 56 effective.) The overall flow:
+
+\begin{enumerate}
+  \item An \emph{initial permutation} IP shuffles the 64 input bits by a fixed wiring. IP has no cryptographic value --- it was an artifact of 1970s hardware --- but it is part of the standard.
+  \item The 64 bits split into $L_0, R_0$ of 32 bits each, and \textbf{16 Feistel rounds} run, using round keys $k_1,\dots,k_{16}$ derived from the master key by the \emph{key schedule}.
+  \item After round 16, the halves are swapped once more and the \emph{final permutation} $\mathrm{IP}^{-1}$ (the inverse of IP) is applied.
+\end{enumerate}
+
+\begin{center}
+\begin{tikzpicture}[>=Stealth, font=\footnotesize, node distance=4mm,
+  blk/.style={draw, rounded corners=1.5pt, minimum width=24mm, minimum height=6mm}]
+  \node[blk, fill=sourceblue!12] (ip) {IP (initial perm.)};
+  \node[blk, below=5mm of ip, fill=structurepurple!12] (r1) {round 1 \;($k_1$)};
+  \node[blk, below=3mm of r1, fill=structurepurple!12] (r2) {round 2 \;($k_2$)};
+  \node[below=2mm of r2] (dots) {$\vdots$};
+  \node[blk, below=2mm of dots, fill=structurepurple!12] (r16) {round 16 \;($k_{16}$)};
+  \node[blk, below=5mm of r16, fill=sourceblue!12] (fp) {$\mathrm{IP}^{-1}$ (final perm.)};
+  \draw[->] (ip)--(r1); \draw[->] (r1)--(r2); \draw[->] (r2)--(dots);
+  \draw[->] (dots)--(r16); \draw[->] (r16)--(fp);
+  \node[above=4mm of ip] (in) {64-bit plaintext block};
+  \node[below=4mm of fp] (out) {64-bit ciphertext block};
+  \draw[->] (in)--(ip); \draw[->] (fp)--(out);
+\end{tikzpicture}
+\end{center}
+
+\subsection{The DES round function $f$}
+
+This is the heart of DES, and where confusion and diffusion are manufactured. The round function $f$ takes a 32-bit half $R$ and a 48-bit round key $k_i$ and returns 32 bits, in four steps:
+
+\begin{enumerate}
+  \item \textbf{Expansion ($E$).} The 32-bit half is expanded to 48 bits by duplicating 16 of its bits according to a fixed table. This widens $R$ to match the 48-bit round key, and --- crucially --- it makes each input bit feed into \emph{two} adjacent S-boxes, which is a diffusion engine.
+  \item \textbf{Key mixing.} XOR the 48-bit expanded half with the 48-bit round key: $E(R) \xor k_i$. This is the only place the key enters --- confusion's entry point.
+  \item \textbf{Substitution (S-boxes).} The 48 bits are cut into eight 6-bit chunks. Each chunk goes through its own S-box $S_1,\dots,S_8$, a fixed table that maps 6 bits to 4 bits. Eight S-boxes output $8\times 4 = 32$ bits. \textbf{This is the only nonlinear step in all of DES.} Everything else --- expansion, XOR, permutation --- is linear over $\F_2$. Strip out the S-boxes and DES collapses into solvable linear algebra. They carry the entire weight of confusion.
+  \item \textbf{Permutation ($P$).} The 32 S-box output bits are shuffled by a fixed permutation $P$, so that each S-box's 4 output bits are scattered to feed \emph{different} S-boxes in the next round. This is the diffusion spreader.
+\end{enumerate}
+
+\begin{center}
+\begin{tikzpicture}[>=Stealth, font=\footnotesize, node distance=4mm,
+  blk/.style={draw, rounded corners=1.5pt, minimum height=8mm, align=center}]
+  \node[blk, fill=targetgreen!14, minimum width=16mm] (E) {Expand\\32$\to$48};
+  \node[draw,circle,inner sep=1pt, right=7mm of E] (x) {$\xor$};
+  \node[above=6mm of x, font=\scriptsize] (k) {round key $k_i$ (48)};
+  \node[blk, fill=trapred!14, right=7mm of x, minimum width=22mm] (S) {S-boxes\\$S_1 \ldots S_8$\\48$\to$32};
+  \node[blk, fill=sourceblue!14, right=7mm of S, minimum width=14mm] (P) {Perm $P$\\32$\to$32};
+  \node[left=7mm of E, font=\scriptsize] (in) {$R$ (32)};
+  \node[right=7mm of P, font=\scriptsize] (out) {$f$ (32)};
+  \draw[->] (in)--(E); \draw[->] (E)--(x); \draw[->] (k)--(x);
+  \draw[->] (x)--(S); \draw[->] (S)--(P); \draw[->] (P)--(out);
+\end{tikzpicture}
+\end{center}
+
+\subsection{Inside an S-box}
+
+Take $S_1$. It is a table with 4 rows and 16 columns, holding 4-bit values. The 6-bit input $b_1 b_2 b_3 b_4 b_5 b_6$ is read cleverly: the \emph{outer} bits $b_1 b_6$ pick the row ($0$--$3$), and the \emph{inner} four bits $b_2 b_3 b_4 b_5$ pick the column ($0$--$15$). The entry there is the 4-bit output.
+
+\begin{example}[Pushing 6 bits through $S_1$]
+\label{ch11:ex-sbox}
+Feed $S_1$ the input $\texttt{011011}_2$.
+\begin{itemize}
+  \item Row bits: $b_1 b_6 = \texttt{0}\,\texttt{1} = \texttt{01}_2 = 1$. So row $1$.
+  \item Column bits: $b_2 b_3 b_4 b_5 = \texttt{1101}_2 = 13$. So column $13$.
+\end{itemize}
+Row 1, column 13 of $S_1$ holds the value $5 = \texttt{0101}_2$. So $S_1(\texttt{011011}) = \texttt{0101}$. Six bits in, four bits out, and not a linear function in sight: flipping $b_3$ can change the output in ways flipping $b_4$ does not, which is the whole point of a lookup table over a formula.
+\end{example}
+
+\begin{whybox}[What makes a DES S-box good]
+The S-boxes were not random. They were engineered against criteria, several of which only became public years later:
+\begin{itemize}
+  \item \textbf{Nonlinearity.} No output bit is close to a linear (XOR) combination of input bits. This is what blocks you from writing the cipher as linear algebra, and it is the direct defense against \emph{linear cryptanalysis} (Matsui, 1993).
+  \item \textbf{The 4-row design.} Each row of an S-box is a permutation of $\{0,\dots,15\}$, and the rows differ, so the outer ``control'' bits genuinely reshape the mapping.
+  \item \textbf{Differential resistance.} For any fixed input XOR-difference $\Delta_{\mathrm{in}}$, the output differences are spread out, never concentrated on one value. This is the property that defeats \emph{differential cryptanalysis} --- and the reason the NSA's S-box edits, far from being a backdoor, strengthened the cipher against an attack the public would not discover until 1990.
+\end{itemize}
+A change of even a single S-box entry tends to wreck one of these properties, which is why ``random-looking'' S-boxes are usually worse than carefully designed ones.
+\end{whybox}
+
+\subsection{The key schedule}
+
+The 56-bit key is split into two 28-bit halves $C_0, D_0$. Before each round both halves are rotated left (by 1 or 2 positions, per a fixed schedule), and then 48 of the 56 bits are selected by a compression permutation to form that round's 48-bit key $k_i$. Because the halves keep rotating, each round sees a different slice of the key. For decryption you simply present the round keys in reverse order --- the Feistel structure does the rest, exactly as in our toy.
+
+\subsection{A first taste of differential cryptanalysis}
+
+The brute-force story below is the practical killer, but it is worth seeing why the \emph{internal} attacks --- differential and linear cryptanalysis --- failed to bring DES down faster, because that failure is the S-box design paying off. Both attacks are statistical: they collect many plaintext/ciphertext pairs and look for a bias the cipher should not have if it were a random permutation.
+
+Differential cryptanalysis tracks how an input \emph{difference} propagates. Fix two plaintexts $P$ and $P^* = P \xor \Delta$ with a chosen XOR-difference $\Delta$. Because XOR and the bit permutations are linear, a difference passes through them deterministically --- $\Delta$ in gives a fixed $\Delta$ out, key and all, since the key XOR cancels: $(x\xor k)\xor(x^*\xor k) = x\xor x^*$. The \emph{only} place a difference behaves probabilistically is the S-boxes.
+
+\begin{example}[An S-box difference is not uniform]
+\label{ch11:ex-diff}
+Consider one DES S-box and a fixed input difference $\Delta_{\mathrm{in}}$ across its 6 input bits. For each of the $2^6 = 64$ input pairs $(x, x\xor\Delta_{\mathrm{in}})$, record the output difference $\Delta_{\mathrm{out}} = S(x)\xor S(x\xor\Delta_{\mathrm{in}})$. If the S-box behaved like a random function, the 64 pairs would scatter their output differences fairly evenly over the $2^4 = 16$ possible $\Delta_{\mathrm{out}}$ values --- about $64/16 = 4$ pairs each. The table of counts over all $(\Delta_{\mathrm{in}}, \Delta_{\mathrm{out}})$ is the S-box's \emph{difference distribution table}. A cryptanalyst's dream is a cell with a large count: an input difference that forces a particular output difference with high probability. For the DES S-boxes the worst cell tops out at $16/64 = 1/4$, and most are at or below $4/64$. Those small, flat peaks are exactly what the NSA's edits tuned, and they are what makes the full 16-round differential characteristic so weak that you need about $2^{47}$ chosen plaintexts to exploit it --- far more than the $2^{56}$ brute force but still wildly impractical.
+\end{example}
+
+\begin{focusbox}
+The takeaway is not the arithmetic of one S-box but the shape of the argument. Every linear operation is transparent to a difference; the S-boxes are the only fog. So the entire cryptanalytic strength of DES is concentrated in eight little tables, and a designer's whole job is to flatten their difference distribution and their linear-approximation tables at once. Get one flat and the other spiky and you have merely traded which attack works. The genius of the published DES boxes is that they are good against \emph{both} --- including against an attack (differential) that would not be public for another fifteen years.
+\end{focusbox}
+
+\section{Why DES Died: 56 Bits Is Not Enough}
+\label{ch11:bruteforce}
+
+DES's downfall was never a clever break of its internals. Differential and linear cryptanalysis exist and are beautiful, but both need an impractical pile of chosen or known plaintexts ($2^{47}$ chosen pairs for differential; $2^{43}$ known plaintexts for linear) --- more than an attacker usually has. The real killer was arithmetic: the key space is only $2^{56}$, and you can just try them all.
+
+\begin{attackbox}[Exhaustive key search]
+Given a single known plaintext/ciphertext pair $(P, C)$ with $C = \mathrm{DES}_k(P)$, recover $k$ by trying every candidate:
+\begin{enumerate}
+  \item For each $\hat k = 0, 1, 2, \dots, 2^{56}-1$: compute $\mathrm{DES}_{\hat k}(P)$.
+  \item If it equals $C$, output $\hat k$ as the (probable) key.
+\end{enumerate}
+With a 64-bit block and a 56-bit key, a single pair already pins the key down with overwhelming odds: the chance a wrong key also maps $P\mapsto C$ is about $2^{56}/2^{64} = 2^{-8}$, so two or three pairs leave essentially one survivor. The search is also \emph{embarrassingly parallel} --- split the key range across $N$ machines and each tests $2^{56}/N$ keys with zero coordination.
+\end{attackbox}
+
+\begin{walkbox}
+Put numbers on it. Deep Crack tested about $9\times 10^{10}$ keys per second. Half the $2^{56} \approx 7.2\times 10^{16}$ key space is $3.6\times 10^{16}$ keys, so the expected time is $3.6\times 10^{16} / 9\times 10^{10} \approx 4\times 10^{5}$ seconds, about \emph{4.6 days} --- and indeed Deep Crack's averages landed in the day-to-days range. Now redo the sum for AES-128: half of $2^{128}$ is $1.7\times 10^{38}$ keys, and even at a fanciful $10^{18}$ keys/second that is $1.7\times 10^{20}$ seconds, which is roughly $400$ times the $4\times 10^{17}$-second age of the universe. Same machine, same algorithm, $72$ extra key bits --- and the search time jumps from a long weekend to hundreds of universe-lifetimes. That is what each doubling, compounded $72$ times, does.
+\end{walkbox}
+
+Now the timeline that turned this from theory into demolition:
+
+\begin{itemize}
+  \item \textbf{1977.} Whitfield Diffie and Martin Hellman estimate that a \$20 million special-purpose machine could find a DES key in a day. A warning, not yet a weapon.
+  \item \textbf{1997.} A distributed Internet effort (DESCHALL) cracks an RSA Security challenge in 96 days by farming the key space across thousands of volunteer computers.
+  \item \textbf{1998.} The Electronic Frontier Foundation builds \emph{Deep Crack} for about \$250{,}000: 1{,}856 custom chips, each testing many keys in parallel, in a machine the size of a few PC towers. It finds a DES key in \textbf{56 hours}. The EFF publishes the full design in a book, partly to demolish the official line that DES was still safe.
+  \item \textbf{1999.} Deep Crack teams up with the distributed.net network and cracks a DES key in \textbf{22 hours}.
+\end{itemize}
+
+Today a few GPUs, or rented cloud time, or an FPGA cluster like COPACOBANA, find a single-DES key in hours to days for a modest budget. Single DES is dead for confidentiality.
+
+\begin{connectionbox}
+The brute-force cost is pure counting, the kind the algorithms companion formalizes. Searching a $\kappa$-bit key is $\Theta(2^{\kappa})$ cipher evaluations; each added key bit \emph{doubles} the work. That exponential is also exactly why merely \emph{lengthening} the key --- AES-128, AES-256 --- buys an astronomical margin: $2^{128}$ is so far beyond $2^{56}$ that no foreseeable classical machine touches it. The attacker and the defender both ride the same exponential; the defender just needs to start a few dozen bits higher.
+\end{connectionbox}
+
+\subsection{The natural fix that mostly fails: Double DES}
+
+If 56 bits is too few, why not encrypt twice with two keys, $C = \mathrm{DES}_{k_2}(\mathrm{DES}_{k_1}(P))$, for a 112-bit combined key? It looks like you doubled the security. You did not --- and the reason is a gorgeous attack.
+
+\begin{attackbox}[Meet-in-the-middle on Double DES]
+\label{ch11:mitm}
+Write the relation as $\mathrm{DES}_{k_1}(P) = \mathrm{DES}_{k_2}^{-1}(C)$. The intermediate value $M$ must be reachable from $P$ going forward under \emph{some} $k_1$, and from $C$ going backward under \emph{some} $k_2$. So:
+\begin{enumerate}
+  \item \textbf{Build a table.} For all $2^{56}$ keys $k_1$, compute $M = \mathrm{DES}_{k_1}(P)$ and store the pair $(M, k_1)$, indexed by $M$. (About $2^{56}$ entries.)
+  \item \textbf{Scan from the other side.} For all $2^{56}$ keys $k_2$, compute $M' = \mathrm{DES}_{k_2}^{-1}(C)$ and look up $M'$ in the table. Each hit gives a candidate pair $(k_1, k_2)$.
+  \item \textbf{Filter.} Test surviving pairs against a second plaintext/ciphertext pair to kill false positives.
+\end{enumerate}
+Total work: about $2^{56} + 2^{56} = 2^{57}$ encryptions --- not $2^{112}$. You traded enormous \emph{memory} (a $2^{56}$-entry table) for time. Double DES gives roughly \emph{one} extra bit of effective security, not 56. The meet-in-the-middle technique is general: any ``do it twice'' scheme is vulnerable to it.
+\end{attackbox}
+
+\begin{walkbox}
+Where did the ``one extra bit'' go? Count it. Naive double-key brute force is $2^{56}\times 2^{56} = 2^{112}$ encryptions. Meet-in-the-middle does $2^{56}$ forward encryptions to fill the table, then $2^{56}$ backward decryptions to scan it: $2^{56} + 2^{56} = 2^{57}$ operations. Compared to single DES's $2^{56}$, that is a single doubling --- one bit. The catch is the table: $2^{56}$ entries of (say) 8 bytes of intermediate plus a key index is on the order of $2^{59}$ bytes, roughly $5\times 10^{17}$ bytes --- hundreds of petabytes. So the attack is not free; it is a \emph{time--memory trade}, and the memory is what an engineer fights. Time--memory trade-offs (Hellman tables, rainbow tables) let you slide along a curve --- spend more time to use less memory --- but the product stays stubbornly large. The lesson that outlives DES: ``compose it twice'' almost never doubles security, because a meet-in-the-middle seam runs right down the middle of any two-stage construction.
+\end{walkbox}
+
+\begin{whybox}[Why Triple DES survives where Double DES fails]
+The repair is \textbf{Triple DES (3DES)}: $C = \mathrm{DES}_{k_3}(\mathrm{DES}_{k_2}^{-1}(\mathrm{DES}_{k_1}(P)))$, the famous EDE (encrypt--decrypt--encrypt) order. Why the middle decryption? So that setting $k_1 = k_2 = k_3$ makes 3DES collapse to single DES, giving backward compatibility with legacy hardware. With three independent keys the combined key is 168 bits, but meet-in-the-middle still bites: split it as ``first stage'' versus ``last two stages'' and you get an attack costing about $2^{112}$ time with $2^{56}$ memory. So 3DES delivers roughly \textbf{112 bits} of security, not 168 --- comfortably out of brute-force range, which is why it lingered in banking and payment systems (EMV chip cards, some PIN-block formats) long after single DES was abandoned. Its weakness today is the small 64-bit \emph{block}, not the key: the birthday bound (the $q^2/2^n$ term from the connection box in Section~\ref{ch11:what}) makes 3DES leak after about $2^{32}$ blocks under one key --- the basis of the 2016 SWEET32 attack. NIST has deprecated 3DES; AES is the modern answer.
+\end{whybox}
+
+\begin{applicationbox}
+Where these ciphers actually run:
+\begin{itemize}
+  \item \textbf{TLS / HTTPS.} Modern TLS 1.3 uses AES (and ChaCha20, a stream cipher) only --- DES and 3DES were removed. But TLS 1.0/1.1 offered 3DES cipher suites for years, and SWEET32 is precisely why those 64-bit-block suites were finally purged from browsers and servers around 2016.
+  \item \textbf{Banking and payments.} The EMV chip-card and ATM ecosystem leaned on 3DES for PIN encryption and message authentication well into the 2010s, with a long, careful migration to AES because replacing deployed hardware is slow and expensive.
+  \item \textbf{Legacy and embedded.} Old VPNs (IPsec with 3DES), Kerberos's original single-DES types (long since deprecated), set-top boxes, and SIM/telecom kit all carried DES-family ciphers. You still meet them in protocol negotiations, which is why knowing the structure --- and the weaknesses --- matters when you audit a real system.
+\end{itemize}
+The takeaway for a working cryptographer: never reach for DES or 3DES in a new design. Use AES (next chapter). But you must understand the Feistel/DES machinery, because it is the template every later cipher reacts to, and because legacy DES will outlive us all in the field.
+\end{applicationbox}
+
+\section{What to Carry Forward}
+\label{ch11:summary}
+
+A block cipher is a keyed permutation that should look like a random one --- a (strong) pseudorandom permutation. Security against everything built on top (the modes of Chapter 13) reduces to that single property. You manufacture a good permutation by alternating \emph{confusion} (nonlinear S-boxes, which tangle the key into the output) with \emph{diffusion} (permutations and expansions, which smear each input bit across the whole block), round after round, until one flipped input bit avalanches into half the output.
+
+The \emph{Feistel construction} is the structural trick that makes the permutation invertible for free: split, mix one half into the other with an arbitrary function $f$, swap, repeat. XOR being its own inverse means $f$ never has to be inverted, so $f$ can be as nonlinear and nasty as you like. Luby--Rackoff proves three or four Feistel rounds over a strong pseudorandom function already yield a (strong) PRP; real ciphers add many more rounds to compensate for using cheap, fixed, structured components instead of idealized ones.
+
+\emph{DES} put this into silicon: 16 Feistel rounds, eight carefully hardened S-boxes carrying all the nonlinearity, a 64-bit block, and a 56-bit key. Its internal design was strong enough to resist differential and linear cryptanalysis decades ahead of their public discovery. But 56 bits was always too few, and exhaustive search --- parallel, cheap, inexorable --- killed it by 1998. Double DES fails to help because meet-in-the-middle trades memory for time; Triple DES buys real headroom (about 112 bits) but is hobbled by a 64-bit block and is now deprecated in favor of AES. The next chapter builds AES, which abandons the Feistel structure for a substitution--permutation network with a 128-bit block and keys long enough to retire brute force for good.
+
+\section*{Exercises}
+\addcontentsline{toc}{section}{Exercises}
+
+\begin{exercise}
+\label{ch11:ex-perm-count}
+A toy block cipher has block length $n = 3$ bits. (a) How many distinct permutations of $\{0,1\}^3$ exist? (b) If the key is 4 bits, what fraction of all permutations can the cipher possibly realize? (c) Explain in one or two sentences why this gap is unavoidable for any real cipher, and why it is not, by itself, a security flaw.
+\end{exercise}
+
+\begin{exercise}
+\label{ch11:ex-trace}
+Using the toy Feistel cipher of Section~\ref{ch11:toy} (the same S-box, rotation, and round keys $k_1=\mathrm{A}, k_2=3, k_3=\mathrm{C}$), encrypt the plaintext byte $P = \texttt{1100\,0101}_2$ by hand. Show $(L_i, R_i)$ after each round and give the final ciphertext in hex.
+\end{exercise}
+
+\begin{exercise}
+\label{ch11:ex-decrypt}
+Take the ciphertext $C = \texttt{8A}_{16}$ from the worked example and decrypt it fully by hand, recovering $\texttt{6B}_{16}$. Write out all three round-undo steps, and at each step state the value of $f(k_i,\cdot)$ you reuse. Confirm you never invert the S-box.
+\end{exercise}
+
+\begin{exercise}
+\label{ch11:ex-sbox-eval}
+Evaluate the DES S-box $S_1$ (using the row/column convention of Example~\ref{ch11:ex-sbox}) on the 6-bit inputs $\texttt{000000}$, $\texttt{111111}$, and $\texttt{101010}$. For each, state which row and column you used. You may take $S_1$'s row 0 to be $(\mathrm{E},4,\mathrm{D},1,2,\mathrm{F},\mathrm{B},8,3,\mathrm{A},6,\mathrm{C},5,9,0,7)$; look up the other rows from a DES reference table.
+\end{exercise}
+
+\begin{exercise}
+\label{ch11:ex-avalanche}
+Modify the Python toy cipher to run 16 rounds (repeat the three round keys cyclically). Encrypt $P = \texttt{0x6B}$ and $P' = \texttt{0x6A}$ (one bit different) and count how many of the 8 ciphertext bits differ. Repeat for several plaintext pairs differing in one bit and report the average. How close to 4 (half) do you get, and what does that say about diffusion versus round count?
+\end{exercise}
+
+\begin{exercise}
+\label{ch11:ex-invert-proof}
+Prove from the round equations that one Feistel round $\rho_k(L,R) = (R,\, L \xor f(k,R))$ is a bijection on $\{0,1\}^n$ for \emph{every} function $f$, by exhibiting its inverse explicitly and verifying $\rho_k^{-1}\circ\rho_k = \mathrm{id}$. Where, exactly, does the proof use that $f$ need not be invertible?
+\end{exercise}
+
+\begin{exercise}
+\label{ch11:ex-bruteforce}
+A machine tests $10^{12}$ DES keys per second. (a) How long, on average, to find a 56-bit key by exhaustive search (expect to scan half the space)? (b) The same machine attacks AES-128. How long on average? Express the answer in a way that makes the gap visceral (compare to the age of the universe, about $4\times 10^{17}$ seconds).
+\end{exercise}
+
+\begin{exercise}
+\label{ch11:ex-mitm}
+Explain why the meet-in-the-middle attack of Section~\ref{ch11:mitm} reduces Double DES to roughly $2^{57}$ time rather than $2^{112}$. (a) What resource does it consume heavily in exchange? (b) State the rough time and memory cost of the analogous attack on Triple DES, and conclude how many bits of security 3DES actually offers.
+\end{exercise}
+
+\begin{exercise}
+\label{ch11:ex-block-vs-key}
+3DES has a 168-bit key but is considered to offer about 112 bits of security and is nonetheless deprecated. (a) Why 112 and not 168? (b) Separately from the key length, name the \emph{block-size} weakness that motivated deprecation, identify the attack (SWEET32), and estimate after roughly how many blocks under one key a 64-bit-block cipher starts leaking, citing the birthday bound $q^2/2^n$.
+\end{exercise}
+
+\begin{exercise}
+\label{ch11:ex-diff-toy}
+Differential cryptanalysis (Example~\ref{ch11:ex-diff}) leans on the S-box \emph{difference distribution table}. Take the toy S-box of Section~\ref{ch11:toy} (the $4$-bit table $S$) and fix the input difference $\Delta_{\mathrm{in}} = \texttt{0001}_2$. (a) For all $16$ inputs $x$, compute $\Delta_{\mathrm{out}} = S[x]\xor S[x\xor\texttt{0001}]$ and tally how often each $\Delta_{\mathrm{out}}$ value appears. (b) If the S-box were a random function, roughly how many of the $16$ pairs would you expect per output difference? (c) Does any output difference occur noticeably more often than that baseline, and what would such a peak mean for an attacker?
+\end{exercise}
+
+\begin{exercise}
+\label{ch11:ex-avalanche-trace}
+Reproduce the worked avalanche trace of Section~\ref{ch11:toy}: encrypt $P' = \texttt{6A}$ by hand and confirm the ciphertext is $\texttt{C6}$. Then XOR it against the original $\texttt{8A}$ and verify three of the eight bits differ. Now flip a \emph{different} single input bit of $\texttt{6B}$ (your choice) and repeat; do you get three again, more, or fewer? What does the spread of these counts say about why one trial is not enough to judge diffusion?
+\end{exercise}
+
+\begin{exercise}
+\label{ch11:ex-linearity}
+Suppose someone replaces all eight DES S-boxes with \emph{linear} functions over $\F_2$ (each output bit an XOR of some input bits). Argue that the entire cipher then becomes an affine map over $\F_2$, and sketch why this lets an attacker recover the key from a handful of known plaintext/ciphertext pairs by solving a linear system. What does this tell you about which DES component is load-bearing for security?
+\end{exercise}

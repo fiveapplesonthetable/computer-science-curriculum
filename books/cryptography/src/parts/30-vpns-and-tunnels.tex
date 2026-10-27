@@ -1,0 +1,505 @@
+\chapter{VPNs and Tunnels}
+
+A virtual private network is a promise dressed up as a network device. The promise is roughly: ``pretend this packet was born inside a private network it does not physically belong to, and protect it on the way there.'' Everything interesting about VPNs lives in the gap between what that promise sounds like and what the cryptography can actually deliver.
+
+We have spent many chapters building the primitives: authenticated encryption (Chapter on AEAD), Diffie--Hellman key exchange and forward secrecy (Chapters on Diffie--Hellman and forward secrecy), elliptic curves (Chapter on ECC), and the way TLS stitches them into a real protocol (Chapter on TLS). A VPN is what you get when you point those same tools at a different target. Instead of protecting one TCP connection between a browser and a web server, a VPN protects \emph{whole packets}---and sometimes whole networks---between two endpoints that have agreed to trust each other.
+
+This chapter does three things. First, it nails down precisely what a tunnel is, and the threat model: what a VPN protects, what it leaks anyway, and the popular fictions sold under the word ``privacy.'' Second, it works through the three families that matter in practice---IPsec (the old, sprawling, standards-body design), WireGuard (the modern minimal design built on the Noise protocol and Curve25519), and TLS-based VPNs (OpenVPN and friends). Third, it shows you concrete failure modes: a downgrade, a replay, a key-reuse catastrophe, and the difference between encrypting a packet and hiding that you sent it.
+
+\chapterline
+
+\section{What a tunnel actually is}
+\label{ch30:tunnel}
+
+Start with the bare mechanism, no crypto yet. A packet on the Internet has a destination address in its header, and routers along the way read that address to forward it. A \emph{tunnel} is the trick of taking a whole packet---header and all---and stuffing it inside the payload of \emph{another} packet addressed somewhere else. The outer packet travels to that somewhere-else, which unwraps it and releases the inner packet onto a different network. This is called \emph{encapsulation}.
+
+\begin{intuitionbox}
+Think of mailing a sealed envelope inside another envelope. The inner envelope says ``To Bob, Apartment 4, Internal Mailroom.'' The post office never sees that; it only reads the outer envelope, ``To the Mailroom Building, 5th Avenue.'' The mailroom opens the outer envelope and drops the inner one into Bob's slot. The public postal system routed a letter to an address it could not itself deliver to, by wrapping it in one it could.
+
+A VPN is exactly this, plus the inner envelope is encrypted and sealed so the postal workers cannot read it or forge it.
+\end{intuitionbox}
+
+Concretely, suppose Alice's laptop has private address \texttt{10.0.0.7} on her company's network, and the company gateway sits at public address \texttt{203.0.113.9}. Alice is at a coffee shop with public address \texttt{198.51.100.4}. When Alice's machine wants to reach the internal server \texttt{10.0.0.50}, it builds an inner IP packet:
+
+\begin{center}
+\ttfamily src=10.0.0.7\quad dst=10.0.0.50\quad [TCP payload]
+\end{center}
+
+The VPN software encrypts that entire inner packet, then wraps it in an outer packet the coffee-shop router can actually deliver:
+
+\begin{center}
+\ttfamily src=198.51.100.4\quad dst=203.0.113.9\quad [ENCRYPTED inner packet]
+\end{center}
+
+\begin{center}
+\begin{tikzpicture}[font=\small,>=Stealth,node distance=4mm]
+\node[draw,rounded corners,fill=blue!4,minimum width=2.4cm,minimum height=1cm,align=center] (alice) {Alice laptop\\\ttfamily 10.0.0.7};
+\node[draw,fill=gray!8,right=22mm of alice,minimum height=1cm,align=center] (net) {coffee-shop\\Wi-Fi + ISP\\\textit{(untrusted)}};
+\node[draw,rounded corners,fill=green!4,right=22mm of net,minimum width=2.4cm,minimum height=1cm,align=center] (gw) {Gateway\\\ttfamily 203.0.113.9};
+\node[draw,rounded corners,fill=green!6,right=14mm of gw,minimum height=1cm,align=center] (srv) {Server\\\ttfamily 10.0.0.50};
+\draw[->] (alice) -- node[above,align=center]{\scriptsize outer pkt\\\scriptsize \{enc inner\}} (net);
+\draw[->] (net) -- node[above,align=center]{\scriptsize same\\\scriptsize ciphertext} (gw);
+\draw[->] (gw) -- node[above,align=center]{\scriptsize decrypted\\\scriptsize inner pkt} (srv);
+\end{tikzpicture}
+\end{center}
+
+Two design dimensions fall out of this picture, and they recur in every VPN technology:
+
+\begin{itemize}
+\item \textbf{Tunnel mode vs.\ transport mode.} In \emph{tunnel mode} you encapsulate the entire inner IP packet (header included), as above; the endpoints can be gateways protecting whole subnets. In \emph{transport mode} you keep the original IP header and only protect the payload; this is for two hosts talking directly, with no address translation. Tunnel mode is what people mean by ``VPN''; transport mode is a host-to-host special case.
+\item \textbf{Site-to-site vs.\ remote-access.} A \emph{site-to-site} VPN joins two networks (the New York office and the London office) so machines on each see the other as local. A \emph{remote-access} VPN connects one roaming device (Alice's laptop) into a network. The crypto is the same; the routing and address assignment differ.
+\end{itemize}
+
+\begin{focusbox}
+A VPN is two ideas glued together: (1) \emph{encapsulation}, a pure networking trick that re-routes packets through a chosen endpoint, and (2) \emph{authenticated encryption} of the encapsulated payload, the cryptographic trick that makes the channel private and tamper-evident. Strip away the crypto and you still have a tunnel---an unprotected one, like GRE or plain IP-in-IP. Strip away the encapsulation and you have ordinary transport security like TLS on a single connection. The word ``VPN'' is the union.
+\end{focusbox}
+
+\section{The threat model, stated precisely}
+\label{ch30:threat}
+
+Before any protocol, pin down who Eve is and what she can do. This is where most public confusion about VPNs lives, so we will be pedantic.
+
+\textbf{The channel adversary.} The classic VPN adversary is a Dolev--Yao network attacker who controls the path between Alice and the gateway: she sees every outer packet, can drop, reorder, replay, and inject packets, and can read and rewrite anything not cryptographically protected. This is the coffee-shop Wi-Fi snoop, the malicious ISP, the airport router, the nation-state tapping a backbone link. Against \emph{this} adversary a good VPN delivers a lot.
+
+\begin{formalbox}
+A VPN tunnel should provide, for the encapsulated traffic, the same guarantees as a secure channel:
+\begin{itemize}
+\item \textbf{Confidentiality.} Eve learns nothing about inner-packet contents beyond length and timing.
+\item \textbf{Integrity / authenticity.} Eve cannot forge or modify an inner packet that the receiver will accept; every accepted packet was sent by the holder of the key.
+\item \textbf{Replay resistance.} Eve cannot resubmit a previously valid packet and have it accepted as fresh.
+\item \textbf{Forward secrecy} (for good designs). Compromise of long-term keys today does not decrypt traffic Eve recorded yesterday.
+\end{itemize}
+We will hold every scheme below up to this list.
+\end{formalbox}
+
+Now the part the marketing leaves out. A VPN moves the trust boundary; it does not abolish it.
+
+\begin{trapbox}
+\textbf{What a VPN does \emph{not} protect.}
+\begin{itemize}
+\item \textbf{The endpoints.} Everything is plaintext at Alice's laptop and at the gateway. Malware on either end sees it all. The gateway operator (your employer, or a commercial ``VPN provider'') sees every site you visit, because the tunnel \emph{terminates there} and your traffic exits onto the real Internet from that point. You did not become anonymous; you swapped ``my ISP can see me'' for ``my VPN provider can see me.''
+\item \textbf{Traffic metadata.} Eve still sees that Alice's IP is sending a steady stream of encrypted packets to \texttt{203.0.113.9}, how many, how big, and when. Packet \emph{lengths} and \emph{timing} leak: a VPN does not hide that you are on a video call, and often not even which site you loaded (see traffic analysis below).
+\item \textbf{What the server logs.} The destination web server sees the gateway's IP, not Alice's---good for hiding her home IP---but it still sets cookies, fingerprints her browser, and logs her login. ``The website cannot identify me because I used a VPN'' is false the moment she signs in.
+\item \textbf{DNS, unless you are careful.} If name resolution leaks outside the tunnel (the infamous \emph{DNS leak}), Eve learns every hostname even though the traffic is encrypted.
+\item \textbf{The existence of the tunnel.} Encryption hides contents, not the fact that you are running a VPN. A censor can often detect and block VPN traffic by its fingerprint even without breaking it.
+\end{itemize}
+\end{trapbox}
+
+\begin{applicationbox}
+The one-line summary for the public: a VPN \emph{relocates} your traffic's exit point and \emph{protects the first hop}. That is genuinely useful---on hostile Wi-Fi, against a snooping local network, to reach a corporate intranet, or to make your traffic appear to originate elsewhere. It is not anonymity (use Tor for that, and understand its limits too), and ``no-logs'' is a legal and operational claim about a company, not a cryptographic guarantee you can verify. Several providers advertising ``military-grade encryption'' and ``total anonymity'' have, when subpoenaed, produced exactly the logs they swore they did not keep.
+\end{applicationbox}
+
+\begin{historybox}
+The first widely deployed tunneling protocol, Microsoft's PPTP (1996), used MS-CHAPv2 for authentication and a stream cipher (RC4) for confidentiality with the user's password hash mixed into the key. It is comprehensively broken: MS-CHAPv2 reduces to a single DES key recoverable by brute force (Marlinspike and Hulton, 2012, turned it into a guaranteed crack via a cloud service), and the RC4 keystream was reused across packets in a way that leaks plaintext. PPTP is a museum piece and a cautionary tale: a VPN is only as strong as its weakest primitive, and bolting a fast cipher onto a weak authenticated key exchange buys you nothing.
+\end{historybox}
+
+\section{IPsec: the standards-body design}
+\label{ch30:ipsec}
+
+IPsec is the IETF's answer to ``encrypt IP itself.'' It is not one protocol but a suite, and its sprawl is legendary---negotiable algorithms, two key-exchange protocol versions, multiple modes. We will extract the usable core.
+
+IPsec has two data-plane protocols and a control-plane protocol:
+
+\begin{itemize}
+\item \textbf{AH (Authentication Header)} authenticates a packet but does not encrypt it. Almost nobody uses AH today; it conflicts badly with NAT (it authenticates parts of the outer header that NAT rewrites). We mention it and move on.
+\item \textbf{ESP (Encapsulating Security Payload)} is the workhorse: it encrypts \emph{and} authenticates the payload. This is what carries your data.
+\item \textbf{IKE (Internet Key Exchange)} is the handshake that authenticates the peers and derives the keys ESP uses. IKEv2 (RFC 7296) is the modern version; use it, not IKEv1.
+\end{itemize}
+
+\subsection{ESP: the data plane}
+
+A modern ESP packet in tunnel mode, using an AEAD cipher (AES-GCM is the standard choice), looks like this:
+
+\begin{center}
+\begin{tikzpicture}[font=\footnotesize,>=Stealth]
+\def\h{0.85cm}
+\foreach \x/\w/\lbl/\col in {
+  0/2.0/{New IP hdr\\(outer)}/gray!12,
+  2.0/2.4/{ESP hdr:\\SPI \(\concat\) seq}/blue!10,
+  4.4/1.6/{IV / nonce}/orange!12,
+  6.0/4.0/{Encrypted:\\inner IP pkt + pad + next-hdr}/green!12,
+  10.0/2.0/{ICV (auth tag)}/red!10}{
+  \draw[fill=\col] (\x,0) rectangle (\x+\w,\h);
+  \node[align=center] at (\x+\w/2,\h/2) {\lbl};
+}
+\draw[decorate,decoration={brace,amplitude=5pt,mirror},red!60!black] (4.4,-0.15) -- (12,-0.15)
+  node[midway,below=4pt,red!60!black]{\scriptsize covered by integrity check (authenticated)};
+\draw[decorate,decoration={brace,amplitude=5pt},green!50!black] (6.0,\h+0.1) -- (10.0,\h+0.1)
+  node[midway,above=3pt,green!50!black]{\scriptsize encrypted};
+\end{tikzpicture}
+\end{center}
+
+Two header fields earn their keep:
+
+\begin{itemize}
+\item The \textbf{SPI (Security Parameter Index)} is a 32-bit tag that names \emph{which} security association---which set of keys and algorithms---this packet belongs to. The receiver may hold many tunnels at once; the SPI tells it which keys to grab. It is a lookup index, not a secret.
+\item The \textbf{sequence number} is a monotonically increasing 32-bit (or 64-bit, extended) counter. The sender increments it per packet; the receiver tracks a sliding window of recently seen numbers and rejects duplicates or anything too old. This is the anti-replay mechanism.
+\end{itemize}
+
+\begin{whybox}
+\textbf{Why ESP-with-AEAD is secure (as a channel).} ESP with AES-GCM is, packet by packet, just authenticated encryption with associated data. The plaintext is the inner IP packet plus padding plus a ``next header'' byte; the associated data is the ESP header (SPI and sequence number); the nonce is derived from the sequence number. Under the standard AEAD security definition, an adversary without the key cannot (a) distinguish the ciphertext of two equal-length inner packets, giving confidentiality, nor (b) produce any new (header, ciphertext, tag) triple the receiver accepts except with negligible probability, giving integrity. The sequence number, fed into the integrity check and checked against the replay window, upgrades per-packet integrity to \emph{stream} integrity: Eve cannot replay, reorder undetectably, or splice.
+
+The single most important rule: \textbf{the GCM nonce must never repeat under one key.} Because the nonce is built from the per-packet sequence number and the sequence number strictly increases, it never repeats \emph{within} a security association---which is exactly why IKE must rekey before the counter wraps. Repeat a GCM nonce and you leak the XOR of two plaintexts and, far worse, you leak the GHASH authentication key, letting Eve forge arbitrary packets. We will see this failure concretely below.
+\end{whybox}
+
+\subsection{IKE: the control plane}
+
+ESP needs keys. IKE is a Diffie--Hellman handshake that authenticates both peers and produces a shared secret, from which all the ESP keys are derived. IKEv2 runs in two exchanges:
+
+\begin{enumerate}
+\item \textbf{IKE\_SA\_INIT.} The peers do an (anonymous) Diffie--Hellman exchange and negotiate algorithms. After this exchange they share a secret but have not yet proven who they are.
+\item \textbf{IKE\_AUTH.} Under the encryption keys from step 1, each peer proves its identity---by a pre-shared key (PSK), an RSA/ECDSA signature, or EAP---and they set up the first ESP security association.
+\end{enumerate}
+
+\begin{center}
+\begin{tikzpicture}[font=\small,>=Stealth]
+\node (a) at (0,3.2) {\textbf{Alice (initiator)}};
+\node (b) at (8,3.2) {\textbf{Gateway (responder)}};
+\draw[very thick,aliceblue] (0,-0.4) -- (0,3);
+\draw[very thick,bobgreen] (8,-0.4) -- (8,3);
+\draw[->] (0,2.7) -- node[above,font=\scriptsize]{$\mathrm{SA}_i,\ g^a,\ n_i$ \ (proposals + DH share + nonce)} (8,2.7);
+\draw[->] (8,2.1) -- node[above,font=\scriptsize]{$\mathrm{SA}_r,\ g^b,\ n_r$} (0,2.1);
+\node[font=\scriptsize,align=center] at (4,1.55) {now both know $g^{ab}$;\ derive $\mathrm{SK}$ keys via PRF};
+\draw[->] (0,1.05) -- node[above,font=\scriptsize]{$\{\,\mathrm{ID}_i,\ \mathrm{AUTH}_i,\ \mathrm{SA}_2,\ \mathrm{TS}\,\}_{\mathrm{SK}}$} (8,1.05);
+\draw[->] (8,0.45) -- node[above,font=\scriptsize]{$\{\,\mathrm{ID}_r,\ \mathrm{AUTH}_r,\ \mathrm{SA}_2,\ \mathrm{TS}\,\}_{\mathrm{SK}}$} (0,0.45);
+\node[font=\scriptsize] at (4,-0.1) {child SA established; ESP traffic flows};
+\end{tikzpicture}
+\end{center}
+
+The shared secret \(g^{ab}\) is fed into a PRF (an HMAC, typically) together with the nonces to derive a key tree: \(\mathrm{SK}_d\) (for deriving child SA keys), \(\mathrm{SK}_{ai}, \mathrm{SK}_{ar}\) (integrity, each direction), \(\mathrm{SK}_{ei}, \mathrm{SK}_{er}\) (encryption, each direction), and \(\mathrm{SK}_{pi}, \mathrm{SK}_{pr}\) (for the AUTH payload). Because the DH exponents \(a,b\) are ephemeral and discarded after the handshake, IKEv2 gives \textbf{forward secrecy}: recording the traffic and later stealing the PSK or signing key does not recover \(g^{ab}\).
+
+The AUTH payload is where identity binds to the handshake. Each side signs (or MACs, under the PSK) a transcript of the messages it sent and the other's nonce. This is the same trick TLS uses: by signing the transcript, a peer proves both ``I am who I claim'' and ``I saw exactly these handshake messages,'' which defeats a man-in-the-middle who tried to substitute her own DH share.
+
+\begin{implementbox}
+\textbf{The IKEv2 key schedule, with toy numbers.} The whole tree hangs off one seed value \(\mathrm{SKEYSEED} = \mathrm{PRF}(n_i \concat n_r,\ g^{ab})\)---the nonces key the PRF, the DH secret is the message. From \(\mathrm{SKEYSEED}\), IKEv2 runs \(\mathrm{PRF+}\), a counter-mode expansion that chains the PRF to produce as many key bytes as the negotiated algorithms need:
+\[
+\mathrm{PRF{+}}(K, S) = T_1 \concat T_2 \concat T_3 \concat \cdots,\quad
+T_1 = \mathrm{PRF}(K, S \concat \texttt{0x01}),\
+T_{j+1} = \mathrm{PRF}(K,\ T_j \concat S \concat (j{+}1)).
+\]
+The output stream is sliced, in fixed order, into \(\mathrm{SK}_d \concat \mathrm{SK}_{ai}\concat \mathrm{SK}_{ar}\concat \mathrm{SK}_{ei}\concat \mathrm{SK}_{er}\concat \mathrm{SK}_{pi}\concat \mathrm{SK}_{pr}\). Suppose (absurdly small, for illustration) the PRF were a function returning one byte and we needed three one-byte keys \(\mathrm{SK}_d,\mathrm{SK}_{ai},\mathrm{SK}_{ar}\). With \(\mathrm{SKEYSEED}=K\) and seed \(S = n_i\concat n_r\concat \mathrm{SPI}_i\concat \mathrm{SPI}_r\):
+\begin{itemize}
+\item \(T_1 = \mathrm{PRF}(K, S\concat \texttt{01})\) becomes \(\mathrm{SK}_d\),
+\item \(T_2 = \mathrm{PRF}(K, T_1\concat S\concat \texttt{02})\) becomes \(\mathrm{SK}_{ai}\),
+\item \(T_3 = \mathrm{PRF}(K, T_2\concat S\concat \texttt{03})\) becomes \(\mathrm{SK}_{ar}\).
+\end{itemize}
+The chaining (\(T_2\) depends on \(T_1\)) means you cannot compute a later key without the earlier ones, and every key depends on both nonces, both SPIs, and the DH secret. Two properties fall out for free: distinct directions get distinct keys (so a packet captured in one direction can never be replayed into the other---they verify under different \(\mathrm{SK}_a\)), and re-running the same handshake with fresh nonces yields a completely independent key tree even if \(g^{ab}\) somehow repeated.
+\end{implementbox}
+
+\subsection{Rekeying, dead peers, and roaming}
+
+A long-lived tunnel cannot ride one key forever. Two clocks force a rekey. The first is the AEAD data limit: as the ESP sequence number climbs toward wrap, the GCM nonce would eventually repeat (see the nonce-reuse catastrophe below), so IKEv2 negotiates a \emph{child SA} rekey---a fresh Diffie--Hellman (\(\mathrm{CREATE\_CHILD\_SA}\) with a new DH group) that installs new ESP keys and retires the old SPI. The second is simply policy: rekey every hour, or every few gigabytes, whichever comes first. Because each rekey can carry its own ephemeral DH, forward secrecy is renewed continuously---an attacker who compromises today's session keys learns nothing about the segment of traffic before the last rekey.
+
+Two operational pieces round out IKEv2 in the field:
+
+\begin{itemize}
+\item \textbf{Dead Peer Detection (DPD).} Either side periodically sends an encrypted, acknowledged ``are you there?'' (an informational exchange). Silence past a threshold tears down the SA, freeing state and prompting a reconnect. Without it, a gateway leaks memory to half-open tunnels whose clients vanished.
+\item \textbf{MOBIKE (RFC 4555).} The mobility extension lets an established SA survive a change of the client's outer IP address. When Alice's phone hops from Wi-Fi to LTE, MOBIKE updates the SA's endpoint address \emph{without} a new handshake---the keys are unchanged, only the routing of the outer packet moves. This is why IKEv2 is the default ``always-on'' phone VPN: the tunnel does not drop every time the radio changes.
+\end{itemize}
+
+\begin{whybox}
+\textbf{Why the man-in-the-middle fails.} Suppose Mallory sits between Alice and the gateway and swaps in her own DH shares, so she shares \(g^{a m'}\) with Alice and \(g^{m b}\) with the gateway. She can decrypt and re-encrypt the encrypted handshake messages. But IKE\_AUTH requires each party to authenticate a transcript that \emph{includes the DH share the other party actually sent}. The gateway signs over the value it received; Alice expects a signature over the value \emph{she} sent. Mallory cannot produce the gateway's signature over Alice's original share (she lacks the gateway's signing key), and she cannot make Alice's share equal the one she forwarded without breaking DH. The AUTH check fails on at least one side and the tunnel never forms. Authentication of the key exchange is the whole game; an unauthenticated DH is wide open to exactly this.
+\end{whybox}
+
+\begin{attackbox}
+\textbf{Aggressive mode and offline PSK cracking (IKEv1).} The older IKEv1 had a ``main mode'' and a faster ``aggressive mode.'' Aggressive mode with a pre-shared key sends a hash of the PSK \emph{before} the channel is encrypted, and---worse---an attacker can simply \emph{ask} a misconfigured responder for it by initiating a handshake. The captured hash \(H = \mathrm{PRF}(\text{PSK},\ g^{a}\concat g^{b}\concat \cdots)\) is then a target for an offline dictionary attack: guess a PSK, recompute \(H\), compare. Tools like \texttt{ike-scan} plus \texttt{psk-crack} automate this. The lessons: never use IKEv1 aggressive mode with a guessable PSK; prefer certificate authentication; and remember that ``it is encrypted'' says nothing if the secret is a human-chosen password exposed to offline guessing.
+\end{attackbox}
+
+\begin{attackbox}
+\textbf{Logjam and weak DH groups.} IKE negotiates a Diffie--Hellman group. Several IPsec deployments offered 768- or 1024-bit groups, and crucially many used the \emph{same} standardized prime. The Logjam work (2015) showed that the expensive number-field-sieve precomputation for discrete log can be done \emph{once per prime}, after which individual exchanges fall quickly. A 1024-bit standard group is within reach of a nation-state budget; the authors argued this plausibly explained bulk IPsec decryption in leaked intelligence slides. Fix: use 2048-bit groups or, better, elliptic-curve groups (Curve25519, P-256), and do not all share one prime. This is the same Logjam that hit TLS---the lesson transfers wholesale because the math is identical.
+\end{attackbox}
+
+\section{WireGuard: the minimal modern design}
+\label{ch30:wireguard}
+
+If IPsec is a Swiss Army knife with forty blades and three safety recalls, WireGuard (Jason Donenfeld, 2016) is a single very sharp blade. It fits in a few thousand lines of kernel code, has \emph{no} algorithm negotiation, and is built directly on the Noise protocol framework. The design philosophy is: pick good primitives, hard-code them, and make misconfiguration nearly impossible.
+
+The fixed cipher suite, no negotiation:
+\begin{itemize}
+\item \textbf{Curve25519} for the Diffie--Hellman key exchange (Chapter on ECC).
+\item \textbf{ChaCha20-Poly1305} for authenticated encryption of data packets (Chapter on AEAD).
+\item \textbf{BLAKE2s} for hashing and as the HMAC core in key derivation.
+\item \textbf{HKDF} (over BLAKE2s) to derive session keys.
+\end{itemize}
+
+\begin{intuitionbox}
+Algorithm negotiation is where protocols go to die. Every ``which cipher shall we use?'' message is a downgrade opportunity for an attacker and a configuration mistake waiting to happen (recall the historybox on PPTP and the attackbox on Logjam---both are negotiation failures). WireGuard's answer is to delete the question. There is exactly one cipher suite. If it is ever broken, you ship a new protocol version, not a new negotiated option. This is ``cryptographic agility considered harmful,'' and for a tunnel it is the right call.
+\end{intuitionbox}
+
+\subsection{Identity is a public key}
+
+In WireGuard there are no certificates, no usernames, no PKI. A peer \emph{is} its Curve25519 static public key. You configure your own private key and a list of peers, each pinned to its public key and the IP ranges (\texttt{AllowedIPs}) it is permitted to use. This is the SSH \texttt{authorized\_keys} model, applied to a network tunnel: trust is a list of public keys you typed in, not a chain you validate.
+
+\subsection{The handshake: Noise IK}
+
+WireGuard's handshake is the \textbf{Noise\_IK} pattern. The names encode the situation: \emph{I} = the initiator's static key is \emph{Immediately} transmitted (encrypted), \emph{K} = the responder's static key is \emph{Known} to the initiator in advance (you configured it). Because the responder's key is known up front, the initiator can encrypt to it from the very first message---no round trip wasted establishing who the responder is.
+
+A Noise handshake threads every key through a running hash and a chaining key. Let me write the core with small notation. Each party has a static keypair \((s, S=g^{s})\) and generates an ephemeral keypair \((e, E=g^{e})\) per handshake (\(g\) is the Curve25519 base point; \(g^{x}\) means scalar multiplication). Write \(\mathrm{DH}(x, Y) = Y^{x}\) for the shared point. The handshake performs a sequence of DH operations and mixes each result into a chaining key \(C\) via HKDF:
+
+\begin{center}
+\begin{tikzpicture}[font=\small,>=Stealth]
+\node (a) at (0,2.7) {\textbf{Initiator} (knows $S_r$)};
+\node (b) at (8.4,2.7) {\textbf{Responder}};
+\draw[very thick,aliceblue] (0,-1.1) -- (0,2.5);
+\draw[very thick,bobgreen] (8.4,-1.1) -- (8.4,2.5);
+\draw[->] (0,2.0) -- node[above,font=\scriptsize,align=center]{msg1: $E_i$, \ enc($S_i$), \ enc(timestamp)} (8.4,2.0);
+\node[font=\scriptsize,align=left,anchor=west] at (0.1,1.45)
+  {\scriptsize mixes: $\mathrm{DH}(e_i,S_r),\ \mathrm{DH}(s_i,S_r)$};
+\draw[->] (8.4,0.85) -- node[above,font=\scriptsize,align=center]{msg2: $E_r$, \ enc(empty)} (0,0.85);
+\node[font=\scriptsize,align=right,anchor=east] at (8.3,0.3)
+  {\scriptsize mixes: $\mathrm{DH}(e_r,E_i),\ \mathrm{DH}(e_r,S_i)$};
+\node[font=\scriptsize] at (4.2,-0.4) {both derive sending/receiving keys $T_{i\to r},\,T_{r\to i}$};
+\node[font=\scriptsize] at (4.2,-0.85) {data packets: ChaCha20-Poly1305 with 64-bit counter nonce};
+\end{tikzpicture}
+\end{center}
+
+The chaining key absorbs four DH outputs across the two messages: ephemeral--static, static--static, ephemeral--ephemeral, and ephemeral--static the other way. The mix of \emph{both} ephemerals gives forward secrecy; the mix of \emph{both} statics gives mutual authentication. Because each side proves it can compute DH with the other's static key, identity is bound to the handshake without a single signature.
+
+\begin{whybox}
+\textbf{Why mixing DH outputs authenticates without signatures.} The final session key is a hash of all four DH results. The responder can compute \(\mathrm{DH}(s_r, S_i) = \mathrm{DH}(s_i, S_r)\) only if it holds \(s_r\); the initiator includes that term by computing \(\mathrm{DH}(s_i, S_r)\). If Mallory does not know \(s_r\), she cannot compute the static--static term, so she derives a different key and her data packets fail Poly1305 verification. The ephemeral--ephemeral term \(\mathrm{DH}(e_i,e_r)\) requires at least one fresh secret she does not have, giving forward secrecy: even if she later steals \(s_i\) and \(s_r\), the ephemerals \(e_i,e_r\) were discarded, so recorded sessions stay closed. It is the same logic as authenticated DH in IKE, but accomplished purely by \emph{which keys you DH together}, with no transcript signature at all.
+\end{whybox}
+
+\begin{whybox}
+\textbf{Identity hiding and the stealth design.} The initiator's static public key \(S_i\) is encrypted in message 1 (under a key derived from \(\mathrm{DH}(e_i, S_r)\)), so a passive eavesdropper does not learn who is connecting---only the responder, who can decrypt it, does. Furthermore WireGuard does not reply to unauthenticated packets: if the first DH-derived MAC does not check out, the server is silent, as if no service were listening. This makes a WireGuard endpoint hard to discover by scanning---an attacker who does not already know a valid peer key gets no response at all.
+\end{whybox}
+
+\begin{walkbox}
+Trace which of the four DH outputs each party can compute, and \emph{when}, to see that the key is bound to both identities. Label the secrets: the initiator holds \(e_i, s_i\) and knows \(S_r\); the responder holds \(e_r, s_r\) and (after decrypting msg1) learns \(S_i\).
+\begin{itemize}
+\item \(\mathrm{DH}(e_i, S_r) = \mathrm{DH}(s_r, E_i)\): the initiator computes it from \(e_i, S_r\) at send time; the responder computes the equal value from \(s_r, E_i\) on receipt. This is the key that \emph{encrypts \(S_i\)} in msg1, so only the holder of \(s_r\) can unwrap the initiator's identity---identity hiding.
+\item \(\mathrm{DH}(s_i, S_r) = \mathrm{DH}(s_r, S_i)\): the static--static term. The responder can match it only with \(s_r\); the initiator only with \(s_i\). Folding it into the chaining key means a correct final key proves \emph{both} long-term identities---mutual authentication.
+\item \(\mathrm{DH}(e_r, E_i) = \mathrm{DH}(e_i, E_r)\): the ephemeral--ephemeral term. Neither long-term key appears, so even total static-key compromise later cannot reconstruct it---forward secrecy.
+\item \(\mathrm{DH}(e_r, S_i) = \mathrm{DH}(s_i, E_r)\): binds the responder's fresh ephemeral to the initiator's identity, completing the responder's confidence that it is talking to \(S_i\) and not a replay.
+\end{itemize}
+A man-in-the-middle who lacks \(s_r\) is stuck at the very first term: she cannot decrypt \(S_i\), and even if she guessed it she cannot produce the static--static term, so her derived key diverges and every subsequent message fails Poly1305. No signature was used anywhere; \emph{which keys you DH together} carries the entire authentication argument.
+\end{walkbox}
+
+\begin{attackbox}
+\textbf{Handshake floods and the cookie reply.} A naive responder that ran a Curve25519 scalar multiply for every msg1 it received would be a denial-of-service target: an attacker spraying forged msg1 packets from spoofed source addresses could pin the CPU doing DH for garbage. WireGuard defends with two MACs on each handshake packet. \(\mathrm{mac1}\) is keyed by the responder's \emph{public} key, so only someone who knows whom they are dialing can form a packet worth examining---this silences internet background scans cheaply. Under active load the responder switches on \(\mathrm{mac2}\): it replies with a \emph{cookie} (an encrypted token bound to the sender's source IP), and refuses to do the expensive DH until a subsequent packet echoes a valid \(\mathrm{mac2}\) computed from that cookie. Because the cookie is tied to the source address, an attacker spoofing addresses cannot collect valid cookies, and the responder spends real CPU only on peers that have proven they can receive at their claimed address. It is the same anti-DoS idea as a TCP SYN cookie, lifted into the handshake's MAC structure.
+\end{attackbox}
+
+\subsection{The data plane and the counter nonce}
+
+After the handshake each direction has a symmetric key \(T\) and a 64-bit counter \(N\) starting at zero. A data packet is
+
+\[
+\texttt{type}\concat \texttt{receiver\_index}\concat N \concat \underbrace{\text{ChaCha20Poly1305}_{T}(N,\ \text{inner packet})}_{\text{ciphertext} \concat \text{16-byte tag}}.
+\]
+
+The nonce for ChaCha20-Poly1305 is simply the counter \(N\), incremented once per packet and never reset within a session. No randomness, no negotiation: the counter cannot repeat because it only goes up, and WireGuard rekeys (a fresh handshake every two minutes of use, by default) long before a 64-bit counter could wrap. The receiver uses a sliding window, exactly like IPsec's anti-replay, to reject duplicates and stale packets while tolerating reordering.
+
+\begin{connectionbox}
+The counter-nonce discipline here is the practical face of a theorem from the AEAD chapter: ChaCha20-Poly1305 (like AES-GCM) is secure \emph{only} as a nonce-respecting AEAD. Reuse a \((\text{key}, \text{nonce})\) pair and Poly1305's one-time-MAC structure collapses---the polynomial evaluation key becomes recoverable, and forgeries follow. WireGuard's ``counter that only increases, plus frequent rekeying'' is the engineering that guarantees the theorem's hypothesis. The cost of a single DH and one HKDF every two minutes is the price of never having to think about nonce reuse again. See also the modular-exponentiation cost discussion in the companion algorithms book: a Curve25519 scalar multiply is a few hundred microseconds, cheap enough to rekey constantly.
+\end{connectionbox}
+
+\begin{implementbox}
+A toy sketch of the WireGuard \emph{data-plane} transform (NOT the handshake), to make the counter-nonce idea concrete. This is for learning only---it skips the handshake, key derivation, replay window, framing, and timing-attack hardening that a real implementation needs. Never use it for anything real.
+
+\begin{lstlisting}[language=Python]
+# LEARNING TOY -- not secure, not real WireGuard. Do not deploy.
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+import struct
+
+class ToyTunnel:
+    def __init__(self, send_key, recv_key):
+        self.s = ChaCha20Poly1305(send_key)   # one key per direction
+        self.r = ChaCha20Poly1305(recv_key)
+        self.send_ctr = 0
+        self.recv_seen = set()                 # toy replay check
+
+    def seal(self, inner_packet):
+        n = self.send_ctr
+        self.send_ctr += 1                      # counter ONLY goes up
+        nonce = struct.pack('<Q', n) + b'\x00\x00\x00\x00'  # 12-byte nonce
+        ct = self.s.encrypt(nonce, inner_packet, None)
+        return struct.pack('<Q', n) + ct        # send counter in the clear
+
+    def open(self, wire):
+        n = struct.unpack('<Q', wire[:8])[0]
+        if n in self.recv_seen:                 # reject replays
+            raise ValueError("replay!")
+        nonce = struct.pack('<Q', n) + b'\x00\x00\x00\x00'
+        pt = self.r.decrypt(nonce, wire[8:], None)  # raises if tag bad
+        self.recv_seen.add(n)
+        return pt
+\end{lstlisting}
+
+The whole point is the line \texttt{self.send\_ctr += 1}: the nonce is a monotonic counter, so a \((\text{key},\text{nonce})\) pair never repeats. The real protocol replaces \texttt{recv\_seen} (which grows forever) with a fixed-size sliding bitmap window, and replaces the two hard-coded keys with the output of the Noise handshake.
+\end{implementbox}
+
+\begin{applicationbox}
+WireGuard is now in the mainline Linux kernel (since 5.6), and consumer ``VPN apps'' increasingly use it (sometimes under their own branding, e.g.\ NordLynx, Tailscale, Mullvad). Its statelessness is a feature: a roaming phone that changes networks just sends from a new address, and the server updates the peer's endpoint on the next authenticated packet---no reconnection dance. The flip side: because a peer's endpoint is whatever address last sent a valid packet, and there is no built-in dynamic IP assignment or DNS push, products layer their own control plane on top (Tailscale's coordination server, for instance, distributes keys and \texttt{AllowedIPs} so users never hand-edit configs).
+\end{applicationbox}
+
+\section{A worked nonce-reuse catastrophe}
+\label{ch30:noncereuse}
+
+The single most important crypto rule in any of these tunnels is ``never reuse a nonce under one key.'' Let me show, with tiny numbers, exactly why a VPN that violates it is not merely weakened but \emph{forgeable}.
+
+Both ChaCha20-Poly1305 and AES-GCM are stream-cipher-plus-polynomial-MAC constructions. The cipher produces a keystream \(Z\) depending only on \((\text{key}, \text{nonce})\); the ciphertext is \(C = P \xor Z\). The tag is a polynomial in the ciphertext evaluated at a secret point.
+
+\textbf{Step 1: two plaintexts under one nonce leak their XOR.} Suppose a buggy VPN encrypts two packets \(P_1, P_2\) under the same key and same nonce. Then
+\[
+C_1 \xor C_2 = (P_1 \xor Z)\xor(P_2 \xor Z) = P_1 \xor P_2 .
+\]
+The keystream cancels. With tiny 1-byte plaintexts: say \(P_1 = \texttt{0x48}\) (`H'), \(P_2=\texttt{0x69}\) (`i'), and the keystream byte is \(Z=\texttt{0xAC}\). Then \(C_1 = \texttt{0x48}\xor\texttt{0xAC}=\texttt{0xE4}\) and \(C_2=\texttt{0x69}\xor\texttt{0xAC}=\texttt{0xC5}\). Eve never learns \(Z\), but \(C_1\xor C_2=\texttt{0xE4}\xor\texttt{0xC5}=\texttt{0x21}=\texttt{0x48}\xor\texttt{0x69}\). Knowing one plaintext (packets are full of known headers) hands her the other.
+
+\textbf{Step 2: nonce reuse leaks the \emph{authentication} key, which is the real disaster.} Poly1305 computes a tag as the evaluation of a polynomial whose coefficients are the ciphertext blocks, at a secret point \(r\), in a prime field \(\F_p\) with \(p = 2^{130}-5\):
+\[
+\mathrm{tag} = \Big(\sum_{i} c_i\, r^{\,k-i} \Big) + s \pmod p,
+\]
+where \(r\) and the one-time pad \(s\) are derived from \((\text{key},\text{nonce})\). The crucial fact: \(r\) and \(s\) are \emph{fixed by the nonce}. If two messages share a nonce, they share the same \(r\) and \(s\). Subtracting their two tag equations \emph{cancels} the unknown \(s\) and leaves a polynomial equation in the single unknown \(r\):
+\[
+\mathrm{tag}_1 - \mathrm{tag}_2 = \Big(\textstyle\sum c^{(1)}_i r^{k-i} - \sum c^{(2)}_i r^{k-i}\Big) \pmod p .
+\]
+Everything but \(r\) is known (Eve sees the ciphertexts and tags). She solves this polynomial for its roots over \(\F_p\) (a handful of candidates), recovering \(r\). With \(r\) known she can compute \(s\) for that nonce from either equation, and now she can produce a \emph{valid tag for any ciphertext she likes}. The tunnel's integrity is gone: she forges packets at will.
+
+\begin{intuitionbox}
+A miniature of the same algebra over \(\F_{17}\). Imagine a one-block ``tag'' \( \mathrm{tag} = c\cdot r + s \pmod{17}\). One observation is useless: one equation, two unknowns \((r,s)\). But two messages reusing the nonce share \(r,s\):
+\[
+\mathrm{tag}_1 = c_1 r + s,\qquad \mathrm{tag}_2 = c_2 r + s \pmod{17}.
+\]
+Subtract: \(\mathrm{tag}_1-\mathrm{tag}_2 = (c_1-c_2)\,r\), so \(r = (\mathrm{tag}_1-\mathrm{tag}_2)(c_1-c_2)^{-1}\). Concretely with \(c_1=5, c_2=2, \mathrm{tag}_1=14, \mathrm{tag}_2=8\): \(r = (14-8)\cdot(5-2)^{-1} = 6\cdot 3^{-1}\). Since \(3\cdot 6 = 18 \equiv 1\), \(3^{-1}=6\), so \(r = 6\cdot 6 = 36 \equiv 2 \pmod{17}\). Then \(s = \mathrm{tag}_1 - c_1 r = 14 - 10 = 4\). Eve now has \((r,s)=(2,4)\) and forges the tag for \emph{any} \(c\): for \(c=9\), \(\mathrm{tag}=9\cdot 2 + 4 = 22 \equiv 5\). Two reused nonces turned a secret MAC into an open book. This is precisely why every tunnel in this chapter is fanatical about nonce uniqueness.
+\end{intuitionbox}
+
+\begin{attackbox}
+This is not hypothetical. The 2016 ``Nonce-Disrespecting Adversaries'' survey scanned the Internet for IPsec and TLS endpoints that repeated AES-GCM nonces (usually from a broken random nonce generator or a counter that reset on reboot) and found real, exploitable hosts whose GHASH authentication key could be recovered exactly as above. The mitigations are structural: derive the nonce from a counter that physically cannot repeat (WireGuard, modern ESP), and rekey before it wraps. ``Use a random nonce'' is the dangerous option---a 96-bit random nonce collides by the birthday bound after about \(2^{48}\) packets, which a busy gateway reaches in hours.
+\end{attackbox}
+
+\begin{connectionbox}
+That \(2^{48}\)-packet figure is the birthday bound from the probability companion: drawing 96-bit nonces uniformly, the chance of a collision crosses \(1/2\) near \(\sqrt{2^{96}} = 2^{48}\) draws. It is the same calculation that sets safe data limits for a single key and that underlies hash-collision attacks. A tunnel's rekey interval is, at bottom, a birthday-bound budget.
+\end{connectionbox}
+
+\section{TLS-based VPNs}
+\label{ch30:tlsvpn}
+
+The third family wraps the tunnel inside TLS instead of inventing its own record layer. OpenVPN is the canonical example; ``SSL VPN'' web portals and protocols like AnyConnect are cousins.
+
+The idea: open a TLS connection from client to gateway (the chapter on TLS gives you the handshake and record layer for free), then run the encapsulated IP packets \emph{through} that connection. TLS already provides authenticated encryption, forward secrecy (with ephemeral DH), certificate-based authentication, and a battle-tested handshake; the VPN just has to move packets across it.
+
+OpenVPN actually uses \emph{two} channels: a TLS \emph{control} channel that does the handshake and key negotiation, and a \emph{data} channel that carries the tunneled packets under keys derived from the TLS session. Historically the data channel could run over UDP (lower latency, no head-of-line blocking) with its own packet format, or over TCP.
+
+\begin{trapbox}
+\textbf{TCP-in-TCP meltdown.} Running OpenVPN over TCP, and then carrying a TCP connection inside the tunnel, stacks one reliable-retransmit loop inside another. When the outer TCP slows down and retransmits, the inner TCP \emph{also} thinks packets were lost and retransmits, and the two timers fight each other---throughput collapses under loss. The standard advice is to tunnel over UDP and let the inner TCP do its own congestion control. This is a networking pitfall, not a crypto one, but it is the first thing that bites people who reach for ``TLS VPN = TCP'' by reflex.
+\end{trapbox}
+
+\begin{intuitionbox}
+Why would anyone wrap a VPN in TLS when WireGuard exists? \textbf{Censorship resistance and firewall traversal.} TLS over port 443 looks exactly like ordinary HTTPS web traffic. A restrictive network that blocks WireGuard's recognizable handshake or IKE's UDP ports often cannot block a connection that is indistinguishable from someone reading the news over HTTPS---blocking it would block the whole web. This is why ``stealth'' VPN modes almost always mean ``make it look like TLS to a web server.'' The price is the overhead and complexity of TLS, and the TCP-in-TCP trap above when UDP is also blocked.
+\end{intuitionbox}
+
+\begin{applicationbox}
+The split in practice: \textbf{WireGuard} when you control both ends and want speed and simplicity (site-to-site, Tailscale-style mesh, a personal VPN to your home). \textbf{IPsec/IKEv2} where you need interoperability with enterprise gear, OS-native clients (it is built into Windows, macOS, iOS), and certificate-based auth at scale; IKEv2's quick reconnection (MOBIKE) makes it the default ``always-on'' phone VPN. \textbf{TLS-based (OpenVPN)} where you must punch through hostile firewalls by masquerading as HTTPS, or need its mature ecosystem of clients. None is strictly best; the threat model and the network you must cross decide.
+\end{applicationbox}
+
+\section{What a VPN leaks even when the crypto is perfect}
+\label{ch30:trafficanalysis}
+
+Suppose every primitive is flawless: AEAD with fresh nonces, authenticated forward-secret key exchange, no implementation bugs. Eve \emph{still} sees the outer packets---their sizes, counts, and timing---and that side channel is rich.
+
+\begin{attackbox}
+\textbf{Website fingerprinting.} Loading a web page generates a characteristic burst pattern: a small request, then a sequence of responses whose sizes reflect the page's resources. Even fully encrypted and padded into the tunnel, the \emph{sequence of packet sizes and inter-arrival times} forms a fingerprint. A classifier trained on a closed set of sites can identify which of them you visited through the VPN with accuracy that has been reported above 90\% in lab conditions. The tunnel hid the bytes; it did not hide the shape of the traffic. Defenses (constant-rate padding, traffic shaping) cost bandwidth and latency, which is why most VPNs do not deploy them---and why VPN \(\neq\) anonymity.
+\end{attackbox}
+
+\begin{attackbox}
+\textbf{The DNS leak and the kill-switch gap.} Two classic operational failures. (1) If the OS resolves hostnames using a configured DNS server \emph{outside} the tunnel, every site name you visit travels in cleartext to that resolver even though the page traffic is encrypted---Eve reads your browsing history from the DNS alone. Fix: route DNS through the tunnel and use the gateway's resolver. (2) If the VPN drops (handshake re-key fails, Wi-Fi flaps) and traffic silently falls back to the raw interface, you leak your real IP and plaintext until it reconnects. The fix is a \emph{kill switch}: a firewall rule that forbids any traffic except through the tunnel, so a dropped VPN means no connectivity rather than a silent leak. These are configuration bugs, not crypto bugs, and they account for most real-world VPN privacy failures.
+\end{attackbox}
+
+\begin{walkbox}
+You are on an airport network. You connect a correctly configured WireGuard tunnel to your home server and browse. Walk through what the airport's network operator can and cannot learn.
+
+\emph{Cannot:} the contents of any page, the hostnames you visit (DNS goes through the tunnel), which inner services you reach, or modify/inject anything (Poly1305 rejects tampering).
+
+\emph{Can:} that your device is running WireGuard (the packet format and port are recognizable), the IP of your home server, the total volume and timing of your traffic, when you are active, and---via website fingerprinting on packet sizes/timing---a guess at which sites you loaded from a known set. If you log into your bank inside the tunnel, the bank still knows it is you; the tunnel only hides you from the airport, not from the destination.
+\end{walkbox}
+
+\section{Putting the families side by side}
+\label{ch30:comparison}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}p{2.6cm}p{3.3cm}p{3.3cm}p{3.3cm}@{}}
+\toprule
+& \textbf{IPsec / IKEv2} & \textbf{WireGuard} & \textbf{TLS VPN (OpenVPN)} \\
+\midrule
+Key exchange & IKEv2, neg.\ DH groups & Noise\_IK, Curve25519 only & TLS handshake (ECDHE) \\
+Data AEAD & ESP, AES-GCM (neg.) & ChaCha20-Poly1305 only & TLS record / data channel \\
+Auth model & PSK, X.509 certs, EAP & pinned public keys & X.509 certs (+ optional tls-auth) \\
+Negotiation & extensive (attack surface) & none & cipher suites (TLS) \\
+Forward secrecy & yes (ephemeral DH) & yes (ephemeral DH) & yes (ECDHE) \\
+Nonce discipline & seq.\ number, then rekey & counter, rekey $\sim$2\,min & TLS sequence numbers \\
+Firewall stealth & poor (known ports) & poor (known format) & strong (looks like HTTPS) \\
+Code size & very large & tiny ($\sim$4k LoC) & large (OpenSSL + glue) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{connectionbox}
+\textbf{The store-now-decrypt-later clock.} Every design here rests on Diffie--Hellman---X25519, P-256, or a finite-field group. A large quantum computer running Shor's algorithm breaks all of them, recovering \(g^{ab}\) from the public shares. The forward secrecy that protects against \emph{stolen keys} does \emph{not} protect against this: an adversary recording ciphertext today can decrypt it once the machine exists, because the DH transcript needed to recover the session key is right there in the recording. This is why both IPsec and WireGuard are gaining \emph{hybrid} key exchange: run the classical DH and a post-quantum KEM (e.g.\ ML-KEM/Kyber) side by side and feed \emph{both} shared secrets into the key-derivation PRF. The session stays secure as long as \emph{either} primitive holds, so a quantum break of DH alone no longer exposes the traffic. WireGuard's fixed-suite philosophy makes this a version bump, not a negotiation; IKEv2 already has an RFC (8784/9370) for mixing in a post-quantum or pre-shared secret. The migration is driven entirely by the recording-today threat, not by any quantum computer existing yet.
+\end{connectionbox}
+
+\begin{recoverybox}
+Three ideas to carry out of this chapter. (1) A VPN = encapsulation (a routing trick) + authenticated encryption (the crypto), and it moves the trust boundary to the gateway rather than erasing it. (2) Every family solves the \emph{same} cryptographic problem---authenticated, forward-secret key exchange feeding a nonce-respecting AEAD---and their differences are about negotiation, identity, and how they cross networks, not about secrecy guarantees. (3) The reliable failures are at the seams: weak or negotiated parameters (Logjam), nonce reuse (forgeable AEAD), and leaks outside the tunnel (DNS, kill-switch, traffic analysis). The cipher is rarely the weak point; the plumbing around it is.
+\end{recoverybox}
+
+\section{Exercises}
+\label{ch30:exercises}
+
+\begin{exercise}[Encapsulation by hand]
+Alice's laptop (\texttt{10.0.0.7}) on a coffee-shop network (her public IP \texttt{198.51.100.4}) tunnels to a gateway at \texttt{203.0.113.9} to reach internal server \texttt{10.0.0.50}. Write out the source and destination addresses of (a) the inner packet and (b) the outer packet, for a request \emph{and} for the reply. Which addresses can the coffee-shop router see, and which are hidden inside the ciphertext?
+\end{exercise}
+
+\begin{exercise}[Threat-model true/false]
+For a correctly configured remote-access VPN, mark each claim true or false and justify in one sentence: (a) ``My ISP cannot see which websites I visit.'' (b) ``The websites I visit cannot tell who I am.'' (c) ``My VPN provider cannot see my traffic.'' (d) ``An attacker on the same Wi-Fi cannot modify my packets.'' (e) ``Nobody can tell I am using a VPN.''
+\end{exercise}
+
+\begin{exercise}[Recover the Poly1305-style key]
+A toy authenticator computes \(\mathrm{tag} = c_1 r + s \pmod{23}\) for a single ciphertext block \(c_1\), with secret \((r,s)\) fixed by the nonce. Two messages reuse the nonce: \((c_1, \mathrm{tag}) = (4, 19)\) and \((c_1,\mathrm{tag})=(9, 7)\). Recover \(r\) and \(s\), then forge a valid tag for \(c_1 = 15\). (Hint: subtract the equations; you will need an inverse mod 23.)
+\end{exercise}
+
+\begin{exercise}[Why the counter, not randomness]
+WireGuard uses a strictly increasing 64-bit counter as its ChaCha20-Poly1305 nonce, while a naive design might draw a random 96-bit nonce per packet. (a) Using the birthday bound, estimate after how many packets a uniform 96-bit nonce has a noticeable chance of repeating. (b) Explain why a 64-bit counter that never resets and is rekeyed every two minutes is strictly safer than the random scheme. (c) What event, in the random scheme, makes nonce reuse near-certain after a reboot?
+\end{exercise}
+
+\begin{exercise}[Authenticated DH defeats Mallory]
+In IKEv2, Mallory sits in the middle and substitutes her own DH share toward each side. Explain precisely which message lets the legitimate peers detect her, and what secret Mallory would need to forge it. Then explain why an \emph{unauthenticated} Diffie--Hellman tunnel (no AUTH payload, no signature) gives Mallory a working man-in-the-middle.
+\end{exercise}
+
+\begin{exercise}[Noise IK without signatures]
+WireGuard's handshake mixes four Diffie--Hellman outputs into the session key: \(\mathrm{DH}(e_i,S_r)\), \(\mathrm{DH}(s_i,S_r)\), \(\mathrm{DH}(e_r,E_i)\), \(\mathrm{DH}(e_r,S_i)\). For each, state whether it primarily contributes \emph{forward secrecy}, \emph{authentication of the initiator}, \emph{authentication of the responder}, or \emph{identity hiding}, and explain why. Then argue why no digital signature is needed.
+\end{exercise}
+
+\begin{exercise}[Logjam arithmetic]
+A weak IPsec deployment uses a fixed 1024-bit Diffie--Hellman prime shared across thousands of endpoints. Explain why the number-field-sieve cost structure (an expensive per-\emph{prime} precomputation, then a cheap per-\emph{connection} solve) makes a shared prime far more dangerous than a unique prime per endpoint of the same size. What two concrete fixes remove the problem?
+\end{exercise}
+
+\begin{exercise}[Detect the nonce-reuse host]
+You are auditing a gateway that encrypts ESP packets with AES-GCM using a 96-bit nonce drawn from a pseudorandom generator that is \emph{not} reseeded after reboot. (a) Describe an observation you could make purely from captured ciphertext that reveals two packets reused a nonce. (b) Once you have such a pair, sketch the steps to recover the GHASH authentication key and forge a packet. (c) Name the structural fix.
+\end{exercise}
+
+\begin{exercise}[TCP-in-TCP]
+Explain, in terms of retransmission timers and congestion control, why tunneling a TCP connection over an OpenVPN-on-TCP link degrades badly under packet loss, while OpenVPN-on-UDP does not. Is this a cryptographic weakness? Why or why not?
+\end{exercise}
+
+\begin{exercise}[Design a kill switch]
+Write (in prose or pseudo-firewall rules) a kill-switch policy that guarantees no application traffic ever leaves the machine except through the VPN tunnel interface, while still permitting the handshake packets needed to (re)establish the tunnel to the gateway's public IP. Explain how your rules behave at three moments: before the tunnel is up, while it is up, and at the instant it drops.
+\end{exercise}
+
+\begin{exercise}[Traffic-analysis budget]
+A privacy tool wants to defeat website fingerprinting by padding all traffic to a constant rate of \(R\) bytes per second regardless of activity. (a) Why does this defeat size/timing fingerprinting? (b) Express the bandwidth overhead for a user whose genuine average rate is \(r < R\). (c) Explain why most commercial VPNs do not do this, and what that implies about equating ``VPN'' with ``anonymity.''
+\end{exercise}
+
+\begin{exercise}[The IKEv2 key tree]
+IKEv2 derives all keys from \(\mathrm{SKEYSEED} = \mathrm{PRF}(n_i\concat n_r,\ g^{ab})\) and then expands with \(\mathrm{PRF{+}}\), slicing the stream in the fixed order \(\mathrm{SK}_d, \mathrm{SK}_{ai}, \mathrm{SK}_{ar}, \mathrm{SK}_{ei}, \mathrm{SK}_{er}, \dots\). (a) Why does feeding the nonces into the PRF (rather than only \(g^{ab}\)) matter, given that a repeated DH value is at least conceivable? (b) Why are the integrity keys for the two directions, \(\mathrm{SK}_{ai}\) and \(\mathrm{SK}_{ar}\), deliberately different? (c) The expansion is a \emph{chain}: \(T_{j+1}\) depends on \(T_j\). What property would be lost if each \(T_j\) were instead computed independently as \(\mathrm{PRF}(K, S\concat j)\)?
+\end{exercise}
+
+\begin{exercise}[Rekeying and forward secrecy]
+A site-to-site IPsec tunnel rekeys its child SA every hour using \(\mathrm{CREATE\_CHILD\_SA}\) with a fresh ephemeral Diffie--Hellman exchange. An attacker records all ciphertext and, at 14:30, fully compromises the gateway and extracts its current session keys. (a) Which recorded traffic can the attacker now decrypt, and which stays protected? (b) How would the answer change if the rekey carried \emph{no} new DH and instead derived the next keys from \(\mathrm{SK}_d\) of the current SA? (c) What does this tell you about the difference between ``rekeying'' and ``forward secrecy''?
+\end{exercise}
+
+\begin{exercise}[Cookie-reply DoS defense]
+WireGuard's responder will not perform the expensive Curve25519 operation for an incoming handshake until the sender has echoed a valid \(\mathrm{mac2}\) cookie tied to its source IP. (a) Explain how this stops an attacker who floods msg1 packets with \emph{spoofed} source addresses. (b) Why does the cheaper \(\mathrm{mac1}\) (keyed by the responder's public key) not by itself stop a flood from an attacker who \emph{does} know the responder's public key? (c) Compare this to a TCP SYN cookie: what is the analogous ``proof of return reachability''?
+\end{exercise}
+
+\begin{exercise}[Store now, decrypt later]
+A surveillance agency records, but cannot yet break, the Diffie--Hellman handshakes of a heavily used WireGuard deployment. (a) Explain why classical forward secrecy does \emph{not} protect this traffic against a future quantum computer, even though the ephemeral keys were discarded. (b) A hybrid handshake mixes both an X25519 secret and an ML-KEM secret into the key-derivation PRF. Why does the session stay secure if \emph{only one} of the two is later broken? (c) Why is WireGuard's no-negotiation design an advantage rather than an obstacle when rolling out such a change?
+\end{exercise}
