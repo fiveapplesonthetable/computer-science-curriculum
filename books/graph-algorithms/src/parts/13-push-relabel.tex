@@ -1,0 +1,580 @@
+\chapter{Push-Relabel and Modern Max-Flow}
+
+The augmenting-path family of max-flow algorithms -- Ford--Fulkerson, Edmonds--Karp, Dinic -- all share one organizing idea: keep a \emph{valid} flow at all times, and repeatedly push more of it from source to sink along whole augmenting paths in the residual graph. Every intermediate object the algorithm holds is a feasible flow; the algorithm walks uphill in flow value until no augmenting path remains, and min-cut duality certifies optimality.
+
+Push-relabel, invented by Goldberg and Tarjan in 1986, throws out the path discipline. It maintains an object that is \emph{not} a flow -- a \emph{preflow}, in which a vertex may temporarily receive more than it sends out -- and it moves flow one edge at a time, governed by a system of vertex \emph{heights} that act like potential energy. Flow only ever runs downhill. When the dust settles, the excess that could not reach the sink drains back to the source, the preflow becomes a flow, and that flow is maximum. The payoff is a family of algorithms that hit $\Oh(V^2\sqrt{E})$ and $\Oh(V^3)$ time without ever computing a shortest path, and that are, in practice, the fastest general-purpose max-flow codes for most inputs.
+
+This chapter builds the paradigm from the ground up: the local push and relabel operations, the height function and what it really measures, the generic $\Oh(V^2E)$ bound, then the FIFO and highest-label selection rules that bring it down to $\Oh(V^3)$ and $\Oh(V^2\sqrt{E})$, the gap heuristic that makes it fly, and finally a tour of why these methods dominate empirically and how the 2022 almost-linear-time algorithm changes the theoretical landscape.
+
+\chapterline
+
+\section{Preflows: dropping conservation}
+\label{ch13:preflows}
+
+Fix a flow network: a directed graph $\Gph=(V,E)$ with a source $s$, a sink $t$, and a nonnegative integer capacity $c(u,v)$ on every ordered pair, where $c(u,v)=0$ for non-edges. We use the standard antisymmetric convention for flows: a function $f:V\times V\to\R$ is a \emph{flow} if it obeys capacity ($f(u,v)\le c(u,v)$), skew symmetry ($f(u,v)=-f(v,u)$), and conservation ($\sum_v f(u,v)=0$ for $u\notin\set{s,t}$).
+
+A \emph{preflow} keeps the first two and relaxes the third in one direction only.
+
+\begin{definition}[Preflow]
+\label{ch13:def-preflow}
+A function $f:V\times V\to\R$ is a \emph{preflow} if it satisfies capacity and skew symmetry, and for every vertex $u\in V\setminus\set{s}$ the \emph{excess}
+\[
+  e(u) \;=\; \sum_{v\in V} f(v,u) \;=\; (\text{flow in}) - (\text{flow out}) \;\ge\; 0.
+\]
+A vertex $u\notin\set{s,t}$ with $e(u)>0$ is called \emph{active}.
+\end{definition}
+
+So a preflow lets flow pile up at interior vertices, but never lets a vertex leak out more than came in. The whole game is to discharge that excess: push it onward toward $t$, or, for whatever cannot get there, push it back toward $s$. A preflow with \emph{no} active vertices is exactly a flow, and at that moment $e(t)$ equals the flow value $\abs{f}$.
+
+\begin{intuitionbox}
+Think of the network as a system of pipes laid on a hillside, and think of $e(u)$ as a puddle of water standing at junction $u$. Water only flows downhill. Push-relabel keeps raising junctions (relabeling) so that some downhill pipe opens up, then lets the puddle slosh down it (pushing). Junctions near $s$ end up high, junctions near $t$ stay low, and water finds its way to the sink. When no puddle can move, the water has settled into a maximum flow, and any water that got stranded behind a ridge runs back down to the source.
+\end{intuitionbox}
+
+The residual graph is exactly as in the augmenting-path world. The residual capacity is $c_f(u,v)=c(u,v)-f(u,v)$, and the residual graph $\Gph_f$ contains every edge $(u,v)$ with $c_f(u,v)>0$. A residual edge $(u,v)$ either has slack on a forward capacity edge or represents flow on $(v,u)$ that we are allowed to cancel.
+
+\section{Heights and the two operations}
+\label{ch13:heights}
+
+The engine has exactly two moves. To control them we attach to every vertex a \emph{height} (also called a label or distance label) $h:V\to\N$.
+
+\begin{definition}[Height function]
+\label{ch13:def-height}
+A function $h:V\to\N$ is a \emph{valid height function} for a preflow $f$ if
+\[
+  h(s)=\abs{V},\qquad h(t)=0,\qquad\text{and}\qquad h(u)\le h(v)+1\ \text{ for every residual edge } (u,v)\in\Gph_f.
+\]
+\end{definition}
+
+The constraint $h(u)\le h(v)+1$ is the heart of the method. It says heights drop by at most one as you cross any residual edge, so heights are a \emph{Lipschitz} function along $\Gph_f$. Two consequences fall out immediately and we use them constantly:
+
+\begin{itemize}
+  \item If $h(u)>h(v)+1$ then $(u,v)\notin\Gph_f$, i.e. the edge is saturated (no residual capacity). A steep downhill drop cannot exist.
+  \item There is never a residual path from $s$ to $t$. Walk any \emph{simple} residual path $s=u_0,u_1,\dots,u_k=t$. Each step drops height by at most one, so $h(s)\le h(t)+k=k$. But $h(s)=\abs{V}$, forcing $k\ge\abs{V}$, impossible for a simple path on $\abs{V}$ vertices, which has at most $\abs{V}-1$ edges.
+\end{itemize}
+
+That second bullet is the punchline of the whole approach: \emph{as long as a valid height function exists, there is no augmenting path.} So if we can drive the preflow to an actual flow while keeping heights valid, that flow is automatically maximum.
+
+\subsection*{Push}
+
+Excess at $u$ can move to a neighbor $v$ only if (a) there is residual capacity on $(u,v)$, and (b) $v$ is strictly lower, $h(u)=h(v)+1$. Water runs downhill, and the validity constraint guarantees the only downhill residual edges are exactly the ones one step down.
+
+\begin{algorithm}[H]
+\caption{$\textsc{Push}(u,v)$ -- applies when $e(u)>0$, $c_f(u,v)>0$, $h(u)=h(v)+1$}
+\label{ch13:alg-push}
+\DontPrintSemicolon
+$\delta \gets \min\bigl(e(u),\, c_f(u,v)\bigr)$\;
+$f(u,v) \gets f(u,v) + \delta$\;
+$f(v,u) \gets f(v,u) - \delta$ \tcp*{maintain skew symmetry}
+$e(u) \gets e(u) - \delta$\;
+$e(v) \gets e(v) + \delta$\;
+\end{algorithm}
+
+We call the push \emph{saturating} if $\delta=c_f(u,v)$ (the edge leaves $\Gph_f$ afterward) and \emph{nonsaturating} otherwise (then $e(u)$ becomes $0$, so $u$ goes inactive). This distinction drives the entire complexity analysis.
+
+\subsection*{Relabel}
+
+An active vertex $u$ with no admissible downhill edge is stuck: it has excess to get rid of but every residual neighbor is at least as high. We lift it just high enough to open one edge.
+
+\begin{algorithm}[H]
+\caption{$\textsc{Relabel}(u)$ -- applies when $e(u)>0$ and $h(u)\le h(v)$ for all $(u,v)\in\Gph_f$}
+\label{ch13:alg-relabel}
+\DontPrintSemicolon
+$h(u) \gets 1 + \min\set{\, h(v) : (u,v)\in\Gph_f \,}$\;
+\end{algorithm}
+
+The minimum is over residual neighbors of $u$. Because $u$ is active, it has positive excess; that excess arrived from somewhere, so $u$ has at least one residual edge (the reverse of an edge that delivered flow), and the minimum is well defined. The new height is the smallest value that creates an admissible edge while keeping $h$ valid.
+
+\begin{definition}[Admissible edge]
+\label{ch13:def-admissible}
+A residual edge $(u,v)\in\Gph_f$ is \emph{admissible} if $h(u)=h(v)+1$. $\textsc{Push}$ acts only on admissible edges; $\textsc{Relabel}$ fires exactly when no admissible edge leaves $u$.
+\end{definition}
+
+\section{The generic algorithm}
+\label{ch13:generic}
+
+Initialize, then repeat any applicable operation until none applies.
+
+\begin{algorithm}[H]
+\caption{$\textsc{GenericPushRelabel}(G,s,t)$}
+\label{ch13:alg-generic}
+\DontPrintSemicolon
+\ForEach{$u\in V$}{$h(u)\gets 0$;\quad $e(u)\gets 0$}
+$h(s)\gets \abs{V}$\;
+\ForEach{edge $(s,v)\in E$}{
+  $f(s,v)\gets c(s,v)$;\quad $f(v,s)\gets -c(s,v)$\;
+  $e(v)\gets c(s,v)$;\quad $e(s)\gets e(s)-c(s,v)$ \tcp*{saturate every source edge}
+}
+\While{some operation \textsc{Push} or \textsc{Relabel} applies}{
+  select an active vertex $u$ and apply $\textsc{Push}(u,\cdot)$ if admissible, else $\textsc{Relabel}(u)$\;
+}
+\Return $f$\;
+\end{algorithm}
+
+The initialization is deliberate and not optional. Saturating every edge out of $s$ floods the neighbors of $s$ with excess; setting $h(s)=\abs{V}$ both satisfies the height constraint (since all source edges are now saturated, the constraint $h(s)\le h(v)+1$ has no residual edge to apply to) and guarantees no $s$--$t$ residual path forever after. The source can never be relabeled, because by convention $s$ is never placed in the active set; its height stays pinned at $\abs{V}$.
+
+\begin{intuitionbox}
+The opening move dumps a huge amount of water at $s$'s neighbors and sets $s$ on a mountaintop of height $\abs{V}$. From there everything is downhill toward $t$ at height $0$. The main loop is just: find a puddle, push it one step downhill if you can, otherwise raise the junction until you can. Eventually the only puddles left are ones trapped behind the source's mountain; relabeling lifts \emph{them} above $\abs{V}$ too, and they drain back to $s$.
+\end{intuitionbox}
+
+\subsection{Correctness}
+\label{ch13:correctness}
+
+We prove three things: the loop maintains the invariants (preflow $+$ valid heights), it terminates, and on termination the preflow is a maximum flow.
+
+\begin{lemma}[Invariant maintenance]
+\label{ch13:lem-invariants}
+Throughout \textsc{GenericPushRelabel}, $f$ is a preflow and $h$ is a valid height function for $f$. Moreover heights never decrease.
+\end{lemma}
+
+\begin{proof}
+After initialization $f$ is a preflow: every $u\ne s$ either is a saturated source-neighbor with $e(u)=c(s,u)\ge0$ or has $e(u)=0$. The height $h$ is valid: $h(s)=\abs{V}$, $h(t)=0$, and the only vertex with nonzero height initially is $s$, whose outgoing residual edges were all saturated away, so no constraint $h(s)\le h(v)+1$ is active.
+
+$\textsc{Push}(u,v)$ moves $\delta\le e(u)$ units, so $e(u)$ stays $\ge0$ and $e(v)$ only grows: still a preflow. It can create the new residual edge $(v,u)$. Validity of that new edge needs $h(v)\le h(u)+1$; but the push required $h(u)=h(v)+1$, so $h(v)=h(u)-1\le h(u)+1$. Other edges are unaffected (pushes only delete edges or use existing valid ones), so $h$ stays valid.
+
+$\textsc{Relabel}(u)$ does not touch $f$, so the preflow property is untouched. It sets $h(u)=1+\min_v\set{h(v):(u,v)\in\Gph_f}$. For every residual edge $(u,v)$ we now have $h(u)\le h(v)+1$ by the choice of minimum. For every residual edge \emph{into} $u$, say $(w,u)$, raising $h(u)$ only makes $h(w)\le h(u)+1$ easier to satisfy. And relabel only fires when $h(u)\le h(v)$ for all residual neighbors, so the new height strictly exceeds the old: heights never decrease.
+\end{proof}
+
+\begin{lemma}[Heights stay bounded]
+\label{ch13:lem-height-bound}
+At all times, every vertex has $h(u)\le 2\abs{V}-1$.
+\end{lemma}
+
+\begin{proof}
+A vertex is relabeled only while active, i.e. $e(u)>0$. We use the fact (Exercise~\ref{ch13:ex-path-to-source}) that \emph{if $u$ is active then there is a residual path from $u$ back to $s$ in $\Gph_f$}. Running a flow-decomposition argument on the preflow, any unit of excess at $u$ can be traced back along edges carrying positive flow, and the reverse of each such edge is residual; hence a residual $u\!\to\!s$ path exists, and we may take it simple. Along it heights drop by at most $1$ per step over at most $\abs{V}-1$ edges, so $h(u)\le h(s)+(\abs{V}-1)=2\abs{V}-1$. A relabel raises $h(u)$ to one more than a residual neighbor's height, and that neighbor obeys the same bound, so no height ever exceeds $2\abs{V}-1$.
+\end{proof}
+
+\begin{theorem}[Correctness of generic push-relabel]
+\label{ch13:thm-correct}
+If \textsc{GenericPushRelabel} terminates, the preflow it returns is a maximum flow.
+\end{theorem}
+
+\begin{proof}
+On termination no operation applies, so no vertex in $V\setminus\set{s,t}$ is active: $e(u)=0$ for all interior $u$, which is exactly conservation. So $f$ is a flow. By Lemma~\ref{ch13:lem-invariants} a valid height function exists, and we showed in Section~\ref{ch13:heights} that a valid height function precludes any residual $s$--$t$ path. By max-flow min-cut (no augmenting path $\Rightarrow$ optimal), $f$ is a maximum flow. Concretely, let $S=\set{u:h(u)\ge\abs{V}}$ and $T=V\setminus S$; then $s\in S$, $t\in T$, and every edge crossing from $S$ to $T$ is saturated while every edge from $T$ to $S$ carries zero flow, so $(S,T)$ is a minimum cut certifying optimality.
+\end{proof}
+
+That leaves termination, which we get for free once we bound the number of operations -- the same bounds that give the running time.
+
+\section{Counting the operations: the generic bound}
+\label{ch13:generic-bound}
+
+Three counts: relabels, saturating pushes, nonsaturating pushes.
+
+\begin{lemma}[Relabel count]
+\label{ch13:lem-relabel-count}
+Each vertex is relabeled at most $2\abs{V}-1$ times, so the total number of relabels is at most $(2\abs{V}-1)(\abs{V}-2)<2\abs{V}^2$, and the time spent relabeling is $\Oh(V E)$.
+\end{lemma}
+
+\begin{proof}
+Each relabel of $u$ strictly increases $h(u)$ (Lemma~\ref{ch13:lem-invariants}), and $h(u)\le 2\abs{V}-1$ (Lemma~\ref{ch13:lem-height-bound}), with only $V\setminus\set{s,t}$ ever relabeled. Each $\textsc{Relabel}(u)$ scans $u$'s residual edges in time $\Oh(\deg u)$; summing $\deg u$ over $\Oh(V)$ relabels per vertex gives $\Oh(V)\cdot\sum_u\deg u=\Oh(VE)$.
+\end{proof}
+
+\begin{lemma}[Saturating push count]
+\label{ch13:lem-satpush}
+The number of saturating pushes is at most $\abs{V}\abs{E}$, i.e. $\Oh(VE)$.
+\end{lemma}
+
+\begin{proof}
+Consider a fixed edge $(u,v)$. A saturating push on it requires $h(u)=h(v)+1$ and erases $(u,v)$ from $\Gph_f$. For it to be pushable again we first need a push on $(v,u)$, which requires $h(v)=h(u)+1$ -- so $h(v)$ must have risen by at least $2$ in between, hence $h(u)$ must rise by at least $2$ before the next saturating push on $(u,v)$. Since heights range in $[0,2\abs{V}-1]$, each edge sees at most $\abs{V}$ saturating pushes. Summing over the $\Oh(E)$ residual edges (both orientations of each pair) gives $\Oh(VE)$.
+\end{proof}
+
+\begin{lemma}[Nonsaturating push count, generic rule]
+\label{ch13:lem-nonsatpush}
+With arbitrary selection, the number of nonsaturating pushes is $\Oh(V^2E)$.
+\end{lemma}
+
+\begin{proof}
+Use the potential $\Phi=\sum_{u\ \text{active}} h(u)$. Initially $\Phi=0$ (active vertices have height $0$), and $\Phi\ge0$ always. A \emph{nonsaturating} push on $(u,v)$ drives $e(u)$ to $0$, so $u$ leaves the active set, dropping $\Phi$ by $h(u)$; it may activate $v$, raising $\Phi$ by $h(v)=h(u)-1$. Net change $\le -1$: every nonsaturating push decreases $\Phi$ by at least one.
+
+What can \emph{increase} $\Phi$? A relabel of $u$ raises $\Phi$ by the increment in $h(u)$; total relabel increase is at most $\sum_u (2\abs{V}-1)=\Oh(V^2)$. A saturating push on $(u,v)$ can newly activate $v$, raising $\Phi$ by $h(v)\le 2\abs{V}-1$; total saturating increase is $\Oh(VE)\cdot\Oh(V)=\Oh(V^2E)$. Since $\Phi$ starts and ends at $0$ and each nonsaturating push costs it $\ge1$, the number of nonsaturating pushes is at most the total increase, $\Oh(V^2)+\Oh(V^2E)=\Oh(V^2E)$.
+\end{proof}
+
+\begin{theorem}[Generic running time]
+\label{ch13:thm-generic-time}
+\textsc{GenericPushRelabel} performs $\Oh(V^2E)$ operations and runs in $\Oh(V^2E)$ time with the right data structures.
+\end{theorem}
+
+\begin{proof}
+Relabels $\Oh(V^2)$, saturating pushes $\Oh(VE)$, nonsaturating pushes $\Oh(V^2E)$; the last term dominates. Each push is $\Oh(1)$ work given a current-edge pointer (below); relabel work totals $\Oh(VE)$. Total $\Oh(V^2E)$. Finiteness of all three counts also proves termination.
+\end{proof}
+
+\begin{complexitybox}
+Generic push-relabel: $\Oh(V^2 E)$ time, $\Oh(E)$ space. The bottleneck is the $\Oh(V^2E)$ nonsaturating pushes. Both improved variants below attack precisely that term by choosing \emph{which} active vertex to discharge.
+\end{complexitybox}
+
+\subsection*{The current-edge data structure}
+
+Implementations never re-scan an edge list from scratch. Each vertex keeps a \emph{current-edge} pointer into its incident-edge list. To discharge $u$: examine the current edge; if admissible, push; if not, advance the pointer; if you run off the end, relabel $u$ and reset the pointer to the front. The cost of all pointer advances between two consecutive relabels of $u$ is $\Oh(\deg u)$, and there are $\Oh(V)$ relabels per vertex, so the amortized scanning cost folds into the $\Oh(VE)$ already accounted for. This $\textsc{Discharge}$ subroutine is the unit of work for the fast variants.
+
+\begin{algorithm}[H]
+\caption{$\textsc{Discharge}(u)$ -- push out all of $u$'s excess, relabeling as needed}
+\label{ch13:alg-discharge}
+\DontPrintSemicolon
+\While{$e(u)>0$}{
+  \uIf{\textnormal{current edge} $(u,v)$ \textnormal{is admissible}}{
+    $\textsc{Push}(u,v)$\;
+  }
+  \uElseIf{\textnormal{current edge is not the last}}{
+    advance $u$'s current-edge pointer\;
+  }
+  \Else{
+    $\textsc{Relabel}(u)$;\quad reset $u$'s current-edge pointer to the start\;
+  }
+}
+\end{algorithm}
+
+\paragraph{Storing the residual graph.} The standard representation stores edges in pairs. Each undirected edge slot holds a forward arc and its reverse, kept adjacent in an array so that the reverse of arc index $i$ is index $i\oplus 1$ (XOR with one). An arc records its head vertex and a single residual-capacity field $c_f$; a $\textsc{Push}$ of $\delta$ then does exactly two updates, $c_f[i]\mathrel{-}=\delta$ and $c_f[i\oplus1]\mathrel{+}=\delta$, and skew symmetry is automatic because the two fields always sum to the original capacity of the pair. There is no separate $f$ array at all in fast codes; the residual capacities \emph{are} the state, and the actual flow on an arc is recovered as original-capacity minus current residual. This is why the trap of ``forgetting the reverse edge'' is so easy to fall into and so total in its consequences: a single missing $c_f[i\oplus1]\mathrel{+}=\delta$ means flow can never be cancelled, and the algorithm silently computes the wrong answer.
+
+Each vertex stores the index of the first arc in its adjacency list and the current-edge pointer is just an integer offset into that list, so resetting it on relabel is a single assignment. The active set is a queue for FIFO and an array of buckets indexed by height for highest-label; in both cases insertion, removal, and the gap-heuristic's $\mathrm{cnt}$ updates are $\Oh(1)$.
+
+\section{A worked trace by hand}
+\label{ch13:trace}
+
+Run the algorithm with FIFO selection on a five-vertex network. Capacities are on the edges.
+
+\begin{center}
+\begin{tikzpicture}[>=Stealth,node distance=20mm,
+  vtx/.style={circle,draw,thick,minimum size=8mm,inner sep=0pt,font=\small},
+  caplbl/.style={font=\scriptsize,inner sep=1pt}]
+  \node[vtx,fill=sourceblue!20] (s) at (0,0) {$s$};
+  \node[vtx] (a) at (2.4,1.2) {$a$};
+  \node[vtx] (b) at (2.4,-1.2) {$b$};
+  \node[vtx] (c) at (4.8,1.2) {$c$};
+  \node[vtx,fill=targetgreen!25] (t) at (4.8,-1.2) {$t$};
+  \draw[->,thick] (s) -- node[caplbl,above left]{$3$} (a);
+  \draw[->,thick] (s) -- node[caplbl,below left]{$2$} (b);
+  \draw[->,thick] (a) -- node[caplbl,above]{$2$} (c);
+  \draw[->,thick] (a) -- node[caplbl,pos=0.4,right]{$1$} (b);
+  \draw[->,thick] (b) -- node[caplbl,below]{$3$} (t);
+  \draw[->,thick] (c) -- node[caplbl,right]{$2$} (t);
+\end{tikzpicture}
+\end{center}
+
+There are $\abs{V}=5$ vertices, so $h(s)=5$. Initialization saturates $s\!\to\!a$ ($\delta=3$) and $s\!\to\!b$ ($\delta=2$):
+\[
+  e(a)=3,\quad e(b)=2,\quad h=(s{:}5,\,a{:}0,\,b{:}0,\,c{:}0,\,t{:}0).
+\]
+The FIFO queue of active vertices is $[a,b]$. We discharge in queue order.
+
+\textbf{Discharge $a$.} $a$ has excess $3$, but all residual neighbors $c,b$ sit at height $0=h(a)$: no admissible edge. Relabel: residual neighbors of $a$ are $c$ ($h=0$), $b$ ($h=0$), and $s$ via the reverse edge ($h=5$); the minimum is $0$, so $h(a)\gets1$. Now $a\!\to\!c$ and $a\!\to\!b$ are admissible. Push to $c$: $\delta=\min(3,2)=2$, saturating; $e(a)=1$, $e(c)=2$. Push to $b$: $\delta=\min(1,1)=1$, saturating; $e(a)=0$, $e(b)=3$. $a$ is drained. Queue becomes $[b,c]$ ($b$ was already queued; $c$ newly active).
+
+\textbf{Discharge $b$.} $e(b)=3$, $h(b)=0$. Residual neighbors: $t$ ($h=0$), and reverse edges to $s$ ($h=5$) and $a$ ($h=1$). No admissible edge, so relabel: $\min(0,5,1)=0$, $h(b)\gets1$. Now $b\!\to\!t$ admissible. Push to $t$: $\delta=\min(3,3)=3$, saturating; $e(b)=0$, $e(t)=3$. $b$ drained. Queue $[c]$.
+
+\textbf{Discharge $c$.} $e(c)=2$, $h(c)=0$. Residual neighbors: $t$ ($h=0$), reverse to $a$ ($h=1$). Relabel: $\min(0,1)=0$, $h(c)\gets1$. Push $c\!\to\!t$: $\delta=\min(2,2)=2$, saturating; $e(c)=0$, $e(t)=5$. Queue empty.
+
+No active vertices remain. The preflow is now a flow of value $e(t)=5$. Heights are $(s{:}5,a{:}1,b{:}1,c{:}1,t{:}0)$.
+
+\begin{center}
+\begin{tikzpicture}[>=Stealth,
+  vtx/.style={circle,draw,thick,minimum size=9mm,inner sep=0pt,font=\small},
+  flw/.style={font=\scriptsize,inner sep=1pt}]
+  \node[vtx,fill=sourceblue!20] (s) at (0,0) {$s$};
+  \node[vtx] (a) at (2.6,1.2) {$a$};
+  \node[vtx] (b) at (2.6,-1.2) {$b$};
+  \node[vtx] (c) at (5.2,1.2) {$c$};
+  \node[vtx,fill=targetgreen!25] (t) at (5.2,-1.2) {$t$};
+  \node[font=\scriptsize] at (0,-0.95) {$h{=}5$};
+  \node[font=\scriptsize] at (2.6,2.0) {$h{=}1$};
+  \node[font=\scriptsize] at (2.6,-2.0) {$h{=}1$};
+  \node[font=\scriptsize] at (5.2,2.0) {$h{=}1$};
+  \node[font=\scriptsize] at (5.2,-2.0) {$h{=}0$};
+  \draw[->,thick,sourceblue] (s) -- node[flw,above left]{$3/3$} (a);
+  \draw[->,thick,sourceblue] (s) -- node[flw,below left]{$2/2$} (b);
+  \draw[->,thick,sourceblue] (a) -- node[flw,above]{$2/2$} (c);
+  \draw[->,thick,sourceblue] (a) -- node[flw,pos=0.4,right]{$1/1$} (b);
+  \draw[->,thick,sourceblue] (b) -- node[flw,below]{$3/3$} (t);
+  \draw[->,thick,sourceblue] (c) -- node[flw,right]{$2/2$} (t);
+\end{tikzpicture}
+\end{center}
+
+Every edge is saturated; value $5$. The min-cut is $\set{s}$ versus the rest, with capacity $c(s,a)+c(s,b)=5$. Max-flow min-cut confirms optimality.
+
+\begin{labbox}
+Re-run the same network but discharge in the order $b$ first, then $a$, then $c$. You should get the same flow value $5$ but a different sequence of pushes, and possibly different final heights -- the order changes the trace, never the optimum. Then change $c(s,a)$ from $3$ to $5$: now $a$ has excess $5$, but $a\!\to\!c\!\to\!t$ can only absorb $2$ and $a\!\to\!b\!\to\!t$ only $1$ more after $b$'s edge fills; the leftover $2$ units have nowhere to go but back to $s$. Watch $h(a)$ climb past $5$ so that $a$ can push the trapped excess back up to the source. This is the ``drain back'' phase, and tracing it is the best way to feel why heights can exceed $\abs{V}$.
+\end{labbox}
+
+\subsection{A trace with drain-back}
+\label{ch13:trace-drain}
+
+The first trace was too tidy: every unit of source flow reached $t$, so the preflow turned into a flow with no excess sent back. That is the exception, not the rule. To see the characteristic ``drain back'' behaviour -- excess that climbs \emph{above} the source and pours back -- take the same graph but raise the first capacity to $c(s,a)=5$. Now $a$ receives more than its downstream edges can carry.
+
+\begin{center}
+\begin{tikzpicture}[>=Stealth,
+  vtx/.style={circle,draw,thick,minimum size=8mm,inner sep=0pt,font=\small},
+  caplbl/.style={font=\scriptsize,inner sep=1pt}]
+  \node[vtx,fill=sourceblue!20] (s) at (0,0) {$s$};
+  \node[vtx] (a) at (2.4,1.2) {$a$};
+  \node[vtx] (b) at (2.4,-1.2) {$b$};
+  \node[vtx] (c) at (4.8,1.2) {$c$};
+  \node[vtx,fill=targetgreen!25] (t) at (4.8,-1.2) {$t$};
+  \draw[->,thick] (s) -- node[caplbl,above left]{$5$} (a);
+  \draw[->,thick] (s) -- node[caplbl,below left]{$2$} (b);
+  \draw[->,thick] (a) -- node[caplbl,above]{$2$} (c);
+  \draw[->,thick] (a) -- node[caplbl,pos=0.4,right]{$1$} (b);
+  \draw[->,thick] (b) -- node[caplbl,below]{$3$} (t);
+  \draw[->,thick] (c) -- node[caplbl,right]{$2$} (t);
+\end{tikzpicture}
+\end{center}
+
+Initialization saturates $s\!\to\!a$ ($\delta=5$) and $s\!\to\!b$ ($\delta=2$), giving $e(a)=5$, $e(b)=2$, all interior heights $0$, $h(s)=5$. Queue $[a,b]$.
+
+\textbf{Discharge $a$.} Relabel $a$ to $1$ ($c,b$ both at height $0$). Push $a\!\to\!c$: saturating, $\delta=2$, $e(a)=3$, $e(c)=2$. Push $a\!\to\!b$: saturating, $\delta=1$, $e(a)=2$, $e(b)=3$. Now $a$ still has excess $2$ but both forward edges $a\!\to\!c$ and $a\!\to\!b$ are saturated; its only residual neighbour is $s$ (height $5$) via the reverse of $s\!\to\!a$. No admissible edge, so relabel: $h(a)\gets 1+5=6$. The excess at $a$ is now \emph{above} the source, making the reverse edge $a\!\to\!s$ admissible ($h(a)=h(s)+1$). Push $a\!\to\!s$: its residual capacity is $5$ (the reverse of the saturated edge $s\!\to\!a$), but only $\delta=\min(e(a),5)=2$ moves, so this push is nonsaturating; $e(a)=0$, and $2$ units return to the source. $a$ drained. Queue $[b,c]$.
+
+\textbf{Discharge $b$.} $e(b)=3$, relabel $b$ to $1$, push $b\!\to\!t$: $\delta=3$, $e(b)=0$, $e(t)=3$. Queue $[c]$.
+
+\textbf{Discharge $c$.} $e(c)=2$, relabel $c$ to $1$, push $c\!\to\!t$: $\delta=2$, $e(c)=0$, $e(t)=5$. Queue empty.
+
+No active vertices remain. Final heights $(s{:}5,a{:}6,b{:}1,c{:}1,t{:}0)$, flow value $e(t)=5$. The two extra units injected at $a$ never reached $t$; they piled up, lifted $a$ to height $6$, and drained back to $s$ exactly as the hillside picture predicts. The min cut is still $\set{s}$ versus the rest -- the bottleneck is the pair of source edges, total usable capacity $c(s,a)+c(s,b)=5$ once we account for the wasted slack on $s\!\to\!a$.
+
+\begin{whybox}
+The drain-back step is what lets push-relabel be greedy at the source without penalty. The opening move floods $s$'s neighbours with the \emph{full} capacity of every source edge, even when downstream cannot absorb it. Any over-injection is not a mistake to be avoided; it is recovered automatically, because the same relabel-and-push machinery that pushes excess toward $t$ will, once a vertex climbs above height $\abs{V}$, push it back toward $s$. A vertex with $h(u)>\abs{V}$ is provably cut off from $t$ (Section~\ref{ch13:heights}), so the algorithm has lost nothing by lifting it: its excess was never going to reach the sink.
+\end{whybox}
+
+\begin{trapbox}
+The most common implementation bug is forgetting to update the reverse edge $f(v,u)\gets f(v,u)-\delta$ inside $\textsc{Push}$, or storing residual capacities without paired edges. If reverse residual capacity is wrong, the algorithm cannot cancel flow, excess gets stranded, and it either loops forever or returns a non-maximum value. The second classic bug: relabeling $s$. The source must be excluded from the active set; if your queue ever contains $s$, $h(s)$ creeps above $\abs{V}$ and silently breaks the min-cut certificate. The third: initializing $h(s)=0$ instead of $\abs{V}$ -- then an $s$--$t$ residual path can exist initially and the no-augmenting-path invariant fails from the start.
+\end{trapbox}
+
+\section{FIFO push-relabel: \texorpdfstring{$\Oh(V^3)$}{O(V cubed)}}
+\label{ch13:fifo}
+
+The generic bound is dominated by $\Oh(V^2E)$ nonsaturating pushes. The selection rule decides how many of those we actually do. The \emph{FIFO} rule keeps active vertices in a queue: pop the front, $\textsc{Discharge}$ it completely (which may relabel it and enqueue newly activated vertices at the back), repeat.
+
+\begin{algorithm}[H]
+\caption{$\textsc{FifoPushRelabel}(G,s,t)$}
+\label{ch13:alg-fifo}
+\DontPrintSemicolon
+initialize $f,h,e$ as in \textsc{GenericPushRelabel}\;
+$Q \gets$ queue of all initially active vertices (the neighbors of $s$ with excess)\;
+\While{$Q\ne\emptyset$}{
+  $u\gets Q.\textsc{dequeue}()$\;
+  $\textsc{Discharge}(u)$ \tcp*{enqueue any vertex newly made active, if not already in $Q$}
+}
+\Return $f$\;
+\end{algorithm}
+
+The analysis groups operations into \emph{phases}. Phase $1$ is the discharge of the vertices present in $Q$ right after initialization. Phase $i+1$ is the discharge of exactly those vertices that were enqueued during phase $i$. (Equivalently: imagine a marker at the tail of $Q$; each time the marker is reached, a new phase begins.)
+
+\begin{lemma}[Phase count]
+\label{ch13:lem-phases}
+$\textsc{FifoPushRelabel}$ runs for $\Oh(V^2)$ phases.
+\end{lemma}
+
+\begin{proof}
+Use $\Psi=\max\set{h(u):u\text{ active}}$ (with $\Psi=0$ if no vertex is active). Consider a phase with no relabel. Every push in such a phase is from a vertex $u$ to a strictly lower vertex $v$, and $u$ is emptied; the vertices active at the end of the phase are a subset of the $v$'s that received flow, all of which are strictly below the maximum at the phase's start. So $\Psi$ \emph{strictly decreases} across any relabel-free phase. A phase that \emph{does} contain a relabel raises some $h(u)$, and across the whole run the total relabel increase is $\Oh(V^2)$ (Lemma~\ref{ch13:lem-relabel-count}), bounding how much $\Psi$ can ever rise. Since $\Psi$ starts and ends at $0$, decreases by $\ge1$ in each relabel-free phase, and rises by a total of $\Oh(V^2)$, the number of relabel-free phases is $\Oh(V^2)$. Phases that contain a relabel are at most the number of relabels, $\Oh(V^2)$. Total $\Oh(V^2)$.
+\end{proof}
+
+\begin{theorem}[FIFO running time]
+\label{ch13:thm-fifo}
+$\textsc{FifoPushRelabel}$ runs in $\Oh(V^3)$ time.
+\end{theorem}
+
+\begin{proof}
+Each phase discharges each vertex at most once, so each phase does at most one nonsaturating push per vertex: $\Oh(V)$ nonsaturating pushes per phase. (Within a single discharge of $u$, only the \emph{last} push -- the one that empties $u$ -- can be nonsaturating; all earlier pushes from $u$ in that discharge saturate their edges.) Over $\Oh(V^2)$ phases that is $\Oh(V^3)$ nonsaturating pushes. Saturating pushes ($\Oh(VE)$) and relabel work ($\Oh(VE)$) are subsumed since $E\le V^2$. Total $\Oh(V^3)$.
+\end{proof}
+
+\begin{whybox}
+Why does FIFO beat the generic $\Oh(V^2E)$? The generic analysis charged each nonsaturating push to a global potential and got $\Oh(V^2E)$. FIFO adds structure: a vertex is discharged at most once per phase, so within a phase the nonsaturating pushes number $\Oh(V)$, not $\Oh(E)$. The $E$ in the generic bound came from re-discharging the same vertex many times in close succession; the queue serializes discharges so that re-activation only happens in a \emph{later} phase, and there are only $\Oh(V^2)$ phases.
+\end{whybox}
+
+\section{Highest-label push-relabel: \texorpdfstring{$\Oh(V^2\sqrt{E})$}{O(V\^2 sqrt E)}}
+\label{ch13:highest}
+
+A second natural rule: always discharge an active vertex of \emph{maximum height}. Water at the highest puddle has the longest way to fall, so emptying it first tends to cascade flow far downhill before anything is re-activated above it.
+
+\begin{algorithm}[H]
+\caption{$\textsc{HighestLabelPushRelabel}(G,s,t)$}
+\label{ch13:alg-highest}
+\DontPrintSemicolon
+initialize $f,h,e$\;
+maintain buckets $B[0\,..\,2\abs{V}-1]$ of active vertices indexed by height\;
+\While{some bucket is nonempty}{
+  let $k$ be the largest index with $B[k]\ne\emptyset$;\quad $u\gets$ any vertex in $B[k]$\;
+  $\textsc{Discharge}(u)$ \tcp*{moves $u$ between buckets on relabel; inserts newly active vertices}
+}
+\Return $f$\;
+\end{algorithm}
+
+A pointer scanning down from the top bucket finds the highest active vertex; relabels only move vertices \emph{up}, and the scan pointer rises with them, so the total pointer travel is $\Oh(V^2)$ -- cheap. The win is in the nonsaturating push count.
+
+\begin{intuitionbox}
+Discharging the highest active vertex first is the greedy choice that avoids wasted motion. If you instead emptied a low vertex, the flow it pushes downhill might immediately be overtaken by flow arriving from a higher vertex you had not yet touched, and the low vertex would re-activate -- a second discharge of the same vertex, a second nonsaturating push. By always taking the top, no flow is ever pushed onto a vertex that still has un-discharged excess sitting above it, so a vertex re-activates only after the whole top layer has drained past it. That is exactly why the re-discharge count, and with it the nonsaturating-push count, drops below the FIFO bound.
+\end{intuitionbox}
+
+\begin{theorem}[Highest-label running time]
+\label{ch13:thm-highest}
+$\textsc{HighestLabelPushRelabel}$ performs $\Oh(V^2\sqrt{E})$ nonsaturating pushes and runs in $\Oh(V^2\sqrt{E})$ time.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+The argument (Cheriyan--Maheshwari, tightened by Tun\c{c}el) again partitions the run into phases delimited by changes in the maximum active height. Set a threshold $K=\sqrt{E}$. Call a phase \emph{cheap} if it contains at most $K$ nonsaturating pushes and \emph{expensive} otherwise. The number of phases is $\Oh(V^2)$ as before, so cheap phases contribute $\Oh(V^2\sqrt{E})$ pushes. For expensive phases, use a potential $\Phi=\tfrac1K\sum_{u\ \text{active}} \abs{\set{w:h(w)\le h(u)}}$; one shows each expensive phase decreases $\Phi$ by an amount proportional to its push count over $K$, while the total increase of $\Phi$ across the whole run is $\Oh(V^2)$. Balancing the two sources of pushes at $K=\sqrt E$ yields $\Oh(V^2\sqrt E)$. Each nonsaturating push is $\Oh(1)$ amortized and the other costs are dominated, so the total time matches.
+\end{proof}
+
+\begin{historybox}
+Goldberg and Tarjan introduced push-relabel (they called it the ``preflow-push'' method) in 1986, unifying and simplifying a line of work that began with Karzanov's 1974 \emph{preflow} idea and Dinic's blocking flows. The generic bound is $\Oh(V^2E)$; FIFO gives $\Oh(V^3)$; highest-label with the right bucket structure gives $\Oh(V^2\sqrt E)$, matching the best strongly-polynomial bound for a long time. Goldberg and Tarjan's later dynamic-tree implementation reaches $\Oh(VE\log(V^2/E))$. The conceptual leap -- abandon global augmenting paths for purely local moves driven by a potential (height) function -- echoes through later flow algorithms and is, in retrospect, the same ``move locally, certify globally'' pattern that powers electrical-flow and interior-point methods.
+\end{historybox}
+
+\section{The gap heuristic and why it matters in practice}
+\label{ch13:gap}
+
+Asymptotics undersell push-relabel. In practice it is the fastest general max-flow method on most networks, and two heuristics are responsible.
+
+\paragraph{Gap heuristic.} Maintain a count $\mathrm{cnt}[k]$ of vertices at each height $k$. Suppose at some moment no vertex has height exactly $g$ (a \emph{gap} at $g$), but some vertices have height $>g$. Any vertex $u$ with $h(u)>g$ is cut off from $t$: every residual path from $u$ to $t$ would have to descend through height $g$, but no vertex sits there, and heights drop by at most $1$ per edge, so $t$ (at height $0$) is unreachable from $u$ in $\Gph_f$. Such a $u$ can never push its excess to $t$; the excess is destined to return to $s$. We may as well lift $u$ immediately to $\abs{V}+1$ (above the source) so it drains back in one stroke instead of being relabeled one unit at a time.
+
+\begin{algorithm}[H]
+\caption{Gap heuristic, invoked right after a relabel that empties height $h_{\mathrm{old}}$}
+\label{ch13:alg-gap}
+\DontPrintSemicolon
+\If{$\mathrm{cnt}[h_{\mathrm{old}}]=0$ \textnormal{after the relabel and} $h_{\mathrm{old}}<\abs{V}$}{
+  \ForEach{vertex $w$ with $h_{\mathrm{old}}<h(w)<\abs{V}$}{
+    $h(w)\gets \abs{V}+1$;\quad update $\mathrm{cnt}$\;
+  }
+}
+\end{algorithm}
+
+\begin{whybox}
+The gap heuristic is a correctness-preserving shortcut, not an approximation. If height $g$ becomes empty, the Lipschitz property of $h$ proves that every higher vertex is permanently separated from $t$ in the residual graph -- raising them to $\abs{V}+1$ keeps $h$ valid (the only residual edges out of a raised vertex now go to other equally-or-higher vertices or back toward $s$) and skips a long ladder of unit relabels. On many real instances, especially those with a near-cut found early, the gap heuristic empties whole layers at once and accounts for most of the practical speedup.
+\end{whybox}
+
+To make the gap concrete (Figure~\ref{ch13:fig-gap}), suppose at some moment in a run on a $7$-vertex graph the height-count array reads
+\[
+  \mathrm{cnt} = (\,\mathrm{cnt}[0],\dots,\mathrm{cnt}[6]\,) = (1,\;2,\;0,\;1,\;1,\;0,\;2),
+\]
+so one vertex sits at height $0$ (the sink), two at height $1$, none at height $2$, and the remaining four scattered at heights $3,4,$ and $6$ (two at height $6$). Height $g=2$ is empty while vertices live above it, and $g<\abs{V}=7$. Every vertex at height $3,4,$ or $6$ would have to descend through the empty layer $2$ to reach $t$ at height $0$, but heights fall by at most one per residual edge, so none of them can reach $t$ in $\Gph_f$ -- they are stranded behind the gap. Instead of relabeling each one upward a single unit at a time over many iterations, the heuristic lifts all four to $\abs{V}+1=8$ in one sweep, after which they drain straight back to $s$. Without the heuristic, the vertex at height $3$ alone might be relabeled $3\to8$ in five separate $\textsc{Relabel}$ calls, each preceded by a wasted scan of its edge list.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Stealth,
+  lvl/.style={font=\scriptsize},
+  dot/.style={circle,draw,thick,fill=nodeblue!25,minimum size=4.5mm,inner sep=0pt}]
+  % height axis
+  \foreach \k in {0,1,2,3,4,5,6,7,8}{
+    \draw[gray!40] (0,\k*0.62) -- (7.4,\k*0.62);
+    \node[lvl,left=2pt] at (0,\k*0.62) {$h{=}\k$};
+  }
+  % occupied vertices
+  \node[dot,fill=targetgreen!30] at (1.2,0) {}; \node[lvl,right=1pt] at (1.5,0) {$t$};
+  \node[dot] at (1.2,0.62) {}; \node[dot] at (2.0,0.62) {};
+  % gap at 2 (empty) -- mark in red
+  \node[trapred,font=\scriptsize\bfseries] at (3.7,2*0.62) {gap: no vertex at $h{=}2$};
+  \node[dot] at (1.2,3*0.62) {};
+  \node[dot] at (1.2,4*0.62) {};
+  \node[dot] at (1.2,6*0.62) {}; \node[dot] at (2.0,6*0.62) {};
+  % stranded region brace
+  \draw[decorate,decoration={brace,amplitude=5pt},trapred,thick]
+    (2.6,3*0.62-0.18) -- (2.6,6*0.62+0.18)
+    node[midway,right=6pt,font=\scriptsize,trapred,align=left]{stranded above\\the gap:\\lift to $h{=}8$};
+  % source level
+  \node[dot,fill=sourceblue!30] at (6.6,5*0.62) {}; \node[lvl,right=1pt] at (6.9,5*0.62) {$s$};
+\end{tikzpicture}
+\caption{The gap at height $2$. Every vertex above an empty layer is cut off from $t$ (any residual path to $t$ must pass through the missing layer), so the heuristic lifts all of them to $\abs{V}+1=8$ at once instead of relabeling each by one unit at a time.}
+\label{ch13:fig-gap}
+\end{figure}
+
+\paragraph{Global relabeling.} Periodically (say every $\Oh(E)$ operations) recompute every height as its exact BFS distance to $t$ in the residual graph, and for vertices that cannot reach $t$, set $h=\abs{V}$ plus the BFS distance to $s$. Exact distances are always valid heights and they are the largest valid heights, so global relabeling makes the height function as informative as possible. It costs one $\Oh(E)$ BFS but typically pays for itself many times over by routing excess on near-shortest paths.
+
+\begin{applicationbox}
+Push-relabel with gap and global-relabeling heuristics is the engine inside Cherkassky and Goldberg's \texttt{hi\_pr} code, for years the reference max-flow benchmark, and inside the Boykov--Kolmogorov ecosystem for computer-vision energy minimization (graph cuts for image segmentation, stereo, and Markov-random-field MAP inference). In those vision instances the graph is a grid with a source and sink wired to every pixel; highest-label push-relabel with gaps routinely beats augmenting-path solvers because the cut is found early and the gap heuristic prunes aggressively. The same machinery underlies project-selection, bipartite matching at scale, and network-reliability computations.
+\end{applicationbox}
+
+\begin{complexitybox}
+Summary of the variants on $n=\abs{V}$, $m=\abs{E}$:
+\begin{center}\small
+\begin{tabular}{lll}
+\toprule
+Variant & Time & Note\\
+\midrule
+Generic (any order) & $\Oh(n^2 m)$ & nonsaturating pushes dominate\\
+FIFO & $\Oh(n^3)$ & $\Oh(n^2)$ phases, $\Oh(n)$ pushes each\\
+Highest-label & $\Oh(n^2\sqrt m)$ & best simple strongly-poly bound\\
+Goldberg--Tarjan (dynamic trees) & $\Oh(nm\log(n^2/m))$ & best with link-cut trees\\
+\bottomrule
+\end{tabular}
+\end{center}
+All variants use $\Oh(m)$ space. Heuristics (gap, global relabel) do not change worst-case bounds but dominate real-world performance.
+\end{complexitybox}
+
+\section{A note on almost-linear max-flow}
+\label{ch13:modern}
+
+For decades the question ``how fast can max-flow be?'' inched forward: blocking flows, scaling, dynamic trees, and -- starting around 2008 -- the \emph{electrical-flow} revolution, in which max-flow is solved by a sequence of Laplacian linear systems, each an electrical-flow computation, wrapped in an interior-point or multiplicative-weights outer loop. Christiano--Kelner--Madry--Spielman--Teng (2011) used electrical flows to approximate undirected max-flow in roughly $\tilde\Oh(m^{4/3})$ time; Madry pushed exact unit-capacity max-flow to $\tilde\Oh(m^{10/7})$; a chain of interior-point refinements followed.
+
+The capstone arrived in 2022: Chen, Kyng, Liu, Peng, Probst Gutenberg, and Sachdeva proved that max-flow -- indeed min-cost flow, on directed graphs with arbitrary integer capacities -- can be solved in
+\[
+  m^{1+o(1)}\quad\text{time},
+\]
+\emph{almost linear} in the number of edges. The algorithm is a world away from push-relabel: it runs an interior-point method whose every iteration requires solving a min-ratio cycle problem on a slowly-changing graph, supported by a sophisticated dynamic data structure built on low-stretch spanning trees and the $\ell_1$ analogue of the Laplacian-solver toolkit.
+
+\begin{connectionbox}
+The modern result ties this chapter to the spectral and electrical half of the book. The interior-point outer loop reduces flow to repeatedly solving a \emph{weighted} flow/potential problem; for the $\ell_2$ (energy) version that is exactly an electrical flow, i.e. a Laplacian linear system $\Lap x = b$ (the chapters on the graph Laplacian and on Laplacian solvers and electrical flows). Spielman--Teng's nearly-linear Laplacian solvers are the engine that made electrical flows cheap enough to iterate. Push-relabel and the almost-linear algorithm sit at opposite poles: one is combinatorial, local, and integral, certified by a height function; the other is continuous, global, and numerical, certified by interior-point duality and electrical energy. Both compute the same max-flow, and seeing that a height function and an electrical potential are two readings of the same vertex-potential idea is one of the quiet unifications this book is built around. For the role of the Laplacian as a discrete operator, see the chapters on random walks and electrical networks.
+\end{connectionbox}
+
+\begin{focusbox}
+Practical guidance. For exact max-flow on a concrete graph today: use highest-label push-relabel with the gap and global-relabeling heuristics, or Dinic's algorithm with scaling. Push-relabel tends to win on dense graphs and on vision-style grids; Dinic often wins on unit-capacity and bipartite-matching instances. The almost-linear algorithm is, as of now, a theoretical breakthrough whose constants and implementation complexity keep it from displacing these workhorses in practice -- but it settles the asymptotic question that push-relabel left open.
+\end{focusbox}
+
+\section{Exercises}
+\label{ch13:exercises}
+
+\begin{exercise}[Trace it]
+Run push-relabel with FIFO selection on the network with vertices $s,a,b,t$ and capacities $c(s,a)=4$, $c(s,b)=2$, $c(a,b)=3$, $c(a,t)=1$, $c(b,t)=4$. Show $h$, $e$, and the queue after every operation, and identify the minimum cut from the final heights.
+\end{exercise}
+
+\begin{exercise}[Why $\abs{V}$?]
+Prove that if you initialize $h(s)=\abs{V}-1$ instead of $\abs{V}$, the algorithm can fail to maintain the invariant ``no residual $s$--$t$ path,'' and exhibit a small network where it returns a non-maximum value. Then prove that any $h(s)\ge\abs{V}$ is safe.
+\end{exercise}
+
+\begin{exercise}[Saturating-push bound]
+Construct a family of networks on which generic push-relabel performs $\Om(VE)$ saturating pushes, demonstrating that Lemma~\ref{ch13:lem-satpush} cannot be improved by more than constant factors.
+\end{exercise}
+
+\begin{exercise}[Nonsaturating pushes for FIFO]
+Give a family of networks for which FIFO push-relabel performs $\Om(V^3)$ nonsaturating pushes, so Theorem~\ref{ch13:thm-fifo} is tight. (Hint: a long chain forces many phases, each with $\Th(V)$ nonsaturating pushes.)
+\end{exercise}
+
+\begin{exercise}[Gap correctness]
+Prove rigorously that the gap heuristic preserves the validity of the height function: if height $g$ is empty and $g<\abs{V}$, then raising every vertex $w$ with $g<h(w)<\abs{V}$ to $\abs{V}+1$ yields a valid height function for the current preflow. Where exactly do you use the Lipschitz property $h(u)\le h(v)+1$?
+\end{exercise}
+
+\begin{exercise}[Excess implies path to source]
+\label{ch13:ex-path-to-source}
+Fill in the flow-decomposition argument behind Lemma~\ref{ch13:lem-height-bound}: show that for any preflow, if $e(u)>0$ then there is a path from $u$ to $s$ in the residual graph $\Gph_f$. (Hint: consider the set $R$ of vertices that can reach $s$ in $\Gph_f$; sum excesses over $V\setminus R$ and derive a contradiction if $u\notin R$.)
+\end{exercise}
+
+\begin{exercise}[Implement \textsc{Discharge}]
+Implement the current-edge $\textsc{Discharge}$ routine and the highest-label selection with height buckets. Verify on random graphs that your output value matches a reference Edmonds--Karp implementation, and plot operation counts with and without the gap heuristic to see the practical difference.
+\end{exercise}
+
+\begin{exercise}[Highest-label phases]
+Show that under the highest-label rule, between two consecutive relabels of any \emph{fixed} vertex $u$, the algorithm performs at most $\Oh(V)$ nonsaturating pushes that originate at vertices of height $\ge h(u)$. Use this to give an alternative, self-contained proof that the number of nonsaturating pushes is $\Oh(V^3)$ (a weaker but easier bound than $\Oh(V^2\sqrt E)$).
+\end{exercise}
+
+\begin{exercise}[Min-cut from the run]
+After push-relabel terminates, you have a maximum preflow that is a flow. Prove that $S=\set{u:h(u)\ge\abs{V}}$ and $T=V\setminus S$ is a minimum $s$--$t$ cut, by showing every edge from $S$ to $T$ is saturated and every edge from $T$ to $S$ carries zero flow. Why does this not require an extra BFS?
+\end{exercise}
+
+\begin{exercise}[From preflow to flow, explicitly]
+Some implementations stop as soon as $t$ is unreachable from every active vertex (a maximum \emph{preflow}), skipping the drain-back phase, because the flow \emph{value} is already $e(t)$ and the value is what most applications want. Describe a second phase that converts a maximum preflow into an actual maximum flow of the same value, and bound its running time. (Hint: a decomposition / reverse traversal that cancels excess along residual edges back to $s$.)
+\end{exercise}
+
+\begin{exercise}[Connection to electrical flow]
+The almost-linear algorithm replaces ``push flow downhill in height'' with ``route flow to minimize electrical energy.'' On the small network of Section~\ref{ch13:trace}, set every edge's resistance to $1$ and compute the electrical flow of value $1$ from $s$ to $t$ by solving the Laplacian system $\Lap\, x=b$ with $b=\mathbf{1}_s-\mathbf{1}_t$. Compare the vertex potentials $x$ to the final push-relabel heights $h$: both are vertex potentials that ``explain'' the flow, but one is integral and combinatorial and the other is real-valued and energy-minimizing.
+\end{exercise}
+
+\begin{exercise}[Discharge invariant]
+Prove the claim used in Theorem~\ref{ch13:thm-fifo}: within a single call to $\textsc{Discharge}(u)$, every push except possibly the last is saturating. (Hint: a nonsaturating push empties $e(u)$ and ends the call.)
+\end{exercise}
+
+\begin{exercise}[Drain-back, traced]
+Reproduce the drain-back trace of Section~\ref{ch13:trace-drain} for the network with $c(s,a)=5$, recording $h$, $e$, and the queue after every push and relabel. Confirm that exactly $2$ units return to $s$, that $h(a)$ reaches $6$, and that the final flow value is $5$. Then push the capacity further to $c(s,a)=9$ and predict, before tracing, how high $h(a)$ must climb and how many units drain back.
+\end{exercise}
+
+\begin{exercise}[Paired-arc representation]
+Implement the residual graph with the paired-arc scheme of Section~\ref{ch13:trace}: store arcs in an array, place each arc next to its reverse, and recover the reverse of index $i$ as $i\oplus1$. Write $\textsc{Push}$ as the two updates $c_f[i]\mathrel{-}=\delta$, $c_f[i\oplus1]\mathrel{+}=\delta$. Then deliberately delete the second update and run it on the network of Section~\ref{ch13:trace}; report what value the broken code returns and explain, in terms of un-cancellable flow, why it is wrong.
+\end{exercise}
+
+\begin{exercise}[Gap heuristic on a count array]
+Given the height-count array $\mathrm{cnt}=(1,2,0,1,1,0,2)$ on a $7$-vertex graph, identify every gap, state which vertices the heuristic lifts and to what height, and write out the array $\mathrm{cnt}$ after the lift. Then argue that the heuristic never needs to scan below the \emph{lowest} gap, and use that to bound the total work the gap heuristic does over an entire run.
+\end{exercise}
+
+\begin{exercise}[Highest-label versus FIFO empirically]
+On the same family of random graphs, run highest-label and FIFO selection and count nonsaturating pushes for each. For which density regime (sparse vs.\ dense) does highest-label's $\Oh(V^2\sqrt E)$ advantage over FIFO's $\Oh(V^3)$ actually show up in the counts? Explain the crossover in terms of how $\sqrt E$ compares to $V$.
+\end{exercise}
