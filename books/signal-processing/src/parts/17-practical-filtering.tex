@@ -1,0 +1,1179 @@
+\chapter{Practical Filtering}
+
+In the last chapter we designed filters: we chose a cutoff, picked a window or a
+Butterworth shape, and ended up holding a set of coefficients. That is the easy
+part. A filter on paper is an idealization --- an infinitely precise impulse
+response, applied to an infinitely long signal, with infinite numerical
+accuracy, in zero time. The moment you want to run it on a stream of samples
+arriving in real time from an accelerometer strapped to a moving wrist, every
+one of those idealizations breaks, and a new set of questions appears that the
+textbook filter-design chapter never asked:
+
+\begin{itemize}
+  \item The signal never ends. How do I filter \emph{now}, with only the
+        samples I have seen so far, before the next one arrives?
+  \item Samples come one at a time, but the FFT wants a whole block. Do I
+        filter sample-by-sample, or buffer up a block and transform it? What is
+        the cost of each?
+  \item A long FIR filter convolved the slow way costs $N$ multiplies per output
+        sample. Can the FFT make that cheaper, even on a live stream?
+  \item My multiplies are not exact --- they round. On a microcontroller they
+        may not even be floating point. When does that rounding bite?
+  \item Every filter delays the signal. For a musical instrument you are
+        \emph{playing}, that delay is felt in the fingertips. How much can I
+        afford, and where does it come from?
+  \item Real sensor data has spikes, dropouts, and drift that no linear filter
+        handles gracefully. What actually cleans it up?
+\end{itemize}
+
+This chapter is about turning a designed filter into a thing that runs. It is
+the most concrete chapter in the book, and one of the most important for the
+wrist controller, because a gesture instrument lives or dies on \emph{latency}
+and on \emph{robust de-noising}. We will build everything from the same
+geometric pictures we have been using --- convolution as a sliding overlap, the
+spectrum as a set of frequency knobs --- and then get our hands dirty with
+buffers, ring indices, fixed-point scaling, and the humble moving average that
+does ninety percent of the real work in a sensor pipeline.
+
+\section{Streaming: the signal that never ends}
+\label{ch17:streaming}
+
+When we wrote convolution in Chapter~13 we treated the whole signal as a vector
+sitting in memory. That is \emph{offline} or \emph{batch} processing: you have a
+recording, you process it, you save the result. Plenty of DSP is like that ---
+cleaning up a finished audio file, analyzing a stored IMU log. But a live
+instrument is the opposite. Samples arrive forever, one (or a few) at a time,
+and you must emit output continuously, keeping up with the input rate and never
+falling behind.
+
+\begin{definition}[Real-time / streaming processing]
+A processing system is \emph{real-time} if it produces each output within a
+fixed, bounded time of receiving the input that determines it, and \emph{keeps
+up} indefinitely: the average time to process one sample must be less than the
+sample period $T_s = 1/f_s$. A \emph{streaming} algorithm is one that can run on
+an unbounded input using bounded memory, holding only a finite window of past
+samples (its \emph{state}).
+\end{definition}
+
+The two words are not the same. ``Streaming'' is about memory: you cannot store
+the whole signal, so you keep only what you need. ``Real-time'' is about a
+deadline: you must finish before the next sample, on average, with a worst case
+you can bound. A filter can be streaming but too slow for real time (it keeps
+up on a fast PC but not on a tiny microcontroller), and offline processing can
+be wonderfully fast without being real-time at all.
+
+\begin{intuitionbox}
+Picture the signal as a paper tape being pulled past a reading head at $f_s$
+characters per second. Offline processing is reading the whole tape spread out
+on a table. Streaming is reading it through a slot: you only ever see a short
+window, and once a character scrolls past the slot it is gone unless you copied
+it. The filter's memory is exactly the part of the tape currently inside the
+slot --- and a good filter design keeps that slot short.
+\end{intuitionbox}
+
+\subsection{What a causal filter is allowed to know}
+
+A filter that runs on a stream can only use samples that have already arrived.
+That is the \emph{causality} constraint from Chapter~12, and now it is not a
+mathematical nicety --- it is physics. At sample time $n$ you may use
+$x[n], x[n-1], x[n-2],\dots$ and past outputs $y[n-1],y[n-2],\dots$, but you
+cannot use $x[n+1]$, because it does not exist yet.
+
+This immediately rules out the symmetric, zero-delay filters we like to draw.
+The ideal low-pass filter has a $\sinc$ impulse response that stretches
+infinitely in \emph{both} directions; half of it is in the future. A symmetric
+linear-phase FIR of length $N$ is centered at tap $(N-1)/2$, so to compute the
+output ``at the center'' you need samples up to $(N-1)/2$ ahead. In a stream you
+cannot peek ahead, so you simply wait: you emit the centered result $(N-1)/2$
+samples \emph{late}. That delay is the price of causality, and we will track it
+obsessively in Section~\ref{ch17:latency}.
+
+\begin{focusbox}
+Three knobs control everything in this chapter, and they trade off against each
+other:
+\begin{itemize}
+  \item \textbf{Quality} --- how sharp the cutoff, how deep the stopband.
+  \item \textbf{Latency} --- how long after a sample arrives you can act on it.
+  \item \textbf{Cost} --- multiplies, adds, and memory per sample.
+\end{itemize}
+You cannot maximize all three. A sharp linear-phase FIR is high quality but
+high latency; a short IIR is low latency and cheap but has phase distortion. The
+art of practical filtering is picking the right corner of this triangle for the
+job.
+\end{focusbox}
+
+\section{Sample-by-sample versus block processing}
+\label{ch17:sample-vs-block}
+
+There are two fundamental ways to structure a streaming filter, and the choice
+colors the whole implementation.
+
+\paragraph{Sample-by-sample.} You process exactly one input sample at a time,
+producing one output sample, updating a little bundle of internal state in
+between. This is how you naturally implement a difference equation, an IIR
+filter, a one-pole smoother, a PLL. The code reads like the math:
+
+\begin{lstlisting}[language=C]
+// Direct-Form I FIR, one sample in -> one sample out.
+// h[0..N-1] are the taps; z[] is a ring buffer of the last N inputs.
+float fir_step(float x, const float *h, float *z, int *pos, int N) {
+    z[*pos] = x;                 // store newest input
+    float acc = 0.0f;
+    int k = *pos;
+    for (int i = 0; i < N; i++) {
+        acc += h[i] * z[k];      // newest tap times newest sample, etc.
+        k = (k == 0) ? N - 1 : k - 1;   // walk backward in time
+    }
+    *pos = (*pos + 1) % N;       // advance ring head
+    return acc;
+}
+\end{lstlisting}
+
+The virtues are minimal latency (you can emit output the instant a sample
+arrives) and simple, predictable timing. The cost is that long FIR filters do
+$N$ multiply-accumulates (MACs) per sample, every sample, forever.
+
+\paragraph{Block (frame) processing.} You collect $L$ samples into a buffer,
+then process the whole block at once. This is mandatory for anything built on
+the FFT --- spectrograms (Chapter~10), fast convolution (below), spectral
+subtraction --- because the FFT operates on a block. It is also how audio
+hardware actually delivers data: a sound card or an I2S peripheral hands you a
+buffer of (say) 64 or 128 samples per interrupt, not one sample per interrupt,
+because per-sample interrupts would drown the CPU.
+
+\begin{happeningbox}
+Block processing buys efficiency by amortizing fixed costs --- the FFT's
+$O(L\log L)$, function-call overhead, cache warm-up --- across many samples. But
+it spends \emph{latency} to do it: you cannot start processing a block until its
+last sample has arrived, so the first sample of a block waits one full block
+time, $L\,T_s$, before anything happens. Bigger blocks are more efficient and
+more laggy. This single tradeoff is why a guitar amp plugin set to a 512-sample
+buffer at 48~kHz feels rubbery (about 11~ms of buffering latency before any
+processing) while 32 samples feels immediate but burns CPU.
+\end{happeningbox}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & \textbf{Sample-by-sample} & \textbf{Block} \\
+\midrule
+Latency        & minimal (filter delay only) & block delay $+$ filter delay \\
+FFT-based work & not possible                & natural \\
+Per-sample cost& fixed, every sample         & amortized, bursty \\
+Code shape     & difference equation         & buffer then transform \\
+Typical use    & IIR, smoothers, control     & fast convolution, spectral \\
+\bottomrule
+\end{tabular}
+\caption{The two streaming structures. Most real systems mix them: a
+sample-by-sample pre-filter feeding a block-based analysis stage.}
+\label{ch17:tab-sampleblock}
+\end{table}
+
+\begin{goalbox}
+For the wrist controller, the IMU runs slowly --- typically $f_s$ between
+$100$ and $1000$~Hz --- so per-sample MACs are cheap and we will favor
+\emph{sample-by-sample} processing on the motion path to keep latency near
+zero. The EMG/FMG path, if present, samples faster (1--2~kHz) and may want short
+blocks for feature extraction. The lesson to carry forward: keep the
+\emph{control} path (the part that decides ``a note happened now'')
+sample-by-sample and short; push any heavy spectral analysis onto a
+block-based path that is allowed to lag, and use it only for slow decisions like
+``which gesture mode are we in.''
+\end{goalbox}
+
+\section{Fast convolution: filtering with the FFT}
+\label{ch17:fastconv}
+
+Suppose your filter is genuinely long --- an FIR with $N = 1024$ taps, say a
+finely-shaped equalizer or a reverberation impulse response. Direct convolution
+costs $N$ MACs per output sample. Can we do better? Yes, and the lever is the
+convolution theorem from Chapter~11: convolution in time is multiplication in
+frequency.
+
+\begin{equation}
+  y[n] = (x \conv h)[n]
+  \quad\Longleftrightarrow\quad
+  Y(e^{\jj\omega}) = X(e^{\jj\omega})\,H(e^{\jj\omega}).
+  \label{ch17:convthm}
+\end{equation}
+
+So we could FFT the signal, multiply by the FFT of $h$, and inverse-FFT. The cost
+of an FFT of length $M$ is $O(M\log M)$, so multiplying two spectra and
+transforming back is far cheaper than $N$ multiplies per sample when $N$ is
+large. There is just one catch, and it is a sharp one.
+
+\subsection{The wrap-around problem}
+
+The DFT does not implement ordinary (linear) convolution. It implements
+\emph{circular} convolution: it treats both sequences as if they were periodic,
+wrapped around a circle of length $M$. When you multiply two length-$M$ DFTs and
+invert, the output is
+
+\begin{equation}
+  y_{\text{circ}}[n] = \sum_{k=0}^{M-1} x[k]\, h[\,(n-k)\bmod M\,].
+  \label{ch17:circ}
+\end{equation}
+
+The $\bmod M$ is the villain. The tail of $h$ that should have spilled past the
+end of the block instead wraps around and corrupts the \emph{beginning}, a defect
+called \emph{time-domain aliasing}. The fix is classic: give the convolution
+enough room so the tail has somewhere to go that is not the start.
+
+\begin{whybox}
+Linear convolution of a length-$L$ signal block with a length-$N$ filter
+produces an output of length $L + N - 1$. If we run the DFT at a length
+$M \ge L + N - 1$ --- by zero-padding both inputs out to $M$ --- then the
+wrapped copies of the result land entirely in the zero-padding region and never
+overlap the genuine output. Circular convolution at length $M \ge L+N-1$
+\emph{equals} linear convolution. That single inequality is the whole secret of
+fast convolution.
+\end{whybox}
+
+\subsection{Overlap-add}
+\label{ch17:ola}
+
+A stream is too long to transform in one shot, so we chop it into consecutive
+blocks of length $L$ and filter each block separately. Each block, convolved
+with the length-$N$ filter, grows to length $L+N-1$ --- so consecutive outputs
+\emph{overlap} by $N-1$ samples. Overlap-add says: just add the overlapping
+tails back together.
+
+\begin{equation}
+  x[n] = \sum_{r} x_r[n], \qquad
+  y[n] = \sum_r (x_r \conv h)[n],
+  \label{ch17:olasum}
+\end{equation}
+where $x_r$ is the $r$-th block of $L$ input samples (zeros elsewhere). Because
+convolution is linear, the convolution of the sum is the sum of the
+convolutions, so adding the overlapping output pieces reconstructs the exact
+linear convolution of the whole stream.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=1.0]
+  % timeline
+  \draw[->,thick] (0,0) -- (11,0) node[right]{$n$};
+  % three input blocks of length L=3 units, spaced by L
+  \foreach \r/\xo/\col in {0/0/sigblue, 1/3/targetgreen, 2/6/quotientorange} {
+    \draw[\col,very thick] (\xo,2.2) -- (\xo+3,2.2);
+    \node[\col] at (\xo+1.5,2.5) {block \r};
+  }
+  \node[left] at (0,2.2) {input};
+  % output pieces of length L+N-1 = 3+2 = 5, starting at same offsets, drawn lower, overlapping by N-1=2
+  \foreach \r/\xo/\col in {0/0/sigblue, 1/3/targetgreen, 2/6/quotientorange} {
+    \draw[\col,very thick,->] (\xo,1.1) -- (\xo+5,1.1);
+  }
+  \node[left] at (0,1.1) {conv out};
+  % overlap brackets
+  \draw[trapred,decorate,decoration={brace,amplitude=4pt}] (3,0.85) -- (5,0.85);
+  \draw[trapred,decorate,decoration={brace,amplitude=4pt}] (6,0.85) -- (8,0.85);
+  \node[trapred] at (4,0.5) {\small add};
+  \node[trapred] at (7,0.5) {\small add};
+\end{tikzpicture}
+\caption{Overlap-add with block length $L=3$ and filter length $N=3$ (so each
+convolved block has length $L+N-1=5$). Consecutive output pieces overlap by
+$N-1=2$ samples; summing the overlaps reconstructs the exact linear
+convolution.}
+\label{ch17:fig-ola}
+\end{figure}
+
+The recipe, per block:
+\begin{enumerate}
+  \item Take the next $L$ input samples; zero-pad to length $M \ge L+N-1$ (use a
+        power of two for the FFT).
+  \item Multiply its FFT by $H = \FT\{h\}$ (computed \emph{once}, ahead of time).
+  \item Inverse-FFT to get $L+N-1$ output samples.
+  \item Add the first $N-1$ of them to the saved tail from the previous block;
+        emit; save this block's last $N-1$ samples as the new tail.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python]
+import numpy as np
+
+def overlap_add(x, h, L):
+    N = len(h)
+    M = 1 << int(np.ceil(np.log2(L + N - 1)))   # FFT length, power of 2
+    H = np.fft.rfft(h, M)                         # precompute once
+    y = np.zeros(len(x) + N - 1)
+    for i in range(0, len(x), L):
+        blk = x[i:i+L]
+        Y = np.fft.irfft(np.fft.rfft(blk, M) * H, M)  # = linear conv of blk*h
+        y[i:i+len(Y)] += Y                            # overlap and ADD
+    return y[:len(x) + N - 1]
+\end{lstlisting}
+
+\subsection{Overlap-save}
+\label{ch17:ols}
+
+Overlap-save attacks the same problem from the other side. Instead of zero-padding
+the input and adding tails, it deliberately \emph{allows} the circular
+wrap-around to corrupt part of each block, then simply throws the corrupted part
+away.
+
+You feed the FFT blocks of length $M$ that \emph{overlap the input} by $N-1$
+samples (each block reuses the last $N-1$ samples of the previous one). After
+circular convolution at length $M$, the first $N-1$ output samples are garbage
+(wrapped) and the remaining $M-N+1$ are correct linear-convolution outputs. Save
+the good ones, discard the rest. No addition of tails is needed --- hence the
+older name ``overlap-discard.''
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & \textbf{Overlap-add} & \textbf{Overlap-save} \\
+\midrule
+Input blocks      & contiguous, no overlap        & overlap by $N-1$ \\
+Per block         & zero-pad input                & no zero-pad of input \\
+Combine step      & add overlapping output tails  & discard first $N-1$ outputs \\
+Bookkeeping       & save and add a tail buffer    & save last $N-1$ input samples \\
+Arithmetic        & identical FFT count           & identical FFT count \\
+\bottomrule
+\end{tabular}
+\caption{Overlap-add versus overlap-save. They compute the same answer with the
+same number of FFTs; they differ only in how they stitch blocks together. Pick
+whichever bookkeeping you find less error-prone.}
+\label{ch17:tab-ola-ols}
+\end{table}
+
+\begin{trapbox}
+The single most common fast-convolution bug is choosing $M$ too small. If
+$M < L + N - 1$ the wrap-around eats into real output and you get a quiet,
+hard-to-spot distortion --- often a faint echo or a click at block boundaries.
+Always assert $M \ge L + N - 1$ in code. The second most common bug is
+forgetting that $H = \FT\{h\}$ must be computed at the \emph{same} FFT length
+$M$ as the blocks; reuse a precomputed $H$, but recompute it if you change $M$.
+\end{trapbox}
+
+\begin{whybox}
+\textbf{When is fast convolution actually worth it?} Direct FIR costs about $N$
+real MACs per output sample. Overlap-add costs roughly two length-$M$ FFTs and
+$M$ complex multiplies per block of $L \approx M$ outputs, i.e.\ on the order of
+$\,c\log_2 M\,$ operations per output sample for a small constant $c$. The
+crossover is around $N \approx 60$--$100$ taps on a typical CPU: below that,
+direct convolution wins (and has lower latency and zero block delay); above it,
+FFT convolution pulls steadily ahead, and for $N$ in the thousands it is
+dramatically faster. For the wrist tracker's short smoothing filters ($N$ of a
+handful to a few dozen), \emph{direct} convolution is both faster and lower
+latency --- save fast convolution for long audio impulse responses.
+\end{whybox}
+
+\section{Implementing the filter: direct forms}
+\label{ch17:directforms}
+
+Set the FFT aside and look at how a filter's difference equation actually becomes
+a data-flow of delays, multiplies, and adds. The general LTI difference equation
+from Chapter~15 is
+
+\begin{equation}
+  y[n] = \sum_{i=0}^{N} b_i\, x[n-i] \;-\; \sum_{k=1}^{M} a_k\, y[n-k],
+  \label{ch17:diffeq}
+\end{equation}
+
+with feedforward (numerator) coefficients $b_i$ and feedback (denominator)
+coefficients $a_k$. An FIR filter is the special case with no feedback
+($a_k = 0$); an IIR filter has feedback. There are several ways to wire this up,
+all algebraically equal but \emph{numerically different}.
+
+\subsection{Direct Form I and II}
+
+\textbf{Direct Form I} implements Equation~\eqref{ch17:diffeq} literally: one
+chain of delays for the past inputs, another for the past outputs, multiply by
+the $b$'s and $a$'s, sum. It needs $N + M$ delay registers.
+
+\textbf{Direct Form II} notices that the two delay chains carry redundant
+information and merges them, halving the delay storage to $\max(N,M)$. It
+computes an intermediate ``state'' signal $w[n]$:
+\begin{align}
+  w[n] &= x[n] - \sum_{k=1}^{M} a_k\, w[n-k], \\
+  y[n] &= \sum_{i=0}^{N} b_i\, w[n-i].
+\end{align}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Stealth, every node/.style={font=\small}]
+  \node (x) {$x[n]$};
+  \node[draw,circle,inner sep=1pt,right=10mm of x] (sum1) {$+$};
+  \node[draw,minimum width=8mm,minimum height=6mm,right=14mm of sum1] (b0) {$b_0$};
+  \node[draw,circle,inner sep=1pt,right=12mm of b0] (sum2) {$+$};
+  \node[right=12mm of sum2] (y) {$y[n]$};
+  \draw[->] (x) -- (sum1);
+  \draw[->] (sum1) -- (b0);
+  \draw[->] (b0) -- (sum2);
+  \draw[->] (sum2) -- (y);
+  % delay chain for w
+  \node[draw,minimum width=8mm,minimum height=6mm,below=10mm of b0] (z1) {$z^{-1}$};
+  \node[draw,minimum width=8mm,minimum height=6mm,below=10mm of z1] (z2) {$z^{-1}$};
+  \draw[->] ($(b0.south)$) -- ++(0,-2mm) -| (z1.north);
+  \draw[->] (z1) -- (z2);
+  % feedback a1, a2 into sum1
+  \node[draw,minimum width=8mm,minimum height=5mm,left=12mm of z1] (a1) {$-a_1$};
+  \node[draw,minimum width=8mm,minimum height=5mm,left=12mm of z2] (a2) {$-a_2$};
+  \draw[->] (z1.west) -- (a1.east);
+  \draw[->] (z2.west) -- (a2.east);
+  \draw[->] (a1.west) -| (sum1.south);
+  \draw[->] (a2.west) -| ($(sum1.south)+(-3mm,0)$);
+  % feedforward b1,b2 into sum2
+  \node[draw,minimum width=7mm,minimum height=5mm,right=10mm of z1] (bb1) {$b_1$};
+  \node[draw,minimum width=7mm,minimum height=5mm,right=10mm of z2] (bb2) {$b_2$};
+  \draw[->] (z1.east) -- (bb1.west);
+  \draw[->] (z2.east) -- (bb2.west);
+  \draw[->] (bb1.east) -| (sum2.south);
+  \draw[->] (bb2.east) -| ($(sum2.south)+(3mm,0)$);
+\end{tikzpicture}
+\caption{Direct Form II of a second-order section. A single delay line
+($z^{-1}$ blocks) holds the shared state $w[n]$; the feedback taps $-a_k$ enter
+the left adder and the feedforward taps $b_i$ enter the right adder. Half the
+delays of Direct Form I.}
+\label{ch17:fig-df2}
+\end{figure}
+
+\begin{trapbox}
+Direct Form II saves memory but is \emph{worse} numerically for high-order IIR
+filters: the shared state $w[n]$ can have a much larger dynamic range than the
+input or output, so it overflows (in fixed point) or loses precision (in
+floating point) more readily. The practical rule, below, sidesteps this entirely.
+\end{trapbox}
+
+\subsection{Cascade of biquads: the practical default}
+\label{ch17:biquad}
+
+Never implement a high-order IIR filter as one big Direct Form. The reason is
+the same one that makes a high-degree polynomial wretched to evaluate from its
+coefficients: the roots (poles and zeros) become wildly sensitive to tiny
+coefficient errors, and a filter that was stable on paper can ring or blow up
+once its coefficients are rounded to 16 or 24 bits.
+
+The cure is to factor the transfer function into a \emph{cascade} of
+second-order sections (``biquads''):
+
+\begin{equation}
+  H(z) = g \prod_{s=1}^{S} \frac{b_{0,s} + b_{1,s}\,z^{-1} + b_{2,s}\,z^{-2}}
+                                 {1 + a_{1,s}\,z^{-1} + a_{2,s}\,z^{-2}}.
+  \label{ch17:cascade}
+\end{equation}
+
+Each second-order section holds just one pole pair and one zero pair, so its
+coefficients localize the action and stay well-conditioned. You run the sections
+one after another, the output of each feeding the next.
+
+\begin{whybox}
+Why second order and not first? Real filter poles and zeros come in
+\emph{complex-conjugate pairs} (because $h[n]$ is real). A complex pole at
+$re^{\jj\theta}$ and its conjugate $re^{-\jj\theta}$ combine into one real
+second-order section with $a_1 = -2r\cos\theta$, $a_2 = r^2$. Keeping each
+conjugate pair together in its own section is what keeps the coefficients real
+and the arithmetic small. This is also why ``biquad'' (bi-quadratic: quadratic
+over quadratic) is the universal currency of audio EQ, sensor filters, and DSP
+chips --- every parametric EQ band you have ever turned is one biquad.
+\end{whybox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=2.6]
+  % unit circle and axes
+  \draw[gray] (0,0) circle (1);
+  \draw[->,thick] (-1.25,0) -- (1.25,0) node[right]{$\mathrm{Re}$};
+  \draw[->,thick] (0,-1.25) -- (0,1.25) node[above]{$\mathrm{Im}$};
+  % conjugate pole pair at r=0.85, theta=+/-0.9 rad
+  \def\rr{0.85}
+  \node[specred] at ({\rr*cos(51.6)},{\rr*sin(51.6)}) {$\times$};
+  \node[specred] at ({\rr*cos(-51.6)},{\rr*sin(-51.6)}) {$\times$};
+  % zero pair on the circle (e.g. at +/-2.4 rad)
+  \node[sigblue] at ({cos(137.5)},{sin(137.5)}) {$\circ$};
+  \node[sigblue] at ({cos(-137.5)},{sin(-137.5)}) {$\circ$};
+  % radius annotation to a pole
+  \draw[densely dashed,specred] (0,0) -- ({\rr*cos(51.6)},{\rr*sin(51.6)});
+  \node[specred,font=\scriptsize] at (0.32,0.28) {$r$};
+  \node[specred,font=\scriptsize] at (0.62,0.78) {pole $re^{\jj\theta}$};
+\end{tikzpicture}
+\caption{Pole-zero plot of one biquad. The complex-conjugate pole pair (red
+$\times$) at $re^{\pm\jj\theta}$ gives the real denominator
+$1+a_1 z^{-1}+a_2 z^{-2}$ with $a_1=-2r\cos\theta$, $a_2=r^2$; the conjugate zero
+pair (blue $\circ$) gives the numerator. Poles inside the unit circle keep the
+section stable; the closer they sit to the circle, the sharper and more
+fixed-point-sensitive the resonance.}
+\label{ch17:fig-polezero}
+\end{figure}
+
+\begin{lstlisting}[language=C]
+// One biquad, Transposed Direct Form II (good numerics, 2 state vars).
+typedef struct { float b0,b1,b2,a1,a2; float z1,z2; } biquad;
+
+float biquad_step(biquad *q, float x) {
+    float y = q->b0 * x + q->z1;
+    q->z1   = q->b1 * x - q->a1 * y + q->z2;
+    q->z2   = q->b2 * x - q->a2 * y;
+    return y;
+}
+// A high-order filter is just an array of these run in sequence.
+float cascade_step(biquad *qs, int S, float x) {
+    for (int s = 0; s < S; s++) x = biquad_step(&qs[s], x);
+    return x;
+}
+\end{lstlisting}
+
+The \emph{transposed} Direct Form II shown here is the workhorse: it has the
+same low storage as Direct Form II but much better numerical behavior, because
+its two state variables stay closer to the signal's natural range. It is what
+you will find inside almost every audio library's biquad.
+
+\section{Fixed-point and numerical issues}
+\label{ch17:fixedpoint}
+
+On a desktop you filter in 32- or 64-bit floating point and rarely think about
+arithmetic error. On the small microcontroller that will live on the wrist
+strap, you may have no floating-point unit at all, or a slow one. Then you filter
+in \emph{fixed point}: integers interpreted as fractions, with an implied binary
+point. Understanding what goes wrong there is the difference between a filter
+that works on the bench and one that hisses, clips, or drifts in the field.
+
+\subsection{What fixed point is}
+
+A fixed-point format $Qm.f$ stores a number as an integer scaled by $2^{-f}$:
+the integer $X$ represents the real value $X \cdot 2^{-f}$, with $m$ integer bits
+and $f$ fractional bits. For example $Q1.15$ uses a 16-bit signed integer to
+represent values in $[-1, 1)$ with a resolution of $2^{-15} \approx 3\times
+10^{-5}$. Adding two $Q1.15$ numbers is just integer addition; \emph{multiplying}
+two of them gives a $Q2.30$ result that you must shift back down by 15 bits to
+return to $Q1.15$.
+
+\begin{connectionbox}
+This is exactly the quantization story of Chapter~19, applied not to the input
+sample but to every internal coefficient and intermediate result. Each rounding
+injects a tiny error that, statistically, behaves like added noise (Chapter~20):
+uniform on $\pm \tfrac12$ LSB, with variance $\Delta^2/12$ where $\Delta=2^{-f}$
+is the quantization step. A filter is a chain of such injections, and the
+question is whether they accumulate or wash out.
+\end{connectionbox}
+
+\subsection{The three things that bite}
+
+\paragraph{1. Coefficient quantization.} Rounding the $b_i$, $a_k$ to fixed
+point moves the poles and zeros. For a sharp, high-order filter the poles sit
+close together and close to the unit circle, where small coefficient nudges
+cause big pole movements --- exactly the ill-conditioning that the biquad cascade
+fixes. A direct-form 8th-order filter quantized to 16 bits can have its poles
+shoved outside the unit circle and \emph{go unstable}; the same filter as four
+biquads stays put.
+
+\paragraph{2. Roundoff (product) noise.} Every multiply produces more bits than
+fit, so the result is rounded, adding noise. In an IIR filter this noise
+circulates through the feedback and can be amplified near resonant peaks. The
+defense is to keep enough fractional bits and to scale section gains so signals
+use the available range without overflowing.
+
+\paragraph{3. Overflow and limit cycles.} If an intermediate sum exceeds the
+representable range it \emph{wraps} (in two's-complement) from the largest
+positive value to the largest negative --- a catastrophic, full-scale glitch.
+Worse, the feedback in an IIR filter can sustain a small self-perpetuating
+oscillation called a \emph{limit cycle}: with a constant or zero input, the
+rounded output settles into a tiny periodic wiggle instead of going to rest.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=11cm, height=5cm,
+  xlabel={sample $n$}, ylabel={output},
+  domain=0:40, samples=41,
+  ymin=-1.2, ymax=1.2, xmin=0, xmax=40,
+  axis lines=left, enlarge x limits=false,
+  legend pos=north east, legend style={font=\footnotesize},
+]
+% ideal: decaying ringing to zero
+\addplot[sigblue, very thick] {0.95^x * cos(deg(0.6*x))};
+\addlegendentry{ideal (float): decays to 0}
+% quantized: decays then locks into a small limit cycle
+\addplot[specred, very thick, dashed] {max(abs(0.95^x*cos(deg(0.6*x))), 0.06)*sign(cos(deg(0.6*x)))};
+\addlegendentry{fixed point: limit cycle}
+\addplot[gray, dotted, thick] coordinates {(0,0.06)(40,0.06)};
+\addplot[gray, dotted, thick] coordinates {(0,-0.06)(40,-0.06)};
+\end{axis}
+\end{tikzpicture}
+\caption{A limit cycle in an IIR filter. In floating point the resonator's
+ringing decays smoothly to zero (solid). In fixed point, rounding can trap the
+output in a small sustained oscillation (dashed) that never dies --- audible as
+a faint idle tone, or as a sensor reading that refuses to settle.}
+\label{ch17:fig-limitcycle}
+\end{figure}
+
+\begin{focusbox}
+Practical fixed-point survival kit:
+\begin{itemize}
+  \item Implement IIR filters as cascaded \emph{biquads}, never one big direct
+        form.
+  \item Use \emph{transposed Direct Form II} sections.
+  \item Accumulate products in a wider register (e.g.\ 32- or 64-bit accumulator
+        for 16-bit data) and round only once, at the end.
+  \item \emph{Scale} each section so internal signals fill the range without
+        overflowing; saturate (clamp) rather than wrap on overflow.
+  \item For FIR filters, prefer fixed point freely --- with no feedback they
+        cannot have limit cycles or go unstable, only add bounded roundoff noise.
+\end{itemize}
+\end{focusbox}
+
+\begin{trapbox}
+\emph{Saturating} arithmetic (clamp to the max/min on overflow) turns a
+catastrophic wrap-around glitch into a graceful, soft distortion. Most DSP
+instruction sets have saturating add/multiply for exactly this reason. If your
+platform wraps by default, add an explicit clamp on the accumulator before
+storing the output. One missing clamp is the classic cause of an occasional loud
+``pop'' in an otherwise clean audio path.
+\end{trapbox}
+
+\section{Latency: the clock you cannot cheat}
+\label{ch17:latency}
+
+For a musical controller, latency is the single most important number in the
+whole system. A performer feels the gap between moving and hearing the result in
+their fingertips, and beyond a threshold the instrument stops feeling like part
+of the body. So let us account for every microsecond a filter costs.
+
+\subsection{Group delay: how late the filter makes the signal}
+
+A filter's frequency response $H(e^{\jj\omega}) = \abs{H}\,e^{\jj\phi(\omega)}$
+has a phase $\phi(\omega)$. The \emph{group delay} is the negative slope of that
+phase,
+\begin{equation}
+  \tau_g(\omega) = -\frac{\dd \phi(\omega)}{\dd\omega},
+  \label{ch17:groupdelay}
+\end{equation}
+measured in samples. It is, intuitively, how many samples late the envelope of a
+narrow band of frequencies near $\omega$ comes out of the filter. (We met this in
+Chapter~14; here it becomes a budget line.)
+
+\begin{happeningbox}
+For a \emph{symmetric, linear-phase FIR} of length $N$, the phase is a straight
+line and the group delay is the \emph{same at every frequency}:
+\[
+  \tau_g = \frac{N-1}{2}\ \text{samples}.
+\]
+Every frequency is delayed equally, so the waveform shape is preserved --- but it
+is preserved \emph{late}, by half the filter length. A 101-tap linear-phase
+low-pass at $f_s = 200$~Hz delays everything by $50$ samples, i.e.\ $50/200 =
+0.25$~s --- a quarter second! That is unplayable. Linear phase is gorgeous for
+offline analysis and ruinous for live control.
+\end{happeningbox}
+
+\begin{intuitionbox}
+Linear-phase FIR is symmetric, so its ``center of mass'' is in the middle. To
+emit the centered output you must wait until the middle tap lines up with the
+newest sample --- which means waiting $(N-1)/2$ samples after the event you care
+about. The sharper the filter (the more taps), the longer the wait. There is no
+trick around it: \textbf{a sharp linear-phase filter is inherently laggy.}
+\end{intuitionbox}
+
+\subsection{IIR buys low latency with phase distortion}
+
+An IIR filter reaches a given sharpness with far fewer coefficients than an FIR,
+and its group delay can be a handful of samples even for a steep response. The
+price is \emph{nonlinear phase}: different frequencies are delayed by different
+amounts, so transients smear in shape. For control signals (we mostly care
+\emph{when} a gesture happens, not the pristine shape of the waveform) this trade
+is usually worth it: an IIR low-pass with $\tau_g$ of a few samples beats a
+linear-phase FIR with $\tau_g$ of fifty.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=5.2cm,
+  xlabel={normalized frequency $\omega$ (rad/sample)}, ylabel={group delay (samples)},
+  domain=0:3.1416, samples=120,
+  ymin=0, ymax=60, xmin=0, xmax=3.1416,
+  axis lines=left, enlarge x limits=false,
+  legend pos=north west, legend style={font=\footnotesize},
+  xtick={0,1.5708,3.1416}, xticklabels={$0$,$\pi/2$,$\pi$},
+]
+% linear-phase FIR: constant 50 samples
+\addplot[sigblue, very thick] {50};
+\addlegendentry{linear-phase FIR (101 taps)}
+% IIR: small, frequency-dependent, peaking near cutoff ~ 1.0
+\addplot[specred, very thick, dashed] {3 + 7*exp(-((x-1.0)*2.2)^2)};
+\addlegendentry{4th-order IIR (biquads)}
+\end{axis}
+\end{tikzpicture}
+\caption{Group delay versus frequency for two filters of comparable sharpness.
+The FIR delays every frequency by a flat $50$ samples (linear phase). The IIR
+delays by only a few samples but unevenly, peaking near its cutoff (nonlinear
+phase). For live control the IIR's low, if uneven, delay usually wins.}
+\label{ch17:fig-groupdelay}
+\end{figure}
+
+\subsection{The full latency budget}
+
+End-to-end latency for the wrist controller is a sum, and the filter is only one
+term:
+\begin{equation}
+  \tau_{\text{total}} =
+    \underbrace{\tau_{\text{sensor}}}_{\text{ADC + internal LPF}}
+    + \underbrace{\tau_{\text{block}}}_{L\,T_s\ \text{if buffered}}
+    + \underbrace{\tau_{\text{filter}}}_{\tau_g \cdot T_s}
+    + \underbrace{\tau_{\text{compute}}}_{\text{DSP time}}
+    + \underbrace{\tau_{\text{link}}}_{\text{MIDI/BLE}}
+    + \underbrace{\tau_{\text{synth}}}_{\text{sound engine}}.
+  \label{ch17:budget}
+\end{equation}
+
+\begin{goalbox}
+Musicians reliably notice action-to-sound latency above roughly $10$~ms, and
+$20$--$30$~ms feels sluggish for percussive playing. Budget accordingly:
+\begin{itemize}
+  \item \textbf{Sensor LPF:} MEMS IMUs have a built-in anti-alias/low-pass with
+        its own group delay --- read the datasheet; a low bandwidth setting can
+        cost several ms. Choose a bandwidth that just covers your gesture
+        frequencies (motion energy is mostly below $20$~Hz).
+  \item \textbf{Blocking:} go sample-by-sample on the control path; do not buffer
+        the gesture detector.
+  \item \textbf{Filter:} use short IIR smoothers ($\tau_g$ of a few samples).
+        Avoid long linear-phase FIRs on the live path. At $f_s = 200$~Hz, each
+        sample is $5$~ms, so even a 5-sample group delay is $25$~ms --- so
+        \emph{sample faster} ($f_s \ge 500$~Hz) on the control path to shrink the
+        per-sample time.
+  \item \textbf{Link:} classic serial MIDI adds about $1$~ms per message;
+        Bluetooth LE MIDI can add $10$--$30$~ms or more and is jittery ---
+        prefer USB or wired for serious playing.
+\end{itemize}
+The takeaway: filtering latency is one of several terms, and the wireless
+link often dwarfs it. Design the whole chain, not just the filter.
+\end{goalbox}
+
+\begin{historybox}
+The $10$~ms figure is not folklore. Studies of musicians (e.g.\ work by
+Wessel and Wright at Berkeley's CNMAT, and later latency-perception studies)
+consistently find that performers detect and are disturbed by action-to-sound
+delays in the $10$~ms range, with skilled percussionists more sensitive still.
+It is the same order as the acoustic delay of standing a couple of meters from
+your own amplifier --- a delay real musicians already learn to hate.
+\end{historybox}
+
+\subsection{Zero-phase filtering --- and why you cannot use it live}
+
+There is a beloved offline trick: filter the signal forward, then filter the
+result \emph{backward} with the same filter (\texttt{filtfilt} in SciPy/MATLAB).
+The backward pass cancels the forward pass's phase exactly, giving \emph{zero}
+net phase distortion and zero net delay --- and it squares the magnitude
+response, sharpening it.
+
+\begin{trapbox}
+Zero-phase filtering requires running the filter backward in time, which means
+you must have the \emph{entire signal} already. It is fundamentally non-causal
+and \textbf{cannot be used in real time}. It is perfect for cleaning a stored
+IMU log offline, useless on the live wrist stream. Do not let a clean offline
+result fool you into thinking the same filter will work live --- the live version
+will have all the delay back, plus phase distortion.
+\end{trapbox}
+
+\section{Moving average: the workhorse smoother}
+\label{ch17:movingavg}
+
+Almost every real sensor pipeline starts with a moving average, because it is the
+cheapest possible low-pass filter and it is exactly the right tool for knocking
+down broadband noise on a slowly-varying signal. The length-$L$ moving average is
+
+\begin{equation}
+  y[n] = \frac{1}{L}\sum_{k=0}^{L-1} x[n-k].
+  \label{ch17:ma}
+\end{equation}
+
+It is an FIR filter whose $L$ taps are all $1/L$ --- a rectangular impulse
+response. We computed its frequency response in Chapter~14; its magnitude is the
+\emph{aliased sinc} (Dirichlet kernel):
+\begin{equation}
+  \abs{H(e^{\jj\omega})}
+  = \frac{1}{L}\left|\frac{\sin(L\omega/2)}{\sin(\omega/2)}\right|.
+  \label{ch17:ma-mag}
+\end{equation}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=5.2cm,
+  xlabel={normalized frequency $\omega$ (rad/sample)}, ylabel={$|H|$},
+  domain=0.001:3.1416, samples=180,
+  ymin=0, ymax=1.05, xmin=0, xmax=3.1416,
+  axis lines=left, enlarge x limits=false,
+  legend pos=north east, legend style={font=\footnotesize},
+  xtick={0,1.5708,3.1416}, xticklabels={$0$,$\pi/2$,$\pi$},
+]
+\addplot[sigblue, very thick] {abs(sin(deg(4*x/2))/(4*sin(deg(x/2))))};
+\addlegendentry{$L=4$}
+\addplot[specred, very thick, dashed] {abs(sin(deg(8*x/2))/(8*sin(deg(x/2))))};
+\addlegendentry{$L=8$}
+\addplot[targetgreen, very thick, dotted] {abs(sin(deg(16*x/2))/(16*sin(deg(x/2))))};
+\addlegendentry{$L=16$}
+\end{axis}
+\end{tikzpicture}
+\caption{Magnitude response of the length-$L$ moving average. Longer windows
+push the first null lower (more smoothing) but the stopband lobes stay high
+($\approx -13$~dB) --- the moving average is a gentle low-pass with leaky
+stopband, not a sharp filter. The nulls sit at $\omega = 2\pi m/L$.}
+\label{ch17:fig-ma}
+\end{figure}
+
+\begin{happeningbox}
+The moving average is a \emph{terrible} frequency-selective filter --- its first
+sidelobe is only $13$~dB down, so it lets plenty of high frequency leak through.
+But it is a \emph{wonderful} smoother of broadband noise, because averaging $L$
+independent noisy samples reduces the noise standard deviation by $\sqrt{L}$
+(Chapter~20) while passing slow signal almost untouched. When your goal is
+``make this jittery sensor reading calmer,'' not ``isolate a precise frequency
+band,'' the moving average is usually the right and cheapest answer.
+\end{happeningbox}
+
+\subsection{The running-sum trick: \texorpdfstring{$O(1)$}{O(1)} per sample}
+
+The naive moving average does $L$ adds per output. But a moving \emph{sum}
+changes by only two terms each step: add the new sample, subtract the one that
+just fell off the window. So you can compute it in \emph{constant} time
+regardless of $L$:
+
+\begin{equation}
+  S[n] = S[n-1] + x[n] - x[n-L], \qquad y[n] = S[n]/L.
+  \label{ch17:runsum}
+\end{equation}
+
+\begin{lstlisting}[language=C]
+// O(1) moving average via running sum. ring[] holds the last L samples.
+typedef struct { float ring[64]; int L, pos; float sum; } movavg;
+
+float movavg_step(movavg *m, float x) {
+    m->sum += x - m->ring[m->pos];  // add new, drop oldest
+    m->ring[m->pos] = x;
+    m->pos = (m->pos + 1) % m->L;
+    return m->sum / m->L;
+}
+\end{lstlisting}
+
+\begin{trapbox}
+The running-sum recurrence is numerically fragile in fixed point or with a
+constant DC offset: rounding errors and bias accumulate in $S$ forever, since the
+two correction terms never quite cancel in finite precision. Over millions of
+samples $S$ can drift. Use a wide integer accumulator (or periodically recompute
+the sum from scratch), and prefer it only where the per-sample savings matter.
+For short $L$ (a handful of taps) just sum directly --- it is robust and the cost
+is trivial.
+\end{trapbox}
+
+\subsection{The exponential moving average (one-pole IIR)}
+
+The moving average has a hard, finite window. Its cousin the \emph{exponential}
+moving average (EMA) weights the past with a smooth exponential decay and is the
+simplest IIR filter there is:
+
+\begin{equation}
+  y[n] = \alpha\, x[n] + (1-\alpha)\, y[n-1], \qquad 0 < \alpha < 1.
+  \label{ch17:ema}
+\end{equation}
+
+One multiply, one add, one state variable. Smaller $\alpha$ means heavier
+smoothing (a longer effective memory). Its single pole sits at $z = 1-\alpha$,
+its time constant is roughly $\tau \approx 1/\alpha$ samples, and its $-3$~dB
+cutoff is approximately $\omega_c \approx \alpha$ for small $\alpha$.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=5cm,
+  xlabel={sample $n$}, ylabel={step response $y[n]$},
+  domain=0:40, samples=41,
+  ymin=0, ymax=1.1, xmin=0, xmax=40,
+  axis lines=left, enlarge x limits=false,
+  legend pos=south east, legend style={font=\footnotesize},
+]
+\addplot[sigblue, very thick] {1 - (1-0.3)^x};
+\addlegendentry{$\alpha=0.3$ (light smoothing)}
+\addplot[specred, very thick, dashed] {1 - (1-0.1)^x};
+\addlegendentry{$\alpha=0.1$ (heavy smoothing)}
+\addplot[gray, dotted, thick] coordinates {(0,0.95)(40,0.95)};
+\end{axis}
+\end{tikzpicture}
+\caption{Step response of the exponential moving average for two values of
+$\alpha$. The output rises toward the new level as $1-(1-\alpha)^n$; smaller
+$\alpha$ smooths harder but lags more, taking longer to reach the $95\%$ line
+(dotted). The effective memory is about $1/\alpha$ samples.}
+\label{ch17:fig-ema}
+\end{figure}
+
+\begin{focusbox}
+\textbf{Moving average vs.\ EMA --- which to reach for.}
+\begin{itemize}
+  \item \emph{Moving average:} flat weighting, sharper transition for the same
+        memory, exact known group delay $(L-1)/2$, but needs an $L$-sample
+        buffer. Good when you want a defined window and linear phase.
+  \item \emph{EMA:} one state variable, no buffer, trivially cheap, instantly
+        tunable by one knob $\alpha$. Group delay is roughly $(1-\alpha)/\alpha$
+        samples. Good when memory is tight and you want a smooth, gently-decaying
+        response --- the default for embedded sensor smoothing.
+\end{itemize}
+\end{focusbox}
+
+\section{Median filter: killing spikes without smearing edges}
+\label{ch17:median}
+
+Linear filters --- moving average, EMA, any FIR/IIR --- share a fatal weakness
+against \emph{impulsive} noise. A single wild sample (a sensor glitch, an
+electrical spike, a dropped I2C read returning garbage) gets \emph{spread} by a
+linear filter: the moving average smears one bad value across $L$ outputs instead
+of removing it. Worse, it pulls the average toward the outlier.
+
+The \emph{median} filter replaces each sample with the median of a sliding window
+of $L$ samples (odd $L$):
+\begin{equation}
+  y[n] = \operatorname{median}\bigl(x[n-k],\ \dots,\ x[n+k]\bigr),
+  \qquad L = 2k+1.
+  \label{ch17:median-def}
+\end{equation}
+
+The median is a \emph{nonlinear} operation --- it is not a convolution, has no
+frequency response, and does not obey superposition. But it has a magical
+property: it is immune to outliers. A single spike, no matter how huge, cannot be
+the median of a window in which it is a minority, so it is simply discarded ---
+while genuine edges and steps in the signal are preserved sharply, not blurred.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=5.5cm,
+  xlabel={sample $n$}, ylabel={value},
+  xmin=0, xmax=19, ymin=-0.5, ymax=4.5,
+  axis lines=left, enlarge x limits=false,
+  legend pos=north west, legend style={font=\footnotesize},
+]
+% raw: a step from 1 to 3 at n=10, with two spikes
+\addplot[gray, thick, mark=*, mark size=1pt] coordinates {
+ (0,1)(1,1)(2,1)(3,4)(4,1)(5,1)(6,1)(7,1)(8,1)(9,1)(10,3)(11,3)(12,3)(13,3)(14,0)(15,3)(16,3)(17,3)(18,3)(19,3)};
+\addlegendentry{raw (step + spikes)}
+% median L=3 result: spikes removed, edge preserved
+\addplot[specred, very thick] coordinates {
+ (0,1)(1,1)(2,1)(3,1)(4,1)(5,1)(6,1)(7,1)(8,1)(9,1)(10,3)(11,3)(12,3)(13,3)(14,3)(15,3)(16,3)(17,3)(18,3)(19,3)};
+\addlegendentry{median, $L=3$}
+% moving avg L=3: spikes smeared, edge blurred
+\addplot[sigblue, very thick, dashed] coordinates {
+ (0,1)(1,1)(2,2)(3,2)(4,2)(5,1)(6,1)(7,1)(8,1)(9,1.67)(10,2.33)(11,3)(12,3)(13,2)(14,2)(15,2)(16,3)(17,3)(18,3)(19,3)};
+\addlegendentry{moving avg, $L=3$}
+\end{axis}
+\end{tikzpicture}
+\caption{Median versus moving average on a step contaminated by two spikes (at
+$n=3$ and $n=14$). The median (solid red) removes both spikes completely and
+keeps the step edge razor-sharp. The moving average (dashed blue) smears each
+spike into its neighbors and rounds off the edge.}
+\label{ch17:fig-median}
+\end{figure}
+
+\begin{whybox}
+Why does the median preserve edges while the mean blurs them? At a step, the
+window straddling the edge contains some ``low'' samples and some ``high''
+samples. The mean returns an intermediate value --- a ramp across the edge. The
+median returns whichever side is the majority --- it stays low until the window
+is more than half past the edge, then jumps. The output is a clean step, just
+shifted by the window center. Same reason it kills spikes: a spike is a minority
+of one in its window, so the median never selects it.
+\end{whybox}
+
+\begin{lstlisting}[language=Python]
+import numpy as np
+
+def median_filter(x, L):       # L odd
+    k = L // 2
+    xp = np.pad(x, k, mode='edge')
+    return np.array([np.median(xp[i:i+L]) for i in range(len(x))])
+\end{lstlisting}
+
+\begin{trapbox}
+The median filter is more expensive (sorting a window is $O(L\log L)$ naively,
+or $O(L)$ with a maintained sorted structure) and \emph{nonlinear}: cascading two
+median filters is not the same as one, and you cannot reason about it with a
+frequency response. It also rounds off thin peaks narrower than $k$ samples ---
+if a genuine narrow feature is real signal, the median will eat it just like a
+spike. Use it specifically against impulsive noise, not as a general smoother.
+\end{trapbox}
+
+\begin{applicationbox}
+Median filtering is everywhere outliers appear: removing salt-and-pepper noise
+from images (a 2D median, Chapter~32), de-glitching GPS fixes, cleaning ECG
+baselines of motion artifacts, and --- for us --- rejecting the occasional
+corrupt sample from a flaky I2C/SPI sensor read. A common, cheap, and very
+effective combination is a short \emph{median} (length 3 or 5) to kill spikes,
+followed by a moving average or EMA to smooth the residual broadband jitter.
+\end{applicationbox}
+
+\section{Putting a real sensor pipeline together}
+\label{ch17:pipeline}
+
+We now have all the pieces. A robust, low-latency de-noising front end for a
+streaming sensor is almost always the same small stack, in this order:
+
+\begin{enumerate}
+  \item \textbf{De-glitch} with a short median (length 3 or 5) to discard
+        impulsive spikes and dropped-read garbage \emph{before} they can
+        contaminate any averaging.
+  \item \textbf{Smooth} with an EMA or short moving average to knock down the
+        broadband jitter that remains, choosing the cutoff to just cover your
+        gesture frequencies (motion energy lives below $\sim 20$~Hz).
+  \item \textbf{Remove drift / DC} with a gentle high-pass (a one-pole DC
+        blocker $y[n] = x[n]-x[n-1]+\rho\,y[n-1]$, $\rho$ near $1$) if you only
+        care about \emph{changes}, e.g.\ taps and motion onsets, not absolute
+        orientation.
+\end{enumerate}
+
+\begin{lstlisting}[language=C]
+// Streaming sensor front end: median(3) -> EMA -> DC block.
+// State persists across calls; one sample in, one out; minimal latency.
+#include <math.h>
+typedef struct { float m0,m1,m2; float ema; float xp,yp; } pipe;
+
+static float median3(float a, float b, float c){
+    float hi = fmaxf(a,fmaxf(b,c)), lo = fminf(a,fminf(b,c));
+    return a + b + c - hi - lo;            // the middle value
+}
+float pipe_step(pipe *p, float x, float alpha, float rho){
+    p->m2 = p->m1; p->m1 = p->m0; p->m0 = x;     // shift median window
+    float md = median3(p->m0, p->m1, p->m2);     // 1) de-glitch
+    p->ema  = alpha*md + (1.0f-alpha)*p->ema;    // 2) smooth (EMA)
+    float dc = p->ema - p->xp + rho*p->yp;       // 3) DC block (high-pass)
+    p->xp = p->ema; p->yp = dc;
+    return dc;
+}
+\end{lstlisting}
+
+\begin{goalbox}
+This three-stage front end is exactly what runs first on every channel of the
+wrist tracker's IMU --- three accelerometer axes and three gyro axes. It is
+sample-by-sample (no block latency), costs a handful of operations per sample,
+has no large group delay, and is robust to the glitchy reads you \emph{will} get
+from a sensor bus on a moving, sweaty wrist. Everything downstream --- orientation
+fusion (Chapter~36), gesture features (Chapter~38) --- assumes its input has
+already been cleaned by something like this.
+
+And the caveat from the start of the book still holds: this pipeline
+makes the IMU's \emph{coarse motion} signal clean and responsive, but no amount
+of filtering conjures information the sensor never captured. A wrist IMU can give
+you crisp, low-latency detection of \emph{discrete} gestures (a flick, a twist, a
+tap) and continuous \emph{wrist} orientation --- it cannot recover individual
+finger joint angles. For finger-level control you need EMG/FMG on the forearm or
+sensors on the fingers (Chapter~37). Clean signals, and claims that match what
+the sensor can actually measure.
+\end{goalbox}
+
+\section{Summary}
+\label{ch17:summary}
+
+\begin{itemize}
+  \item \textbf{Streaming} means bounded memory on an endless signal;
+        \textbf{real-time} means meeting a per-sample deadline. Causality forbids
+        peeking ahead, so every filter delays.
+  \item \textbf{Sample-by-sample} processing minimizes latency and suits IIR and
+        smoothers; \textbf{block} processing enables FFT-based work but adds one
+        block of delay.
+  \item \textbf{Fast convolution} (overlap-add / overlap-save) makes long FIR
+        filtering cheap via the FFT, provided $M \ge L+N-1$ so circular
+        convolution equals linear. It wins above $\sim 60$--$100$ taps; below
+        that, direct convolution is faster and lower latency.
+  \item Implement IIR filters as \textbf{cascaded transposed-Direct-Form-II
+        biquads}, never one big direct form, to stay stable and accurate ---
+        especially in \textbf{fixed point}, where coefficient quantization,
+        roundoff noise, overflow, and limit cycles are the dangers.
+  \item \textbf{Latency} is a budget. Linear-phase FIR delays by $(N-1)/2$
+        samples; short IIR delays by a few; zero-phase \texttt{filtfilt} is
+        offline only. For a musical controller, keep total action-to-sound delay
+        near $10$~ms.
+  \item For real sensor data, the practical de-noising stack is a short
+        \textbf{median} to kill spikes, then a \textbf{moving average / EMA} to
+        smooth, optionally a \textbf{DC blocker} to remove drift --- cheap,
+        robust, and low-latency.
+\end{itemize}
+
+\section{Exercises}
+\label{ch17:exercises}
+
+\begin{exercise}
+A streaming filter runs on a microcontroller at $f_s = 500$~Hz. Each output
+sample takes $1.2$~ms of compute. Is this real-time? What is the maximum FIR
+length you could afford if each tap costs $2\,\mu$s and you must also leave
+$30\%$ of the sample period free for other work?
+\end{exercise}
+
+\begin{exercise}
+You filter a stream with an FIR of length $N = 200$ using overlap-add with input
+blocks of length $L = 256$. (a) What is the minimum FFT length $M$? Round up to a
+power of two. (b) How many samples of the overlapping output tail must be saved
+and added between consecutive blocks? (c) What is the block-induced latency in
+samples, and in milliseconds at $f_s = 48$~kHz?
+\end{exercise}
+
+\begin{exercise}
+Show by direct expansion that circular convolution of a length-$3$ signal
+$x = [x_0,x_1,x_2]$ with a length-$3$ filter $h=[h_0,h_1,h_2]$ at DFT length
+$M=4$ does \emph{not} equal their linear convolution, but at $M=5$ it does.
+Identify exactly which output sample is corrupted at $M=4$ and why.
+\end{exercise}
+
+\begin{exercise}
+A length-$101$ symmetric linear-phase low-pass FIR runs at $f_s = 200$~Hz.
+(a) What is its group delay in samples and in milliseconds? (b) If a musician
+needs total latency under $10$~ms and this filter alone exceeds it, name two
+concrete changes that would bring the filter's contribution under $5$~ms, and
+state the cost of each.
+\end{exercise}
+
+\begin{exercise}
+An exponential moving average uses $\alpha = 0.1$. (a) Where is its pole?
+(b) Estimate its time constant in samples and its approximate $-3$~dB cutoff in
+rad/sample. (c) At $f_s = 200$~Hz, what is that cutoff in Hz? (d) Roughly how many
+samples does it take for a step input to reach $95\%$ of its final value?
+\end{exercise}
+
+\begin{exercise}
+Implement the running-sum moving average of Equation~\eqref{ch17:runsum} in any
+language and feed it a constant input of $1.0$ for $10^7$ samples using
+\texttt{float32} arithmetic. Compare the final output to the exact value $1.0$.
+Explain the discrepancy in terms of accumulated roundoff, and show that a
+\texttt{float64} or integer accumulator fixes it.
+\end{exercise}
+
+\begin{exercise}
+Take the signal in Figure~\ref{ch17:fig-median} (a step from $1$ to $3$ at
+$n=10$ with a spike of value $4$ at $n=3$ and a spike of value $0$ at $n=14$). By
+hand, compute the output of (a) a length-$3$ median filter and (b) a length-$3$
+moving average at samples $n = 3, 4, 13, 14, 15$. Confirm the median removes the
+spikes and the average smears them.
+\end{exercise}
+
+\begin{exercise}
+A second-order IIR resonator has poles at $r e^{\pm \jj\theta}$ with $r = 0.99$,
+$\theta = 0.5$. (a) Write the real biquad denominator coefficients $a_1, a_2$.
+(b) Explain why this filter is especially prone to fixed-point trouble (limit
+cycles, coefficient sensitivity), referencing the pole radius. (c) What single
+implementation choice most reduces the risk?
+\end{exercise}
+
+\begin{exercise}
+Explain in one paragraph each why (a) you cannot use SciPy's \texttt{filtfilt}
+zero-phase filtering on the live wrist-controller stream, and (b) a moving average
+is a poor choice when you need to isolate a narrow frequency band but an
+excellent choice when you simply want to reduce broadband sensor noise.
+\end{exercise}
+
+\begin{exercise}
+Design (on paper) the de-noising front end for the wrist controller's gyroscope
+channel. The gyro is sampled at $f_s = 500$~Hz, occasionally returns a single
+garbage sample from a bad SPI read, and carries broadband noise plus a slow
+temperature-dependent bias drift. Specify each stage (type, length or $\alpha$),
+justify your choices against latency and the gesture bandwidth ($< 20$~Hz), and
+estimate the total group delay of your chain in milliseconds.
+\end{exercise}
+
+\begin{exercise}
+(Harder.) The transposed Direct Form II biquad in the C listing of
+Section~\ref{ch17:biquad} uses two state variables $z_1, z_2$. Trace through the
+update equations for an impulse input $x = [1,0,0,\dots]$ with coefficients
+$b_0=1,\ b_1=b_2=0,\ a_1=-0.9,\ a_2=0$ (a one-pole filter dressed as a biquad).
+Confirm that the output is the expected geometric decay $y[n] = 0.9^n$, and state
+the pole location.
+\end{exercise}

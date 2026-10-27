@@ -1,0 +1,927 @@
+\chapter{Edges, Features, and the 2D Convolution}
+
+In the last two chapters we learned to read an image as a two-dimensional
+signal --- a grid of brightness values $f[m,n]$ --- and we learned what its
+2D Fourier transform says about it: low frequencies are the broad washes of
+tone, high frequencies are the fine detail, the texture, and above all the
+\emph{edges}. This chapter is about going after those edges directly, in the
+spatial domain, with a single tool: the \textbf{2D convolution}. We will see
+that an astonishing amount of computer vision --- finding boundaries, detecting
+corners, blurring, sharpening, spotting blobs --- is just convolution with a
+cleverly chosen little grid of numbers called a \emph{kernel}.
+
+And then we get to the punchline that makes this chapter matter far beyond
+images. The 2D convolution is the atomic operation of the convolutional neural
+network (CNN), the architecture behind essentially all modern image
+recognition. The difference between a 1980s edge detector and a 2020s vision
+model is not the operation --- both convolve an image with small kernels. The
+difference is \emph{where the kernels come from}: a human designed the old
+ones from geometry; gradient descent \emph{learns} the new ones from data. By
+the end of this chapter you will see those two worlds as one.
+
+\begin{goalbox}
+Our wrist tracker is about motion, not images --- so why study image edges?
+Three reasons. First, the 2D convolution is the same flip-shift-multiply-sum
+machine from Chapter~13, now run over a grid, and seeing it twice cements it.
+Second, when we turn a window of IMU or EMG samples into a small 2D
+``time $\times$ channel'' array (Chapter~38), the very same convolutional
+layers that read images will read our gesture data. Third, the idea of a
+\emph{learned filter bank} replacing hand-designed features is exactly how
+modern gesture recognizers work. This chapter is where the vision world and
+the gesture world quietly merge.
+\end{goalbox}
+
+\chapterline
+
+\section{An edge is a place where brightness changes fast}
+\label{ch32:what-is-an-edge}
+
+Look at any photograph and ask where the ``edges'' are. Your eye lands on the
+boundary between an object and its background, between a shadow and the lit
+floor, between the dark trunk of a tree and the bright sky. In every case the
+defining feature is the same: as you walk across that boundary, the brightness
+\emph{changes sharply over a short distance}. Inside a region of uniform tone,
+brightness barely changes; at an edge, it jumps.
+
+That single observation hands us the whole strategy. ``Changes fast'' is the
+language of the \emph{derivative}. In one dimension, a function changes fast
+where its derivative is large in magnitude. An image is a function of two
+variables, so the right object is the \textbf{gradient} --- the pair of partial
+derivatives,
+\begin{equation}
+\label{ch32:gradient-cont}
+\nabla f(x,y) \;=\; \left( \frac{\partial f}{\partial x},\; \frac{\partial f}{\partial y} \right).
+\end{equation}
+The gradient is a vector. Its magnitude $\norm{\nabla f}$ tells you \emph{how
+fast} brightness is changing at that point, and its direction tells you
+\emph{which way} the brightness increases most steeply --- which is always
+perpendicular to the edge itself.
+
+\begin{intuitionbox}
+Think of the image as a landscape: bright pixels are hilltops, dark pixels are
+valleys. The gradient at a point is the direction a marble would roll if you
+flipped the landscape upside down --- straight uphill --- and its magnitude is
+how steep that slope is. A flat plateau (uniform region) has zero gradient. A
+cliff (an edge) has a huge gradient pointing over the edge. To find edges, find
+the cliffs: find where $\norm{\nabla f}$ is large.
+\end{intuitionbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12.5cm, height=5.2cm,
+  xlabel={position $x$ across a row of pixels}, ylabel={brightness},
+  xmin=0, xmax=10, ymin=-1.4, ymax=2.4,
+  xtick={0,2,4,6,8,10}, ytick={0,1,2},
+  axis lines=left, ymajorgrids, grid style={gray!18},
+  legend style={at={(0.02,0.97)},anchor=north west,font=\small,draw=gray!40},
+  legend cell align=left,
+]
+% a smoothed step edge: f(x)
+\addplot[thick, color=sigblue, samples=160, domain=0:10]
+  {1/(1+exp(-3*(x-5)))};
+\addlegendentry{$f$ (brightness)}
+% its derivative: a bump at the edge
+\addplot[thick, color=specred, samples=160, domain=0:10]
+  {3*exp(-3*(x-5))/(1+exp(-3*(x-5)))^2};
+\addlegendentry{$f'$ (gradient magnitude)}
+\addplot[dashed, gray, samples=2, domain=0:10]{0};
+\end{axis}
+\end{tikzpicture}
+\caption{One row of pixels crossing an edge. The brightness $f$ rises from dark
+to light over a short stretch (a smoothed step). Its derivative $f'$ is near
+zero on the flat parts and \emph{peaks exactly at the edge}. Detecting edges
+means finding the peaks of the derivative.}
+\label{ch32:fig-step-edge}
+\end{figure}
+
+\subsection{Discrete derivatives: differences between neighbors}
+
+Our image is sampled --- a grid of integers, not a smooth surface --- so we
+cannot take a true derivative. We approximate it the way Chapter~30 taught us:
+a derivative is a limit of differences, and on a grid we simply keep the
+difference. The cleanest estimate of $\partial f/\partial x$ at pixel $[m,n]$
+is the \textbf{central difference},
+\begin{equation}
+\label{ch32:central-diff}
+\frac{\partial f}{\partial x}\bigg|_{[m,n]} \;\approx\; \frac{f[m,n+1] - f[m,n-1]}{2},
+\end{equation}
+the brightness of the pixel to the right minus the pixel to the left (the $2$
+in the denominator accounts for the two-pixel span; in practice it is often
+dropped because we only care about \emph{relative} edge strength). The vertical
+derivative is the same idea down a column.
+
+Now here is the move that ties this whole chapter together. Equation
+\eqref{ch32:central-diff} can be written as a tiny convolution. Lay the
+coefficients $\tfrac12(\,+1,\,0,\,-1\,)$ over the three pixels
+$(n+1, n, n-1)$, multiply, and sum. That little row of numbers is a
+\emph{kernel}. Taking a derivative \emph{is} convolving with a kernel. Once we
+see that, every operation in this chapter becomes ``pick a kernel and
+convolve.''
+
+\section{The 2D convolution, concretely}
+\label{ch32:2d-conv}
+
+Recall the 1D convolution from Chapter~13: flip one signal, slide it across the
+other, and at each shift multiply overlapping samples and add them up. The 2D
+version is identical in spirit --- we just slide a small grid over a big grid.
+
+\begin{definition}[2D convolution]
+\label{ch32:def-conv}
+Given an image $f[m,n]$ and a kernel $h[i,j]$, their convolution is
+\begin{equation}
+\label{ch32:conv2d}
+(f \conv h)[m,n] \;=\; \sum_{i}\sum_{j} f[m-i,\,n-j]\,h[i,j].
+\end{equation}
+The output pixel at $[m,n]$ is a weighted sum of the input pixels in a
+neighborhood, with the weights given by the (flipped) kernel.
+\end{definition}
+
+\begin{happeningbox}
+Strip away the index gymnastics and here is what physically happens. Park the
+kernel --- a small grid, usually $3\times3$ or $5\times5$ --- on top of one
+pixel of the image, centered there. Multiply each kernel weight by the image
+pixel beneath it. Add up all those products. That single number is the output
+pixel. Now slide the kernel one step over and repeat, for every pixel in the
+image. The output is a brand-new image the same size as the input. Every output
+pixel is a little weighted opinion poll of its neighborhood, and the kernel is
+the set of votes.
+\end{happeningbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=0.62, every node/.style={font=\small}]
+% input grid 6x6
+\foreach \x in {0,...,5}{
+  \foreach \y in {0,...,5}{
+    \fill[gray!8] (\x,\y) rectangle (\x+1,\y+1);
+    \draw[gray!40] (\x,\y) rectangle (\x+1,\y+1);
+  }
+}
+% highlight 3x3 patch
+\foreach \x in {1,2,3}{
+  \foreach \y in {2,3,4}{
+    \fill[sigblue!18] (\x,\y) rectangle (\x+1,\y+1);
+    \draw[sigblue!70,thick] (\x,\y) rectangle (\x+1,\y+1);
+  }
+}
+\node[anchor=south] at (3,6.2) {input image $f$};
+% kernel
+\begin{scope}[xshift=9cm,yshift=1.6cm]
+  \foreach \x in {0,1,2}{
+    \foreach \y in {0,1,2}{
+      \fill[specred!12] (\x,\y) rectangle (\x+1,\y+1);
+      \draw[specred!70,thick] (\x,\y) rectangle (\x+1,\y+1);
+    }
+  }
+  \node at (0.5,2.5){\scriptsize $h_{00}$};
+  \node at (1.5,2.5){\scriptsize $h_{01}$};
+  \node at (2.5,2.5){\scriptsize $h_{02}$};
+  \node at (1.5,1.5){\scriptsize $\cdots$};
+  \node[anchor=south] at (1.5,3.2) {kernel $h$};
+\end{scope}
+% output pixel
+\begin{scope}[xshift=14cm,yshift=2.6cm]
+  \fill[targetgreen!22] (0,0) rectangle (1,1);
+  \draw[targetgreen!70,thick] (0,0) rectangle (1,1);
+  \node[anchor=south] at (0.5,1.2){\scriptsize one output pixel};
+\end{scope}
+\draw[-{Stealth},thick,gray] (7.2,3) -- (8.6,3);
+\draw[-{Stealth},thick,gray] (12.3,3) -- (13.8,3);
+\node[font=\scriptsize,gray] at (7.9,3.4){overlay};
+\node[font=\scriptsize,gray] at (13.05,3.4){sum};
+\end{tikzpicture}
+\caption{The 2D convolution as overlay-multiply-sum. The $3\times3$ kernel is
+laid over a patch of the image; each weight multiplies the pixel beneath it;
+the products are summed into a single output pixel. Sliding the kernel over
+every position produces the full output image.}
+\label{ch32:fig-conv-overlay}
+\end{figure}
+
+\begin{trapbox}
+\textbf{Convolution flips the kernel; correlation does not.} The minus signs in
+Eq.~\eqref{ch32:conv2d} flip the kernel both horizontally and vertically before
+overlaying. Most image-processing code and \emph{all} deep-learning frameworks
+actually implement \emph{cross-correlation},
+$\sum_{i,j} f[m+i,n+j]\,h[i,j]$, which skips the flip. For a symmetric kernel
+(a blur) the two are identical. For an antisymmetric kernel (a derivative) the
+flip just negates the result --- a sign you can absorb into the kernel. So in
+practice people say ``convolution'' and mean ``correlation,'' and it almost
+never bites you. We will follow that convention but keep the distinction in
+mind; it matters when you compare a textbook kernel to a library's output.
+\end{trapbox}
+
+\begin{whybox}
+Why is convolution the \emph{right} operation, and not some other neighborhood
+combination? Because it is the only operation that is both \emph{linear} (the
+response to a sum of images is the sum of the responses) and
+\emph{shift-invariant} (a feature looks the same wherever it appears in the
+frame). An edge in the top-left corner and the same edge in the bottom-right
+must produce the same response --- a face is a face wherever it sits in the
+photo. Exactly as in Chapter~12, ``linear + shift-invariant'' forces the
+operation to be convolution with some kernel. The kernel \emph{is} the system's
+impulse response, now a little 2D patch.
+\end{whybox}
+
+\subsection{Boundaries, separability, and cost}
+
+Two practical points before we start choosing kernels.
+
+\textbf{Edges of the image.} When the kernel hangs off the side of the image,
+some of its weights have no pixel beneath them. The standard fixes are to
+\emph{zero-pad} (pretend the outside is black), \emph{replicate} the border
+pixel outward, or \emph{reflect} the image across its edge. Reflection usually
+looks best because it avoids inventing a fake dark border that would itself
+register as an edge.
+
+\textbf{Separability.} A kernel is \emph{separable} if it factors as an outer
+product of a column and a row, $h[i,j] = c[i]\,r[j]$. Then a 2D convolution
+splits into two cheap 1D convolutions: convolve every row with $r$, then every
+column with $c$. This drops the cost per output pixel from $K^2$ multiplies to
+$2K$ --- a large saving for big kernels, and the reason the Gaussian blur (which
+is separable) is so fast. We will see that several of our edge kernels are
+separable too.
+
+\begin{example}[A $3\times3$ convolution by hand]
+\label{ch32:ex-byhand}
+Take a tiny image patch and the horizontal-difference kernel:
+\[
+f = \begin{pmatrix} 10 & 10 & 90 \\ 10 & 10 & 90 \\ 10 & 10 & 90 \end{pmatrix},
+\qquad
+h = \begin{pmatrix} -1 & 0 & 1 \\ -1 & 0 & 1 \\ -1 & 0 & 1 \end{pmatrix}.
+\]
+Centered on the middle pixel, cross-correlation gives
+\[
+\sum h_{ij} f_{ij}
+= (-1)(10) + (0)(10) + (1)(90) + (-1)(10) + 0 + (1)(90) + (-1)(10) + 0 + (1)(90)
+= 240.
+\]
+A large positive number --- this kernel has detected the strong dark-to-light
+edge running down the right side of the patch. Slide it to a flat patch where
+all pixels equal $10$ and the sum is $0$: no edge, no response. The kernel
+\emph{is} an edge detector, and the arithmetic is nothing more than a weighted
+sum of nine numbers.
+\end{example}
+
+\section{From differences to the Sobel operator}
+\label{ch32:sobel}
+
+The crude central-difference kernel $(\,+1,\,0,\,-1\,)$ works, but it has a
+flaw: it is brutally sensitive to noise. A single noisy pixel produces a fake
+edge. The cure is to \emph{average in the direction along the edge while
+differencing across it}. That is exactly what the famous \textbf{Sobel
+operator} does. Its horizontal-gradient kernel is
+\begin{equation}
+\label{ch32:sobel-x}
+G_x \;=\;
+\begin{pmatrix} -1 & 0 & +1 \\ -2 & 0 & +2 \\ -1 & 0 & +1 \end{pmatrix},
+\qquad
+G_y \;=\;
+\begin{pmatrix} -1 & -2 & -1 \\ \phantom{-}0 & \phantom{-}0 & \phantom{-}0 \\ +1 & +2 & +1 \end{pmatrix}.
+\end{equation}
+
+Read $G_x$ as a product of two intentions. \emph{Across} the kernel (left to
+right) it is the difference $(-1,0,+1)$ --- a derivative. \emph{Down} the kernel
+it is the smoothing weights $(1,2,1)$ --- a little blur. In fact $G_x$ factors
+exactly:
+\begin{equation}
+\label{ch32:sobel-sep}
+G_x =
+\begin{pmatrix} 1 \\ 2 \\ 1 \end{pmatrix}
+\begin{pmatrix} -1 & 0 & +1 \end{pmatrix},
+\end{equation}
+so it is separable: smooth vertically with $(1,2,1)$, then difference
+horizontally with $(-1,0,+1)$. \emph{Differentiate across the edge, blur along
+it.} That is the whole design philosophy of a good gradient operator.
+
+\begin{whybox}
+Why blend blurring with differencing? Differentiation \emph{amplifies} high
+frequencies --- and noise is the highest-frequency content of all (Chapter~20).
+A pure difference kernel is a high-pass filter, so it boosts noise enormously.
+Blurring is low-pass; it suppresses noise. Sobel multiplies a low-pass along
+one axis by a high-pass along the other, giving a \emph{band-pass} response
+that is tuned to real edges (which are spatially extended structures) while
+rejecting isolated noisy pixels (which are not). This is the same
+smooth-then-differentiate logic behind the derivative-of-Gaussian filter we
+meet in the next section.
+\end{whybox}
+
+Once we have $G_x$ and $G_y$ as two convolved images, we combine them into the
+gradient magnitude and direction at every pixel:
+\begin{equation}
+\label{ch32:grad-mag}
+\norm{\nabla f} = \sqrt{G_x^2 + G_y^2}, \qquad
+\theta = \operatorname{atan2}(G_y,\, G_x).
+\end{equation}
+The magnitude image is bright exactly along edges and near-black everywhere
+else; the direction tells us each edge's orientation. Thresholding the
+magnitude gives a first, rough edge map.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12.5cm, height=5cm,
+  xlabel={position $x$ across the row}, ylabel={value},
+  xmin=0, xmax=12, ymin=-1.7, ymax=2.6,
+  xtick={0,2,4,6,8,10,12}, ytick={-1,0,1,2},
+  axis lines=left, ymajorgrids, grid style={gray!18},
+  legend style={at={(0.98,0.97)},anchor=north east,font=\small,draw=gray!40},
+  legend cell align=left,
+]
+% noisy step
+\addplot[thick, color=sigblue, samples=200, domain=0:12]
+  {1/(1+exp(-2.5*(x-6))) + 0.12*sin(deg(11*x)) + 0.08*cos(deg(23*x))};
+\addlegendentry{noisy brightness}
+% naive derivative (amplifies noise) -- emulate with a wiggly bump
+\addplot[thin, color=gray, samples=200, domain=0:12]
+  {2.5*exp(-2.5*(x-6))/(1+exp(-2.5*(x-6)))^2 + 0.35*cos(deg(23*x))};
+\addlegendentry{raw difference}
+% smoothed derivative (Sobel-like) -- clean bump
+\addplot[thick, color=specred, samples=200, domain=0:12]
+  {2.5*exp(-2.5*(x-6))/(1+exp(-2.5*(x-6)))^2};
+\addlegendentry{Sobel (smoothed)}
+\addplot[dashed, gray, samples=2, domain=0:12]{0};
+\end{axis}
+\end{tikzpicture}
+\caption{Why Sobel smooths along the edge. The raw difference of a noisy
+brightness profile (gray) is itself noisy --- full of spurious bumps that would
+become fake edges. Sobel's built-in $(1,2,1)$ smoothing yields a clean bump
+(red) located right at the true edge.}
+\label{ch32:fig-sobel-smooth}
+\end{figure}
+
+\begin{lstlisting}[language=Python,caption={Sobel edge magnitude in NumPy/SciPy.},label={ch32:lst-sobel}]
+import numpy as np
+from scipy.ndimage import convolve
+
+Gx = np.array([[-1, 0, 1],
+               [-2, 0, 2],
+               [-1, 0, 1]], dtype=float)
+Gy = Gx.T  # transpose gives the vertical kernel
+
+def sobel_edges(img):
+    img = img.astype(float)
+    gx = convolve(img, Gx, mode="reflect")   # reflect padding at borders
+    gy = convolve(img, Gy, mode="reflect")
+    mag = np.hypot(gx, gy)                    # sqrt(gx**2 + gy**2)
+    return mag / mag.max()                    # normalize to [0, 1]
+\end{lstlisting}
+
+\begin{applicationbox}
+Sobel and its cousins (Prewitt, with equal $(1,1,1)$ smoothing; Scharr, with
+optimized $(3,10,3)$ weights for better rotational accuracy) are everywhere in
+real systems: lane-line detection in cars, defect inspection on assembly lines,
+fingerprint ridge enhancement, and the first preprocessing step of countless
+medical-imaging pipelines. They run in real time on the cheapest hardware
+because they are just nine multiplies per pixel --- which is precisely why they
+survived into the deep-learning era as the kind of filter a network's first
+layer reliably re-discovers on its own.
+\end{applicationbox}
+
+\section{Canny: turning a gradient into clean edges}
+\label{ch32:canny}
+
+A thresholded Sobel magnitude is messy: edges come out as thick smears, faint
+edges flicker in and out depending on the threshold, and noise speckles the
+result. In 1986 John Canny asked what an \emph{optimal} edge detector would
+look like and derived a multi-stage procedure that is still the default in
+practice. We will not redo his variational derivation, but the four stages are
+deeply intuitive once you have the gradient picture.
+
+\begin{enumerate}
+\item \textbf{Smooth with a Gaussian.} Convolve the image with a Gaussian blur
+first, to tame noise before differentiating. The blur width $\sigma$ sets the
+scale of edges you care about: small $\sigma$ finds fine detail, large $\sigma$
+finds only the big boundaries.
+
+\item \textbf{Compute the gradient.} Apply Sobel to get $\norm{\nabla f}$ and
+$\theta$ at every pixel. (Steps 1 and 2 together are a
+\emph{derivative-of-Gaussian} filter --- one convolution, by associativity.)
+
+\item \textbf{Non-maximum suppression.} An edge should be one pixel thick, not
+a fat ridge. Walk along the gradient direction; keep a pixel only if its
+magnitude is a \emph{local maximum} compared to its two neighbors across the
+edge. This thins the smear down to a crisp line at the ridge crest.
+
+\item \textbf{Hysteresis thresholding.} Use \emph{two} thresholds. Pixels above
+the high threshold are definitely edges. Pixels below the low threshold are
+definitely not. Pixels in between count as edges only if they connect to a
+strong edge. This links up broken contours while rejecting isolated noise ---
+the trick that makes Canny output look like clean line drawings.
+\end{enumerate}
+
+\begin{intuitionbox}
+Sobel answers ``how steep is the cliff here?'' Canny answers ``draw me the exact
+ridgeline of the cliffs, one pixel wide, with no gaps and no false starts.''
+The first is a measurement; the second is a decision. Non-maximum suppression
+is the ``thin it'' decision; hysteresis is the ``connect it'' decision. Both are
+heuristics layered on top of the same gradient convolution.
+\end{intuitionbox}
+
+\begin{connectionbox}
+The derivative-of-Gaussian filter from step 2 is a beautiful meeting point with
+the calculus and linear-algebra companion books. By the convolution theorem
+(Chapter~11), \emph{differentiating a blurred image equals convolving with the
+derivative of the blur}: $\frac{\dd}{\dd x}(g \conv f) = (\frac{\dd g}{\dd x})
+\conv f$. So we never differentiate the noisy image at all --- we differentiate
+the smooth Gaussian once, analytically, and convolve that fixed kernel with the
+image. Calculus does the hard part on paper; convolution does the cheap part on
+pixels.
+\end{connectionbox}
+
+\section{Blurring versus differentiating: two faces of one operation}
+\label{ch32:blur-vs-diff}
+
+It is worth pausing on a duality that runs through everything above. Blurring
+and differentiating are both convolutions, but with opposite-looking kernels,
+and they do opposite things in the frequency domain.
+
+A \textbf{blur} kernel has all-positive weights that sum to $1$. The simplest
+is the $3\times3$ box average (every weight $\tfrac19$); the better-behaved one
+is the Gaussian,
+\begin{equation}
+\label{ch32:gauss-kernel}
+g[i,j] \;\propto\; \exp\!\left(-\frac{i^2 + j^2}{2\sigma^2}\right),
+\end{equation}
+normalized so the weights sum to $1$. Because the weights sum to one, a blur
+preserves the overall brightness and \emph{attenuates high frequencies} --- it
+is a low-pass filter. The output is a smoothed, softened image.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=11cm, height=4.6cm,
+  xlabel={offset from center (pixels)}, ylabel={weight},
+  xmin=-4, xmax=4, ymin=0, ymax=0.5,
+  xtick={-4,-2,0,2,4}, ytick={0,0.2,0.4},
+  axis lines=left, ymajorgrids, grid style={gray!18},
+  legend style={at={(0.98,0.97)},anchor=north east,font=\small,draw=gray!40},
+  legend cell align=left,
+]
+% Gaussian 1D profile, sigma=1
+\addplot[thick, color=sigblue, samples=120, domain=-4:4]
+  {0.3989*exp(-x^2/2)};
+\addlegendentry{Gaussian ($\sigma=1$)}
+% box average over 5 taps (each 0.2) shown as a step
+\addplot[thick, color=quotientorange, const plot, samples at={-4,-3,-2.5,-1.5,-0.5,0.5,1.5,2.5,3,4}]
+  {0.2*(abs(x)<2.5)};
+\addlegendentry{box average (5 taps)}
+\end{axis}
+\end{tikzpicture}
+\caption{Two smoothing kernels in 1D. The box average gives every neighbor an
+equal vote (a hard window); the Gaussian weights nearby pixels more than distant
+ones (a soft window). Both sum to $1$, so both preserve brightness, but the
+Gaussian's smooth taper avoids the ringing artifacts a sharp box edge produces.}
+\label{ch32:fig-blur-kernels}
+\end{figure}
+
+A \textbf{derivative} kernel has weights that sum to \emph{zero} (look back at
+Sobel: $-1-2-1+1+2+1 = 0$). A zero-sum kernel ignores constant brightness
+entirely --- convolve it with a flat gray field and you get zero. It responds
+only to \emph{changes}, which is why it is a high-pass filter and an edge
+detector. Differentiating boosts high frequencies; blurring suppresses them.
+
+\begin{focusbox}
+The single most useful rule of thumb for reading any kernel:
+\begin{itemize}
+\item \textbf{Weights sum to $1$} $\Rightarrow$ it is a \emph{smoother /
+low-pass} (blur, average). Preserves brightness, kills detail.
+\item \textbf{Weights sum to $0$} $\Rightarrow$ it is a \emph{differentiator /
+high-pass} (edge, derivative). Kills flat regions, keeps changes.
+\item \textbf{Center positive, surround negative, summing to $1$}
+$\Rightarrow$ it is a \emph{sharpener} --- original plus a dash of high-pass.
+\end{itemize}
+Glance at the numbers, add them up, and you already know what a kernel does
+before you ever run it.
+\end{focusbox}
+
+The two combine to give the second-derivative edge detector, the
+\textbf{Laplacian}, whose kernel is the discrete $\nabla^2 = \partial_{xx} +
+\partial_{yy}$:
+\begin{equation}
+\label{ch32:laplacian}
+L =
+\begin{pmatrix} 0 & 1 & 0 \\ 1 & -4 & 1 \\ 0 & 1 & 0 \end{pmatrix}.
+\end{equation}
+It sums to zero (a differentiator), and instead of \emph{peaking} at an edge
+like the first derivative, it \emph{crosses zero} there --- the second
+derivative is positive on one side of the edge and negative on the other.
+Finding ``zero crossings'' of the Laplacian is another classic edge detector
+(Marr--Hildreth), and the Laplacian-of-Gaussian is the workhorse of the blob
+detector we meet next.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12.5cm, height=5cm,
+  xlabel={position $x$}, ylabel={value},
+  xmin=0, xmax=10, ymin=-2.4, ymax=2.6,
+  xtick={0,2,4,6,8,10}, ytick={-2,-1,0,1,2},
+  axis lines=left, ymajorgrids, grid style={gray!18},
+  legend style={at={(0.02,0.03)},anchor=south west,font=\small,draw=gray!40},
+  legend cell align=left,
+]
+\addplot[thick, color=sigblue, samples=160, domain=0:10]
+  {1/(1+exp(-3*(x-5)))};
+\addlegendentry{$f$ (edge)}
+\addplot[thick, color=specred, samples=160, domain=0:10]
+  {3*exp(-3*(x-5))/(1+exp(-3*(x-5)))^2};
+\addlegendentry{$f'$ (peaks at edge)}
+\addplot[thick, color=quotientorange, samples=200, domain=0:10]
+  {9*exp(-3*(x-5))*(exp(-3*(x-5))-1)/(1+exp(-3*(x-5)))^3};
+\addlegendentry{$f''$ (zero-crosses at edge)}
+\addplot[dashed, gray, samples=2, domain=0:10]{0};
+\end{axis}
+\end{tikzpicture}
+\caption{First versus second derivative at an edge. The first derivative $f'$
+\emph{peaks} at the edge (find the maximum). The second derivative $f''$
+\emph{crosses zero} at the edge (find the sign change). Sobel uses the first;
+the Laplacian uses the second.}
+\label{ch32:fig-first-second-deriv}
+\end{figure}
+
+\section{Beyond edges: corners and blobs}
+\label{ch32:corners-blobs}
+
+An edge is a 1D feature --- it has a direction, and you can slide along it
+without anything changing. That makes a single edge a poor landmark: if you are
+trying to track a point from frame to frame (which is exactly what motion and
+gesture systems do), a point on an edge could be anywhere along that edge. What
+you want is a feature that is \emph{distinctive in every direction} --- a
+\textbf{corner}.
+
+\subsection{Corners: the structure tensor}
+
+The insight (Harris and Stephens, 1988; Moravec before them) is to ask: if I
+nudge a little window in any direction, how much does the patch underneath
+change? On a flat region, nudging changes nothing. Along an edge, nudging along
+the edge changes nothing, but nudging across it changes a lot --- change in
+\emph{one} direction. At a corner, nudging in \emph{any} direction changes the
+patch a lot. Corners are where the brightness varies strongly along two
+independent directions at once.
+
+We make this precise with the \textbf{structure tensor}, built entirely from
+the gradients we already have. Over a small window $W$ around a pixel, form
+\begin{equation}
+\label{ch32:structure-tensor}
+M \;=\; \sum_{W}
+\begin{pmatrix} G_x^2 & G_x G_y \\ G_x G_y & G_y^2 \end{pmatrix}.
+\end{equation}
+This $2\times2$ matrix summarizes how the gradient behaves in the window. Its
+two eigenvalues $\lambda_1, \lambda_2$ tell the whole story:
+\begin{itemize}
+\item Both small $\Rightarrow$ flat region (no structure).
+\item One large, one small $\Rightarrow$ an edge (strong variation in one
+direction only).
+\item Both large $\Rightarrow$ a corner (strong variation in two directions).
+\end{itemize}
+Computing eigenvalues per pixel is costly, so Harris uses the cheap
+\emph{corner response} $R = \det M - k(\operatorname{tr} M)^2 = \lambda_1
+\lambda_2 - k(\lambda_1 + \lambda_2)^2$, which is large and positive only when
+both eigenvalues are large. Peaks of $R$ are corners.
+
+\begin{connectionbox}
+The structure tensor is a gorgeous use of the linear-algebra companion book.
+The eigenvectors of $M$ point along the directions of least and most change;
+the eigenvalues measure how much change. An edge is a near-singular $M$ (one
+tiny eigenvalue); a corner is a well-conditioned $M$ (two healthy eigenvalues).
+``Is this a corner?'' literally becomes ``is this $2\times2$ matrix
+well-conditioned?'' --- and every ingredient ($G_x$, $G_y$, the window sum) is a
+convolution.
+\end{connectionbox}
+
+\subsection{Blobs: the Laplacian of Gaussian across scale}
+
+A \textbf{blob} is a roughly circular region that differs from its surroundings
+--- a dot, a spot, a small object. The natural detector is the
+\textbf{Laplacian-of-Gaussian} (LoG): blur with a Gaussian of width $\sigma$,
+then take the Laplacian. The LoG kernel looks like a ``Mexican hat'': a positive
+bump in the middle ringed by a negative moat. Convolved with the image, it
+responds most strongly where a bright blob of size matched to $\sigma$ sits on a
+darker background.
+
+The crucial idea is \emph{scale}. A blob has a size, and the LoG only responds
+strongly when its $\sigma$ matches that size. So we run the LoG at a whole stack
+of scales and look for peaks in both space \emph{and} scale --- the
+$(x, y, \sigma)$ where the response is maximal tells us \emph{where} the blob is
+and \emph{how big} it is. This scale-space search is the heart of classic
+feature detectors like SIFT (which approximates the LoG by a cheap
+\emph{difference of Gaussians}, two blurs subtracted).
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=5cm,
+  xlabel={position $x$ (1D slice through a blob)}, ylabel={LoG response},
+  xmin=-6, xmax=6, ymin=-0.8, ymax=1.15,
+  xtick={-6,-4,-2,0,2,4,6}, ytick={-0.5,0,0.5,1},
+  axis lines=left, ymajorgrids, grid style={gray!18},
+]
+% Mexican-hat / Ricker wavelet: (1 - x^2) e^{-x^2/2}
+\addplot[thick, color=structurepurple, samples=200, domain=-6:6]
+  {(1 - x^2/2)*exp(-x^2/4)};
+\addplot[dashed, gray, samples=2, domain=-6:6]{0};
+\end{axis}
+\end{tikzpicture}
+\caption{A 1D slice of the Laplacian-of-Gaussian (``Mexican hat'') kernel: a
+positive center flanked by negative lobes. It fires hardest on a bright blob
+whose size matches the central lobe --- the basis of multi-scale blob
+detection.}
+\label{ch32:fig-log}
+\end{figure}
+
+\section{The 2D convolution as the heart of a CNN}
+\label{ch32:cnn}
+
+Everything so far has been hand-designed: a human looked at the geometry of
+edges, corners, and blobs, and wrote down kernels by reasoning. The
+revolutionary idea of the convolutional neural network is to keep the
+operation --- convolve the image with small kernels --- but \emph{stop choosing
+the kernels by hand}. Instead, treat the kernel weights as unknowns and
+\emph{learn} them from labeled examples by gradient descent.
+
+\begin{happeningbox}
+A convolutional layer is structurally identical to what we have been doing.
+It holds a bank of small kernels (say sixty-four $3\times3$ kernels). It
+convolves each one with the input image, producing sixty-four output images
+called \emph{feature maps} --- each map is bright wherever its kernel's pattern
+appears. A nonlinearity (usually ReLU: clamp negatives to zero) is applied,
+and the maps are downsampled (\emph{pooling}). Then another convolutional layer
+does the same to those feature maps, and another, stacking dozens deep. The
+only thing the network ``knows'' at the start is that it will convolve; the
+\emph{contents} of every kernel are learned.
+\end{happeningbox}
+
+The reason this works --- and the reason convolution rather than a fully
+connected layer --- comes straight from the geometry we built earlier.
+
+\begin{whybox}
+Why convolution instead of a generic neural-network layer? Two priors baked
+into the architecture, both of which we have already justified.
+\begin{itemize}
+\item \textbf{Locality.} A pixel's meaning is set by its neighbors, not by a
+pixel on the far side of the image. A small kernel looks only at a local patch.
+\item \textbf{Translation invariance / weight sharing.} The same kernel slides
+over the whole image, so a feature is detected identically wherever it appears
+--- exactly the shift-invariance argument from Section~\ref{ch32:2d-conv}. This
+also slashes the number of parameters: a $3\times3$ kernel has nine weights, no
+matter how big the image, versus millions for a fully connected layer.
+\end{itemize}
+These are the same two assumptions --- linear and shift-invariant --- that
+forced us to convolution in the first place. The CNN simply lets the data fill
+in the kernel weights that those assumptions left open.
+\end{whybox}
+
+\subsection{Learned filters rediscover the classics}
+
+Here is the most satisfying fact in this chapter. When you train a CNN on
+natural images and then \emph{look at} the kernels its first convolutional
+layer learned, you do not see random noise. You see oriented edge detectors at
+various angles, color-contrast detectors, small blobs, and little textures ---
+the learned first-layer filters look strikingly like Sobel kernels, Gabor
+filters, and Laplacians of Gaussian. The network, given only a pile of photos
+and a classification goal, \emph{rediscovers the very operators that Sobel,
+Canny, Harris, and Marr designed by hand.}
+
+\begin{aestheticbox}
+This convergence is not a coincidence; it is a statement about the world.
+Natural images really are built from oriented edges and blobs at multiple
+scales --- that is the statistical structure of photographs of a world made of
+surfaces and objects under light. Any system that must efficiently represent
+such images, whether a human visual cortex (whose first-stage cells Hubel and
+Wiesel found to be oriented edge detectors in 1959), a hand-designed pipeline,
+or a trained CNN, lands on the same first-layer vocabulary. Three completely
+different design processes --- evolution, engineering, optimization --- arrive
+at the same answer because the answer is dictated by the data, not the
+designer.
+\end{aestheticbox}
+
+\begin{connectionbox}
+This section is the bridge to the machine-learning and algorithms companion
+books. There you will see how the convolution's weights are trained:
+backpropagation computes the gradient of a loss with respect to each kernel
+weight, and gradient descent nudges them. The key fact that makes it work is
+that \emph{convolution is differentiable in its weights} --- and, pleasingly,
+the gradient of a convolution is itself a convolution. The forward pass, the
+backward pass, and the weight update are all the same flip-shift-multiply-sum
+machine we built in Chapter~13, run in three directions.
+\end{connectionbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[node distance=4mm and 9mm, font=\small,
+  every node/.style={align=center}]
+\tikzset{
+  blk/.style={draw, rounded corners, minimum height=10mm, minimum width=15mm,
+    fill=gray!6, thick},
+  conv/.style={blk, fill=sigblue!12, draw=sigblue!70},
+  pool/.style={blk, fill=targetgreen!14, draw=targetgreen!70},
+  fc/.style={blk, fill=quotientorange!14, draw=quotientorange!70},
+}
+\node[blk] (in) {image\\$H\times W$};
+\node[conv, right=of in] (c1) {conv\\$+$ReLU};
+\node[pool, right=of c1] (p1) {pool};
+\node[conv, right=of p1] (c2) {conv\\$+$ReLU};
+\node[pool, right=of c2] (p2) {pool};
+\node[fc, right=of p2] (fc) {dense\\$\to$ class};
+\foreach \a/\b in {in/c1, c1/p1, p1/c2, c2/p2, p2/fc}
+  \draw[-{Stealth},thick,gray] (\a) -- (\b);
+\node[font=\scriptsize,gray,below=1mm of c1] {learned\\edges};
+\node[font=\scriptsize,gray,below=1mm of c2] {learned\\parts};
+\end{tikzpicture}
+\caption{A small CNN as a stack of convolutions. Each \texttt{conv} block is a
+bank of learned 2D kernels --- the same operation as a Sobel filter, but with
+weights set by training. Early layers learn edge-like filters; deeper layers
+combine them into parts and objects; a final dense layer reads out a class.}
+\label{ch32:fig-cnn}
+\end{figure}
+
+\section{Carrying the idea to the wrist}
+\label{ch32:to-wrist}
+
+\begin{goalbox}
+The wrist tracker never sees an image --- so where does the 2D convolution land?
+In two concrete places.
+
+\textbf{1. Time $\times$ channel maps.} Take a one-second window of our sensor
+data and stack the channels into a 2D array: rows are channels (3 accelerometer
+axes, 3 gyroscope axes, several EMG electrodes), columns are time samples. That
+array \emph{is} a small image, and a CNN's 2D kernels can sweep across it,
+learning filters that detect, say, ``a sharp flexion burst on EMG channel~2
+coincident with a downward accelerometer spike.'' This is exactly how many
+published gesture and human-activity-recognition models work, and it is the
+same convolution from this chapter.
+
+\textbf{2. 1D convolution as the natural form.} More often, each sensor channel
+is convolved on its own with a small 1D kernel (a \emph{1D CNN}). That is
+nothing but the 1D special case of Definition~\ref{ch32:def-conv}: the same
+learned-filter idea, sliding a tiny window along the time axis to detect
+temporal motifs --- the onset of a tap, the plateau of a held pose.
+
+In both cases the lesson of this chapter carries over intact: a small, shared,
+learned kernel sliding over the signal, detecting a local pattern wherever it
+occurs.
+\end{goalbox}
+
+\begin{trapbox}
+\textbf{Know what convolution can and cannot recover.} A learned
+convolutional filter is only as informative as the signal it sees. No amount of
+clever kernels on a \emph{wrist-worn IMU alone} will reconstruct continuous
+individual finger-joint angles --- the wrist simply does not carry that
+information, and a CNN cannot conjure it from data that is not there. What 2D/1D
+convolutional features genuinely deliver from the wrist is robust detection of
+\emph{coarse, discrete} gestures (a flick, a twist, a tap, a hold) and, with
+forearm \emph{EMG or force myography}, discrimination among a modest set of
+finger and grip patterns. Continuous finger \emph{pose} needs sensors on the
+fingers themselves (instrumented rings or gloves). The convolution is a
+pattern matcher, not a source of information that the sensor never captured.
+\end{trapbox}
+
+\begin{buildbox}
+A practical first-layer feature extractor for the wrist, runnable on a Pi or a
+beefy microcontroller, mirrors this chapter exactly. Treat a window of IMU
+samples as a $C \times T$ array (channels by time) and convolve with a handful
+of small learned 1D kernels, then pool. The skeleton:
+\begin{lstlisting}[language=Python,caption={A 1D conv feature stage for IMU windows (PyTorch sketch).},label={ch32:lst-imu-cnn}]
+import torch.nn as nn
+
+# input: (batch, C_channels=6, T_samples=128)  -- a window of accel+gyro
+feature = nn.Sequential(
+    nn.Conv1d(6, 16, kernel_size=7, padding=3),  # 16 learned temporal kernels
+    nn.ReLU(),
+    nn.MaxPool1d(2),                             # downsample in time
+    nn.Conv1d(16, 32, kernel_size=5, padding=2), # combine into motifs
+    nn.ReLU(),
+    nn.AdaptiveAvgPool1d(1),                     # one vector per window
+)
+# feed the resulting vector to a small classifier over your gesture set
+\end{lstlisting}
+Each \texttt{Conv1d} kernel is the 1D sibling of a Sobel row. Train it on
+labeled gestures and inspect the learned kernels: you will find some that look
+like edge detectors (firing at motion \emph{onsets}) and some that look like
+smoothers (averaging out tremor) --- the same two faces of convolution from
+Section~\ref{ch32:blur-vs-diff}.
+\end{buildbox}
+
+\section{Summary}
+\label{ch32:summary}
+
+\begin{itemize}
+\item An \textbf{edge} is where brightness changes fast; the \textbf{gradient}
+$\nabla f$ measures that change in magnitude and direction.
+\item Estimating derivatives on a grid is a small \textbf{convolution}: a
+derivative is just a kernel of differences.
+\item The \textbf{2D convolution} (Def.~\ref{ch32:def-conv}) is overlay-
+multiply-sum of a small kernel over the image --- the unique linear,
+shift-invariant neighborhood operation.
+\item \textbf{Sobel} differentiates across an edge while smoothing along it
+(separable, noise-robust); \textbf{Canny} thins and links the gradient into
+clean one-pixel contours.
+\item A kernel summing to \textbf{1} blurs (low-pass); summing to \textbf{0}
+differentiates (high-pass). The \textbf{Laplacian} is a second-derivative
+detector whose zero crossings mark edges.
+\item \textbf{Corners} (structure-tensor eigenvalues both large) and
+\textbf{blobs} (Laplacian-of-Gaussian peaks across scale) are more distinctive
+features, all built from gradient convolutions.
+\item A \textbf{CNN} keeps the convolution but \emph{learns} the kernels; its
+first layer reliably rediscovers edge, blob, and texture detectors --- the same
+operators engineers designed by hand.
+\item For the wrist, the same idea appears as \textbf{1D/2D convolutions over
+time $\times$ channel windows} --- a reliable detector of coarse gestures, but
+not a substitute for sensors that the wrist alone cannot replace.
+\end{itemize}
+
+\section{Exercises}
+\label{ch32:exercises}
+
+\begin{exercise}
+\label{ch32:ex-byhand2}
+Take the $3\times3$ patch $f = \big(\begin{smallmatrix} 5 & 5 & 5 \\ 5 & 5 & 5
+\\ 80 & 80 & 80 \end{smallmatrix}\big)$ and apply the vertical Sobel kernel
+$G_y$ from Eq.~\eqref{ch32:sobel-x} by cross-correlation centered on the middle
+pixel. Compute the response. Does its sign tell you whether the edge runs
+dark-to-light going downward or upward? Now apply $G_x$; explain why you get
+zero.
+\end{exercise}
+
+\begin{exercise}
+\label{ch32:ex-sum-rule}
+For each kernel below, sum the weights and state from the rule in
+Section~\ref{ch32:blur-vs-diff} whether it blurs, differentiates, or sharpens:
+(a) $\tfrac{1}{16}\big(\begin{smallmatrix} 1&2&1\\2&4&2\\1&2&1
+\end{smallmatrix}\big)$; (b) $\big(\begin{smallmatrix} 0&-1&0\\-1&5&-1\\0&-1&0
+\end{smallmatrix}\big)$; (c) the Laplacian of Eq.~\eqref{ch32:laplacian}.
+Verify your answers by predicting what each does to a flat gray image.
+\end{exercise}
+
+\begin{exercise}
+\label{ch32:ex-separable}
+Show that the Gaussian kernel of Eq.~\eqref{ch32:gauss-kernel} is separable by
+writing it as an outer product of two 1D Gaussians. Count the multiplies per
+output pixel for a $7\times7$ Gaussian done as a single 2D convolution versus
+two 1D convolutions. By what factor is the separable version cheaper?
+\end{exercise}
+
+\begin{exercise}
+\label{ch32:ex-dog}
+The \emph{difference of Gaussians} approximates the Laplacian-of-Gaussian:
+$\text{DoG} = g_{\sigma_1} - g_{\sigma_2}$ with $\sigma_1 < \sigma_2$. Sketch
+the 1D profile of $g_{\sigma_1}(x) - g_{\sigma_2}(x)$ and argue that it has the
+Mexican-hat shape of Figure~\ref{ch32:fig-log}. Why is DoG so much cheaper to
+compute than a true LoG in a multi-scale pyramid?
+\end{exercise}
+
+\begin{exercise}
+\label{ch32:ex-noise}
+Explain, using the frequency-domain view, why differentiating an image
+amplifies noise and why pre-smoothing fixes it. Relate your answer to the
+band-pass nature of the Sobel operator described in Section~\ref{ch32:sobel}.
+\end{exercise}
+
+\begin{exercise}
+\label{ch32:ex-tensor}
+Consider the structure tensor of Eq.~\eqref{ch32:structure-tensor} computed
+over a window lying entirely on a straight vertical edge. Argue that one
+eigenvalue is large and the other near zero. What does this imply for the
+Harris response $R$? Why does this correctly say ``edge, not corner''?
+\end{exercise}
+
+\begin{exercise}
+\label{ch32:ex-corr-vs-conv}
+A library reports that it computes ``convolution,'' but feeding it the kernel
+$(-1, 0, 1)$ and a step that rises left-to-right gives a \emph{negative} peak,
+the opposite of what Eq.~\eqref{ch32:central-diff} predicts. Using the
+trap box of Section~\ref{ch32:2d-conv}, explain what happened and how to fix
+your kernel so the signs come out as expected.
+\end{exercise}
+
+\begin{exercise}
+\label{ch32:ex-cnn-params}
+A convolutional layer with $64$ kernels of size $3\times3$ takes a single-
+channel input. How many weights does it have (ignore biases)? Compare to a
+fully connected layer mapping a $256\times256$ image to $64$ outputs. Use the
+ratio to explain the ``weight sharing'' argument of Section~\ref{ch32:cnn}.
+\end{exercise}
+
+\begin{exercise}
+\label{ch32:ex-imu-map}
+You build a $6 \times 128$ ``channel $\times$ time'' array from one second of
+accel+gyro data and convolve it with a $3\times3$ learned kernel. Describe in
+words one spatiotemporal pattern such a kernel could learn to detect. Then
+state plainly one thing this representation \emph{cannot} recover from the wrist
+alone, citing the limits-of-recovery trap of Section~\ref{ch32:to-wrist}.
+\end{exercise}
+
+\begin{exercise}
+\label{ch32:ex-learned-classic}
+It is observed that the first layer of a CNN trained on photos learns filters
+resembling oriented edge detectors. Give two independent reasons --- one about
+the statistics of natural images, one about the architecture's built-in priors
+--- for why this happens, connecting to the why box and aesthetic box of
+Section~\ref{ch32:cnn}.
+\end{exercise}

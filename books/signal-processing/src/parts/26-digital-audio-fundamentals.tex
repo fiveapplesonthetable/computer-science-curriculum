@@ -1,0 +1,813 @@
+\chapter{Digital Audio Fundamentals}
+
+\chapterline
+
+We have spent the book so far building general machinery: signals as vectors, frequency as
+rotation, the Fourier transform as projection, sampling and quantization as the bridge between
+the continuous world and the computer. Now we point all of it at one of the richest and most
+familiar signals there is -- \textbf{sound}. This chapter is where the abstractions earn their
+keep. By the end you will know, concretely and without hand-waving, how the pressure wave at
+your eardrum becomes a list of integers in a file, why those integers are sampled $44{,}100$
+times a second and stored in $16$ bits, what "loud" really means, what clipping is and how to
+avoid it, and how to record and play a sound on a Raspberry Pi.
+
+This is also the launchpad for the next several chapters. Once we agree on what a digital audio
+signal \emph{is}, we can extract features from it (Chapter 27), shape it with effects and
+synthesize it from scratch (Chapter 28), and analyze the signals of real instruments
+(Chapter 29). And although our through-line project is a \emph{gesture} controller, audio is
+both its eventual \emph{output} (it will emit MIDI that drives a synthesizer) and a possible
+\emph{input} (a contact microphone on the wrist hears tendon snaps and taps). So sound matters
+to us in two directions, and it pays to understand it from the ground up.
+
+\section{From a pressure wave to a number}
+\label{ch26:pressure}
+
+Sound is a mechanical wave: a region of slightly compressed air chases a region of slightly
+rarefied air outward from a vibrating source. What reaches your ear -- or a microphone -- is
+the \emph{air pressure at one point} rising and falling over time. Strip away everything else
+and a sound is exactly the object from Chapter 1: a function $p(t)$ giving pressure (really, the
+tiny deviation from atmospheric pressure) at each instant.
+
+A microphone is a transducer: it converts that pressure variation into a proportional voltage
+$v(t)$. A dynamic mic moves a coil in a magnetic field; a condenser mic varies the gap of a
+charged capacitor; a MEMS mic (the kind inside your phone, and the kind you will solder to a
+Pi) flexes a micromachined membrane over a tiny back-plate. The physics differs, but the job is
+identical: pressure in, voltage out, ideally with the voltage a clean scaled copy of the
+pressure. From the signal-processing point of view we do not care which mic; we care that we now
+have a continuous-time electrical signal $v(t)$ that \emph{is} the sound.
+
+\begin{intuitionbox}
+Picture the whole chain as a relay of copies of the same wiggle. Vibrating object $\to$ air
+pressure $\to$ membrane motion $\to$ voltage $\to$ (after the steps below) a list of numbers
+$\to$ (on playback) voltage $\to$ speaker cone motion $\to$ air pressure $\to$ your eardrum.
+Every arrow is supposed to preserve the \emph{shape} of the wiggle. Digital audio is the art of
+turning the wiggle into integers and back without your ear noticing the round trip.
+\end{intuitionbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  node distance=4.5mm,
+  box/.style={draw, rounded corners=2pt, minimum height=8mm, align=center,
+    font=\scriptsize, inner sep=3pt},
+  >={Stealth[length=2mm]},
+]
+\node[box, fill=sigblue!12] (src) {vibrating\\source};
+\node[box, right=of src, fill=sigblue!12] (air1) {air\\pressure};
+\node[box, right=of air1, fill=sigblue!12] (mic) {microphone\\(voltage)};
+\node[box, right=of mic, fill=quotientorange!18] (adc) {sample +\\quantize};
+\node[box, right=of adc, fill=quotientorange!28] (pcm) {PCM\\numbers};
+\node[box, below=8mm of pcm, fill=quotientorange!18] (dac) {DAC\\(voltage)};
+\node[box, left=of dac, fill=sigblue!12] (spk) {speaker\\cone};
+\node[box, left=of spk, fill=sigblue!12] (air2) {air\\pressure};
+\node[box, left=of air2, fill=targetgreen!16] (ear) {eardrum};
+\draw[->] (src) -- (air1);
+\draw[->] (air1) -- (mic);
+\draw[->] (mic) -- (adc);
+\draw[->] (adc) -- (pcm);
+\draw[->] (pcm) -- (dac);
+\draw[->] (dac) -- (spk);
+\draw[->] (spk) -- (air2);
+\draw[->] (air2) -- (ear);
+\end{tikzpicture}
+\caption{The audio chain, top row capture and bottom row playback. Every arrow should preserve the
+shape of the wiggle; the two orange stages (sample plus quantize on the way in, reconstruct on the
+way out) are where the continuous world meets the integers of this chapter.}
+\label{ch26:fig-chain}
+\end{figure}
+
+Figure~\ref{ch26:fig-chain} lays out that relay end to end. To get from the continuous voltage
+$v(t)$ to numbers we apply the two operations developed in Chapters 18 and 19, now in their audio
+incarnation:
+
+\begin{enumerate}
+\item \textbf{Sampling} (discretize \emph{time}): measure $v(t)$ at regular instants
+  $t = nT_s$, producing a sequence $v[n] = v(nT_s)$. The spacing $T_s$ is the sampling period;
+  its reciprocal $f_s = 1/T_s$ is the \emph{sample rate}.
+\item \textbf{Quantization} (discretize \emph{value}): snap each measured voltage to the nearest
+  level on a finite grid, so it fits in a fixed number of bits. The number of bits is the
+  \emph{bit depth}.
+\end{enumerate}
+
+The result -- a stream of quantized samples taken at a fixed rate -- is called \textbf{pulse-code
+modulation}, PCM. It is the bedrock representation underneath WAV files, audio CDs, and the
+buffers your sound card hands you. Everything fancier (MP3, AAC, Opus) is a clever way of storing
+\emph{fewer} bits that decode \emph{back} to PCM before they reach a speaker. We will build PCM
+from the geometry and treat compression as a later refinement.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=13cm, height=5.2cm,
+  xlabel={time $t$ (ms)}, ylabel={value},
+  xmin=0, xmax=2, ymin=-1.5, ymax=1.5,
+  axis lines=left, enlargelimits=false,
+  ytick={-1,-0.5,0,0.5,1},
+  legend style={at={(0.99,1.25)}, anchor=north east, draw=none, fill=none, font=\small},
+  legend cell align=left,
+]
+% continuous signal
+\addplot[sigblue, thick, domain=0:2, samples=200] {sin(deg(2*pi*1.5*x)) * 0.9};
+\addlegendentry{continuous $v(t)$}
+% quantization grid lines (drawn first so stems sit on top)
+\foreach \q in {-1.25,-1,-0.75,-0.5,-0.25,0,0.25,0.5,0.75,1,1.25} {
+  \addplot[gray!35, dashed, samples=2, domain=0:2] {\q};
+}
+% sample instants as stems, snapped to quantization grid (steps of 0.25)
+\addplot[specred, ycomb, mark=*, mark size=1.3pt, samples=21, domain=0:2]
+  {0.25*round(4*0.9*sin(deg(2*pi*1.5*x)))};
+\addlegendentry{quantized samples $v[n]$}
+\end{axis}
+\end{tikzpicture}
+\caption{The two discretizations of PCM. Time is sampled (the dots occur only at multiples of
+$T_s$); value is quantized (the dots land only on the dashed level grid). The smooth blue curve
+is the original continuous signal; the red stems are what the computer actually stores.}
+\label{ch26:fig-pcm}
+\end{figure}
+
+\begin{happeningbox}
+Notice that two completely different things are happening in Figure~\ref{ch26:fig-pcm}, and it is
+worth keeping them mentally separate forever. \emph{Sampling} is about the horizontal axis: we
+only know the signal at certain instants. \emph{Quantization} is about the vertical axis: even at
+those instants we only record a rounded value. Sampling errors show up as aliasing (Chapter 18);
+quantization errors show up as a faint noise floor (Chapter 19). Audio quality is the project of
+making both errors small enough that the ear cannot hear them.
+\end{happeningbox}
+
+\section{What the ear demands: the hearing range}
+\label{ch26:hearing}
+
+Audio is the one branch of signal processing where the specification is written by biology. We do
+not need to capture sound perfectly; we need to capture it well enough to fool a particular
+organ. So before choosing numbers we ask: what can a human ear actually detect?
+
+\paragraph{Frequency range.} A healthy young ear responds to vibrations from roughly $20$~Hz to
+$20{,}000$~Hz ($20$~kHz). Below $20$~Hz you feel rumble more than hear pitch; above $20$~kHz
+(ultrasound) the cochlea simply does not respond. With age the upper limit retreats -- many
+adults top out near $15$--$16$~kHz. This three-decade span (a factor of $1000$ in frequency) is
+the single most important fact in audio engineering, because it sets how fast we must sample.
+
+\paragraph{Amplitude range.} The ear's dynamic range is staggering. The quietest audible sound
+pressure (the \emph{threshold of hearing}) and the loudest tolerable sound (the
+\emph{threshold of pain}) differ by a factor of about $10^6$ in pressure amplitude -- a power
+ratio of about $10^{12}$. No one wants to write "the pressure was $0.0000063$ pascals," so
+loudness is measured logarithmically, in \textbf{decibels} (dB). We will make decibels precise in
+Section~\ref{ch26:loudness}; for now just register that the ear hears \emph{ratios}, not absolute
+amounts, which is exactly why a logarithmic scale fits it.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{semilogxaxis}[
+  width=13cm, height=5.4cm,
+  xlabel={frequency (Hz, log scale)}, ylabel={loudness (dB SPL)},
+  xmin=20, xmax=20000, ymin=-10, ymax=130,
+  axis lines=left, enlargelimits=false,
+  xtick={20,100,1000,10000,20000},
+  xticklabels={20,100,1k,10k,20k},
+  legend style={at={(0.02,0.98)}, anchor=north west, draw=none, fill=none, font=\small},
+]
+% threshold of hearing (schematic, U-shaped, lowest near 3-4 kHz)
+\addplot[sigblue, thick, samples=80, domain=20:20000]
+  {18 + 35*( (ln(x)-ln(3500))/2.4 )^2};
+\addlegendentry{threshold of hearing}
+% threshold of pain (roughly flat near 120 dB)
+\addplot[specred, thick, samples=2, domain=20:20000] {120};
+\addlegendentry{threshold of pain}
+% mark the most sensitive region
+\addplot[gray, dashed, samples=2] coordinates {(3500,-10) (3500,120)};
+\node[anchor=south, font=\scriptsize, gray] at (axis cs:3500,-8) {most sensitive $\approx$ 2--5 kHz};
+\end{semilogxaxis}
+\end{tikzpicture}
+\caption{The audible field (schematic). Sound is heard only between the two curves. The ear is
+most sensitive around $2$--$5$~kHz (where speech consonants and a crying baby live), and far less
+sensitive at the extremes of the range. The vertical gap is the available dynamic range at each
+frequency.}
+\label{ch26:fig-audiogram}
+\end{figure}
+
+\begin{connectionbox}
+That the ear hears on a logarithmic scale in \emph{both} axes -- octaves in frequency (next
+section) and decibels in amplitude -- is the same Weber--Fechner pattern you met in the
+probability and calculus companions, where perception tracks the \emph{logarithm} of a stimulus.
+The recurring lesson: when a quantity spans many orders of magnitude and we care about relative
+change, work in $\log$. We did it for the Bode plots of Chapter 16; we do it again here.
+\end{connectionbox}
+
+\section{Choosing the sample rate}
+\label{ch26:samplerate}
+
+The Nyquist--Shannon theorem (Chapter 18) is blunt: to capture all frequencies up to $f_{\max}$
+without aliasing, you must sample at more than twice $f_{\max}$. Set $f_{\max} = 20$~kHz, double
+it, and you get $40$~kHz as the bare minimum sample rate for full-range audio. Real systems push
+a little above the minimum to leave room for a non-ideal anti-aliasing filter (which cannot drop
+from passband to stopband infinitely fast). That margin is exactly why the standard rates sit a
+bit over $40$~kHz.
+
+\begin{whybox}
+Why $44{,}100$~Hz of all numbers? History, not acoustics. Early digital audio masters were stored
+on video tape (the only affordable medium with enough bandwidth in the late 1970s), using a PCM
+adaptor that packed audio samples into the lines of a video frame. The arithmetic of NTSC and PAL
+video lines -- so many usable lines per field, so many fields per second, so many samples per
+line -- happened to land on $44{,}100$ samples per second for both formats. Sony and Philips
+adopted it for the Compact Disc, and the world inherited it. It comfortably exceeds the
+$40$~kHz Nyquist floor, giving the anti-alias filter a $2$~kHz transition band above $20$~kHz.
+\end{whybox}
+
+\begin{historybox}
+The deeper root is older still. In 1928 Harry Nyquist, at Bell Labs, studied how many distinct
+pulses a telegraph channel of a given bandwidth could carry; in 1949 Claude Shannon turned the
+idea into the sampling theorem we use today. Their result -- that a bandlimited signal is
+\emph{exactly} reconstructible from samples taken faster than twice its highest frequency -- is
+the reason digital audio can be transparent at all. Without it, "sampling" would be a lossy
+guess; with it, sampling above Nyquist loses \emph{nothing} (before quantization). Every time you
+hear a CD, you are hearing Shannon's theorem in action.
+\end{historybox}
+
+The common rates you will meet:
+
+\begin{center}
+\begin{tabular}{@{}llp{8.2cm}@{}}
+\toprule
+Rate & Nyquist limit & Where it is used \\
+\midrule
+$8{,}000$~Hz   & $4$~kHz   & Telephone speech; intelligible but dull (no high consonant detail).\\
+$16{,}000$~Hz  & $8$~kHz   & ``Wideband'' speech, voice assistants, many speech models.\\
+$22{,}050$~Hz  & $\approx 11$~kHz & Half of CD rate; older games, low-bandwidth music.\\
+$44{,}100$~Hz  & $\approx 22$~kHz & Audio CD; the default for music distribution.\\
+$48{,}000$~Hz  & $24$~kHz  & Pro audio, video, film, and most computer sound hardware.\\
+$96{,}000$~Hz  & $48$~kHz  & High-resolution recording and studio production.\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{trapbox}
+``More is better'' is a trap. Sampling music at $192$~kHz does not make it sound better to a human
+ear -- there is nothing audible above $20$~kHz to capture, so you are storing ultrasonic noise at
+four times the file size. Higher rates earn their keep \emph{during production} (they ease filter
+design and reduce artifacts when pitch-shifting or applying nonlinear effects), then you render
+down. For a final delivery file, $44.1$ or $48$~kHz is transparent. The same restraint applies to
+our IMU and EMG work later: sample fast enough to clear Nyquist for the band you care about, plus
+a margin, and not absurdly faster.
+\end{trapbox}
+
+\subsection*{A quick reality check by hand}
+
+\begin{example}[Will it alias?]
+\label{ch26:ex-alias}
+You record at $f_s = 8000$~Hz (telephone rate) and someone whistles a pure tone at $6000$~Hz with
+no anti-aliasing filter. What happens? The Nyquist frequency is $f_s/2 = 4000$~Hz. A $6000$~Hz
+tone exceeds it, so it folds: the apparent frequency is
+\[
+  f_{\text{alias}} = \abs{f_s - f_{\text{in}}} = \abs{8000 - 6000} = 2000~\text{Hz}.
+\]
+The whistle is recorded as a $2$~kHz tone -- a genuinely wrong pitch. This is why every real ADC
+front end has an analog low-pass (anti-alias) filter before the sampler, cutting everything above
+$f_s/2$. The filter cannot be perfect, which is the whole reason we sampled a bit above the
+$40$~kHz floor in the first place.
+\end{example}
+
+\section{Bit depth: how finely we measure each sample}
+\label{ch26:bitdepth}
+
+Sampling fixes \emph{when} we measure; bit depth fixes \emph{how precisely}. With $b$ bits per
+sample we have $2^b$ available levels to represent the voltage. Audio almost always uses
+\emph{signed} integers so that $0$ sits in the middle and the wave swings positive and negative:
+$8$-bit audio runs $-128 \dots 127$, $16$-bit runs $-32768 \dots 32767$, and so on.
+
+The key consequence is the \textbf{signal-to-quantization-noise ratio}. Rounding each sample to
+the nearest level introduces an error of at most half a level. Treating that error as roughly
+uniform noise (Chapter 19), the resulting SNR for a full-scale signal works out to the famous
+rule of thumb
+\[
+  \mathrm{SNR}_{\text{dB}} \approx 6.02\,b + 1.76.
+\]
+Every bit you add buys about $6$~dB of dynamic range (Figure~\ref{ch26:fig-snr}). This single line
+explains every standard bit depth at a glance:
+
+\begin{center}
+\begin{tabular}{@{}lll p{6.6cm}@{}}
+\toprule
+Bits $b$ & Levels $2^b$ & SNR $\approx 6b{+}1.76$ dB & Character \\
+\midrule
+$8$  & $256$        & $\approx 50$~dB  & Audibly hissy; old games, telephony.\\
+$12$ & $4096$       & $\approx 74$~dB  & Decent; many low-cost ADCs and DACs.\\
+$16$ & $65{,}536$   & $\approx 98$~dB  & CD quality; transparent for playback.\\
+$24$ & $16.7$M      & $\approx 146$~dB & Studio recording; huge headroom margin.\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=5cm,
+  xlabel={bit depth $b$}, ylabel={SNR (dB)},
+  xmin=0, xmax=26, ymin=0, ymax=160,
+  axis lines=left, enlargelimits=false,
+  xtick={4,8,12,16,20,24}, ytick={0,40,80,120,160},
+  legend style={at={(0.02,0.98)}, anchor=north west, draw=none, fill=none, font=\small},
+]
+\addplot[sigblue, thick, samples=2, domain=1:25] {6.02*x + 1.76};
+\addlegendentry{$6.02\,b + 1.76$}
+\addplot[only marks, specred, mark=*, mark size=1.6pt] coordinates {
+  (8,49.9) (12,74.0) (16,98.1) (24,146.3)};
+\addplot[gray, dashed, samples=2, domain=0:26] {120};
+\node[anchor=south east, font=\scriptsize, gray] at (axis cs:26,120) {ear's $\approx 120$ dB range};
+\end{axis}
+\end{tikzpicture}
+\caption{Quantization SNR is a straight line in bit depth, about $6$~dB per bit. The dots mark the
+standard depths from the table; $16$~bits already clears the ear's quiet-room-to-loud-passage gap,
+and $24$~bits sits far above the ear's full dynamic range (dashed).}
+\label{ch26:fig-snr}
+\end{figure}
+
+\begin{whybox}
+Why is $16$ bits ``enough'' for a finished recording when the ear's dynamic range is about
+$120$~dB? Because you never need to span the entire range \emph{in one recording at one volume
+setting}. $16$ bits give $\approx 98$~dB of usable range -- more than the difference between a
+quiet room and a loud passage of music -- and dithering (adding a whisper of noise before
+quantizing) smears the residual quantization error into an inaudible, hiss-like floor instead of
+audible distortion. Studios record at $24$ bits not because the ear hears $146$~dB, but because
+extra headroom means you can set levels conservatively, never clip, and still have noise far below
+audibility after mixing.
+\end{whybox}
+
+\begin{connectionbox}
+The $6.02b + 1.76$ formula is not an audio fact; it is a \emph{quantization} fact derived once in
+Chapter 19 from a uniform-noise model. Here we are simply reading it through audio glasses. This
+is the payoff of building general machinery first: a single derivation about rounding error now
+tells us why CDs are $16$-bit and why a cheap $8$-bit sound chip hisses.
+\end{connectionbox}
+
+\subsection*{Integer versus floating point}
+
+Inside a digital audio \emph{workstation}, samples are usually carried as $32$-bit
+floating-point numbers in the range $[-1.0, +1.0]$, not integers. Float has two virtues for
+\emph{processing}: its dynamic range is enormous (so intermediate sums never overflow), and
+crucially, \emph{values above $1.0$ are not destroyed} -- a signal can momentarily exceed
+full scale inside a processing chain and be brought back down before the final integer
+conversion. Integers, by contrast, have no room above the top level; exceed it and the sample is
+permanently clamped. That clamping is clipping, the subject of the next section. The conversion
+between the two worlds is a simple scale: $\text{float } 1.0 \leftrightarrow \text{int } 32767$
+for $16$-bit.
+
+\section{Clipping, full scale, and headroom}
+\label{ch26:clipping}
+
+Every digital format has a hard ceiling: the largest value a sample can hold. We call it
+\textbf{full scale} (often written $0$~dBFS, ``decibels relative to full scale''). When the
+incoming signal tries to swing past full scale, the sample cannot follow -- it gets pinned at the
+maximum. The rounded tops and bottoms of the waveform are \textbf{clipping}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=13cm, height=5cm,
+  xlabel={time}, ylabel={value},
+  xmin=0, xmax=2, ymin=-1.5, ymax=1.5,
+  axis lines=left, enlargelimits=false,
+  ytick={-1,0,1}, yticklabels={$-1$ (full scale),$0$,$+1$ (full scale)},
+  legend style={at={(0.99,1.28)}, anchor=north east, draw=none, fill=none, font=\small},
+  legend cell align=left,
+]
+% original loud sine (amplitude 1.4, exceeds full scale)
+\addplot[gray!55, thick, dashed, domain=0:2, samples=200] {1.4*sin(deg(2*pi*1.5*x))};
+\addlegendentry{intended signal (too hot)}
+% clipped version, clamped to [-1,1]
+\addplot[specred, very thick, domain=0:2, samples=200]
+  {max(-1, min(1, 1.4*sin(deg(2*pi*1.5*x))))};
+\addlegendentry{what is recorded (clipped)}
+% full scale lines
+\addplot[sigblue, samples=2] {1};
+\addplot[sigblue, samples=2] {-1};
+\end{axis}
+\end{tikzpicture}
+\caption{Clipping. The intended sine (gray, dashed) swings beyond full scale, so its peaks are
+flattened against the $\pm 1$ ceiling (red). The flat tops are new sharp corners in the waveform,
+and sharp corners mean new high-frequency content -- harmonics that were not in the original.}
+\label{ch26:fig-clip}
+\end{figure}
+
+\begin{happeningbox}
+What does clipping \emph{do} to the sound, geometrically? Flattening the peaks turns a smooth
+sinusoid into something closer to a square wave. From the Fourier series (Chapter 6) you know a
+square wave is a sine plus odd harmonics at $3f, 5f, 7f, \dots$ (Figure~\ref{ch26:fig-clipspectrum}).
+So clipping \emph{manufactures harmonics that were never played}. Mild clipping adds a gritty edge (guitar distortion pedals do
+this deliberately and gently); hard clipping turns clean audio into a harsh buzz. Crucially, those
+new harmonics can exceed Nyquist and then alias back as inharmonic, metallic tones -- clipping and
+aliasing conspire to make digital overload sound especially nasty.
+\end{happeningbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=4.8cm,
+  xlabel={harmonic of $f_0$}, ylabel={relative level},
+  xmin=0, xmax=10, ymin=0, ymax=1.15,
+  axis lines=left, enlargelimits=false,
+  xtick={1,3,5,7,9}, ytick={0,0.5,1},
+  ybar, bar width=8pt,
+]
+% odd-harmonic amplitudes of a square wave: 1, 1/3, 1/5, 1/7, 1/9
+\addplot[draw=specred, fill=specred!45] coordinates {
+  (1,1) (3,0.3333) (5,0.2) (7,0.1429) (9,0.1111)};
+\end{axis}
+\end{tikzpicture}
+\caption{Spectrum of a hard-clipped sine, which approaches a square wave: the fundamental plus odd
+harmonics at $3f_0, 5f_0, 7f_0, \dots$ with amplitudes $1/3, 1/5, 1/7, \dots$. None of these were
+in the original tone; clipping built them, and the high ones can fold back below Nyquist as
+aliasing.}
+\label{ch26:fig-clipspectrum}
+\end{figure}
+
+\textbf{Headroom} is the safety gap you deliberately leave between your typical signal peaks and
+full scale, measured in dB. If your loudest peaks hit $-6$~dBFS, you have $6$~dB of headroom: a
+sudden transient twice as loud as expected still fits. Recording engineers chase a balance -- too
+little headroom risks clipping on an unexpected peak; too much wastes dynamic range and pushes the
+quiet parts toward the quantization floor. A common practical target is peaks around $-12$ to
+$-6$~dBFS while tracking, leaving comfortable margin.
+
+\begin{example}[How much headroom is that?]
+\label{ch26:ex-headroom}
+You set your recording level so that the loudest expected peak reaches half of full scale, i.e.
+amplitude $0.5$ on a $[-1,1]$ scale. How many dB of headroom is that? Headroom is the ratio of
+full scale to peak, in dB:
+\[
+  \text{headroom} = 20\log_{10}\!\left(\frac{1.0}{0.5}\right) = 20\log_{10}(2) \approx 6.0~\text{dB}.
+\]
+So ``half of full scale'' is exactly $6$~dB of headroom -- another appearance of the
+``factor of two is $6$~dB'' rule that also governs bit depth. A transient up to twice your
+expected peak will just touch full scale without clipping.
+\end{example}
+
+\begin{trapbox}
+Clipping is irreversible. Once peaks are flattened, the lost information is \emph{gone}; no plugin
+can truly un-clip, only disguise it. This is the opposite of being a little too quiet, which you
+can simply amplify later (at the cost of also lifting the noise floor). When in doubt, record
+a touch quieter. The asymmetry -- recoverable quietness versus unrecoverable clipping -- is why
+seasoned engineers leave generous headroom.
+\end{trapbox}
+
+\section{Loudness, decibels, and dBFS}
+\label{ch26:loudness}
+
+We have used decibels three times already; now let us pin them down. A decibel is a way of
+expressing a \emph{ratio} of two quantities on a logarithmic scale. For \emph{power} (or energy,
+or intensity):
+\[
+  L_{\text{dB}} = 10\log_{10}\!\left(\frac{P}{P_{\text{ref}}}\right).
+\]
+For \emph{amplitude} (voltage, pressure, sample value) -- which is the square root of power -- the
+factor doubles to compensate for the square:
+\[
+  L_{\text{dB}} = 20\log_{10}\!\left(\frac{A}{A_{\text{ref}}}\right).
+\]
+The reference $A_{\text{ref}}$ is what makes the number meaningful. Two references dominate audio:
+
+\begin{itemize}
+\item \textbf{dB SPL} (sound pressure level): $A_{\text{ref}} = 20\,\mu\text{Pa}$, the nominal
+  threshold of hearing. This measures sound \emph{in the air}. $0$~dB~SPL is barely audible;
+  conversation is $\approx 60$~dB; a rock concert $\approx 110$~dB; pain $\approx 120$--$130$~dB.
+\item \textbf{dBFS} (decibels relative to full scale): $A_{\text{ref}}$ is the maximum sample
+  value. By construction $0$~dBFS is full scale and every real digital signal sits \emph{below}
+  it, so dBFS values are negative (e.g. $-12$~dBFS).
+\end{itemize}
+
+\begin{intuitionbox}
+The two ``$10$'' and ``$20$'' formulas are not two different definitions -- they are the same
+definition seen through power versus amplitude. Power goes as amplitude squared, and
+$\log(A^2) = 2\log A$, so the factor $10$ on power becomes $20$ on amplitude. Memorize one anchor
+and you can rebuild the rest: \emph{a factor of $2$ in amplitude is $\approx 6$~dB; a factor of
+$10$ in amplitude is exactly $20$~dB; a factor of $10$ in power is exactly $10$~dB.}
+\end{intuitionbox}
+
+\begin{example}[RMS and a sine's level]
+\label{ch26:ex-rms}
+``How loud is a signal'' is usually answered with its \emph{RMS} (root-mean-square) value, not its
+peak, because RMS tracks delivered power and correlates with perceived loudness. For a sine of
+amplitude $A$,
+\[
+  A_{\text{rms}} = \sqrt{\frac{1}{T}\int_0^T \big(A\sin(2\pi f t)\big)^2\,\dd t}
+                 = \frac{A}{\sqrt{2}} \approx 0.707\,A,
+\]
+because the average of $\sin^2$ over a cycle is $1/2$. So a full-scale sine ($A = 1$) has
+$A_{\text{rms}} \approx 0.707$, i.e. its RMS level is $20\log_{10}(0.707) \approx -3$~dBFS even
+though its \emph{peak} is $0$~dBFS. This $3$~dB gap between peak and RMS for a sine -- its
+``crest factor'' -- is why a meter showing peaks and a meter showing loudness never agree, and why
+you must say \emph{which} you mean.
+\end{example}
+
+\begin{applicationbox}
+Modern streaming services (Spotify, YouTube, Apple Music) ``loudness-normalize'' every track to a
+common target measured in \textbf{LUFS} (loudness units relative to full scale), a refinement of
+dBFS that weights frequencies the way the ear does and integrates over time. This is why a quiet
+jazz track and a loud pop track play back at similar perceived volume without you touching the
+knob. It also quietly ended the ``loudness war'' -- the decades-long arms race of squashing
+dynamics to sound louder than the next track -- because over-compressed masters now simply get
+turned \emph{down} to hit the same LUFS target, gaining nothing.
+\end{applicationbox}
+
+\section{The audio spectrum and octaves}
+\label{ch26:octaves}
+
+Because the ear hears frequency logarithmically, the natural unit of pitch is not the hertz but
+the \textbf{octave}: a doubling of frequency. Two notes an octave apart ($f$ and $2f$) sound
+``like the same note, higher'' -- the most consonant interval there is, because every harmonic of
+the upper note coincides with a harmonic of the lower. The entire audible range, $20$~Hz to
+$20$~kHz, spans about $10$ octaves ($2^{10} = 1024 \approx 1000$), which is why we drew the
+audiogram on a log axis.
+
+Western music subdivides each octave into $12$ equal-ratio steps (the equal-tempered semitone),
+so the frequency ratio of one semitone is
+\[
+  r = 2^{1/12} \approx 1.0595.
+\]
+Standard tuning pins one note: A4 (the A above middle C) $= 440$~Hz. Every other note follows by
+multiplying or dividing by $r$:
+\[
+  f(\text{note}) = 440 \cdot 2^{\,n/12},
+\]
+where $n$ is the number of semitones above ($n>0$) or below ($n<0$) A4. This is the exact map we
+will need to \emph{emit} when the wrist controller plays an instrument: a detected gesture chooses
+a MIDI note number, and MIDI note $m$ corresponds to $f = 440 \cdot 2^{(m-69)/12}$~Hz.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{semilogxaxis}[
+  width=13cm, height=4.6cm,
+  xlabel={frequency (Hz, log scale -- equal spacing = equal octaves)},
+  ylabel={}, ytick=\empty,
+  xmin=27, xmax=4400, ymin=0, ymax=1,
+  axis lines=left, enlargelimits=false,
+  xtick={27.5,55,110,220,440,880,1760,3520},
+  xticklabels={A0\\27.5,A1\\55,A2\\110,A3\\220,A4\\440,A5\\880,A6\\1760,A7\\3520},
+  x tick label style={align=center, font=\scriptsize},
+]
+% mark each A with a stem; equal spacing on log axis demonstrates octaves
+\foreach \f in {27.5,55,110,220,440,880,1760,3520} {
+  \addplot[sigblue, thick] coordinates {(\f,0) (\f,0.8)};
+}
+\node[anchor=south, font=\scriptsize] at (axis cs:440,0.82) {concert A = 440 Hz};
+\end{semilogxaxis}
+\end{tikzpicture}
+\caption{Successive A notes, each an octave (a doubling) above the last. On a logarithmic axis the
+octaves are \emph{evenly spaced} -- the same visual distance for every doubling -- which is exactly
+how the ear perceives them.}
+\label{ch26:fig-octaves}
+\end{figure}
+
+\begin{example}[From note to frequency]
+\label{ch26:ex-note}
+What frequency is middle C (C4)? Middle C is $9$ semitones below A4, so $n = -9$:
+\[
+  f = 440 \cdot 2^{-9/12} = 440 \cdot 2^{-0.75} \approx 440 \cdot 0.5946 \approx 261.6~\text{Hz}.
+\]
+And its MIDI note number is $60$, since A4 is MIDI $69$ and $69 - 9 = 60$. You can sanity-check
+with the MIDI formula: $440 \cdot 2^{(60-69)/12} = 440 \cdot 2^{-9/12} \approx 261.6$~Hz. The two
+formulas agree because they are the same equation written with different ``zero'' notes.
+\end{example}
+
+\paragraph{Rough map of the audio band.} It helps to carry a mental partition of the spectrum:
+\emph{sub-bass} ($20$--$60$~Hz, felt more than heard), \emph{bass} ($60$--$250$~Hz, fundamental of
+most instruments), \emph{midrange} ($250$~Hz--$4$~kHz, where speech and melody live and the ear is
+most sensitive), \emph{presence} ($4$--$8$~kHz, consonant clarity and ``edge''), and
+\emph{brilliance} ($8$--$20$~kHz, air and cymbal shimmer). Equalizers, the tone controls of audio,
+simply boost or cut these regions; we will build the filters that do it in Chapter 28.
+
+\section{Build it: record and play on a Raspberry Pi}
+\label{ch26:build}
+
+Enough theory -- let us make a Pi capture real PCM and play it back, so the numbers above stop
+being abstract. A Raspberry Pi has \emph{no} analog audio input of its own, so for recording you
+add a small USB sound card or an I2S MEMS microphone; its onboard $3.5$~mm jack (or HDMI) can play
+\emph{out}. The software stack is ALSA underneath, usually wrapped by friendlier tools.
+
+\begin{buildbox}
+\textbf{Hardware.} A \$5 USB audio dongle (record + play) is the painless choice and shows up as
+an ALSA card. For a tidier, all-digital path use an I2S MEMS mic such as the INMP441 or SPH0645,
+wired to the Pi's I2S pins (BCLK, LRCLK, DOUT, plus 3V3 and GND) and enabled via a device-tree
+overlay in \texttt{/boot/config.txt}. I2S skips analog wiring entirely: the mic does its own ADC
+and streams PCM straight to the Pi.
+
+\textbf{Find your devices.}
+\begin{lstlisting}[language=bash]
+arecord -l      # list capture (input) devices -> note card,device numbers
+aplay   -l      # list playback (output) devices
+\end{lstlisting}
+
+\textbf{Record and play raw PCM.}
+\begin{lstlisting}[language=bash]
+# Record 5 s, 44.1 kHz, 16-bit signed little-endian, mono, from card 1 dev 0
+arecord -D plughw:1,0 -f S16_LE -r 44100 -c 1 -d 5 take1.wav
+# Play it back through the default output
+aplay take1.wav
+\end{lstlisting}
+The flags \emph{are} this chapter: \texttt{-r 44100} is the sample rate, \texttt{S16\_LE} is the
+$16$-bit signed PCM bit depth, \texttt{-c 1} is one (mono) channel.
+\end{buildbox}
+
+Once the bytes are on disk you can treat them as the integer signal we have been discussing. In
+Python, \texttt{numpy} and \texttt{soundfile} (or the stdlib \texttt{wave} module) read a WAV file
+straight into an array of samples:
+
+\begin{lstlisting}[language=Python]
+import numpy as np, soundfile as sf
+
+x, fs = sf.read("take1.wav")          # x in [-1, 1] floats, fs = 44100
+print("samples:", x.shape[0], " rate:", fs, " duration:", x.shape[0]/fs, "s")
+
+peak = np.max(np.abs(x))              # peak amplitude, 0..1
+rms  = np.sqrt(np.mean(x**2))         # RMS amplitude
+dbfs_peak = 20*np.log10(peak + 1e-12)
+dbfs_rms  = 20*np.log10(rms  + 1e-12)
+print(f"peak {dbfs_peak:6.1f} dBFS   rms {dbfs_rms:6.1f} dBFS   "
+      f"headroom {-dbfs_peak:4.1f} dB")
+
+clipped = np.mean(np.abs(x) > 0.999)  # fraction of samples pinned at full scale
+print(f"clipped fraction: {clipped:.4%}")
+\end{lstlisting}
+
+Run that on a recording where you spoke too loudly and the ``clipped fraction'' jumps off zero --
+you have measured the very effect of Figure~\ref{ch26:fig-clip}. Run it on a quiet recording and
+the headroom number balloons, confirming Example~\ref{ch26:ex-headroom}'s arithmetic with your own
+voice.
+
+\begin{labbox}
+Record the same phrase three times: once whispering, once at normal volume, once shouting into the
+mic. Print peak dBFS, RMS dBFS, and clipped fraction for each. Predict before you run: which run
+clips? Which has the most headroom? Then plot the waveforms and confirm by eye that the shout's
+peaks are flat-topped while the whisper rides far below full scale. You have just experienced
+headroom, clipping, and dynamic range as data, not vocabulary.
+\end{labbox}
+
+\begin{buildbox}
+\textbf{Generate a tone to test playback} (no mic needed). This writes a clean A4 sine at
+$-6$~dBFS so you can verify your output chain and hear the difference between clean and clipped:
+\begin{lstlisting}[language=Python]
+import numpy as np, soundfile as sf
+fs, dur, f0 = 44100, 2.0, 440.0
+t = np.arange(int(fs*dur)) / fs
+clean = 0.5 * np.sin(2*np.pi*f0*t)               # peak 0.5 -> -6 dBFS headroom
+hot   = np.clip(1.4*np.sin(2*np.pi*f0*t), -1, 1) # deliberately clipped
+sf.write("clean_a4.wav", clean, fs, subtype="PCM_16")
+sf.write("clipped_a4.wav", hot,  fs, subtype="PCM_16")
+\end{lstlisting}
+Play both through \texttt{aplay}. The clipped one buzzes -- those are the manufactured harmonics
+from the ``what is really happening'' box, now in your ears.
+\end{buildbox}
+
+\section{Channels, interleaving, and file formats}
+\label{ch26:formats}
+
+Real audio is rarely a single stream. \textbf{Stereo} carries two channels (left, right);
+surround formats carry more. In a PCM buffer the samples are usually \emph{interleaved}: L, R, L,
+R, $\dots$ in time order, so frame $n$ holds all channels for instant $n$ back-to-back. A
+two-channel, $16$-bit, $44.1$~kHz stream therefore consumes
+\[
+  44100 \times 2 \times 2 = 176{,}400 \text{ bytes per second} \approx 10.1 \text{ MB/min},
+\]
+which is exactly the uncompressed bitrate of an audio CD. That number is why lossy codecs exist.
+
+\begin{focusbox}
+\textbf{The format zoo, demystified.}
+\begin{itemize}
+\item \textbf{WAV / AIFF} -- raw PCM in a thin container. Lossless, large, universally readable.
+  Our default for analysis because the samples are \emph{exactly} what we recorded.
+\item \textbf{FLAC / ALAC} -- \emph{lossless} compression: smaller files, bit-for-bit identical
+  PCM on decode. Good for archiving.
+\item \textbf{MP3 / AAC / Opus} -- \emph{lossy} compression: discards detail the ear is unlikely
+  to notice (Chapter 33's psychoacoustic masking idea, applied to sound). Small files, but the
+  PCM you get back is \emph{not} the PCM you put in. Never analyze fine spectral detail from a
+  heavily compressed file.
+\end{itemize}
+\end{focusbox}
+
+\begin{example}[Sizing a recording]
+\label{ch26:ex-size}
+How big is a $3$-minute stereo song at CD quality, uncompressed? Bytes per second is
+$44100 \times 2~\text{ch} \times 2~\text{bytes} = 176{,}400$. Over $180$~s that is
+$176{,}400 \times 180 = 31{,}752{,}000$ bytes $\approx 30.3$~MB. The same song as a $256$~kbit/s
+AAC file is $256{,}000 \times 180 / 8 \approx 5.76$~MB -- about a fifth the size for
+near-transparent quality. The factor-of-five-ish saving is the everyday payoff of lossy coding.
+\end{example}
+
+\section{Real limits, and the bridge to the wrist controller}
+\label{ch26:claims}
+
+\begin{goalbox}
+Where does digital audio meet our gesture controller? In two solid places, and one tempting trap.
+
+\textbf{Output (solid).} The controller's job is to \emph{make music}: a recognized gesture maps
+to a MIDI note, and the note maps to a frequency by the equal-tempered formula of
+Section~\ref{ch26:octaves}, which a synth turns into PCM. Every concept here -- sample rate, bit
+depth, headroom, dBFS -- governs that output path. When we build the synthesizer in Chapter 28 we
+will be writing exactly the PCM streams this chapter defined.
+
+\textbf{Input (real but limited).} A \emph{contact} microphone or piezo pressed against the wrist
+can pick up the faint acoustic ``clicks'' of tendons and the thud of a finger tap -- a field
+called \emph{bioacoustic} sensing (Chapter 37). It is genuinely useful for detecting \emph{events}
+(a tap happened; which of a few coarse gestures) using the audio pipeline of this chapter.
+
+\textbf{The trap.} What a wrist microphone \emph{cannot} do is recover continuous, individual
+finger \emph{joint angles}. The acoustic signal is a smeared, overlapping mixture; it does not
+encode per-finger pose. Continuous finger tracking needs sensors \emph{on the fingers} (rings,
+gloves) or, for muscle-level inference, EMG/FMG on the forearm -- and even those give limited,
+calibrated estimates, not perfect joint angles. Treat wrist audio as an \emph{event detector},
+never as a finger-pose sensor.
+\end{goalbox}
+
+\begin{aestheticbox}
+The quiet triumph of this chapter is that one organ's limits -- $20$~Hz to $20$~kHz, a $120$~dB
+dynamic range, logarithmic in both axes -- dictate almost every engineering number in digital
+audio. Sample just above twice $20$~kHz; use enough bits that quantization noise sinks below the
+threshold of hearing; measure loudness in decibels because the ear does. Specs are not arbitrary;
+they are the ear, written in arithmetic. Hold onto that habit -- letting the \emph{receiver}
+define the requirements -- and it will guide every sensor choice in the chapters ahead, audio or
+motion alike.
+\end{aestheticbox}
+
+We now have a firm grip on what a digital audio signal \emph{is}: PCM samples at a chosen rate and
+bit depth, bounded by full scale, measured in decibels, carrying frequencies the ear can place on
+a log scale of octaves. The next chapter turns these samples into \emph{features} -- energy, zero
+crossings, spectral centroid, MFCCs -- the compact descriptions that let a machine (and our
+gesture controller) tell one sound from another.
+
+\section*{Exercises}
+\addcontentsline{toc}{section}{Exercises}
+
+\begin{exercise}
+A mono recording is made at $f_s = 48{,}000$~Hz, $24$-bit, lasting $90$ seconds. (a) How many
+samples are stored? (b) How many bytes (assume $3$ bytes per $24$-bit sample)? (c) What is the
+Nyquist frequency, and is that enough to capture the full audible range?
+\end{exercise}
+
+\begin{exercise}
+Using $\mathrm{SNR}_{\text{dB}} \approx 6.02\,b + 1.76$, find the approximate SNR for $b = 10$,
+$14$, and $20$ bits. How many extra bits would you need to gain $30$~dB of dynamic range over a
+$16$-bit recording, and why is that number what it is?
+\end{exercise}
+
+\begin{exercise}
+A tone of $19$~kHz is recorded at $f_s = 32{,}000$~Hz with the anti-aliasing filter accidentally
+switched off. (a) What is the Nyquist frequency? (b) Does the tone alias, and if so, to what
+apparent frequency? (c) Is the aliased tone audible?
+\end{exercise}
+
+\begin{exercise}
+You record a signal whose loudest peak reaches amplitude $0.25$ on a $[-1,1]$ scale. (a) What is
+the peak level in dBFS? (b) How much headroom (in dB) do you have? (c) If you later amplify the
+file by $9$~dB, what is the new peak amplitude, and have you clipped?
+\end{exercise}
+
+\begin{exercise}
+Show, using the $20\log_{10}$ definition, that doubling a signal's amplitude raises its level by
+about $6$~dB and that multiplying its amplitude by $10$ raises its level by exactly $20$~dB. Then
+explain in one sentence why the power-based formula uses $10\log_{10}$ instead.
+\end{exercise}
+
+\begin{exercise}
+(a) Compute the frequency of the note E5 (E above the treble staff), which is $7$ semitones above
+A4. (b) Compute the frequency of A2, three octaves below A4. (c) What MIDI note number does each
+correspond to, given A4 is MIDI $69$?
+\end{exercise}
+
+\begin{exercise}
+A square wave at fundamental $f_0 = 5$~kHz is recorded at $f_s = 44{,}100$~Hz. Its harmonics fall
+at $3f_0, 5f_0, 7f_0, \dots$. (a) List the harmonic frequencies up to $30$~kHz. (b) Which of them
+exceed the Nyquist frequency and will alias? (c) Compute the aliased frequency of the first one
+that folds. (This is why clipping -- which makes square-like waves -- can sound metallic.)
+\end{exercise}
+
+\begin{exercise}
+A full-scale sine has peak $0$~dBFS. (a) Using $A_{\text{rms}} = A/\sqrt{2}$, what is its RMS
+level in dBFS? (b) A full-scale square wave has $A_{\text{rms}} = A$ (it is always at $\pm A$).
+What is \emph{its} RMS level in dBFS? (c) Explain why, at the same peak level, a square wave
+sounds louder than a sine.
+\end{exercise}
+
+\begin{exercise}
+Estimate the uncompressed storage for one hour of $5.1$ surround sound ($6$ channels) at
+$48$~kHz, $24$-bit. Express the answer in gigabytes. Then estimate the same hour as a
+$1.5$~Mbit/s lossy file and give the compression ratio.
+\end{exercise}
+
+\begin{exercise}
+(Build.) Record a $5$-second clip with \texttt{arecord} at $44.1$~kHz/$16$-bit, then run the
+Python snippet from Section~\ref{ch26:build}. Report peak dBFS, RMS dBFS, and clipped fraction.
+Re-record while speaking much louder and report the same three numbers. Which changed most, and
+does the clipped fraction behave the way Section~\ref{ch26:clipping} predicts?
+\end{exercise}
+
+\begin{exercise}
+(Open-ended.) A product page advertises a wristband that ``listens to your hand with a
+tiny microphone and reconstructs each finger's position in real time.'' Using
+Section~\ref{ch26:claims}, write three sentences separating the plausible claim from the
+implausible one, and name the sensor type that would actually be required for continuous
+finger-pose tracking.
+\end{exercise}

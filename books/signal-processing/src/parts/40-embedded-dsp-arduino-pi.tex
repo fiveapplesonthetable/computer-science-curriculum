@@ -1,0 +1,973 @@
+\chapter{Embedded Signal Processing on Arduino and Raspberry Pi}
+
+\chapterline
+
+Everything in this book so far has lived in a comfortable place: a notebook running NumPy, a
+plot that redraws in a quarter second, arrays of \texttt{float64} that never overflow and never
+run out. That is the right place to \emph{learn} DSP. It is not where DSP \emph{lives}. The
+spectrogram that watches your forearm, the filter that smooths an accelerometer trace, the
+peak-picker that decides a finger just tapped -- in the finished wrist controller those run on a
+chip the size of a fingernail, powered by a coin cell, with no operating system, a few kilobytes
+of RAM, and a hard deadline arriving every millisecond whether you are ready or not. The math is
+identical. The engineering could not be more different.
+
+This chapter is about that crossing -- taking the ideas we built on graph paper and making them
+run, in real time, on a microcontroller (MCU) like an Arduino and on a small Linux computer like
+a Raspberry Pi. We will see how to sample without jitter, why \texttt{float} sometimes becomes
+your enemy and fixed-point your friend, how a ring buffer lets a finite chip process an infinite
+stream, what it actually costs to run an FFT on a Cortex-M, and how processed numbers leave the
+device as serial, BLE, or MIDI. The through-line goal -- a wrist-worn finger-gesture instrument --
+forces every one of these choices to be concrete. There is a real-time budget, a real power budget,
+and a real latency a musician will feel. By the end you should be able to look at the project and
+say, with reasons, ``this part runs on the Arduino, that part runs on the Pi, and here is why.''
+
+A word up front about the sensing, because it shapes every decision that follows. Finger movement
+\emph{is} detectable from a wrist or forearm band, and we will treat it as a solved problem rather
+than a wish. Two physical channels make it work. When you move a finger, the tendons in your
+forearm slide and the muscle bellies change shape; a snug band of force sensors reads that
+mechanical bulge -- this is \textbf{force myography} (FMG). At the same time the muscles fire
+electrical pulses that a pair of skin electrodes can pick up -- \textbf{surface electromyography}
+(sEMG). Neither one needs a camera, a glove, or a machine-learning model. The method is direct: the
+user runs a short guided \emph{enrollment}, performing each finger movement a few times while the
+phone records the signal signature; from those recordings we build a per-user template for each
+finger. Live detection is then a match -- compare the current signal to the calibrated templates
+and fire the closest one. Calibration, not classification, is the heart of the instrument, and the
+whole chapter builds toward making that loop run on a chip you can wear.
+
+\section{The shape of the problem: streaming, not batch}
+\label{ch40:streaming}
+
+On a laptop you think in \emph{batches}. You have the whole signal in an array, you call
+\texttt{np.fft.fft(x)}, you get the answer. On an embedded device the signal does not exist yet.
+It is being born one sample at a time, forever, and you must produce outputs while later inputs
+are still arriving. The mental model is a pipe, not a bucket.
+
+\begin{intuitionbox}
+Batch DSP is a photograph: the whole signal is laid out, and you operate on it at leisure.
+Streaming DSP is a river you stand in: water arrives at a fixed rate, you must scoop and act
+before it flows past, and you never get to hold all of it at once. Every embedded design decision
+-- buffer sizes, fixed-point, interrupt timing -- exists to keep up with the river without falling
+behind and without drowning in stored water.
+\end{intuitionbox}
+
+This single shift reshapes everything. You cannot store an infinite stream, so you keep a short
+sliding window (a \emph{ring buffer}). You cannot afford a sloppy sample clock, because a filter
+designed for $f_s = 1000$~Hz quietly lies if the true rate wobbles. You cannot pause to garbage-
+collect or wait on a disk. And you have a \textbf{real-time budget}: if your per-sample (or
+per-block) work takes longer than the time between samples (or blocks), the river overflows and
+you lose data. That budget is the spine of the whole chapter.
+
+\begin{focusbox}
+Three numbers govern every embedded DSP design, and you should be able to state all three for any
+project before writing code:
+\begin{enumerate}
+  \item \textbf{Sample rate} $f_s$ -- how often a new sample arrives (the deadline clock).
+  \item \textbf{Work per sample/block} -- how many cycles your processing costs.
+  \item \textbf{Cycle budget} -- the MCU clock times the time between deadlines.
+\end{enumerate}
+If work per block exceeds the cycle budget, no amount of clever code saves you; you must lower
+$f_s$, shrink the algorithm, or move to a faster processor.
+\end{focusbox}
+
+\section{Getting samples in: timers, ADCs, and the enemy called jitter}
+\label{ch40:sampling}
+
+Sampling theory told us \emph{how often} to sample. Embedded reality adds a brutal footnote: the
+samples must land on an \emph{evenly spaced} time grid. The whole edifice of the DFT, every filter
+coefficient, every frequency you read off a spectrum -- all of it assumes that sample $n$ happened
+at exactly $t_n = n/f_s$. When the actual instants drift around that grid, we call the error
+\textbf{jitter}, and it is one of the most insidious problems in embedded DSP because the code
+looks correct and the numbers are merely wrong.
+
+\subsection{Where samples come from}
+
+A microcontroller has a built-in ADC. The naive way to use it is a loop:
+
+\begin{lstlisting}[language=C, caption={The WRONG way to sample: timing set by loop speed.}]
+void loop() {
+  int x = analogRead(A0);   // read sensor
+  process(x);               // do DSP
+  delay(1);                 // "1 ms" -- but is it?
+}
+\end{lstlisting}
+
+This is a trap. The interval between samples is now \texttt{delay(1)} \emph{plus} however long
+\texttt{analogRead} took \emph{plus} however long \texttt{process} took \emph{plus} whatever
+interrupt fired in between. The sample spacing breathes with your code. If \texttt{process}
+sometimes branches into a slower path, your $f_s$ changes mid-stream.
+
+\begin{trapbox}
+\texttt{delay()}-based sampling produces a sample rate that depends on your processing time. The
+moment your DSP load varies (a conditional, a heavier block every $N$ samples, an occasional
+log-print), the time grid warps. Spectra smear, filters detune, and the bug is nearly invisible
+because every individual sample looks fine. \textbf{Never set your sample clock from inside the
+work loop.}
+\end{trapbox}
+
+The right way is to let a hardware \textbf{timer} fire an interrupt at a fixed rate and have the
+interrupt -- and \emph{only} the interrupt -- take the sample. The timer counts the crystal
+oscillator directly; it does not know or care what your code is doing. This decouples the sample
+clock from the workload.
+
+\begin{lstlisting}[language=C, caption={Timer-driven sampling on an AVR Arduino (Timer1, $f_s=1$~kHz).}]
+volatile int16_t latest;
+volatile bool ready;
+
+ISR(TIMER1_COMPA_vect) {       // fires exactly every 1 ms
+  latest = analogRead(A0);     // sample on the grid
+  ready = true;                // flag the main loop
+}
+
+void setup() {
+  cli();
+  TCCR1A = 0; TCCR1B = 0; TCNT1 = 0;
+  OCR1A  = 249;                // 16 MHz / 64 / (249+1) = 1000 Hz
+  TCCR1B |= (1 << WGM12);      // CTC mode: clear timer on compare
+  TCCR1B |= (1 << CS11) | (1 << CS10);  // prescaler = 64
+  TIMSK1 |= (1 << OCIE1A);     // enable compare interrupt
+  sei();
+}
+
+void loop() {
+  if (ready) { ready = false; process(latest); }
+}
+\end{lstlisting}
+
+Now the sample instants are nailed to the crystal. The main loop can be late to \emph{process} a
+sample, but the sample itself was taken on time. (Better still on richer chips: have the timer
+trigger the ADC in hardware and have the ADC's done-interrupt fetch the result, so even the
+\texttt{analogRead} latency leaves the timing path. On a Cortex-M you would wire a timer to the
+ADC trigger and the ADC to DMA, and the CPU only wakes when a whole block is ready.)
+
+\subsection{What jitter does to a spectrum}
+
+Jitter is not just untidy -- it injects a noise floor. Suppose each true instant $t_n = n/f_s$ is
+perturbed to $t_n + \delta_n$ with $\delta_n$ small and random. For a sinusoid
+$x(t)=A\sin(2\pi f t)$ the sampled value is
+\[
+  x(t_n+\delta_n) \approx A\sin(2\pi f t_n) + \underbrace{2\pi f A\cos(2\pi f t_n)}_{\text{slope}}\,\delta_n .
+\]
+The error term scales with $f$: \emph{the higher the frequency, the more a fixed timing error
+costs you}. A timing wobble of $\delta$ seconds turns into an amplitude error proportional to
+$2\pi f \delta$. This is why high-frequency, high-resolution sampling is so demanding on the
+clock, and why jitter shows up as a raised, roughly white noise floor that worsens toward the top
+of the band.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=5cm,
+  xlabel={frequency (Hz)}, ylabel={magnitude (dB)},
+  xmin=0, xmax=200, ymin=-70, ymax=5,
+  axis lines=left, enlargelimits=false,
+  legend pos=north east, legend cell align=left,
+]
+\addplot[sigblue, thick] coordinates {(0,-65)(40,-65)(49,-60)(50,0)(51,-60)(60,-66)(200,-66)};
+\addlegendentry{clean clock}
+\addplot[specred, thick, dashed] coordinates {(0,-50)(40,-46)(49,-40)(50,0)(51,-40)(70,-42)(120,-38)(200,-32)};
+\addlegendentry{jittered clock}
+\end{axis}
+\end{tikzpicture}
+\caption{Sampling a single 50~Hz tone. A clean timer keeps the noise floor low and flat (solid).
+Clock jitter (dashed) raises the floor, and the rise grows toward higher frequencies because a
+fixed timing error perturbs fast-moving samples more.}
+\label{ch40:fig-jitter}
+\end{figure}
+
+\begin{whybox}
+A hardware timer fires from a counter clocked by the crystal oscillator, completely independent
+of what the CPU is executing. Its edges are as regular as the crystal itself (tens of ppm). A
+software \texttt{delay()} loop, by contrast, measures time in instructions executed, so anything
+that changes the instruction count -- a branch, an interrupt, a cache miss on bigger chips --
+moves the sample. Timers work because they move the timing decision out of software entirely and
+into dedicated silicon.
+\end{whybox}
+
+\begin{goalbox}
+The wrist controller streams several channels at once: a MEMS IMU (accelerometer and gyro), an FMG
+array of force sensors reading tendon bulge, and one or two sEMG channels reading muscle pulses. For
+gesture timing a musician can feel, you want low, \emph{stable} latency, so every sample clock must
+be rock-steady. Practically: configure the IMU's own internal sample-rate generator (a good MEMS
+IMU has one, e.g. an ICM-20948 at a programmed output data rate) and read it over its FIFO, rather
+than polling \texttt{analogRead} in \texttt{loop()}. The IMU's clock becomes your time grid. For the
+analog FMG and EMG channels, drive the MCU ADC from a timer as above so they land on the same grid
+and can be compared sample for sample. Either way, the rule holds: the clock comes from hardware,
+never from the work loop. Sample-aligned channels are what let the calibration step later treat one
+finger movement as a single multi-sensor signature.
+\end{goalbox}
+
+\section{Ring buffers: a finite window onto an infinite stream}
+\label{ch40:ring}
+
+You cannot store the whole stream, but most DSP only needs a short recent history: an FIR filter
+of length $M$ needs the last $M$ samples; a 256-point FFT needs the last 256; an envelope detector
+needs maybe a few dozen. The data structure that holds ``the last $N$ samples'' efficiently is the
+\textbf{ring buffer} (circular buffer): a fixed array with a write index that wraps around to the
+start when it hits the end. Geometrically it is a loop of tape -- you keep writing forward, and the
+oldest sample is overwritten by the newest, so the buffer always holds a window sliding along the
+signal.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=1]
+\def\Rad{1.6}
+\foreach \i/\a in {0/90,1/45,2/0,3/-45,4/-90,5/-135,6/180,7/135} {
+  \node[draw, circle, minimum size=7mm, fill=fillsig!40] (s\i) at (\a:\Rad) {\footnotesize \i};
+}
+\draw[->, thick, structurepurple] (135:\Rad+0.5) arc (135:95:\Rad+0.5);
+\node[structurepurple] at (90:\Rad+1.05) {\footnotesize write here, then wrap};
+\node at (0,0) {\footnotesize 8-slot ring};
+\end{tikzpicture}
+\caption{A ring buffer of 8 slots. The write index advances around the loop; when it passes slot 7
+it returns to slot 0, overwriting the oldest sample. The array index is the sample number taken
+modulo the buffer length.}
+\label{ch40:fig-ring}
+\end{figure}
+
+The key arithmetic is that the physical array index is the logical sample number \emph{modulo} the
+buffer length $N$. If $N$ is a power of two, that modulo is a single bitwise AND -- one cycle --
+which is exactly why DSP buffer sizes are almost always powers of two.
+
+\begin{lstlisting}[language=C, caption={A power-of-two ring buffer with a single-cycle wrap.}]
+#define N 256                 // must be a power of two
+int16_t buf[N];
+uint16_t head = 0;            // next write position
+
+static inline void ring_push(int16_t x) {
+  buf[head] = x;
+  head = (head + 1) & (N - 1);   // wrap via AND, no modulo divide
+}
+
+// read the sample k steps back (k=0 is newest)
+static inline int16_t ring_get(uint16_t k) {
+  return buf[(head - 1 - k) & (N - 1)];
+}
+\end{lstlisting}
+
+\begin{happeningbox}
+A ring buffer turns ``the last $N$ samples'' into a fixed footprint that never grows. No
+allocation, no shifting of array elements, no copying -- pushing a sample is one store and one
+masked increment. The illusion of a smoothly sliding window is created by moving the \emph{index}
+instead of moving the \emph{data}. This is the single most important data structure in real-time
+DSP, and it is why an MCU with 4~KB of RAM can process a signal that has been running for hours.
+\end{happeningbox}
+
+\begin{trapbox}
+A ring buffer shared between an interrupt (writer) and the main loop (reader) is a classic
+concurrency hazard. The simplest safe pattern: the ISR only \emph{pushes}, the main loop only
+\emph{reads}, indices are a single aligned word (atomic to read/write on the MCU), and shared
+flags are \texttt{volatile}. For block processing, use \emph{two} buffers (double buffering / ping-
+pong): the ISR fills buffer~A while the main loop processes buffer~B, then they swap. Never let the
+reader and writer touch the same buffer at the same time.
+\end{trapbox}
+
+\section{Numbers on a small chip: fixed-point vs floating-point}
+\label{ch40:fixed-point}
+
+On your laptop every number is a 64-bit float and you never think about it. On a small MCU you
+must, because the way you represent numbers directly sets your speed, your memory, and your
+correctness. There are two camps: floating-point and fixed-point.
+
+\subsection{What floating-point costs}
+
+A floating-point number stores a sign, an exponent, and a mantissa -- effectively scientific
+notation in binary, $\pm m \times 2^{e}$. Its glory is \emph{dynamic range}: it represents both
+$0.0001$ and $10000$ with similar relative precision, so you rarely overflow and rarely lose all
+your bits. The catch on embedded hardware is the \textbf{FPU} (floating-point unit). A chip with a
+hardware FPU (Cortex-M4F, M7, the Raspberry Pi) does a float multiply in a cycle or few. A chip
+\emph{without} one (the classic 8-bit AVR Arduino Uno, Cortex-M0/M0+) must emulate every float
+operation in software -- dozens to hundreds of cycles each. On an Uno, a single \texttt{float}
+multiply can cost what an integer multiply costs many times over.
+
+\subsection{What fixed-point is}
+
+Fixed-point keeps the speed of integer arithmetic but reintroduces fractions by \emph{agreeing on
+where the binary point sits}. In the common \textbf{Q-format} notation, $Q_{m.n}$ means an integer
+interpreted as having $n$ fractional bits: the stored integer $X$ represents the real value
+$X / 2^{n}$. For example, in $Q_{1.15}$ (often just ``Q15'') a 16-bit signed integer represents a
+real number in $[-1, 1)$ with $2^{15}$ steps; the value $0.5$ is stored as $16384$.
+
+\begin{intuitionbox}
+Floating-point lets the binary point \emph{float} to wherever the number needs it -- great range,
+hardware cost if there is no FPU. Fixed-point nails the binary point to one agreed place -- you
+trade away automatic range for the raw speed of plain integers. Choosing between them is choosing
+\emph{who tracks the scale}: the silicon (float) or you, the programmer (fixed).
+\end{intuitionbox}
+
+Arithmetic in Q-format follows simple rules once you track the point:
+\begin{itemize}
+  \item \textbf{Add/subtract:} operands must share the same $n$; the result keeps that $n$. Watch
+    for overflow -- two Q15 numbers near $1$ sum to near $2$, which no longer fits.
+  \item \textbf{Multiply:} $Q_{a}\times Q_{b}$ gives a product with $a+b$ fractional bits. Two Q15
+    values multiplied give a 32-bit Q30 result; to return to Q15 you shift right by 15. You must
+    multiply into a \emph{wider} accumulator (16$\times$16 $\to$ 32) or you lose the top bits.
+\end{itemize}
+
+\begin{lstlisting}[language=C, caption={A Q15 fixed-point multiply with a 32-bit accumulator.}]
+typedef int16_t q15_t;        // value v stored as round(v * 32768)
+
+static inline q15_t q15_mul(q15_t a, q15_t b) {
+  int32_t p = (int32_t)a * (int32_t)b;   // Q30 in 32 bits
+  return (q15_t)(p >> 15);               // back to Q15 (truncating)
+}
+// example: 0.5 * 0.5 -> 16384 * 16384 = 268435456; >>15 = 8192 = 0.25
+\end{lstlisting}
+
+\begin{trapbox}
+Two fixed-point sins dominate embedded bug reports. \textbf{Overflow}: a Q15 accumulator quietly
+wraps from $+0.99$ to $-1.0$ when a filter's partial sums exceed the range; the fix is a wider
+accumulator (Q31) and \emph{saturating} arithmetic that clamps instead of wrapping. \textbf{Loss
+of precision}: shifting right too early throws away low bits; keep full width through the whole
+inner sum and round/shift only at the very end. CMSIS-DSP's functions are written precisely to
+manage these for you, which is a strong reason to use them rather than rolling your own.
+\end{trapbox}
+
+\begin{connectionbox}
+Quantization and fixed-point are two faces of the same coin from the ADC chapter. Quantization
+error is the gap between the true value and the nearest representable rung; in $Q_{m.n}$ that rung
+spacing is exactly $2^{-n}$. The ``6~dB per bit'' rule is the same here: each extra fractional bit
+halves the step and buys about 6~dB of headroom against round-off noise. The noise you analyzed
+statistically in the noise chapter is the same round-off noise your fixed-point filter generates
+internally -- which is why understanding random signals pays off the moment you go embedded.
+\end{connectionbox}
+
+\subsection{A practical rule of thumb}
+
+If your chip has an FPU, write in \texttt{float} (or even \texttt{double} on a Pi) first. Floats
+are easier to get correct, and on an M4F/M7 they are fast. Reach for fixed-point only when you
+have no FPU (AVR, M0), when you need every last cycle or microamp, or when a vectorized integer
+path (CMSIS-DSP Q15) is meaningfully faster than the float path on your part. Premature fixed-point
+is a top source of subtle, hard-to-find DSP bugs.
+
+\section{Running real DSP: filters and FFTs on an MCU vs a Pi}
+\label{ch40:running}
+
+Now the heart of it. We have samples on a clean grid, stored in a ring buffer, in a numeric format
+the chip likes. What does it cost to actually \emph{do} the DSP?
+
+\subsection{FIR and IIR filters on the MCU}
+
+A direct-form FIR filter of length $M$ is $y[n]=\sum_{k=0}^{M-1} h[k]\,x[n-k]$ -- $M$ multiply-
+accumulates (MACs) per output sample. This maps beautifully onto a ring buffer: the taps multiply
+the last $M$ ring entries. A Cortex-M4 has a single-cycle MAC, so an $M=64$ FIR costs roughly $64$
+cycles per sample; at $f_s=1$~kHz that is $64{,}000$ cycles/s, a rounding error against an
+$80$~MHz clock. The same filter on an 8-bit AVR in floating point could cost a hundred times more
+per tap and might not keep up.
+
+An IIR biquad is even cheaper -- five MACs per sample per second-order section -- and is the
+workhorse for the gentle low-pass and band-pass filters you will run on IMU and EMG signals. The
+price of that efficiency is sensitivity to coefficient quantization and the need to watch internal
+overflow, which is exactly why biquads are usually run as cascaded second-order sections in
+fixed-point.
+
+\begin{lstlisting}[language=C, caption={A single biquad (Direct Form II transposed), float version.}]
+typedef struct { float b0,b1,b2,a1,a2,z1,z2; } biquad_t;
+
+static inline float biquad(biquad_t* s, float x) {
+  float y = s->b0 * x + s->z1;
+  s->z1   = s->b1 * x - s->a1 * y + s->z2;
+  s->z2   = s->b2 * x - s->a2 * y;
+  return y;                         // 5 mul, 4 add, 2 state updates
+}
+\end{lstlisting}
+
+\subsection{The FFT: CMSIS-DSP on the MCU}
+
+For an FFT on an ARM Cortex-M, do not write your own -- use \textbf{CMSIS-DSP}, ARM's free,
+hand-optimized DSP library. It provides radix-based FFTs in float (\texttt{arm\_rfft\_fast\_f32})
+and fixed-point (\texttt{arm\_rfft\_q15}), plus FIR/IIR, statistics, and vector math, all tuned to
+use the chip's MAC and (on M4/M7) SIMD instructions.
+
+\begin{lstlisting}[language=C, caption={A 256-point real FFT and magnitude with CMSIS-DSP.}]
+#include "arm_math.h"
+#define NFFT 256
+arm_rfft_fast_instance_f32 fft;
+float in[NFFT], spec[NFFT], mag[NFFT/2];
+
+void fft_setup(void) { arm_rfft_fast_init_f32(&fft, NFFT); }
+
+void fft_block(void) {
+  arm_rfft_fast_f32(&fft, in, spec, 0);    // forward real FFT
+  arm_cmplx_mag_f32(spec, mag, NFFT/2);    // |X[k]| for each bin
+}
+\end{lstlisting}
+
+How long does that take? Order-of-magnitude: an $N=256$ float FFT on an $80$~MHz Cortex-M4F is on
+the order of tens of microseconds. If you want a new spectrum every $10$~ms (a $100$~Hz frame rate,
+plenty for gesture work), the FFT eats well under $1\%$ of the budget. This is the headline result
+of the chapter: \emph{modern MCUs are genuinely fast enough to do real frequency-domain DSP in
+real time}, as long as you respect the budget arithmetic.
+
+\begin{walkbox}
+A 256-point FFT in $\sim 30~\mu$s. A frame every $10$~ms ($10{,}000~\mu$s). What fraction of the
+processor does the FFT use, and how many such FFTs could you run per frame before you run out of
+time? \\[2pt]
+\emph{Answer:} $30/10000 = 0.3\%$ per FFT. The math alone would allow on the order of a few hundred
+such FFTs per frame -- but in practice you would hit memory and I/O limits, and windowing/copying
+overhead, long before the FFT arithmetic itself becomes the bottleneck.
+\end{walkbox}
+
+\subsection{The Pi side: NumPy and SciPy}
+
+A Raspberry Pi is a different animal -- a full Linux computer with a multi-core ARM CPU, hundreds
+of megabytes to gigabytes of RAM, and an FPU on every core. Here you write Python with NumPy and
+SciPy exactly as you did while learning. \texttt{np.fft.rfft}, \texttt{scipy.signal.sosfilt},
+\texttt{scipy.signal.spectrogram} -- all available, all fast (NumPy's FFT and filters are C/Fortran
+under the hood). The cost you trade for that comfort is real-time \emph{determinism}: Linux is not
+a hard real-time OS. Most of the time your block runs in a millisecond; occasionally the scheduler,
+a page fault, or another process makes it late. For a feel-it-instantly instrument that occasional
+hiccup matters.
+
+\begin{lstlisting}[language=Python, caption={Streaming block processing on a Raspberry Pi.}]
+import numpy as np
+from scipy.signal import butter, sosfilt
+
+fs = 1000
+sos = butter(4, 20, 'low', fs=fs, output='sos')  # 20 Hz low-pass
+zi  = np.zeros((sos.shape[0], 2))                 # filter state
+
+def process_block(block):           # block: 256 new samples
+    global zi
+    y, zi = sosfilt(sos, block, zi=zi)            # stateful -> streaming
+    spec  = np.abs(np.fft.rfft(y * np.hanning(len(y))))
+    return y, spec
+\end{lstlisting}
+
+\begin{aestheticbox}
+The same five-line biquad is, on the MCU, a hand-managed struct of floats you must budget cycles
+for, and on the Pi, a \texttt{butter()} call you barely think about. Neither is ``better.'' The
+MCU gives you determinism and microamps at the cost of effort; the Pi gives you effortless
+horsepower at the cost of determinism and milliwatts. Mature embedded design is knowing which
+currency you are spending and choosing on purpose.
+\end{aestheticbox}
+
+\section{Getting answers out: serial, BLE, and MIDI}
+\label{ch40:output}
+
+Processing is half the job; the result has to leave the device. Three channels matter for this
+project.
+
+\textbf{Serial (UART/USB).} The workhorse for development and wired use. Simple, reliable, and on
+USB fast enough for raw sample streams. You will use it constantly for debugging -- but printing
+inside your DSP loop is itself a timing hazard (see the trap below).
+
+\textbf{BLE (Bluetooth Low Energy).} The right wireless link for a wearable: low power, ubiquitous
+on phones and laptops, and -- crucially -- it supports \textbf{BLE-MIDI}, a standard profile that
+carries MIDI messages over Bluetooth. A board like a Nordic nRF52 or an ESP32 can advertise as a
+BLE-MIDI device that a DAW or synth app sees as a normal MIDI controller, with no dongle.
+
+\textbf{MIDI.} The destination format for our instrument. MIDI is delightfully thin: most messages
+are three bytes -- a status byte (command + channel) and two data bytes. A Note-On is
+\texttt{0x90 | channel}, then note number ($0$--$127$), then velocity ($0$--$127$). A continuous
+controller (CC), perfect for mapping a gesture to a parameter like filter cutoff or vibrato, is
+\texttt{0xB0 | channel}, controller number, value.
+
+\begin{lstlisting}[language=C, caption={Emitting MIDI: a note and a continuous-control message.}]
+void midi_note_on(uint8_t ch, uint8_t note, uint8_t vel) {
+  uint8_t m[3] = { (uint8_t)(0x90 | (ch & 0x0F)), note, vel };
+  midi_send(m, 3);            // over USB-MIDI, serial-MIDI, or BLE-MIDI
+}
+void midi_cc(uint8_t ch, uint8_t cc, uint8_t val) {
+  uint8_t m[3] = { (uint8_t)(0xB0 | (ch & 0x0F)), cc, val };
+  midi_send(m, 3);
+}
+\end{lstlisting}
+
+\begin{trapbox}
+\texttt{Serial.print()} for debugging inside a sensor- or audio-rate loop can block for
+milliseconds while the UART drains its buffer, blowing your real-time deadline and corrupting your
+sample timing. For diagnostics, either print from a \emph{lower-priority} context (the slow main
+loop, not the ISR), throttle to a few messages per second, toggle a GPIO pin and watch it on a
+logic analyzer, or write to a ring buffer and flush it when idle. Logging is I/O, and I/O is the
+enemy of determinism.
+\end{trapbox}
+
+\begin{goalbox}
+The wrist controller's output path is the whole point: finger gestures in, music out. The natural
+design is BLE-MIDI -- the wearable advertises as a standard MIDI controller, and any phone, tablet,
+or laptop running a synth receives it with zero custom software. Map \emph{discrete} finger
+movements (a per-finger tap or press, matched to its calibrated template) to Note-On/Note-Off, and
+\emph{continuous} signals (finger pressure from FMG, wrist tilt) to CC messages so the player can
+bend, swell, and modulate. Keep total latency -- sample to MIDI out -- as low as you can; beyond
+about $20$--$30$~ms a player begins to feel the lag, which is why the capstone leans on a fast
+onset detector (Section~\ref{ch40:worked}).
+\end{goalbox}
+
+\section{Power and real-time budgets}
+\label{ch40:budgets}
+
+A wearable lives on a battery, so two budgets run in parallel: cycles (can I finish in time?) and
+joules (how long until it dies?). They pull in opposite directions, and good design balances them.
+
+\subsection{The real-time budget, made concrete}
+
+The rule is unforgiving: \emph{work per deadline must be less than time per deadline}. Suppose you
+sample an IMU at $f_s = 200$~Hz and run the heavier feature/analysis block on $32$ samples, so a
+block arrives every $32/200 = 160$~ms. (This block sets the analysis cadence, not the play latency
+-- the fast onset path of Section~\ref{ch40:worked} fires far sooner.) On an $80$~MHz MCU that is
+$80{,}000{,}000 \times 0.160 = 12.8$~million cycles of budget per block -- enormous. Your filtering and a small FFT might use a few tens of thousands.
+You are nowhere near the cliff, which is typical for motion-rate DSP and is exactly why an MCU
+suffices. The budget only gets tight at audio rates ($f_s$ in the tens of kHz) or with big FFTs.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=5cm,
+  xlabel={per-block work (millions of cycles)}, ylabel={fraction of budget},
+  xmin=0, xmax=14, ymin=0, ymax=1.3,
+  xtick={0,2,4,6,8,10,12,14},
+  ytick={0,0.5,1.0}, axis lines=left, enlargelimits=false,
+]
+\addplot[sigblue, thick, domain=0:12.8, samples=2] {x/12.8};
+\addplot[specred, dashed, domain=0:14, samples=2] {1};
+\node[specred, anchor=south east] at (axis cs:14,1.0) {\footnotesize deadline (100\%)};
+\addplot[targetgreen, only marks, mark=*] coordinates {(0.05,0.004)};
+\node[targetgreen, anchor=west] at (axis cs:0.4,0.12) {\footnotesize typical motion-DSP load};
+\end{axis}
+\end{tikzpicture}
+\caption{Real-time budget for a $200$~Hz IMU processed in $32$-sample blocks on an $80$~MHz MCU:
+$12.8$M cycles available per block. As work rises toward the dashed deadline you approach the
+cliff; motion-rate DSP (green dot) sits comfortably near the origin.}
+\label{ch40:fig-budget}
+\end{figure}
+
+\subsection{The power budget}
+
+Battery life is set by average current. The dominant lever on an MCU is \emph{sleep}: a Cortex-M
+draws tens of milliamps running flat out but only microamps in a deep-sleep mode. Because motion
+DSP uses a tiny fraction of the cycle budget, the chip should compute its block, then \emph{sleep}
+until the next timer or IMU interrupt. This ``compute-and-sleep'' duty cycling can cut average
+current by one to two orders of magnitude.
+
+\begin{lstlisting}[language=C, caption={Compute-then-sleep duty cycling (pseudocode).}]
+for (;;) {
+  if (block_ready) {          // set by the IMU FIFO interrupt
+    block_ready = false;
+    process_block();          // a few tens of microseconds of work
+    maybe_emit_midi();
+  }
+  enter_low_power_sleep();    // wake on next interrupt
+}
+\end{lstlisting}
+
+\begin{applicationbox}
+The power gap between Arduino-class and Pi-class hardware is stark. A sleeping nRF52 doing
+intermittent motion DSP and BLE can run for \emph{days} on a small LiPo. A Raspberry Pi (even a
+Zero) idles in the hundreds of milliamps and has no microamp sleep -- it is a poor wearable, often
+needing recharging within hours and a far bulkier battery. This single fact, more than raw compute,
+is why a battery-powered wrist device gravitates to an MCU and a tethered or desktop processor
+gravitates to a Pi.
+\end{applicationbox}
+
+\begin{connectionbox}
+The power story loops back to sampling theory. Lower $f_s$ means fewer interrupts, fewer wake-ups,
+and less radio traffic -- so the Nyquist choice is also a battery choice. Sample only as fast as
+the signal demands: human gesture bandwidth is a few tens of hertz, so a $100$--$200$~Hz IMU rate
+is plenty, and pushing higher just burns joules for no extra information.
+\end{connectionbox}
+
+\section{Arduino vs Raspberry Pi for the wrist controller}
+\label{ch40:compare}
+
+Time to decide. The two platforms are not competitors so much as different tools, and the right
+answer for this project is usually ``use both'' -- a thin wrist node and a capable phone.
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.6cm}p{5.2cm}p{5.2cm}@{}}
+\toprule
+ & \textbf{Arduino / MCU} (nRF52, ESP32, M4) & \textbf{Raspberry Pi} (Linux SBC) \\
+\midrule
+Compute & MHz, single core, KB--MB RAM & GHz, multi-core, GB RAM \\
+Numerics & fixed-point or FPU float; CMSIS-DSP & full \texttt{float}/\texttt{double}; NumPy/SciPy \\
+Real time & hard, deterministic (ISR + timer) & soft; OS jitter, no hard deadlines \\
+Power & mA active, $\mu$A asleep -- days on a coin/LiPo & hundreds of mA -- hours, bulky battery \\
+I/O & native ADC, SPI/I2C, BLE-MIDI & USB, Wi-Fi/BT, needs ADC HAT for analog \\
+Dev effort & C, manual budgets, flash-and-test & Python, fast iteration, easy logging \\
+Best at & always-on sensing, wireless, low latency & calibration, conditioning, deep offline analysis \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{buildbox}
+\textbf{Recommended split for the wrist controller.} The architecture is deliberately lopsided: a
+\emph{thin} wrist node and a \emph{capable} phone.
+\begin{itemize}
+  \item \textbf{On the wrist (MCU, e.g. nRF52840):} read the IMU FIFO and the timer-driven FMG/EMG
+    channels on hardware clocks, apply only light conditioning -- a couple of biquads and an
+    envelope -- compress, and BLE-stream the channels. For live play, run a lightweight on-device
+    template match (a short correlation against the few calibrated per-finger templates) so the
+    note fires with minimal latency even if the phone is busy. Compute-and-sleep between blocks for
+    battery life. This is the always-on, low-latency, low-power core.
+  \item \textbf{On the phone (or a Pi/laptop):} the heavy lifting lives here. The phone runs the
+    guided calibration routine, builds and stores the per-finger templates and thresholds,
+    conditions the streamed signals, and does deep offline analysis from the logged streams to
+    refine the templates. There is no learned model -- ``analysis'' here means filtering, alignment,
+    averaging the enrollment repetitions into a clean template, and picking thresholds. The phone
+    then ships the finished templates back down to the wrist node for the live path.
+\end{itemize}
+The general principle: keep the wrist node cheap in cycles and joules, and let the phone -- which
+has power to spare and a screen to guide the user -- own calibration and conditioning. The wrist
+sleeps; the phone thinks.
+\end{buildbox}
+
+\begin{goalbox}
+\textbf{What the wrist can and cannot sense.} Be precise here, because the boundary is the whole
+design. \emph{Which finger just moved} is observable from the forearm: tendon bulge (FMG) and
+muscle pulses (sEMG) carry a distinct per-finger signature, and after a short per-user calibration a
+template match reads it reliably. WristFlex demonstrated FMG-based finger-tap discrimination from a
+band of force sensors; Thalmic Labs' Myo and the open MyoWare front end read the same intent from
+sEMG. So per-finger \emph{detection} -- this finger tapped, that finger pressed, this one is held
+down -- is firmly on the doable side, and it is plenty for playing an instrument.
+
+The genuinely hard part, and the one limit worth stating plainly, is continuous per-\emph{joint}
+finger \emph{angles}. You cannot recover them from a wrist or forearm band: the mapping from finger pose to
+wrist-surface signal is underdetermined, and the bulk motion of the wrist simply does not contain
+that information. Recovering smooth joint angles needs sensors on the fingers themselves --
+instrumented rings, as in the finger-worn ``Learning on the Rings'' tracking work, or a glove. Treat
+that as an upgrade path, not a launch requirement. Everything the project actually needs -- detect
+which finger moved, how hard, and when -- sits comfortably on the achievable side.
+\end{goalbox}
+
+\begin{historybox}
+The split we just drew is an old one in disguise. In the 1980s the Texas Instruments TMS320 fixed-
+point DSP chips earned their living doing exactly this -- a small, deterministic processor crunching
+filters and FFTs in real time on a tight power budget -- while general-purpose CPUs did the
+flexible, non-real-time work. ARM's CMSIS-DSP library and the Cortex-M's single-cycle MAC are the
+direct descendants of that fixed-point DSP lineage, now small and cheap enough to wear on your
+wrist. The Raspberry Pi, meanwhile, is the heir to the workstation. Embedded DSP has always been
+the art of putting the right work on the right side of that line.
+\end{historybox}
+
+\section{The capstone: a buildable finger-gesture controller}
+\label{ch40:worked}
+
+Now assemble everything into one concrete, end-to-end project (Figure~\ref{ch40:fig-arch}). The
+instrument detects which finger moved, how hard, and when, and emits MIDI -- no camera, no machine
+learning, just multimodal sensing plus per-finger calibration. This section is meant to be
+\emph{built}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  node distance=6mm,
+  box/.style={draw, rounded corners, align=center, font=\footnotesize, minimum height=8mm, inner sep=3pt},
+  >=Stealth,
+]
+\node[box, fill=fillsig!25] (sensors) {IMU + FMG array\\+ sEMG + fast accel};
+\node[box, fill=fillsig!25, right=of sensors] (node) {wrist node (MCU)\\condition, match,\\compress, sleep};
+\node[box, fill=green!12, right=14mm of node] (phone) {phone\\calibration, conditioning,\\offline analysis};
+\node[box, fill=orange!15, below=10mm of phone] (synth) {synth / DAW};
+\draw[->] (sensors) -- (node);
+\draw[->] ([yshift=2mm]node.east) -- node[above, font=\scriptsize]{BLE stream} ([yshift=2mm]phone.west);
+\draw[<-] ([yshift=-2mm]node.east) -- node[below, font=\scriptsize]{templates} ([yshift=-2mm]phone.west);
+\draw[->] (node) |- node[pos=0.75, above, font=\scriptsize]{BLE-MIDI (live)} (synth.west);
+\end{tikzpicture}
+\caption{System architecture. A thin wrist node conditions and template-matches the fused sensor
+channels and emits BLE-MIDI for the low-latency live path. It BLE-streams raw channels to the phone,
+which runs calibration and deep offline analysis and ships finished per-finger templates back down.}
+\label{ch40:fig-arch}
+\end{figure}
+
+\subsection{Bill of materials and wiring}
+
+\begin{itemize}
+  \item \textbf{MCU:} Nordic nRF52840 (Cortex-M4F, FPU, BLE 5, deep-sleep in microamps). The wrist
+    node.
+  \item \textbf{IMU:} ICM-20948 (or LSM6DSx) over SPI, programmed to a $200$~Hz output data rate
+    with FIFO and a data-ready interrupt line.
+  \item \textbf{High-rate accelerometer:} a second, fast accelerometer (a few kHz) used as a
+    \emph{contact / bio-acoustic} sensor -- it hears the tendon snap and skin tap that a slow IMU
+    misses, the trick ViBand (UIST~'16) used to turn a watch into a bio-acoustic input device.
+  \item \textbf{FMG array:} four to eight force-sensitive resistors (FSRs) in a band pressed against
+    the underside of the forearm, each into an ADC channel through a voltage divider.
+  \item \textbf{sEMG:} one or two MyoWare (or equivalent) sEMG front-end boards, each a single
+    analog channel into the ADC.
+  \item \textbf{Power:} a small LiPo (e.g. $150$~mAh) and a charge/regulator board.
+\end{itemize}
+
+Wiring is straightforward: IMU on SPI with its interrupt to a GPIO; the high-rate accelerometer on a
+second SPI or I\textsuperscript{2}C bus with its own interrupt; the FSR dividers and sEMG outputs to
+ADC pins, all sampled from one hardware timer so they share a time grid.
+
+\subsection{The pipeline, channel by channel}
+
+\begin{enumerate}
+  \item \textbf{Acquire (hardware clocks).} The IMU FIFO interrupt and the ADC timer drive
+    acquisition; the high-rate accelerometer interrupts separately. No \texttt{delay()}, no polling.
+    Each channel lands on its own steady grid.
+  \item \textbf{Condition.} Run each slow channel (IMU, FMG) through a biquad low-pass near $20$~Hz
+    to kill motion noise; band-pass the sEMG ($\sim 20$--$450$~Hz) and take its envelope (rectify
+    then low-pass), since the useful sEMG signal is the \emph{amplitude} of the muscle burst, not its
+    waveform. Five MACs per biquad per sample.
+  \item \textbf{Feature.} Per short window, form a small feature vector: FMG channel levels, sEMG
+    envelope levels, a high-rate-accelerometer onset/energy spike, and a couple of IMU stats. This
+    fixed-length vector is the live ``signature.''
+  \item \textbf{Match.} Compare the live signature against the calibrated per-finger templates
+    (next subsection) -- nearest template by correlation or distance, gated by an onset threshold so
+    silence stays silent.
+  \item \textbf{Emit.} Map the matched finger and its pressure to MIDI -- Note-On for a tap, a held
+    note while pressed, CC for continuous pressure or wrist tilt -- and send over BLE-MIDI.
+  \item \textbf{Sleep.} Enter low-power mode until the next interrupt.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=6.2cm,
+  xlabel={time (ms)}, ylabel={channel (offset)},
+  xmin=0, xmax=200, ymin=-0.5, ymax=6.5,
+  ytick={1,3,5}, yticklabels={accel, sEMG env, FMG},
+  axis lines=left, enlargelimits=false, samples=120, domain=0:200,
+  legend pos=north east, legend cell align=left,
+]
+% FMG: slow rise and fall (tendon bulge), baseline 5
+\addplot[sigblue, thick] {5 + 1.4*exp(-((x-95)^2)/2200)};
+% sEMG envelope: muscle burst, baseline 3
+\addplot[quotientorange, thick] {3 + 1.2*exp(-((x-78)^2)/700)};
+% high-rate accel: sharp onset spike, baseline 1
+\addplot[specred, thick] {1 + 1.6*exp(-((x-70)^2)/12)};
+\draw[gray, dashed] (axis cs:70,-0.5) -- (axis cs:70,6.5);
+\node[gray, anchor=south, font=\footnotesize] at (axis cs:70,6.5) {onset};
+\end{axis}
+\end{tikzpicture}
+\caption{One finger tap across three channels, time-aligned. The high-rate accelerometer (bottom)
+spikes first at the contact onset; the sEMG envelope (middle) marks the muscle burst; the FMG
+channel (top) rises and falls more slowly as tendon force builds. The fast accelerometer onset is
+what lets the live path fire early, while the slower channels confirm which finger and how hard.}
+\label{ch40:fig-trace}
+\end{figure}
+
+\subsection{The per-finger calibration routine -- the heart of it}
+
+Everything rests on enrollment. Multimodal fusion (high-rate IMU + FMG array + the bio-acoustic
+accelerometer + sEMG) gives a richer signature than any single-modality lab paper used --
+Figure~\ref{ch40:fig-trace} shows one tap across the channels -- and
+per-finger calibration is what turns that signature into a decision. Combining motion with acoustic
+contact echoes the IMU-plus-acoustic gesture work (PLOS One, 2020), and wrist-IMU gesture counting
+(MDPI Sensors, 2023) shows how much one well-conditioned motion channel already carries; the edge
+here is fusing those channels and calibrating per finger rather than leaning on any one of them. The
+routine runs on the phone:
+
+\begin{enumerate}
+  \item The phone prompts: ``tap your index finger.'' The user does it, say, five times. The wrist
+    streams the conditioned channels; the phone slices out each onset.
+  \item It \emph{aligns} the repetitions on their onset and \emph{averages} them into one clean
+    template $\mathbf{t}_{\text{index}}$ -- a short multi-channel snippet. Averaging suppresses the
+    per-trial noise and leaves the shared signature.
+  \item It records the spread across repetitions to set a per-finger \emph{threshold}: how close a
+    live signature must be to count as a match, and how far from ``idle'' before anything fires.
+  \item Repeat for each finger (and for any chord or combined movement you want as its own gesture).
+  \item The phone ships the finished templates and thresholds back to the wrist node.
+\end{enumerate}
+
+There is no learned model anywhere -- ``analysis'' is filtering, onset alignment, averaging, and
+threshold-picking. Calibration is what makes a band that fits \emph{this} arm read \emph{this}
+user's fingers, and it is why the method generalizes across people without retraining anything.
+
+\subsection{Live template matching}
+
+On the wrist, live detection is a correlation. With templates $\mathbf{t}_f$ for fingers
+$f=1\dots F$ and a live window signature $\mathbf{s}$, pick the finger whose template is closest,
+provided the onset clears the idle threshold:
+\[
+  \hat{f} = \arg\max_{f}\ \frac{\inner{\mathbf{s}}{\mathbf{t}_f}}{\norm{\mathbf{s}}\,\norm{\mathbf{t}_f}},
+  \qquad\text{fire only if onset energy} > \theta_{\text{idle}}.
+\]
+The normalized inner product (cosine similarity) is robust to overall pressure scaling, and the
+onset gate keeps resting fingers quiet. For $F\approx 5$--$10$ templates of a few dozen samples
+each, this is a handful of dot products -- microseconds on an M4F, trivially inside budget.
+
+\begin{lstlisting}[language=C, caption={Live loop: condition, match against calibrated templates, emit MIDI.}]
+void on_block_ready(void) {         // short window of aligned channels
+  signature_t s;
+  build_signature(&s);              // FMG + sEMG env + accel onset + IMU
+  if (onset_energy(&s) > theta_idle) {
+    int f = best_template(&s, templ, F);   // argmax cosine similarity
+    emit_midi_for_finger(f, pressure(&s)); // Note-On / CC over BLE-MIDI
+  }
+  block_ready = false;
+}
+
+void main_loop(void) {
+  for (;;) {
+    if (block_ready) on_block_ready();
+    enter_low_power_sleep();        // wake on next sensor interrupt
+  }
+}
+\end{lstlisting}
+
+\subsection{Latency budget}
+
+Latency is sample-to-MIDI, and the player feels everything past roughly $20$--$30$~ms. Budget it:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lr@{}}
+\toprule
+Stage & Typical \\
+\midrule
+Sense / fill a short window (8 samples at $200$~Hz) & $\sim 40$~ms \\
+Condition + build signature & $< 0.1$~ms \\
+Template match (a few dot products) & $< 0.05$~ms \\
+BLE-MIDI transmit & $\sim 5$--$10$~ms \\
+\midrule
+\textbf{Total} & \textbf{$\sim 45$--$50$~ms} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The window-fill term dominates, so shorten it: detect on a fast \emph{onset} from the high-rate
+accelerometer and sEMG envelope rather than waiting for a full slow-IMU block. Onset detection can
+fire within a sample or two of contact, pulling sense-to-decision down to a few milliseconds; the
+slower channels then confirm and set pressure. With a short onset window the total lands near
+$10$--$15$~ms -- inside the playable range. Choosing the block length is choosing your latency, and
+the contact accelerometer is what buys the fast path.
+
+\subsection{MIDI mapping}
+
+\begin{itemize}
+  \item \textbf{Note:} each finger maps to a Note-On/Note-Off. A tap is a quick on/off; a hold
+    sustains the note while pressure stays above threshold.
+  \item \textbf{Velocity:} the onset energy (how hard the tap) maps to MIDI velocity ($0$--$127$).
+  \item \textbf{Chords:} a calibrated multi-finger gesture is its own template, fired as several
+    Note-Ons together.
+  \item \textbf{CC:} continuous FMG pressure or wrist tilt maps to a continuous controller (e.g.
+    CC~$74$ for filter cutoff, CC~$1$ for vibrato), so a held note can swell and bend.
+\end{itemize}
+
+\subsection{Failure modes}
+
+\begin{itemize}
+  \item \textbf{Band shifts on the arm.} Templates assume the same sensor placement as enrollment;
+    a big slip detunes them. Mitigation: a quick re-enrollment, and a snug, repeatable band fit.
+  \item \textbf{Sweat / electrode drift.} sEMG baseline wanders; lean on FMG and the accelerometer,
+    and high-pass the sEMG envelope's baseline.
+  \item \textbf{Cross-talk between adjacent fingers.} Neighboring tendons co-activate; the
+    multi-channel template and the onset gate separate them better than any single channel.
+  \item \textbf{False fires at rest.} Set $\theta_{\text{idle}}$ from the enrollment spread, not by
+    guessing.
+\end{itemize}
+
+\subsection{The upgrade path}
+
+This build detects which finger moved, how hard, and when -- enough to play. The one thing it
+\emph{cannot} do is recover continuous per-joint finger angles from the wrist, because that
+information is not in wrist-surface signals (Section~\ref{ch40:compare}). If you later want smooth,
+continuous per-finger control -- a finger acting as a fader, not a key -- add finger-worn sensors
+(instrumented rings, in the spirit of the ``Learning on the Rings'' work). That is a clean addition,
+not a redesign: the rings stream another sample-aligned channel into the same fusion-and-match
+pipeline.
+
+Every theme of the chapter is present in this build: hardware-clocked acquisition (no jitter), ring
+buffers holding the windows, conditioning in a chosen numeric format, CMSIS-DSP filters and FFTs
+well inside budget, a thin BLE-MIDI output, and compute-and-sleep to protect the battery. The same
+Fourier and filtering mathematics from the early chapters, now living inside a chip on your arm.
+
+\begin{recoverybox}
+If this chapter felt like a gear change, that is because it is one. We left the frictionless
+notebook and met deadlines, milliamps, and bits that overflow. The
+consolation is that none of the \emph{mathematics} changed -- an FFT is an FFT. What changed is that
+you now also account for \emph{when} the work happens and \emph{what it costs}. Carry these three
+questions into every embedded design: Is my clock from hardware? Does my work fit the budget? Will
+the battery survive? Answer those, and the math takes care of itself.
+\end{recoverybox}
+
+\section{Exercises}
+\label{ch40:exercises}
+
+\begin{exercise}
+A timer-driven sampler uses an AVR with a $16$~MHz clock, Timer1 in CTC mode, and a prescaler of
+$64$. What value of \texttt{OCR1A} gives exactly $f_s = 2000$~Hz? (Recall $f_s = f_{\text{clk}} /
+(\text{prescaler}\times(\text{OCR1A}+1))$.)
+\end{exercise}
+
+\begin{exercise}
+Explain in one paragraph why \texttt{delay()}-based sampling can distort a spectrum even when the
+average sample rate is correct. Give a concrete example of a code change that would shift the rate
+mid-stream.
+\end{exercise}
+
+\begin{exercise}
+A clock has RMS jitter of $\delta = 1~\mu$s. Using the linearization
+$\text{error}\approx 2\pi f A\,\delta$, compute the worst-case amplitude error (as a fraction of
+$A$) when sampling a $50$~Hz tone and a $5$~kHz tone. What does the ratio tell you about
+high-frequency sampling?
+\end{exercise}
+
+\begin{exercise}
+You need a ring buffer that holds the last $200$ samples. Why would you allocate $256$ slots
+instead of exactly $200$, and what single machine instruction does that choice enable for the
+index wrap?
+\end{exercise}
+
+\begin{exercise}
+In $Q_{1.15}$ format, what integer represents $0.75$? Multiply the Q15 representations of $0.75$
+and $0.5$ using the wide-accumulator rule and confirm the result decodes to $0.375$. Show each
+step.
+\end{exercise}
+
+\begin{exercise}
+A Q15 FIR filter has $64$ taps, each up to magnitude $1$, and inputs up to magnitude $1$. Argue why
+a $16$-bit accumulator is unsafe and roughly how many guard bits a safe accumulator needs to hold
+the worst-case sum without overflow.
+\end{exercise}
+
+\begin{exercise}
+An $80$~MHz Cortex-M4F runs a $256$-point float FFT in about $30~\mu$s. If you want a new spectrum
+every $5$~ms, what fraction of the CPU does the FFT use? Roughly how many such FFTs per frame could
+the math alone support, and name two practical limits you would hit first.
+\end{exercise}
+
+\begin{exercise}
+You sample an IMU at $f_s=200$~Hz, process in $32$-sample blocks, on an $80$~MHz MCU. (a) How many
+cycles of budget do you have per block? (b) If your processing costs $40{,}000$ cycles per block,
+what fraction of the budget is used? (c) What happens to the budget if you raise $f_s$ to
+$2000$~Hz with the same block size?
+\end{exercise}
+
+\begin{exercise}
+Explain why a Raspberry Pi is a poor choice for an always-on, battery-powered wrist device but an
+excellent choice for prototyping the gesture-detection algorithm. Frame your answer in terms of the
+two budgets (cycles and joules) from this chapter.
+\end{exercise}
+
+\begin{exercise}
+Write the three MIDI bytes (in hex) for: (a) a Note-On of middle C (note $60$) at velocity $100$ on
+channel $1$ (status nibble $0$); (b) a continuous-controller message setting CC~$74$ to value $64$
+on channel~$1$.
+\end{exercise}
+
+\begin{exercise}
+\textbf{Sensing limits.} A teammate proposes using only the wrist IMU to drive five independent
+synth voices, one per finger, by \emph{continuous} finger flexion -- each finger a smooth fader.
+Explain precisely why continuous per-joint angles cannot be recovered from a wrist band alone, and
+propose what sensor(s) you would add to make continuous per-finger control possible. Separately,
+explain why discrete per-finger \emph{detection} (which finger tapped) \emph{is} achievable with the
+forearm FMG/sEMG channels plus calibration.
+\end{exercise}
+
+\begin{exercise}
+\textbf{Calibration.} Describe the per-finger enrollment routine for the capstone: what the phone
+prompts, what it records, and how it turns several repetitions of one finger movement into a single
+template plus a threshold. Why does averaging aligned repetitions improve the template, and why is
+the threshold derived from the spread across repetitions rather than guessed?
+\end{exercise}
+
+\begin{exercise}
+\textbf{Template match.} Live detection picks $\hat{f}=\arg\max_f
+\inner{\mathbf{s}}{\mathbf{t}_f}/(\norm{\mathbf{s}}\norm{\mathbf{t}_f})$ above an onset threshold.
+Why use the \emph{normalized} inner product rather than the raw dot product, and what does the onset
+gate $\theta_{\text{idle}}$ prevent? For $F=6$ templates of $24$ samples each, estimate the
+multiply-accumulate count per match and confirm it is negligible against a $12.8$M-cycle block
+budget.
+\end{exercise}
+
+\begin{exercise}
+\textbf{Design.} Sketch (in prose or pseudocode) the compute-and-sleep loop for the wrist unit, and
+estimate the duty cycle if each block takes $50~\mu$s of compute and a block arrives every $160$~ms.
+What does that duty cycle imply for average current relative to running the CPU continuously?
+\end{exercise}
