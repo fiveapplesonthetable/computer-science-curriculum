@@ -37,6 +37,18 @@ reader *Proofs From the Ground Up*.
 Requires a TeX Live install with `algorithm2e`, `tcolorbox`, `tikz`, and
 `listings`. Sources are in `src/`, the rendered PDF lands in `dist/`.
 
+## Companion books
+
+Three companion computer-science readers live under `books/`, each merged with its full history (`git subtree`) from its original repository:
+
+| Book | Source | Build | PDF |
+|---|---|---|---|
+| Graph Algorithms From the Ground Up | `books/graph-algorithms/src/main.tex` | `books/graph-algorithms/build.sh` | `books/graph-algorithms/dist/graph-algorithms-from-the-ground-up.pdf` |
+| Cryptography From the Ground Up | `books/cryptography/src/main.tex` | `books/cryptography/build.sh` | `books/cryptography/dist/cryptography-from-the-ground-up.pdf` |
+| Signal Processing From the Ground Up | `books/signal-processing/src/main.tex` | `books/signal-processing/build.sh` | `books/signal-processing/dist/signal-processing-from-the-ground-up.pdf` |
+
+Each `build.sh` runs from its own directory (`cd books/graph-algorithms && ./build.sh`).
+
 ## License
 
 MIT — see `LICENSE`.
