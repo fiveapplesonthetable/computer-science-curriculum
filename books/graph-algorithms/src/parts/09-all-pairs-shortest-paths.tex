@@ -1,0 +1,767 @@
+\chapter{All-Pairs Shortest Paths}
+
+The previous chapters answered a single-source question: fix a vertex $s$ and find the
+distance to every other vertex. Here we raise the stakes. We want the distance between
+\emph{every} ordered pair $(u,v)$ at once -- a full $n \times n$ table of shortest-path
+costs. This is the all-pairs shortest paths (APSP) problem, and it sits at a crossroads of
+dynamic programming, matrix algebra, and clever reweighting tricks.
+
+There are two ways to attack it. The first treats APSP as one big dynamic program over the
+whole graph and produces the Floyd--Warshall algorithm in three nested loops -- fifteen lines
+that handle negative edges, detect negative cycles, and double as a transitive-closure machine.
+The second runs a fast single-source solver from every vertex, which is great on sparse graphs
+but stumbles when edges go negative. Johnson's algorithm rescues the second approach by
+\emph{reweighting} the graph so that all edges become nonnegative without changing which paths
+are shortest -- a potential trick borrowed straight from the Bellman--Ford world. We will build
+both, prove both, trace both on a tiny graph, and tie Floyd--Warshall to the min-plus matrix
+product that connects shortest paths to linear algebra.
+
+\chapterline
+
+\section{The problem, and why it is not just $n$ Dijkstras}
+\label{ch09:problem}
+
+\begin{focusbox}
+We are given a directed graph $\Gph=(V,E)$ with $n=\abs{V}$ vertices, $m=\abs{E}$ edges, and a
+weight $w(u,v)\in\R$ on each edge. We want $\delta(u,v)$, the weight of a minimum-weight path
+from $u$ to $v$, for all $n^2$ ordered pairs. Edge weights may be negative; if a negative-weight
+cycle lies on a path between some pair, the relevant distances are $-\infty$ and we want to
+\emph{report} that rather than return garbage.
+\end{focusbox}
+
+The naive reduction is tempting: run a single-source algorithm $n$ times, once per source. On a
+nonnegative graph each Dijkstra run costs $\Oh(m + n\log n)$ with a Fibonacci heap, so the total
+is $\Oh(nm + n^2\log n)$. For sparse graphs ($m=\Oh(n)$) that is $\Oh(n^2\log n)$, which is
+excellent. But two things break this plan.
+
+\begin{itemize}
+  \item \textbf{Negative edges.} Dijkstra is wrong the moment an edge weight is negative, because
+        its greedy ``settle the closest vertex'' invariant assumes distances only grow. We would
+        fall back to Bellman--Ford at $\Oh(nm)$ per source, giving $\Oh(n^2 m)$ overall -- on a dense
+        graph $m=\Th(n^2)$ that is $\Oh(n^4)$. Painful.
+  \item \textbf{Dense graphs.} When $m=\Th(n^2)$, even $n$ Dijkstras cost $\Oh(n^3 + n^2\log n)=\Oh(n^3)$.
+        At that density a single $\Oh(n^3)$ dynamic program with a tiny constant and contiguous memory
+        access -- Floyd--Warshall -- is simpler and usually faster in practice.
+\end{itemize}
+
+\begin{intuitionbox}
+Two regimes, two champions. \textbf{Dense graphs, or negative edges with simple code:}
+Floyd--Warshall, $\Oh(n^3)$, no heaps, cache-friendly. \textbf{Sparse graphs:} reweight once with
+Johnson's potentials, then run $n$ Dijkstras for $\Oh(nm + n^2\log n)$. The whole chapter is about
+earning the right to make that choice.
+\end{intuitionbox}
+
+\begin{historybox}
+Floyd--Warshall is a convergence of ideas. Bernard Roy (1959) and Stephen Warshall (1962) gave the
+transitive-closure version; Robert Floyd (1962) adapted Warshall's idea to shortest paths in a
+half-page \emph{Communications of the ACM} note. The shared loop structure was so natural that the
+same recurrence was rediscovered repeatedly. Donald Johnson's reweighting algorithm came in 1977,
+and it is the textbook example of using a feasible \emph{potential} to convert a hard-looking problem
+into an easy one -- the same move that powers min-cost flow.
+\end{historybox}
+
+\section{Floyd--Warshall: shortest paths as a dynamic program}
+\label{ch09:fw}
+
+\subsection{The right subproblem}
+
+The art of dynamic programming is choosing what to vary. For a single path the obvious knob is its
+\emph{length} (number of edges), and indeed that gives a working but slower recurrence we meet in
+Section~\ref{ch09:minplus}. Floyd and Warshall found a cleverer knob: restrict which
+\emph{intermediate} vertices a path is allowed to use.
+
+Number the vertices $1,2,\dots,n$. Define
+\[
+  d^{(k)}(i,j) = \text{weight of the shortest path from } i \text{ to } j
+  \text{ whose intermediate vertices all lie in } \set{1,\dots,k}.
+\]
+``Intermediate'' means strictly between the endpoints; $i$ and $j$ themselves are always allowed.
+When $k=0$ no intermediate vertices are permitted, so the only legal paths are single edges:
+\[
+  d^{(0)}(i,j) = \begin{cases}
+    0 & i=j,\\
+    w(i,j) & (i,j)\in E,\\
+    +\infty & \text{otherwise.}
+  \end{cases}
+\]
+When $k=n$ every vertex is allowed as an intermediate, so $d^{(n)}(i,j)=\delta(i,j)$ is exactly the
+answer we want. The whole algorithm is the climb from $k=0$ to $k=n$.
+
+\begin{intuitionbox}
+Think of the vertices $1,\dots,n$ as doors that open one at a time. At stage $k$ the first $k$ doors
+are open. A path may walk through any open door as a waypoint but may not yet use doors
+$k{+}1,\dots,n$. Opening door $k$ can create only one genuinely new kind of shortcut: paths that
+detour \emph{through} $k$. That single observation is the entire recurrence.
+\end{intuitionbox}
+
+\subsection{The recurrence}
+
+Fix a pair $(i,j)$ and suppose we know all of $d^{(k-1)}$. Now we open door $k$. Consider any
+shortest path $P$ from $i$ to $j$ using intermediates in $\set{1,\dots,k}$. Exactly one of two things
+is true:
+
+\begin{itemize}
+  \item $P$ does not use vertex $k$ as an intermediate. Then $P$ already lives in $\set{1,\dots,k-1}$,
+        so its cost is $d^{(k-1)}(i,j)$.
+  \item $P$ uses vertex $k$ once as an intermediate. (Why only once? See the trap box.) Split $P$ at
+        that occurrence into $i \rightsquigarrow k$ then $k \rightsquigarrow j$. Both halves use
+        intermediates only in $\set{1,\dots,k-1}$, so their best costs are $d^{(k-1)}(i,k)$ and
+        $d^{(k-1)}(k,j)$.
+\end{itemize}
+
+Taking the cheaper of the two options:
+\begin{equation}
+  d^{(k)}(i,j) = \min\!\Big(\, d^{(k-1)}(i,j),\;\; d^{(k-1)}(i,k) + d^{(k-1)}(k,j)\,\Big).
+  \label{ch09:fw-recurrence}
+\end{equation}
+
+\begin{trapbox}
+Why may we assume the through-$k$ path uses $k$ \emph{exactly once}? Because we can take $P$ to be a
+shortest \emph{walk}, and if there are no negative cycles a shortest walk never repeats a vertex --
+repeating $k$ would mean a cycle through $k$, which we could delete to get a no-heavier path. If a
+negative cycle \emph{is} present the recurrence still runs, but a diagonal entry $d^{(k)}(i,i)$ goes
+negative; detecting that is exactly how Floyd--Warshall flags negative cycles
+(Section~\ref{ch09:fw-negcycle}). The crucial structural point: both halves $i\to k$ and $k\to j$ avoid
+$k$ as an \emph{interior} vertex, so they are legitimately scored by $d^{(k-1)}$.
+\end{trapbox}
+
+\subsection{Collapsing the third dimension}
+
+Written as stated, $d^{(k)}$ is a stack of $n+1$ matrices -- $\Th(n^3)$ memory. We can do better.
+Update a single matrix $d$ \emph{in place}, overwriting $d^{(k-1)}$ with $d^{(k)}$ as we sweep $k$. The
+worry is that when we read $d(i,k)$ and $d(k,j)$ we might already have overwritten them with their
+$k$-th-layer values. But look at what happens to row $k$ and column $k$ at stage $k$:
+\[
+  d^{(k)}(i,k) = \min\big(d^{(k-1)}(i,k),\, d^{(k-1)}(i,k)+d^{(k-1)}(k,k)\big) = d^{(k-1)}(i,k),
+\]
+using $d^{(k-1)}(k,k)=0$ (true with no negative cycle). The same holds for $d^{(k)}(k,j)=d^{(k-1)}(k,j)$.
+So the $k$-th row and column \emph{do not change} when door $k$ opens, and reading them post- or
+pre-overwrite gives the same number. The in-place update is safe, and memory drops to $\Th(n^2)$.
+
+\begin{algorithm}[H]
+\caption{Floyd--Warshall (distances, predecessors, negative-cycle flag)}
+\label{ch09:alg-fw}
+\DontPrintSemicolon
+\KwIn{Vertices $1..n$; weight $w$; $w(i,j)=+\infty$ if $(i,j)\notin E$.}
+\KwOut{Matrix $d$ with $d(i,j)=\delta(i,j)$; predecessor matrix $\pi$.}
+\For{$i \leftarrow 1$ \KwTo $n$}{
+  \For{$j \leftarrow 1$ \KwTo $n$}{
+    $d(i,j) \leftarrow w(i,j)$;\quad $d(i,i)\leftarrow 0$\;
+    \lIf{$(i,j)\in E$ \textbf{and} $i\neq j$}{$\pi(i,j)\leftarrow i$} \lElse{$\pi(i,j)\leftarrow \text{nil}$}
+  }
+}
+\For{$k \leftarrow 1$ \KwTo $n$}{
+  \For{$i \leftarrow 1$ \KwTo $n$}{
+    \For{$j \leftarrow 1$ \KwTo $n$}{
+      \If{$d(i,k) + d(k,j) < d(i,j)$}{
+        $d(i,j) \leftarrow d(i,k) + d(k,j)$\;
+        $\pi(i,j) \leftarrow \pi(k,j)$\;
+      }
+    }
+  }
+}
+\For{$i \leftarrow 1$ \KwTo $n$}{
+  \lIf{$d(i,i) < 0$}{\textbf{report} ``negative cycle reachable through $i$''}
+}
+\Return $d,\pi$\;
+\end{algorithm}
+
+The predecessor update $\pi(i,j)\leftarrow\pi(k,j)$ records ``the last edge into $j$ on the best
+$i$-to-$j$ path now enters $j$ the way the best $k$-to-$j$ path does.'' Following $\pi$ backward from
+$j$ reconstructs the path, exactly as in single-source algorithms.
+
+\subsection{A picture and a hand trace}
+\label{ch09:fw-trace}
+
+Take a five-vertex directed graph with one negative edge (but no negative cycle).
+
+\begin{center}
+\begin{tikzpicture}[>=Latex, node distance=24mm,
+   v/.style={circle,draw=nodeblue,very thick,fill=blue!4,minimum size=8mm,font=\small}]
+  \node[v] (1) {1};
+  \node[v] (2) [right=of 1] {2};
+  \node[v] (3) [right=of 2] {3};
+  \node[v] (4) [below=18mm of 2] {4};
+  \node[v] (5) [below=18mm of 3] {5};
+  \draw[->,edgegray,thick] (1) -- node[above,font=\scriptsize]{3} (2);
+  \draw[->,edgegray,thick] (2) -- node[above,font=\scriptsize]{4} (3);
+  \draw[->,edgegray,thick] (1) -- node[left,font=\scriptsize]{8} (4);
+  \draw[->,edgegray,thick] (4) -- node[below,font=\scriptsize]{$-2$} (2);
+  \draw[->,edgegray,thick] (2) -- node[right,font=\scriptsize]{1} (5);
+  \draw[->,edgegray,thick] (5) -- node[below,font=\scriptsize]{2} (3);
+  \draw[->,edgegray,thick] (4) to[bend right=18] node[below,font=\scriptsize]{5} (5);
+\end{tikzpicture}
+\end{center}
+
+Edges: $1\!\to\!2(3)$, $2\!\to\!3(4)$, $1\!\to\!4(8)$, $4\!\to\!2(-2)$, $2\!\to\!5(1)$,
+$5\!\to\!3(2)$, $4\!\to\!5(5)$. The starting matrix $d^{(0)}$ (rows = from, columns = to, $\cdot$
+means $+\infty$):
+
+\[
+d^{(0)}=
+\begin{array}{c|ccccc}
+ & 1 & 2 & 3 & 4 & 5\\\hline
+1 & 0 & 3 & \cdot & 8 & \cdot\\
+2 & \cdot & 0 & 4 & \cdot & 1\\
+3 & \cdot & \cdot & 0 & \cdot & \cdot\\
+4 & \cdot & -2 & \cdot & 0 & 5\\
+5 & \cdot & \cdot & 2 & \cdot & 0
+\end{array}
+\]
+
+\textbf{Open door $k=1$.} Vertex 1 has no incoming edges, so no path can route through it; nothing
+changes. $d^{(1)}=d^{(0)}$.
+
+\textbf{Open door $k=2$.} Now paths may detour through 2. Row 4 reaches 2 cheaply via the $-2$ edge:
+$d(4,3)\leftarrow d(4,2)+d(2,3)=-2+4=2$, and $d(4,5)\leftarrow\min(5,\,d(4,2)+d(2,5))=\min(5,-2+1)=-1$.
+Row 1 already reached 2 directly, and through-2 paths give $d(1,3)\leftarrow d(1,2)+d(2,3)=3+4=7$ and
+$d(1,5)\leftarrow 3+1=4$.
+\[
+d^{(2)}=
+\begin{array}{c|ccccc}
+ & 1 & 2 & 3 & 4 & 5\\\hline
+1 & 0 & 3 & 7 & 8 & 4\\
+2 & \cdot & 0 & 4 & \cdot & 1\\
+3 & \cdot & \cdot & 0 & \cdot & \cdot\\
+4 & \cdot & -2 & 2 & 0 & -1\\
+5 & \cdot & \cdot & 2 & \cdot & 0
+\end{array}
+\]
+
+\textbf{Open door $k=3$.} Vertex 3 is a sink (no outgoing edges), so it is never useful as an
+intermediate. $d^{(3)}=d^{(2)}$.
+
+\textbf{Open door $k=4$.} Who can reach 4? Only vertex 1 ($d(1,4)=8$). Routing 1 through 4 gives
+$d(1,2)\leftarrow\min(3,\,8+(-2))=3$, $d(1,3)\leftarrow\min(7,\,8+2)=7$,
+$d(1,5)\leftarrow\min(4,\,8+(-1))=4$ -- no improvements. Door 4 helps nobody here.
+
+\textbf{Open door $k=5$.} Paths may detour through 5 to reach 3 cheaply ($5\to3$ costs 2):
+$d(2,3)\leftarrow\min(4,\,d(2,5)+d(5,3))=\min(4,\,1+2)=3$,
+$d(4,3)\leftarrow\min(2,\,d(4,5)+d(5,3))=\min(2,\,-1+2)=1$, and
+$d(1,3)\leftarrow\min(7,\,d(1,5)+d(5,3))=\min(7,\,4+2)=6$.
+\[
+d^{(5)}=
+\begin{array}{c|ccccc}
+ & 1 & 2 & 3 & 4 & 5\\\hline
+1 & 0 & 3 & 6 & 8 & 4\\
+2 & \cdot & 0 & 3 & \cdot & 1\\
+3 & \cdot & \cdot & 0 & \cdot & \cdot\\
+4 & \cdot & -2 & 1 & 0 & -1\\
+5 & \cdot & \cdot & 2 & \cdot & 0
+\end{array}
+\]
+This is the final $\delta$ matrix. Sanity-check $\delta(1,3)=6$: the path $1\to2\to5\to3$ costs
+$3+1+2=6$; the direct-looking $1\to2\to3$ costs $3+4=7$. The cheaper one wins, and it is exactly the
+path the $k=5$ door opened. The negative edge $4\to2$ never broke anything -- Floyd--Warshall handles
+it without complaint.
+
+\begin{labbox}
+Re-run the trace, but add the edge $3\to1$ with weight $-10$. After $k$ reaches the vertices on the
+cycle $1\to2\to3\to1$ (cost $3+4-10=-3$), watch $d(1,1)$ drop below $0$. That negative diagonal entry
+is the algorithm waving a red flag: a negative cycle is reachable from and back to vertex 1, so the
+distances among those vertices are $-\infty$. Which diagonal entries go negative, and at which value
+of $k$?
+\end{labbox}
+
+\subsection{Correctness}
+
+\begin{theorem}[Floyd--Warshall correctness]
+\label{ch09:thm-fw}
+If $\Gph$ has no negative-weight cycle, then after Algorithm~\ref{ch09:alg-fw} terminates
+$d(i,j)=\delta(i,j)$ for every pair $(i,j)$.
+\end{theorem}
+
+\begin{proof}
+We prove by induction on $k$ that after the outer loop has processed door $k$, the matrix holds
+$d^{(k)}(i,j)$: the shortest-path cost from $i$ to $j$ using intermediates only in $\set{1,\dots,k}$.
+
+\emph{Base case} $k=0$: the initialization sets $d(i,j)=w(i,j)$ (and $0$ on the diagonal), which is
+$d^{(0)}$ by definition -- single edges are the only intermediate-free paths.
+
+\emph{Inductive step.} Assume the matrix holds $d^{(k-1)}$ before door $k$ is processed. Fix $(i,j)$
+and consider an optimal path $P^\star$ from $i$ to $j$ with intermediates in $\set{1,\dots,k}$; since
+there is no negative cycle we may take $P^\star$ to be simple. If $k\notin P^\star$ then $P^\star$
+uses only $\set{1,\dots,k-1}$ and has cost $d^{(k-1)}(i,j)$. If $k\in P^\star$, splitting at $k$ gives
+two subpaths with interiors in $\set{1,\dots,k-1}$, each itself optimal among such paths (an exchange
+argument: a cheaper subpath would yield a cheaper $P^\star$). Their costs are $d^{(k-1)}(i,k)$ and
+$d^{(k-1)}(k,j)$. Hence the true optimum equals
+$\min(d^{(k-1)}(i,j),\,d^{(k-1)}(i,k)+d^{(k-1)}(k,j))$, which is exactly what the inner update
+(equation~\ref{ch09:fw-recurrence}) computes. By the in-place argument above, reading $d(i,k)$ and
+$d(k,j)$ returns their $d^{(k-1)}$ values even though we update in place. So after door $k$ the matrix
+holds $d^{(k)}$. At $k=n$ this is $\delta$.
+\end{proof}
+
+\subsection{Negative-cycle detection}
+\label{ch09:fw-negcycle}
+
+\begin{theorem}
+\label{ch09:thm-fw-negcycle}
+Run Algorithm~\ref{ch09:alg-fw} on \emph{any} weighted digraph (initializing the diagonal to $0$).
+After the triple loop, $\Gph$ contains a negative-weight cycle if and only if $d(i,i)<0$ for some $i$.
+\end{theorem}
+
+\begin{proof}
+($\Leftarrow$) If $d(i,i)<0$ then the recurrence found a closed walk from $i$ back to $i$ of negative
+total weight; a closed walk of negative weight contains a negative cycle.
+
+($\Rightarrow$) Let $C=v_0\to v_1\to\cdots\to v_t=v_0$ be a negative cycle and let $v_p$ be its
+highest-numbered vertex. Rotate $C$ so it starts and ends at $v_p$. Every other vertex of $C$ has index
+$<v_p$, so once door $v_p$ is processed both subpaths $v_p\rightsquigarrow$ and $\rightsquigarrow v_p$
+have interiors below $v_p$, and the update sets $d(v_p,v_p)\leftarrow\min(0,\,\text{negative total})<0$.
+Once a diagonal goes negative the $\min$ keeps it negative. So some diagonal entry is negative at the
+end.
+\end{proof}
+
+\begin{trapbox}
+With negative cycles present, the \emph{off}-diagonal entries are not meaningful: a value like
+$d(i,j)=7$ might really be $-\infty$ because a negative cycle sits between $i$ and $j$. The clean fix is
+a post-pass: for every $k$ with $d(k,k)<0$, set $d(i,j)\leftarrow-\infty$ whenever $d(i,k)<\infty$ and
+$d(k,j)<\infty$ (you can reach $k$ and leave it). Only after this pass should you trust the off-diagonal
+numbers.
+\end{trapbox}
+
+\begin{complexitybox}
+Floyd--Warshall runs in $\Th(n^3)$ time and $\Th(n^2)$ space, independent of $m$. Three nested loops,
+one comparison and possible addition each. No priority queue, no recursion, and the inner loop is a
+tight scan over contiguous rows -- it vectorizes and caches beautifully, which is why it routinely beats
+$n$ Dijkstras on dense graphs even though the asymptotics tie.
+\end{complexitybox}
+
+\section{Transitive closure: reachability with the same loop}
+\label{ch09:closure}
+
+Strip the weights away and ask a yes/no question: is there \emph{any} path from $i$ to $j$? The answer
+is the transitive closure $\Gph^{*}$, the reachability matrix $R$ with $R(i,j)=1$ iff $j$ is reachable
+from $i$. This is Warshall's original 1962 algorithm, and it is Floyd--Warshall with $(\min,+)$ replaced
+by $(\textsc{or},\textsc{and})$:
+\[
+  R^{(k)}(i,j) = R^{(k-1)}(i,j)\;\;\textsc{or}\;\;\big(R^{(k-1)}(i,k)\;\textsc{and}\;R^{(k-1)}(k,j)\big).
+\]
+``$i$ reaches $j$ already, or $i$ reaches $k$ and $k$ reaches $j$.'' Same door-by-door logic.
+
+\begin{algorithm}[H]
+\caption{Warshall transitive closure}
+\label{ch09:alg-warshall}
+\DontPrintSemicolon
+$R(i,j)\leftarrow [\,(i,j)\in E\,]$ for all $i,j$;\quad $R(i,i)\leftarrow 1$\;
+\For{$k\leftarrow 1$ \KwTo $n$}{
+  \For{$i\leftarrow 1$ \KwTo $n$}{
+    \lIf{$R(i,k)$}{\For{$j\leftarrow 1$ \KwTo $n$}{$R(i,j)\leftarrow R(i,j)\;\textsc{or}\;R(k,j)$}}
+  }
+}
+\Return $R$\;
+\end{algorithm}
+
+The guard ``\textbf{if} $R(i,k)$'' hoists the test for $k$ out of the innermost loop -- when $i$ cannot
+reach $k$, the whole $j$-scan is skipped.
+
+\begin{whybox}
+Why does the same triple loop solve both problems? Because both are instances of the same algebraic
+template: a \emph{closed semiring}. Shortest paths use $(\R\cup\set{\infty},\min,+)$ with identities
+$\infty$ and $0$; reachability uses $(\set{0,1},\textsc{or},\textsc{and})$ with identities $0$ and $1$.
+Floyd--Warshall is really the Gauss--Jordan / Kleene-star computation over a semiring, and any semiring
+with the right absorption properties drops straight in -- bottleneck paths use $(\min,\max)$, path
+counting uses $(+,\times)$, and regular-expression construction (Kleene's theorem) uses $(\cup,\cdot)$
+over languages.
+\end{whybox}
+
+\begin{applicationbox}
+Bit-packing makes closure fast in practice. Store each row of $R$ as a machine-word bitset. The inner
+``$R(i,\cdot)\mathrel{|}=R(k,\cdot)$'' becomes a word-parallel OR over $\ceil{n/w}$ words, cutting the
+running time to $\Th(n^3/w)$ for word size $w=64$. This is the standard trick for reachability in
+compilers (which definitions reach a program point) and for the meet-in-the-middle phase of many graph
+queries.
+\end{applicationbox}
+
+\section{The matrix-multiplication view and the min-plus product}
+\label{ch09:minplus}
+
+There is a second, more algebraic, dynamic program for APSP, and it exposes a deep structure. Define
+\[
+  L^{(\ell)}(i,j) = \text{weight of the shortest walk from } i \text{ to } j \text{ using at most } \ell \text{ edges.}
+\]
+A walk with at most $\ell$ edges is a walk with at most $\ell-1$ edges followed by one more edge:
+\[
+  L^{(\ell)}(i,j) = \min_{1\le k\le n}\;\Big(L^{(\ell-1)}(i,k) + w(k,j)\Big),
+  \qquad L^{(1)}(i,j)=w(i,j).
+\]
+Stare at that formula. It is matrix multiplication with $+$ replaced by $\min$ and $\times$ replaced by
+$+$. This is the \textbf{min-plus product} (also called the \emph{tropical} or \emph{distance} product).
+Writing $\otimes$ for it,
+\[
+  (A\otimes B)(i,j) = \min_{k}\big(A(i,k)+B(k,j)\big),
+  \qquad L^{(\ell)} = L^{(\ell-1)}\otimes W = W^{\otimes \ell}.
+\]
+
+\begin{intuitionbox}
+Ordinary matrix powering counts walks: $(\Adjm^\ell)(i,j)$ is the number of length-$\ell$ walks from $i$
+to $j$, because $\sum_k$ adds up ways and $\times$ combines independent choices. Swap the operations to
+$(\min,+)$ and ``count walks'' becomes ``find the lightest walk'' -- summation over ways turns into
+minimization over alternatives, and multiplication of counts turns into addition of lengths. Same
+skeleton, tropical flesh.
+\end{intuitionbox}
+
+In a graph with no negative cycle, every shortest path is simple and uses at most $n-1$ edges, so
+$L^{(n-1)}=\delta$. Computing $W^{\otimes(n-1)}$ by repeated squaring needs only
+$\ceil{\log_2(n-1)}$ min-plus products:
+\[
+  W^{\otimes 1},\; W^{\otimes 2},\; W^{\otimes 4},\;\dots,\; W^{\otimes 2^{\lceil\log_2(n-1)\rceil}}.
+\]
+Each $\otimes$ is the obvious triple loop at $\Th(n^3)$, so this APSP route costs $\Th(n^3\log n)$ -- a
+$\log n$ factor \emph{worse} than Floyd--Warshall. Why bother?
+
+\begin{aestheticbox}
+Two payoffs. First, the min-plus formulation reveals APSP as a linear-algebra problem in disguise, which
+is where the asymptotically fastest known algorithms live. If one could compute a min-plus product in
+$\Oh(n^{3-\eps})$ time, APSP would fall below cubic; the long-standing \emph{APSP conjecture} holds that
+no truly subcubic ($\Oh(n^{3-\eps})$) combinatorial algorithm exists, and a web of problems (negative
+triangle, min-plus product, APSP) are known to be subcubic-equivalent. Williams' bound of
+$n^3/2^{\Th(\sqrt{\log n})}$ shaves off subpolynomial factors but not a true power. Second, over a
+\emph{small integer} weight range the min-plus product can be embedded into a few real matrix
+multiplications and accelerated with Strassen-style $\Oh(n^\omega)$ algebra (Seidel, Zwick), giving
+genuinely subcubic APSP on unweighted or small-weight graphs.
+\end{aestheticbox}
+
+\begin{historybox}
+Min-plus algebra is the \emph{tropical semiring}, named (half-jokingly) after the Brazilian mathematician
+Imre Simon. Seidel's 1995 algorithm computes unweighted-undirected APSP in $\Oh(n^\omega\log n)$ by
+squaring the adjacency matrix and recovering distances via parities; Zwick (2002) pushed weighted
+directed APSP to about $\Oh(n^{2.58})$ for small integer weights using rectangular matrix multiplication.
+The combinatorial frontier, $n^3/2^{\Th(\sqrt{\log n})}$ (Williams 2014), remains the best general
+bound -- evidence for the conjectured cubic barrier.
+\end{historybox}
+
+\begin{connectionbox}
+The min-plus / matrix-power lens is your bridge to the linear-algebra companion. Counting walks with
+$\Adjm^\ell$ links to the spectrum of the adjacency matrix (the spectral graph theory chapter); the
+resolvent $(I-x\Adjm)^{-1}=\sum_\ell x^\ell \Adjm^\ell$ is a walk generating function. Replace the field
+$(\R,+,\times)$ by the semiring $(\R\cup\set{\infty},\min,+)$ and matrix \emph{inversion} becomes the
+Kleene star $W^*=\bigoplus_{\ell\ge 0}W^{\otimes\ell}$ -- which is precisely the all-pairs distance
+matrix. Floyd--Warshall is Gaussian elimination over this semiring. The Laplacian and electrical-flow
+chapters reuse this ``same skeleton, different algebra'' idea when they replace combinatorial distance by
+effective resistance.
+\end{connectionbox}
+
+\section{Johnson's algorithm: reweighting for sparse graphs}
+\label{ch09:johnson}
+
+Floyd--Warshall is $\Th(n^3)$ no matter how few edges the graph has. On a sparse graph ($m=\Oh(n)$ or
+so) we would much rather pay $\Oh(nm+n^2\log n)$ -- $n$ runs of Dijkstra. The obstacle is negative edges:
+Dijkstra needs nonnegative weights. Johnson's algorithm removes the obstacle by \emph{reweighting}.
+
+\subsection{The potential trick}
+
+\begin{intuitionbox}
+Assign every vertex $v$ a number $h(v)$ -- a \emph{height} or \emph{potential}. Reweight each edge by how
+much it goes uphill:
+\[
+  \hat{w}(u,v) = w(u,v) + h(u) - h(v).
+\]
+Now walk any path $u_0\to u_1\to\cdots\to u_t$. The heights telescope:
+\[
+  \hat{w}(\text{path}) = \sum_{i}\big(w(u_{i-1},u_i)+h(u_{i-1})-h(u_i)\big)
+   = w(\text{path}) + h(u_0) - h(u_t).
+\]
+Every path between a fixed pair $(u_0,u_t)$ shifts by the \emph{same} constant $h(u_0)-h(u_t)$. So
+reweighting preserves the \emph{ordering} of paths by cost -- the shortest path stays the shortest. We
+have not changed the problem, only the bookkeeping.
+\end{intuitionbox}
+
+We want heights that make every reweighted edge nonnegative:
+\[
+  \hat{w}(u,v) = w(u,v)+h(u)-h(v) \ge 0
+  \quad\Longleftrightarrow\quad
+  h(v) - h(u) \le w(u,v) \quad\text{for every edge } (u,v).
+\]
+These are exactly the constraints satisfied by shortest-path \emph{distances} from any source: if
+$h(v)=\delta(s,v)$ then the triangle inequality $\delta(s,v)\le\delta(s,u)+w(u,v)$ gives precisely
+$h(v)-h(u)\le w(u,v)$. So a single-source shortest-path tree hands us a feasible potential -- as long as
+we can compute it, which we can with Bellman--Ford, the one solver that tolerates negative edges.
+
+\begin{trapbox}
+There is a catch: a source $s$ might not reach every vertex, leaving $\delta(s,v)=\infty$ and a useless
+potential. Johnson's fix is a \emph{virtual super-source} $q$ with a zero-weight edge $q\to v$ to every
+vertex. Now $q$ reaches everyone, $h(v)=\delta(q,v)$ is finite for all $v$, and the new edges create no
+negative cycle (they point only outward from $q$, which has no incoming edges). If Bellman--Ford from $q$
+detects a negative cycle, we abort -- APSP is ill-posed.
+\end{trapbox}
+
+\subsection{The algorithm}
+
+\begin{algorithm}[H]
+\caption{Johnson's all-pairs shortest paths}
+\label{ch09:alg-johnson}
+\DontPrintSemicolon
+\KwIn{Digraph $\Gph=(V,E)$, weights $w$ (possibly negative).}
+\KwOut{$\delta(u,v)$ for all $u,v$, or report a negative cycle.}
+\textbf{Step 1 (super-source).} Build $\Gph'$ by adding $q$ and edges $q\to v$ of weight $0$ for all $v\in V$\;
+\textbf{Step 2 (potentials).} Run Bellman--Ford from $q$ on $\Gph'$\;
+\lIf{a negative cycle is found}{\textbf{report} and \textbf{stop}}
+$h(v)\leftarrow \delta_{\Gph'}(q,v)$ for every $v\in V$\;
+\textbf{Step 3 (reweight).} \For{each edge $(u,v)\in E$}{$\hat{w}(u,v)\leftarrow w(u,v)+h(u)-h(v)$ \tcp*{$\ge 0$}}
+\textbf{Step 4 (Dijkstra from each source).}\;
+\For{each $u\in V$}{
+  run Dijkstra from $u$ with weights $\hat{w}$ to get $\hat{\delta}(u,v)$ for all $v$\;
+  \For{each $v\in V$}{$\delta(u,v)\leftarrow \hat{\delta}(u,v) - h(u) + h(v)$ \tcp*{undo the shift}}
+}
+\Return $\delta$\;
+\end{algorithm}
+
+The undo step inverts the telescoping: since $\hat\delta(u,v)=\delta(u,v)+h(u)-h(v)$, we recover
+$\delta(u,v)=\hat\delta(u,v)-h(u)+h(v)$.
+
+\subsection{Worked example: same graph, reweighted}
+\label{ch09:johnson-trace}
+
+Reuse the five-vertex graph from Section~\ref{ch09:fw-trace}, whose only negative edge is $4\to2(-2)$.
+Add super-source $q$ with zero edges to all five vertices (Figure~\ref{ch09:fig-supersource}) and run
+Bellman--Ford from $q$. Each $q\to v$ edge has weight $0$, so $h(v)$ is the lightest way to reach $v$
+from anywhere (through $q$). Relaxation propagates through the negative edge, so we follow the chains
+carefully:
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Latex, node distance=20mm,
+   v/.style={circle,draw=nodeblue,very thick,fill=blue!4,minimum size=8mm,font=\small},
+   q/.style={circle,draw=quotientorange,very thick,fill=orange!8,minimum size=8mm,font=\small}]
+  \node[v] (1) {1};
+  \node[v] (2) [right=of 1] {2};
+  \node[v] (3) [right=of 2] {3};
+  \node[v] (4) [below=16mm of 2] {4};
+  \node[v] (5) [below=16mm of 3] {5};
+  \node[q] (q) [left=20mm of 4] {$q$};
+  \draw[->,edgegray,thick] (1) -- node[above,font=\scriptsize]{3} (2);
+  \draw[->,edgegray,thick] (2) -- node[above,font=\scriptsize]{4} (3);
+  \draw[->,edgegray,thick] (1) -- node[left,font=\scriptsize]{8} (4);
+  \draw[->,edgegray,thick] (4) -- node[below,font=\scriptsize]{$-2$} (2);
+  \draw[->,edgegray,thick] (2) -- node[right,font=\scriptsize]{1} (5);
+  \draw[->,edgegray,thick] (5) -- node[below,font=\scriptsize]{2} (3);
+  \draw[->,edgegray,thick] (4) to[bend right=18] node[below,font=\scriptsize]{5} (5);
+  \draw[->,quotientorange,thick,dashed] (q) to[bend left=10] node[above,font=\scriptsize]{0} (1);
+  \draw[->,quotientorange,thick,dashed] (q) to node[above,font=\scriptsize,pos=0.85]{0} (2);
+  \draw[->,quotientorange,thick,dashed] (q) to[bend left=14] node[above,font=\scriptsize,pos=0.9]{0} (3);
+  \draw[->,quotientorange,thick,dashed] (q) -- node[below,font=\scriptsize]{0} (4);
+  \draw[->,quotientorange,thick,dashed] (q) to[bend right=10] node[below,font=\scriptsize,pos=0.85]{0} (5);
+\end{tikzpicture}
+\caption{The worked graph with Johnson's super-source $q$ (dashed orange edges of weight $0$ to every
+vertex). $q$ has no incoming edges, so it adds no cycle; Bellman--Ford from $q$ yields the
+potentials $h(v)=\delta(q,v)$.}
+\label{ch09:fig-supersource}
+\end{figure}
+
+\begin{itemize}
+  \item $h(1)=0$ (direct $q\to1$; nothing reaches $1$).
+  \item $h(2)=-2$ via $q\to4\to2$, beating the direct $q\to2=0$.
+  \item $h(5)=-1$ via $q\to4\to2\to5 = 0-2+1$.
+  \item $h(3)=1$ via $q\to4\to2\to5\to3 = 0-2+1+2$.
+  \item $h(4)=0$ (direct $q\to4$; nothing else reaches $4$).
+\end{itemize}
+\[
+\begin{array}{c|ccccc}
+ v & 1 & 2 & 3 & 4 & 5\\\hline
+ h(v) & 0 & -2 & 1 & 0 & -1
+\end{array}
+\]
+Now reweight every original edge with $\hat{w}(u,v)=w(u,v)+h(u)-h(v)$:
+\[
+\begin{array}{l|c|c}
+\text{edge } (u,v) & w & \hat{w}=w+h(u)-h(v)\\\hline
+1\to2 & 3 & 3+0-(-2)=5\\
+2\to3 & 4 & 4+(-2)-1=1\\
+1\to4 & 8 & 8+0-0=8\\
+4\to2 & -2 & -2+0-(-2)=0\\
+2\to5 & 1 & 1+(-2)-(-1)=0\\
+5\to3 & 2 & 2+(-1)-1=0\\
+4\to5 & 5 & 5+0-(-1)=6
+\end{array}
+\]
+Every reweighted edge is nonnegative -- exactly as Theorem~\ref{ch09:thm-johnson} promises -- and the
+negative edge $4\to2$ became a harmless $0$.
+
+Run Dijkstra from source $1$ on $\hat w$. It settles $\hat\delta(1,2)=5$, $\hat\delta(1,4)=8$, and
+$\hat\delta(1,5)=\min(5+0,\,8+6)=5$ (route $1\to2\to5$). For $1\to3$ the contenders are
+$1\to2\to3$ at $5+1=6$ and $1\to2\to5\to3$ at $5+0+0=5$, so $\hat\delta(1,3)=5$. Undo the shift for
+the $1\to3$ answer:
+\[
+  \delta(1,3) = \hat\delta(1,3) - h(1) + h(3) = 5 - 0 + 1 = 6,
+\]
+matching the $\delta(1,3)=6$ from Floyd--Warshall. Likewise
+$\delta(1,5)=\hat\delta(1,5)-h(1)+h(5)=5-0+(-1)=4$ and $\delta(1,2)=5-0+(-2)=3$. Every number agrees.
+
+\begin{labbox}
+Finish the trace: run Dijkstra from source $4$ on $\hat w$ (starting across the $4\to2(0)$ edge) and undo
+the shift with $h(4)=0$. You should recover row $4$ of the Floyd--Warshall matrix:
+$\delta(4,2)=-2$, $\delta(4,3)=1$, $\delta(4,5)=-1$. Notice the reweighted Dijkstra distances are all
+$\ge 0$ even though the true distances are negative -- the potentials carry the negativity.
+\end{labbox}
+
+\subsection{Correctness}
+
+\begin{theorem}[Johnson reweighting]
+\label{ch09:thm-johnson}
+Let $h(v)=\delta_{\Gph'}(q,v)$ be finite for all $v$ (guaranteed by the super-source when no negative
+cycle exists). Then:
+\begin{enumerate}
+  \item[(a)] $\hat{w}(u,v)=w(u,v)+h(u)-h(v)\ge 0$ for every edge $(u,v)\in E$;
+  \item[(b)] for every pair $(u,v)$, a path is shortest under $w$ iff it is shortest under $\hat w$, and
+        $\delta(u,v)=\hat\delta(u,v)-h(u)+h(v)$.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+(a) Since $h(v)=\delta_{\Gph'}(q,v)$ is a shortest-path distance, it satisfies the triangle inequality
+along the edge $(u,v)$: $\delta_{\Gph'}(q,v)\le\delta_{\Gph'}(q,u)+w(u,v)$, i.e. $h(v)\le h(u)+w(u,v)$.
+Rearranged, $w(u,v)+h(u)-h(v)\ge 0$, which is $\hat w(u,v)\ge 0$.
+
+(b) Take any path $P=(u=x_0,x_1,\dots,x_t=v)$. Summing $\hat w$ along $P$ telescopes:
+\[
+  \hat w(P)=\sum_{i=1}^{t}\big(w(x_{i-1},x_i)+h(x_{i-1})-h(x_i)\big)=w(P)+h(u)-h(v).
+\]
+The term $h(u)-h(v)$ depends only on the endpoints, not on the path. Hence for fixed $(u,v)$ the map
+$P\mapsto\hat w(P)$ is $w(P)$ plus a constant, so it preserves the argmin: the same path minimizes both.
+Taking minima, $\hat\delta(u,v)=\delta(u,v)+h(u)-h(v)$, and rearranging gives the recovery formula.
+Because every $\hat w\ge 0$, Dijkstra correctly computes $\hat\delta$.
+\end{proof}
+
+\begin{whybox}
+The potential $h$ is a \emph{certificate}, not magic. Feasibility ``$h(v)-h(u)\le w(u,v)$ for all edges''
+is the linear-programming dual of shortest paths; a feasible potential exists \emph{iff} there is no
+negative cycle (Bellman--Ford either finds one or proves none exists). So Johnson's algorithm secretly
+solves the shortest-path LP's dual once, then exploits that dual solution $n$ times. The same reweighting
+reappears in the successive-shortest-paths method for min-cost flow, where node potentials keep residual
+edges nonnegative so each augmentation can use Dijkstra.
+\end{whybox}
+
+\begin{complexitybox}
+Johnson's algorithm: Bellman--Ford once at $\Oh(nm)$, reweighting at $\Oh(m)$, then $n$ Dijkstra runs.
+With a binary heap each Dijkstra is $\Oh((n+m)\log n)$, total $\Oh(nm\log n)$; with a Fibonacci heap each
+is $\Oh(m+n\log n)$, total $\Oh(nm+n^2\log n)$. On sparse graphs $m=\Oh(n)$ this is $\Oh(n^2\log n)$ --
+asymptotically beating Floyd--Warshall's $\Th(n^3)$. On dense graphs $m=\Th(n^2)$ both are $\Th(n^3)$
+(Fibonacci) and Floyd--Warshall wins on constants.
+\end{complexitybox}
+
+\section{Choosing an algorithm}
+\label{ch09:choosing}
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Situation & Algorithm & Time & Notes\\
+\midrule
+Dense, any weights & Floyd--Warshall & $\Th(n^3)$ & simplest; cache-friendly\\
+Sparse, nonnegative & $n\times$ Dijkstra & $\Oh(nm+n^2\log n)$ & no reweighting needed\\
+Sparse, negative edges & Johnson & $\Oh(nm+n^2\log n)$ & reweight, then $n$ Dijkstras\\
+Reachability only & Warshall (bitset) & $\Th(n^3/w)$ & word-parallel OR\\
+Small integer weights & Seidel / Zwick & $\Oh(n^\omega\,\poly\log)$ & via fast matmul\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{intuitionbox}
+A one-line decision rule. If the graph is dense or you just want the simplest correct code, write
+Floyd--Warshall. If it is sparse, run Dijkstra from every vertex -- and if any edge is negative, prefix
+that with one Johnson reweighting pass. Everything else is a refinement.
+\end{intuitionbox}
+
+\section{Path reconstruction and a few extensions}
+\label{ch09:extensions}
+
+\paragraph{Recovering the actual paths.} Both algorithms can return paths, not just costs. In
+Floyd--Warshall the predecessor matrix $\pi$ (Algorithm~\ref{ch09:alg-fw}) lets you walk backward from
+$j$: repeatedly replace $j$ by $\pi(i,j)$ until you reach $i$. In Johnson's algorithm each Dijkstra
+already produces a shortest-path tree; reweighting changes edge costs but not path \emph{structure}
+(Theorem~\ref{ch09:thm-johnson}(b)), so the tree edges are the genuine shortest paths.
+
+\paragraph{Bottleneck / widest paths.} Replace $(\min,+)$ by $(\min,\max)$ in the Floyd--Warshall
+update -- $d(i,j)\leftarrow\min(d(i,j),\,\max(d(i,k),d(k,j)))$ -- and you compute the minimax path between
+every pair, the path whose heaviest edge is as light as possible. This is the all-pairs minimum-bottleneck
+problem (and with $(\max,\min)$, maximum-capacity), useful in network routing.
+
+\paragraph{Counting shortest paths.} Carry a count matrix $c$ alongside $d$. When the update strictly
+improves $d(i,j)$, set $c(i,j)\leftarrow c(i,k)\cdot c(k,j)$; when it \emph{ties} the current best, add
+$c(i,j)\mathrel{+}= c(i,k)\cdot c(k,j)$. This computes the number of distinct shortest paths between every
+pair, a quantity central to betweenness-centrality computations on networks.
+
+\begin{applicationbox}
+APSP distance matrices feed graph-analytic measures directly. The \emph{Wiener index}
+$\sum_{i<j}\delta(i,j)$ measures molecular branching in chemistry. \emph{Closeness centrality}
+$1/\sum_j\delta(i,j)$ ranks how central a vertex is; \emph{betweenness} counts shortest paths through each
+vertex (the counting extension above). The graph \emph{diameter} $\max_{i,j}\delta(i,j)$ and \emph{radius}
+fall out of one scan of the matrix. Whenever a pipeline needs ``distance between everything,'' an APSP
+solver is the engine.
+\end{applicationbox}
+
+\section{Exercises}
+\label{ch09:exercises}
+
+\begin{exercise}
+Implement Floyd--Warshall with the predecessor matrix $\pi$ of Algorithm~\ref{ch09:alg-fw} and a path
+reconstruction routine. Test it on the five-vertex graph of Section~\ref{ch09:fw-trace} and confirm it
+reports the path $1\to2\to5\to3$ for the pair $(1,3)$.
+\end{exercise}
+
+\begin{exercise}
+Prove that the in-place update is safe by showing rigorously that row $k$ and column $k$ of $d$ are
+unchanged during the processing of door $k$, and explain exactly where the assumption $d^{(k-1)}(k,k)=0$
+is used. What goes wrong if a negative cycle through $k$ exists?
+\end{exercise}
+
+\begin{exercise}
+Add the edge $3\to1$ with weight $-10$ to the worked graph, creating the cycle $1\to2\to3\to1$ of weight
+$-3$. Trace Floyd--Warshall and identify the first value of $k$ at which some diagonal entry $d(i,i)$
+becomes negative. Then implement the $-\infty$ post-pass from the trap box in
+Section~\ref{ch09:fw-negcycle} and report which off-diagonal entries it corrects.
+\end{exercise}
+
+\begin{exercise}
+(Min-plus by squaring.) Implement APSP via repeated squaring of the min-plus product
+(Section~\ref{ch09:minplus}). Verify it agrees with Floyd--Warshall on random graphs, and confirm
+empirically that it performs $\ceil{\log_2(n-1)}$ products. Why does ordinary squaring fail to detect
+negative cycles the way Floyd--Warshall's diagonal does?
+\end{exercise}
+
+\begin{exercise}
+Prove that the min-plus product is associative, so that $W^{\otimes a}\otimes W^{\otimes b}=W^{\otimes(a+b)}$
+and repeated squaring is valid. Where in the proof do you use that $(\R\cup\set{\infty},\min,+)$ is a
+semiring (in particular, that $+$ distributes over $\min$)?
+\end{exercise}
+
+\begin{exercise}
+Show that a feasible potential $h$ with $h(v)-h(u)\le w(u,v)$ for all edges exists if and only if $\Gph$
+has no negative cycle. (Hint: one direction is Johnson's super-source construction; for the other, sum
+the inequalities around a cycle and watch the potentials cancel.)
+\end{exercise}
+
+\begin{exercise}
+In Johnson's algorithm, suppose you skip the super-source and instead pick an arbitrary vertex $s$ as the
+Bellman--Ford source. Construct a small graph where this produces an infinite potential for some vertex
+and breaks the reweighting. Then argue that the super-source never introduces a negative cycle.
+\end{exercise}
+
+\begin{exercise}
+(Bottleneck APSP.) Modify Floyd--Warshall to compute, for every pair, the minimum possible value of the
+\emph{maximum} edge weight on a path (the minimax path). Prove your recurrence correct by an exchange
+argument analogous to Theorem~\ref{ch09:thm-fw}, and state the semiring you are working over.
+\end{exercise}
+
+\begin{exercise}
+(Counting shortest paths.) Augment Floyd--Warshall with the count matrix $c$ described in
+Section~\ref{ch09:extensions}. Prove that on a graph with nonnegative weights and no zero-weight cycles
+the final $c(i,j)$ equals the number of distinct shortest paths from $i$ to $j$. Explain why zero-weight
+cycles can make this count infinite.
+\end{exercise}
+
+\begin{exercise}
+(Transitive closure as a special case.) Show that running Floyd--Warshall with edge weights $0$ on
+present edges and $+\infty$ on absent ones, then thresholding $d(i,j)<\infty$, recovers the transitive
+closure. Compare its constant factor with the bit-packed Warshall closure of
+Algorithm~\ref{ch09:alg-warshall} and explain when the bitset version wins.
+\end{exercise}
+
+\begin{exercise}
+(Incremental APSP.) After computing the full distance matrix, a single edge weight $w(a,b)$ is
+\emph{decreased}. Give an $\Oh(n^2)$ algorithm to update all $n^2$ distances, and prove it correct.
+(Hint: the only paths that can improve route through $(a,b)$; relax
+$d(i,j)\leftarrow\min(d(i,j),\,d(i,a)+w(a,b)+d(b,j))$.) Why does an edge \emph{increase} not admit the
+same easy update?
+\end{exercise}

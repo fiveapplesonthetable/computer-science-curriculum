@@ -1,0 +1,905 @@
+\chapter{Streaming and Massive Graphs}
+
+Until now we have assumed the whole graph sits in memory, and that we may
+poke at any vertex or edge whenever we like. That assumption breaks the
+moment the graph is a web crawl with $10^{11}$ edges, a social network that
+arrives as a firehose of friend-events, or a router log that streams past
+faster than any disk can absorb. In those regimes the graph never fully
+exists in RAM at one instant. We are handed its edges one at a time, in an
+order we do not control, and we are allowed only a sliver of working memory
+--- far less than the graph itself.
+
+This chapter develops the \emph{streaming} model for graphs: what it costs,
+what it buys, and (the part people forget) what it makes flatly impossible.
+The headline regime is \emph{semi-streaming}: $\Oh(n\,\poly\log n)$ space,
+enough to remember something about every vertex but nowhere near enough to
+remember every edge. We will see that connectivity, bipartiteness, and
+sparse spanners survive in that budget; that exact shortest paths and exact
+triangle counts do not; and that a beautiful piece of linear-algebraic
+trickery --- \emph{linear sketches} and $L_0$ samplers --- lets us handle
+streams where edges are not only inserted but deleted.
+
+\chapterline
+
+\section{The streaming model, precisely}
+\label{ch40:model}
+
+\begin{definition}[Graph stream]\label{ch40:def-stream}
+Let $\Gph=(V,E)$ have $n=\abs{V}$ vertices, known in advance, labelled
+$1,\dots,n$. A \emph{graph stream} is a sequence
+$\sigma = \langle a_1, a_2, \dots, a_m\rangle$ of \emph{tokens} presented one
+at a time. In the \emph{insertion-only} (or \emph{cash-register}) model each
+token $a_i$ is an edge $\set{u,v}$ to be added. In the \emph{dynamic} (or
+\emph{turnstile}) model each token is a pair $(\set{u,v}, \pm 1)$ that
+inserts or deletes an edge. An algorithm reads tokens left to right, keeps a
+memory state $S$ of bounded size, and updates $S$ per token. After the last
+token it answers a query about $\Gph$.
+\end{definition}
+
+Three knobs define the cost:
+
+\begin{itemize}
+\item \textbf{Space} $s$: bits of working memory, the scarce resource. Reading
+a token does not count against $s$; only what we choose to retain does.
+\item \textbf{Passes} $p$: how many times we are allowed to scan $\sigma$ from
+the start. The default and most demanding setting is $p=1$.
+\item \textbf{Per-token (update) time} and \textbf{post-processing time}: usually
+secondary, but we track them.
+\end{itemize}
+
+The input has $n$ vertices and up to $m$ edges, with $m$ potentially as large
+as $\binom{n}{2}=\Th(n^2)$. The whole point is that $s \ll m$.
+
+\begin{definition}[Semi-streaming]\label{ch40:def-semistream}
+An algorithm is \emph{semi-streaming} if it uses $\Oh(n\,\poly\log n)$ bits of
+space and a small number of passes (ideally one).
+\end{definition}
+
+\begin{intuitionbox}
+Why $n\,\poly\log n$ and not, say, $\sqrt{n}$ or $n^{1.5}$? Because $n\log n$
+bits is exactly enough to store $\Oh(n)$ machine words --- one or a few per
+vertex. That is the natural ``remember a little about everyone, forget the
+edges'' frontier. Below it you cannot even hold a spanning forest; above it
+($n^{1+c}$) you can hoard subquadratically many edges and the model stops
+being interesting. Semi-streaming is the sweet spot where vertices fit but
+edges do not, and almost every positive result in this chapter lives there.
+\end{intuitionbox}
+
+\begin{historybox}
+The streaming model for numerical data was crystallized by Alon, Matias, and
+Szegedy in 1996 (frequency moments, the AMS sketch). The graph-specific
+\emph{semi-streaming} model is due to Feigenbaum, Kannan, McGregor, Suri, and
+Zhang (2005), who pinned $\Oh(n\,\poly\log n)$ as the right budget and showed
+connectivity and spanners fit inside it. The turnstile breakthrough ---
+handling edge deletions via linear sketches --- came from Ahn, Guha, and
+McGregor (2012), whose graph-sketching framework reduced connectivity to
+$L_0$ sampling, recasting a combinatorial problem as pure linear algebra.
+\end{historybox}
+
+\subsection{A running graph to keep in mind}
+
+Throughout, return to this little eight-vertex graph. Its edges will arrive
+in a scrambled order so we can watch an online algorithm cope.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  every node/.style={circle,draw=nodeblue,fill=blue!6,minimum size=7mm,
+    font=\small,inner sep=0pt},
+  edge/.style={draw=edgegray,thick}]
+\node (1) at (0,2) {1};
+\node (2) at (2,2.6) {2};
+\node (3) at (4,2) {3};
+\node (4) at (1,0.4) {4};
+\node (5) at (3,0.4) {5};
+\node (6) at (5.2,1) {6};
+\node (7) at (6.8,2) {7};
+\node (8) at (6.8,0) {8};
+\draw[edge] (1)--(2); \draw[edge] (2)--(3); \draw[edge] (1)--(4);
+\draw[edge] (4)--(5); \draw[edge] (2)--(4); \draw[edge] (3)--(5);
+\draw[edge] (3)--(6); \draw[edge] (6)--(7); \draw[edge] (6)--(8);
+\draw[edge] (7)--(8);
+\end{tikzpicture}
+\caption{The running graph $\Gph$: eight vertices, ten edges. Vertices
+$\set{1,2,3,4,5}$ form one cluster and $\set{6,7,8}$ a triangle, joined by the
+single bridge $\set{3,6}$. There is no edge $3$--$4$, so the only triangle on
+the left is $\set{1,2,4}$; the only triangle on the right is $\set{6,7,8}$.}
+\label{ch40:fig-running}
+\end{figure}
+
+We will feed its edges in the adversarial order
+\[
+\sigma = \langle\,(3,6),(1,2),(6,7),(2,4),(4,5),(1,4),(2,3),(3,5),(7,8),(6,8)\,\rangle.
+\]
+
+\section{Connectivity in one pass}
+\label{ch40:connectivity}
+
+The cleanest semi-streaming result: decide whether $\Gph$ is connected (and
+in fact maintain its connected components) in one pass and $\Oh(n\log n)$
+bits.
+
+\begin{intuitionbox}
+A spanning forest already tells you the components, and a forest on $n$
+vertices has at most $n-1$ edges. So we never need to store more than $n-1$
+edges. Maintain a forest incrementally: when an edge $\set{u,v}$ arrives, add
+it only if $u$ and $v$ are not already connected by what we have kept ---
+otherwise it would close a cycle and is useless for connectivity. That is
+exactly Kruskal's forest-building, run online, with a union--find structure
+deciding ``already connected?'' in near-constant amortized time.
+\end{intuitionbox}
+
+\begin{algorithm}[H]
+\caption{\textsc{StreamingSpanningForest}}
+\label{ch40:alg-forest}
+\DontPrintSemicolon
+\KwIn{vertex set $V=\set{1,\dots,n}$; insertion stream of edges}
+\KwOut{a spanning forest $F$; component labels}
+initialize union--find $\mathcal{D}$ with each $v$ in its own set\;
+$F \gets \emptyset$\;
+\ForEach{arriving edge $\set{u,v}$}{
+  \If{$\textsc{Find}(u)\neq\textsc{Find}(v)$}{
+    $F \gets F \cup \set{\set{u,v}}$\;
+    $\textsc{Union}(u,v)$\;
+  }
+}
+\Return $F$ and the \textsc{Find} labels\;
+\end{algorithm}
+
+\begin{whybox}
+\textbf{Correctness.} Claim: at every moment $F$ is a spanning forest of the
+graph seen so far, with the \emph{same} connected components. Induction on
+tokens. Initially both are empty/trivial. When $\set{u,v}$ arrives: if $u,v$
+are already in the same tree of $F$, then by the induction hypothesis they
+were already connected in the seen graph, so adding the edge changes no
+component and skipping it changes no component --- $F$ stays a forest. If they
+are in different trees, the seen graph just merged two components, and adding
+$\set{u,v}$ to $F$ merges exactly those two trees without creating a cycle (it
+joins two distinct trees). So $F$ remains a forest realizing the same
+partition. After all tokens, $\Gph$ is connected iff $F$ is a single tree iff
+$\abs{F}=n-1$.
+\end{whybox}
+
+\begin{complexitybox}
+$F$ holds at most $n-1$ edges $=\Oh(n\log n)$ bits; union--find adds another
+$\Oh(n\log n)$. Total space $\Oh(n\log n)$ --- semi-streaming with one pass.
+Per-token work is one \textsc{Find}/\textsc{Union} pair, $\Oh(\alpha(n))$
+amortized with path compression and union by rank. Post-processing is
+$\Oh(n)$.
+\end{complexitybox}
+
+\begin{labbox}
+Run Algorithm~\ref{ch40:alg-forest} on $\sigma$ from
+Figure~\ref{ch40:fig-running}. Write the forest edges kept and the running
+component count (start: 8 singletons).
+
+\begin{center}
+\begin{tabular}{llcc}
+\toprule
+token & action & kept? & \#comp \\
+\midrule
+$(3,6)$ & $3,6$ separate & yes & 7 \\
+$(1,2)$ & separate & yes & 6 \\
+$(6,7)$ & separate & yes & 5 \\
+$(2,4)$ & separate & yes & 4 \\
+$(4,5)$ & separate & yes & 3 \\
+$(1,4)$ & $1,4$ already linked ($1$--$2$--$4$) & \textbf{no} & 3 \\
+$(2,3)$ & joins $\set{1,2,4,5}$ with $\set{3,6,7}$ & yes & 2 \\
+$(3,5)$ & $3,5$ already linked & \textbf{no} & 2 \\
+$(7,8)$ & joins $8$ in & yes & 1 \\
+$(6,8)$ & already linked & \textbf{no} & 1 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+We kept exactly $7=n-1$ edges and ended at one component: $\Gph$ is connected.
+The three edges we dropped, $(1,4),(3,5),(6,8)$, are precisely the cycle-closing
+ones --- the ``extra'' density the forest is allowed to forget.
+\end{labbox}
+
+\subsection{Bipartiteness and $k$-edge-connectivity for free-ish}
+
+The same skeleton answers more questions with a constant factor more space.
+
+\textbf{Bipartiteness.} Keep the spanning forest \emph{plus} a parity bit
+$\phi(v)\in\set{0,1}$ per vertex (the side of the 2-coloring relative to its
+tree root, maintained as union--find merges). When a non-tree edge
+$\set{u,v}$ arrives with $\textsc{Find}(u)=\textsc{Find}(v)$, check whether
+$\phi(u)=\phi(v)$; if so we have found an odd cycle and the graph is not
+bipartite. This is one pass, $\Oh(n\log n)$ bits.
+
+\textbf{$k$-edge-connectivity.} Maintain $k$ edge-disjoint forests
+$F_1,\dots,F_k$ (Nagamochi--Ibaraki / Thurimella sparsification): insert each
+arriving edge into the first $F_i$ where it does not close a cycle. The union
+$F_1\cup\cdots\cup F_k$ is a \emph{$k$-skeleton} preserving all cuts of size
+$\le k$, so it answers $k$-edge-connectivity exactly. Space $\Oh(kn\log n)$:
+semi-streaming for $k=\poly\log n$.
+
+\begin{connectionbox}
+The forest trick is Kruskal (Chapter~6) without sorting: the stream supplies
+an arbitrary order and we keep whatever extends the forest. The $k$-forest
+sparsifier is the combinatorial cousin of the \emph{spectral} sparsifier from
+Chapters~31--34: there we preserved every quadratic form $x^\top\Lap x$ to
+within $1\pm\eps$ using $\Oh(n\log n/\eps^2)$ \emph{weighted} edges; here we
+preserve every cut of value $\le k$ exactly using $kn$ \emph{unweighted}
+edges. Both say the same moral: a graph's connectivity structure is
+compressible to near-linear size.
+\end{connectionbox}
+
+\section{Spanners: approximate distances in small space}
+\label{ch40:spanners}
+
+A spanning forest forgets distances completely --- it can stretch a length-1
+edge into a length-$\Th(n)$ detour. If we want approximate shortest paths in
+one pass, we need a \emph{spanner}.
+
+\begin{definition}[Spanner]\label{ch40:def-spanner}
+A subgraph $H\subseteq\Gph$ is a \emph{$t$-spanner} (stretch $t$) if for all
+$u,v$,
+\[
+\dist_\Gph(u,v) \;\le\; \dist_H(u,v) \;\le\; t\cdot \dist_\Gph(u,v).
+\]
+Equivalently (it suffices to check edges): for every edge $\set{u,v}\in\Gph$,
+$\dist_H(u,v)\le t$.
+\end{definition}
+
+The ``edges suffice'' remark is worth a line: if every edge is $t$-stretched,
+then concatenating along any shortest path stretches the whole path by at most
+$t$. So a streaming spanner only has to guarantee, edge by edge, that it never
+drops an edge whose endpoints are currently far apart in $H$.
+
+\begin{intuitionbox}
+Greedy spanner, online: when $\set{u,v}$ arrives, ask ``are $u$ and $v$
+already within distance $t$ using the edges I have kept?'' If yes, the new
+edge is redundant --- drop it. If no, keep it. This guarantees stretch $t$ by
+construction. The payoff is that the kept graph $H$ then has \emph{high girth}:
+every cycle in $H$ has length $> t+1$, because the last edge of any short
+cycle would have been dropped. High girth forces sparsity.
+\end{intuitionbox}
+
+\begin{algorithm}[H]
+\caption{\textsc{StreamingGreedySpanner}$(t)$, $t=2k-1$ odd}
+\label{ch40:alg-spanner}
+\DontPrintSemicolon
+\KwIn{stream of edges; stretch parameter $t=2k-1$}
+\KwOut{a $t$-spanner $H$}
+$H \gets \emptyset$\;
+\ForEach{arriving edge $\set{u,v}$}{
+  compute $d \gets \dist_H(u,v)$ by BFS in $H$ (stop early at depth $t$)\;
+  \If{$d > t$ \textbf{(includes $d=\infty$)}}{
+    $H \gets H \cup \set{\set{u,v}}$\;
+  }
+}
+\Return $H$\;
+\end{algorithm}
+
+\begin{whybox}
+\textbf{Stretch.} For any kept edge, trivially $\dist_H\le 1\le t$. For any
+\emph{dropped} edge $\set{u,v}$, we dropped it precisely because
+$\dist_H(u,v)\le t$ at that moment, and $H$ only grows, so the bound persists.
+Hence every original edge is $t$-stretched, and by the edge-suffices remark
+$H$ is a $t$-spanner.
+
+\textbf{Sparsity via girth.} Suppose $H$ contained a cycle $C$ of length
+$\ell\le t+1=2k$. Consider the \emph{last} edge $\set{u,v}$ of $C$ to be added
+to $H$. At that instant the other $\ell-1\le t$ edges of $C$ were already in
+$H$, forming a $u$--$v$ path of length $\ell-1\le t$, so $\dist_H(u,v)\le t$
+and we would have \emph{dropped} $\set{u,v}$ --- contradiction. Therefore $H$
+has girth $\ge t+2 = 2k+1$.
+\end{whybox}
+
+\begin{lemma}[High-girth graphs are sparse, the Moore bound]\label{ch40:lem-moore}
+A graph on $n$ vertices with girth $\ge 2k+1$ has $\Oh(n^{1+1/k})$ edges.
+\end{lemma}
+
+\begin{proof}[Proof sketch]
+If the average degree is $d=2\abs{E}/n$, a standard cleaning gives a subgraph
+of minimum degree $\ge d/2$. Pick any vertex and grow a BFS tree to depth
+$k$; girth $\ge 2k+1$ means no two of these short paths collide before depth
+$k$, so the ball is a genuine tree and contains at least
+$1+(d/2)+(d/2)^2+\cdots$ down to depth $k$, i.e.\ $\gtrsim (d/2)^k$ vertices.
+This must be $\le n$, giving $d/2 \le n^{1/k}$, so
+$\abs{E}=nd/2 \le n\cdot n^{1/k}=n^{1+1/k}$ up to the additive cleaning term.
+\end{proof}
+
+\begin{complexitybox}
+Algorithm~\ref{ch40:alg-spanner} with $t=2k-1$ stores an
+$\Oh(n^{1+1/k})$-edge $(2k-1)$-spanner. Choosing $k=\log n$ gives stretch
+$\Oh(\log n)$ and space $\Oh(n^{1+1/\log n}\log n)=\Oh(n\log n)$ bits ---
+semi-streaming. The per-token cost is one truncated BFS, $\Oh(\abs{E(H)})$ in
+the worst case; the additive-error and faster variants of Baswana--Sen reduce
+this to $\Oh(1)$ expected per edge.
+\end{complexitybox}
+
+\begin{labbox}
+Build a $3$-spanner ($t=3$, $k=2$) of the running graph in stream order
+$\sigma$. Rule: keep $\set{u,v}$ unless $\dist_H(u,v)\le 3$ already.
+
+\begin{center}
+\begin{tabular}{llc}
+\toprule
+token & current $\dist_H(u,v)$ & keep? \\
+\midrule
+$(3,6)$ & $\infty$ & yes \\
+$(1,2)$ & $\infty$ & yes \\
+$(6,7)$ & $\infty$ & yes \\
+$(2,4)$ & $\infty$ & yes \\
+$(4,5)$ & $\infty$ & yes \\
+$(1,4)$ & $1$--$2$--$4$ $=2\le3$ & \textbf{no} \\
+$(2,3)$ & $\infty$ ($\set{1,2,4,5}$ vs $\set{3,6,7}$) & yes \\
+$(3,5)$ & $3$--$2$--$4$--$5$ $=3\le3$ & \textbf{no} \\
+$(7,8)$ & $\infty$ & yes \\
+$(6,8)$ & $6$--$7$--$8$ $=2\le3$ & \textbf{no} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Kept: $\set{(3,6),(1,2),(6,7),(2,4),(4,5),(2,3),(7,8)}$ --- seven edges, a
+tree here (the graph is small so the spanner coincides with a forest). On a
+denser instance the spanner would keep cycle edges that a forest discards, in
+exchange for the stretch guarantee. Sanity check on the dropped edge $(3,5)$:
+in $H$, $\dist(3,5)=3=3\cdot\dist_\Gph(3,5)$, exactly the stretch ceiling.
+Figure~\ref{ch40:fig-spanner} draws the kept and dropped edges.
+\end{labbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  every node/.style={circle,draw=nodeblue,fill=blue!6,minimum size=7mm,
+    font=\small,inner sep=0pt},
+  kept/.style={draw=targetgreen,very thick},
+  dropped/.style={draw=trapred,thick,dashed}]
+\node (1) at (0,2) {1};
+\node (2) at (2,2.6) {2};
+\node (3) at (4,2) {3};
+\node (4) at (1,0.4) {4};
+\node (5) at (3,0.4) {5};
+\node (6) at (5.2,1) {6};
+\node (7) at (6.8,2) {7};
+\node (8) at (6.8,0) {8};
+% kept (solid green): 3-6, 1-2, 6-7, 2-4, 4-5, 2-3, 7-8
+\draw[kept] (3)--(6); \draw[kept] (1)--(2); \draw[kept] (6)--(7);
+\draw[kept] (2)--(4); \draw[kept] (4)--(5); \draw[kept] (2)--(3);
+\draw[kept] (7)--(8);
+% dropped (dashed red): 1-4, 3-5, 6-8
+\draw[dropped] (1)--(4); \draw[dropped] (3)--(5); \draw[dropped] (6)--(8);
+\end{tikzpicture}
+\caption{The $3$-spanner $H$ of the running graph. Solid (green) edges are
+kept; dashed (red) edges $\set{1,4},\set{3,5},\set{6,8}$ were dropped because
+their endpoints were already within distance $3$ in $H$ when they arrived. Here
+$H$ is a tree because the instance is small.}
+\label{ch40:fig-spanner}
+\end{figure}
+
+\begin{trapbox}
+``A spanning forest is a spanner.'' It is a $1$-spanner of nothing useful: a
+forest preserves \emph{connectivity} but can blow up \emph{distance}
+arbitrarily. Connectivity and distance are different currencies; do not pay
+for one expecting the other.
+\end{trapbox}
+
+\section{Dynamic streams: when edges get deleted}
+\label{ch40:sketching}
+
+Algorithms~\ref{ch40:alg-forest} and~\ref{ch40:alg-spanner} are hopeless
+under deletions. The spanning forest may keep edge $\set{u,v}$, and later a
+token $\bigl(\set{u,v},-1\bigr)$ removes it --- but the forest has no idea
+which \emph{other} edge should take its place, because it deliberately threw
+those edges away. Greedy retention is fundamentally non-reversible.
+
+The fix is to store, instead of a chosen subset of edges, a small
+\emph{linear} summary of the entire edge multiset. Linearity is exactly what
+makes deletions painless: a deletion is just an insertion of $-1$, and the
+summary updates by subtraction.
+
+\subsection{The vertex--edge incidence vector}
+
+Index the coordinate space by unordered pairs $\binom{V}{2}$, of dimension
+$\binom{n}{2}$. For a vertex $v$, define its \emph{signed incidence vector}
+$x_v \in \R^{\binom{n}{2}}$: for each edge $\set{u,v}$ present in the graph,
+$x_v$ has a $+1$ or $-1$ in coordinate $\set{u,v}$, with the sign chosen by a
+fixed global rule, say $+1$ if $v<u$ and $-1$ if $v>u$.
+
+\begin{lemma}[Boundary cancellation]\label{ch40:lem-boundary}
+For any vertex subset $S\subseteq V$, the support of $\sum_{v\in S} x_v$ is
+exactly the set of edges crossing the cut $(S,\bar S)$.
+\end{lemma}
+
+\begin{proof}
+Coordinate $\set{u,w}$ receives a contribution from $x_u$ and from $x_w$ only.
+If both $u,w\in S$, the two contributions have opposite signs (one endpoint
+sees the edge as ``smaller'', the other as ``larger'') and cancel to $0$. If
+both are outside $S$, neither contributes. If exactly one is in $S$, the
+coordinate survives with value $\pm1$. So the surviving coordinates are
+precisely the cut edges of $S$.
+\end{proof}
+
+\begin{intuitionbox}
+This is the incidence-matrix identity $\Lap = B^\top B$ from
+Chapter~31 wearing streaming clothes. Summing rows of the incidence matrix
+over $S$ cancels internal edges and leaves the boundary $\partial S$. So if we
+could, for any $S$, recover \emph{one} nonzero coordinate of $\sum_{v\in
+S}x_v$, we would learn one edge leaving $S$ --- enough to grow a spanning
+forest by repeatedly merging components and asking for an outgoing edge. The
+catch: $\sum_{v\in S}x_v$ lives in $\binom{n}{2}$ dimensions and we cannot
+store it. We store a tiny \emph{sketch} of each $x_v$ instead, and exploit
+that the sum of sketches is the sketch of the sum.
+\end{intuitionbox}
+
+\subsection{$L_0$ sampling}
+
+The primitive we need is a sampler that, from a high-dimensional vector
+accessed only through a small linear sketch, returns a uniformly random
+nonzero coordinate.
+
+\begin{definition}[$L_0$ sampler]\label{ch40:def-l0}
+An $L_0$ sampler for vectors $x\in\R^N$ is a randomized linear map
+$\mathsf{Sk}:\R^N\to\R^s$ together with a recovery procedure $\mathsf{Rec}$
+such that, from $\mathsf{Sk}(x)$ alone, with probability $\ge 1-\delta$,
+$\mathsf{Rec}$ outputs a coordinate $i$ with $x_i\neq 0$, and conditioned on
+success $i$ is (near-)uniform over $\mathrm{supp}(x)$. Such samplers exist with
+$s=\Oh(\log^2 N \cdot \log(1/\delta))$.
+\end{definition}
+
+The standard construction \emph{subsamples by levels}. Hash each coordinate to
+a geometric level $j$ with $\Pr[\text{level}\ge j]=2^{-j}$. At level
+$j\approx \log\norm{x}_0$ the survivors number $\Th(1)$ in expectation; at
+that level keep a tiny linear ``$1$-sparse recovery'' gadget that can decode a
+single nonzero coordinate exactly. Run all $\Oh(\log N)$ levels in parallel,
+read off the first level that is $1$-sparse. Each gadget is linear, so the
+whole sampler is linear, so deletions are handled by subtraction. A
+$1$-sparse recovery gadget stores three running linear combinations
+$\bigl(\sum_i x_i,\ \sum_i i\,x_i,\ \sum_i \mathrm{fp}(i)\,x_i\bigr)$;
+when the support is a single index $i^\star$ with value $a$, the first slot is
+$a$, the second is $a\,i^\star$, and dividing recovers $i^\star=$ (slot2)/(slot1),
+with the fingerprint slot detecting (whp) that the support really was size one.
+
+\begin{whybox}
+\textbf{Why it is exactly linear, and why that matters.} Every quantity stored
+--- the level hashes are fixed in advance, and each gadget keeps only
+\emph{sums} $\sum_i c_i x_i$ for fixed coefficients $c_i$. When token
+$(\set{u,v},\pm1)$ arrives we add $\pm1$ to two incidence vectors $x_u,x_v$,
+which adds $\pm c_{\set{u,v}}$ into the relevant sums. Insertion and deletion
+are the same operation with opposite sign. The sketch never ``remembers
+which edges were kept''; it remembers numerical aggregates that automatically
+forget a deleted edge. This is the entire reason linear sketches survive
+turnstile streams while greedy forests cannot.
+\end{whybox}
+
+\subsection{Connectivity in dynamic streams (AGM sketching)}
+
+Now assemble the pieces. Maintain, for each vertex $v$, an independent
+collection of $\Oh(\log n)$ $L_0$ sketches of its incidence vector $x_v$ ---
+one fresh sketch per round of a Bor\r{u}vka-style component merge.
+
+\begin{algorithm}[H]
+\caption{\textsc{SketchConnectivity}}
+\label{ch40:alg-agm}
+\DontPrintSemicolon
+\KwIn{turnstile edge stream; $R=\ceil{\log_2 n}+1$ rounds}
+\KwOut{a spanning forest of the final graph}
+\textbf{During the stream:} for each $v$ keep $R$ independent $L_0$ sketches
+$\mathsf{Sk}_1(x_v),\dots,\mathsf{Sk}_R(x_v)$, updated linearly per token\;
+\textbf{After the stream (Bor\r{u}vka):}\;
+$\mathcal{C}\gets$ partition of $V$ into singletons; $F\gets\emptyset$\;
+\For{$r=1$ \KwTo $R$}{
+  \ForEach{component $S\in\mathcal{C}$}{
+    using \emph{round-$r$} sketches, compute
+    $\mathsf{Sk}_r\!\bigl(\sum_{v\in S}x_v\bigr)=\sum_{v\in S}\mathsf{Sk}_r(x_v)$\;
+    run $\mathsf{Rec}$ to sample an edge leaving $S$ (a nonzero coordinate)\;
+  }
+  add every sampled inter-component edge to $F$ and merge the components it
+  joins, updating $\mathcal{C}$\;
+}
+\Return $F$\;
+\end{algorithm}
+
+\begin{whybox}
+\textbf{Why $R=\Oh(\log n)$ rounds suffice.} Each Bor\r{u}vka round, every
+current component samples (at least) one outgoing edge if one exists, so every
+non-maximal component merges with another. The number of components therefore
+at least halves each round; after $\ceil{\log_2 n}$ rounds it stops shrinking,
+and the partition equals the true connected components. Each round must use a
+\emph{fresh independent} sketch: the components queried in round $r$ depend on
+the random outcomes of rounds $1,\dots,r-1$, so reusing a sketch would
+correlate the query set with the sketch's randomness and void the $L_0$
+guarantee. That is why we pay $\Oh(\log n)$ sketches per vertex, not one.
+
+\textbf{Why the sum-of-sketches step is valid.} By linearity
+$\sum_{v\in S}\mathsf{Sk}_r(x_v)=\mathsf{Sk}_r(\sum_{v\in S}x_v)$, and by
+Lemma~\ref{ch40:lem-boundary} that argument vector is supported exactly on the
+cut $\partial S$. An $L_0$ sample from it is therefore a (uniform) edge
+leaving $S$ --- precisely Bor\r{u}vka's needed primitive.
+\end{whybox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  comp/.style={draw=structurepurple,thick,rounded corners,inner sep=3pt},
+  every node/.style={circle,draw=nodeblue,fill=blue!6,minimum size=5.5mm,
+    font=\scriptsize,inner sep=0pt},
+  cut/.style={draw=trapred,very thick,dashed}]
+% left: round start, components A={a,b}, B={c}, C={d,e}
+\node (a) at (0,1.2) {a};
+\node (b) at (0,0) {b};
+\node (c) at (2.0,0.6) {c};
+\node (d) at (4.0,1.2) {d};
+\node (e) at (4.0,0) {e};
+\draw[edgegray,thick] (a)--(b);
+\draw[edgegray,thick] (d)--(e);
+\draw[cut] (b)--(c);
+\draw[cut] (c)--(d);
+\begin{scope}[on background layer]
+  \node[comp,fit=(a)(b),label=above:{\scriptsize $S$}] {};
+  \node[comp,fit=(c)] {};
+  \node[comp,fit=(d)(e)] {};
+\end{scope}
+\node[draw=none,fill=none,font=\scriptsize\itshape] at (2.0,-1.2)
+  {$L_0$ sample from $\sum_{v\in S}x_v$ returns a dashed (cut) edge};
+\end{tikzpicture}
+\caption{One Bor\r{u}vka round under sketching. Summing the incidence sketches
+over a component $S$ cancels its internal solid edges
+(Lemma~\ref{ch40:lem-boundary}) and leaves only the dashed boundary edges; the
+$L_0$ sampler returns one of them, merging $S$ with a neighbor.}
+\label{ch40:fig-boruvka}
+\end{figure}
+
+\begin{complexitybox}
+To make every one of the $\Oh(n\log n)$ component-queries across all rounds
+succeed simultaneously, take the per-sketch failure to $\delta=1/\poly(n)$, so
+each $L_0$ sketch is $\Oh(\log^2 N\cdot\log(1/\delta))=\Oh(\log^3 n)$ bits
+(Definition~\ref{ch40:def-l0} with $N=\binom n2$, $\log N=\Th(\log n)$). Per
+vertex we keep $R=\Oh(\log n)$ of them, giving $\Oh(\log^4 n)$ bits per vertex
+and $\Oh(n\log^4 n)$ bits total --- semi-streaming, one pass, and it handles
+arbitrary insertions and deletions. Sharper $L_0$ samplers shave this to the
+$\Oh(n\log^3 n)$ headline figure of the original AGM analysis. The classical
+insertion-only forest (Algorithm~\ref{ch40:alg-forest}) is cheaper at
+$\Oh(n\log n)$; sketching pays the extra $\log$ factors precisely to buy
+deletion-tolerance.
+\end{complexitybox}
+
+\begin{connectionbox}
+Lemma~\ref{ch40:lem-boundary} is the streaming face of the boundary operator
+$B$ (the signed incidence matrix) studied in the Laplacian chapter:
+$\sum_{v\in S}x_v = B^\top \mathbf{1}_S$ is the indicator of the cut, and
+$\norm{B^\top\mathbf{1}_S}_0=\abs{\partial S}$. Graph sketching is, quite
+literally, doing Bor\r{u}vka's MST/connectivity algorithm
+(Chapter~6) over a compressed coordinate space, with the cut/boundary algebra
+of Chapter~31 supplying the correctness. The same incidence-sketch idea
+extends (Ahn--Guha--McGregor) to spanners, sparsifiers, and even spectral
+sparsifiers in turnstile streams.
+\end{connectionbox}
+
+\section{Approximate triangle counting}
+\label{ch40:triangles}
+
+Let $T$ be the number of triangles in $\Gph$. Triangle counts measure
+clustering --- the tendency of friends-of-friends to be friends --- and feed
+network-science statistics like the global clustering coefficient. Computing
+$T$ exactly in small space is impossible (Section~\ref{ch40:lower}); we
+estimate it.
+
+\subsection{A clean sampling estimator (one pass)}
+
+\begin{intuitionbox}
+A triangle is three edges $\set{a,b},\set{b,c},\set{a,c}$. Pick one edge at
+random as the ``base'', then a third vertex at random, and \emph{watch} the
+rest of the stream to see whether the two edges that would complete the
+triangle on that vertex actually show up. If we structure the random choice so
+that each triangle has a known probability of being ``set up'' and then
+``confirmed'', the indicator of confirmation is an unbiased $1/p$-scaled
+estimator of $T$.
+\end{intuitionbox}
+
+A concrete one-pass estimator (Buriol et al.): sample a uniformly random
+position $i$ in the stream and a uniformly random vertex $w\notin$ the edge
+$e_i=\set{u,v}$ at that position. Then scan the \emph{rest} of the stream; let
+the indicator $X=1$ if both edges $\set{u,w}$ and $\set{v,w}$ appear after
+position $i$. Each triangle $\set{u,v,w}$ is detected exactly when we sampled
+its earliest edge as $e_i$ and picked the opposite vertex $w$, an event of
+probability $\tfrac{1}{m}\cdot\tfrac{1}{n-2}$. Hence
+\[
+\mathbb{E}[X] \;=\; \frac{T}{m\,(n-2)},
+\qquad\text{so}\qquad
+\widehat T \;=\; m\,(n-2)\,X
+\]
+is unbiased: $\mathbb{E}[\widehat T]=T$. Averaging $s$ independent copies
+and applying Chebyshev drives the variance down.
+
+\begin{algorithm}[H]
+\caption{\textsc{TriangleEstimate} (one independent copy)}
+\label{ch40:alg-tri}
+\DontPrintSemicolon
+\KwIn{insertion stream $e_1,\dots,e_m$; $n,m$}
+\KwOut{unbiased estimate $\widehat T$ of triangle count}
+pick uniform $i\in\set{1,\dots,m}$ via reservoir sampling\;
+\tcp{when token $e_i=\set{u,v}$ is the current reservoir choice:}
+pick uniform $w\in V\setminus\set{u,v}$; set $a\gets b\gets \text{false}$\;
+\ForEach{token $e_j$ with $j>i$}{
+  \lIf{$e_j=\set{u,w}$}{$a\gets\text{true}$}
+  \lIf{$e_j=\set{v,w}$}{$b\gets\text{true}$}
+}
+$X\gets [\,a \wedge b\,]$\;
+\Return $\widehat T \gets m\,(n-2)\,X$\;
+\end{algorithm}
+
+\begin{whybox}
+\textbf{Unbiasedness.} Fix a triangle $\tau=\set{u,v,w}$ and let $e_i$ be its
+first edge in stream order, say $\set{u,v}$. The copy ``catches'' $\tau$ iff
+the reservoir landed on that very position \emph{and} the random third vertex
+equals the remaining vertex $w$. These choices are uniform and independent, so
+$\Pr[\text{catch }\tau]=\frac1m\cdot\frac1{n-2}$, and given a catch both
+completing edges appear later (by definition of ``first edge''), so $X=1$.
+Catches of distinct triangles are disjoint events for a single copy, hence
+$\mathbb{E}[X]=\sum_\tau \frac1{m(n-2)}=\frac{T}{m(n-2)}$ and
+$\mathbb{E}[\widehat T]=T$.
+\end{whybox}
+
+\begin{complexitybox}
+One copy uses $\Oh(1)$ words (reservoir index, the chosen edge, $w$, two
+bits). Reducing variance to get a $(1\pm\eps)$ estimate with confidence
+$1-\delta$ requires
+$s=\Oh\!\bigl(\tfrac{1}{\eps^2}\cdot\tfrac{m\,\Delta}{T}\cdot\log\tfrac1\delta\bigr)$
+parallel copies, where $\Delta$ bounds how many triangles share an edge ---
+intuitively, the harder the instance hides its triangles, the more samples you
+must spend. With $T$ large relative to $m$ this is genuinely sublinear; with
+$T$ tiny it degrades, which the lower bound below shows is unavoidable.
+\end{complexitybox}
+
+\begin{labbox}
+The running graph has exactly two triangles: $\set{1,2,4}$ and $\set{6,7,8}$,
+so $T=2$, with $m=10$, $n=8$, giving $\widehat T=10\cdot 6\cdot X=60X$ per
+copy. The triangle $\set{6,7,8}$ has edges at positions $3\,(6,7)$, $9\,(7,8)$,
+$10\,(6,8)$; its first edge is $(6,7)$ at position $3$. A copy catches it iff
+the reservoir picks $i=3$ \emph{and} $w=8$: probability
+$\frac1{10}\cdot\frac16=\frac1{60}$, contributing $60\cdot\frac1{60}=1$ to
+$\mathbb{E}[\widehat T]$. The triangle $\set{1,2,4}$ contributes another $1$.
+Sum: $\mathbb{E}[\widehat T]=2=T$. A single copy almost always reports $0$ and
+occasionally $60$; only the \emph{average} of many copies is informative ---
+the working lesson of high-variance estimators.
+\end{labbox}
+
+\begin{applicationbox}
+Triangle and clustering-coefficient counts on streamed graphs drive spam and
+bot detection (fraud rings form unusually dense triangle clusters),
+recommendation (``triadic closure'' predicts new links), and bioinformatics
+(motif counts in protein interaction networks). Real systems --- think a
+social platform ingesting billions of edge events per day --- cannot store the
+graph, so unbiased streaming estimators like
+Algorithm~\ref{ch40:alg-tri} (and its sketch-based turnstile cousins) are how
+these statistics get computed at all.
+\end{applicationbox}
+
+\section{What small space cannot do}
+\label{ch40:lower}
+
+The positive results above are tightly bounded by impossibility theorems.
+The standard tool is \emph{communication complexity}: split the stream between
+two players, Alice (the prefix) and Bob (the suffix); a streaming algorithm
+using $s$ bits induces a protocol where Alice sends Bob her $s$-bit memory
+state, so any $s$-bit one-pass algorithm yields an $s$-bit one-way protocol.
+Lower-bounding the communication then lower-bounds $s$.
+
+\begin{theorem}[Connectivity needs $\Om(n)$ space]\label{ch40:thm-lb-conn}
+Any (even randomized, constant-error) one-pass streaming algorithm that
+decides connectivity uses $\Om(n)$ bits.
+\end{theorem}
+
+\begin{proof}[Proof idea]
+Reduce from one-way \textsc{Index}. Alice holds a string $y\in\set{0,1}^N$
+with $N=\Th(n)$, Bob holds an index $k$, and Bob must output $y_k$;
+one-way communication forces $\Om(N)$ bits. Encode $y$ as the presence/absence
+of $N$ candidate edges incident to a gadget so that the final graph is
+connected iff $y_k=1$. Alice streams her edges and passes the memory state;
+Bob streams the query edges; the connectivity answer reveals $y_k$. Since the
+protocol transmits exactly the memory state, $s=\Om(N)=\Om(n)$.
+\end{proof}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,
+  vtx/.style={circle,draw=nodeblue,fill=blue!6,minimum size=6mm,inner sep=0pt}]
+\node[draw=sourceblue,thick,rounded corners,minimum width=3.2cm,
+  minimum height=2.6cm,label=above:{\scriptsize Alice (prefix of $\sigma$)}]
+  (A) at (0,0) {};
+\node[draw=targetgreen,thick,rounded corners,minimum width=2.6cm,
+  minimum height=2.6cm,label=above:{\scriptsize Bob (suffix of $\sigma$)}]
+  (B) at (5.4,0) {};
+\draw[-{Stealth[length=2.5mm]},thick]
+  ($(A.east)+(0,0.2)$) -- node[above,font=\scriptsize]{$s$-bit state}
+  ($(B.west)+(0,0.2)$);
+\node[draw=none,fill=none,font=\scriptsize] at (2.7,-1.0)
+  {connected? $\;\Leftrightarrow\; y_k=1$};
+\end{tikzpicture}
+\caption{The communication reduction behind
+Theorem~\ref{ch40:thm-lb-conn}. Alice encodes her bitstring $y$ as the prefix
+of the edge stream and forwards only the algorithm's $s$-bit memory state; Bob
+appends query edges for index $k$ and reads $y_k$ off the connectivity answer.
+A protocol this cheap forces $s=\Om(N)=\Om(n)$.}
+\label{ch40:fig-lb}
+\end{figure}
+
+So semi-streaming connectivity ($\Oh(n\log n)$) is optimal up to the
+logarithmic factor. Distances are dramatically worse:
+
+\begin{theorem}[No exact distances, and stretch needs space]\label{ch40:thm-lb-dist}
+Any one-pass algorithm that, for a designated pair $(s,t)$, distinguishes
+$\dist(s,t)\le d$ from $\dist(s,t)>d$ exactly requires $\Om(n^2)$ bits in the
+worst case --- essentially the whole graph. More generally, a one-pass
+$(2k-1)$-spanner-quality stretch bound forces $\Om(n^{1+1/k})$ space, matching
+Algorithm~\ref{ch40:alg-spanner} up to logs.
+\end{theorem}
+
+\begin{intuitionbox}
+The spanner lower bound is the Moore bound (Lemma~\ref{ch40:lem-moore}) read
+backwards. There exist graphs of girth $> 2k$ with $\Th(n^{1+1/k})$ edges in
+which \emph{every} edge is essential: delete any one and some pair's distance
+jumps. To certify stretch $< 2k+1$ you must remember $\Om(n^{1+1/k})$ bits,
+because forgetting any edge of such a graph is detectable. Stretch and space
+trade off along exactly the same curve the greedy spanner achieves --- the
+algorithm is optimal, not merely good.
+\end{intuitionbox}
+
+\begin{theorem}[Triangle detection needs $\Om(n^2)$ space]\label{ch40:thm-lb-tri}
+Distinguishing $T=0$ from $T\ge1$ in one pass requires $\Om(n^2)$ bits.
+Consequently any multiplicative $(1\pm\eps)$ approximation of $T$ needs space
+growing as $T$ shrinks; no algorithm in $o(n^2)$ space can certify
+triangle-freeness.
+\end{theorem}
+
+\begin{proof}[Proof idea]
+Reduce from two-party \textsc{Disjointness}: Alice's set and Bob's set
+intersect iff a specific triangle exists in a bipartite-plus-query gadget.
+\textsc{Disjointness} needs $\Om(N)=\Om(n^2)$ communication even for
+randomized protocols, and again the protocol cost equals the memory state, so
+$s=\Om(n^2)$.
+\end{proof}
+
+\begin{trapbox}
+A multiplicative approximation of $T$ \emph{cannot} tell $T=0$ from $T=1$ ---
+$(1\pm\eps)\cdot0=0$, yet you would need to detect the single triangle, which
+Theorem~\ref{ch40:thm-lb-tri} forbids in small space. This is why
+Algorithm~\ref{ch40:alg-tri}'s sample complexity blows up as $T\to0$: the
+estimator is not broken, the problem is provably hard there. Always read an
+approximation guarantee together with what it silently excludes.
+\end{trapbox}
+
+\subsection{The tradeoffs, laid bare}
+
+There is no free lunch; there are only well-mapped exchanges. Pin them down:
+
+\begin{center}
+\begin{tabular}{lllll}
+\toprule
+problem & model & space & passes & answer quality \\
+\midrule
+connectivity & insertion & $\Oh(n\log n)$ & 1 & exact \\
+connectivity & turnstile & $\Oh(n\log^3 n)$ & 1 & exact whp \\
+bipartiteness & insertion & $\Oh(n\log n)$ & 1 & exact \\
+$(2k{-}1)$-spanner & insertion & $\Oh(n^{1+1/k}\log n)$ & 1 & stretch $2k{-}1$ \\
+exact distance & either & $\Om(n^2)$ & 1 & exact (impossible small) \\
+triangle count & insertion & $\widetilde\Oh\!\big(\tfrac{m\Delta}{\eps^2 T}\big)$ & 1 & $(1{\pm}\eps)$ whp \\
+triangle $T\!>\!0$? & either & $\Om(n^2)$ & 1 & exact (impossible small) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Three axes are in tension, and you can only bend one by spending another:
+
+\begin{itemize}
+\item \textbf{Space vs.\ accuracy.} Spanners trade more space ($n^{1+1/k}$) for
+less stretch ($2k-1$); triangle estimators trade more samples for smaller
+$\eps$. The frontier curves are matched by lower bounds --- you cannot cheat
+them.
+\item \textbf{Space vs.\ passes.} Many problems collapse to $\Oh(n)$ space if
+you allow $\Oh(\log n)$ passes (e.g.\ exact shortest paths via repeated
+Bellman--Ford-style sweeps). One pass is the strict regime; each extra pass is
+a real-world cost (re-reading petabytes) but a real algorithmic lever.
+\item \textbf{Insertion vs.\ turnstile.} Deletions force linearity, which costs
+extra log factors and forces randomization (the sketches fail with small
+probability). Insertion-only lets you be greedy and deterministic. If your
+application never deletes, do not pay the sketching tax.
+\end{itemize}
+
+\begin{aestheticbox}
+The recurring shape of every result here is the same: \emph{a graph's useful
+structure is near-linear-size and linearly compressible}, while its
+\emph{exact} fine structure (precise distances, the presence of one specific
+triangle) is irreducibly quadratic. Semi-streaming is the science of living on
+the right side of that divide --- keeping one number per vertex, exploiting cut
+and boundary algebra, and accepting approximation exactly where the lower
+bounds say you must. It is the same compressibility that powers spectral
+sparsifiers and Laplacian solvers, viewed through the keyhole of a single
+left-to-right scan.
+\end{aestheticbox}
+
+\section{Exercises}
+\label{ch40:exercises}
+
+\begin{exercise}[Implement: components and a witness]
+Implement Algorithm~\ref{ch40:alg-forest} with union by rank and path
+compression. Extend it so that, on a disconnected input, it outputs an actual
+vertex pair $(u,v)$ in different components as a certificate of
+disconnection. Argue your extension stays within $\Oh(n\log n)$ bits.
+\end{exercise}
+
+\begin{exercise}[Prove: bipartiteness parity bits]
+Prove that the parity-bit augmentation in
+Section~\ref{ch40:connectivity} correctly reports non-bipartiteness exactly
+when an odd cycle exists. Show that maintaining $\phi(v)$ under union--find
+merges (flipping a whole subtree's parities when roots merge with conflicting
+orientation) is correct, and bound the total parity-update work.
+\end{exercise}
+
+\begin{exercise}[Break: greedy forest under deletions]
+Exhibit a turnstile stream on $4$ vertices on which
+Algorithm~\ref{ch40:alg-forest}, naively re-run with deletions removing edges
+from $F$, reports the wrong number of components. Explain precisely which step
+of the correctness proof in Section~\ref{ch40:connectivity} fails, and why
+linearity in Section~\ref{ch40:sketching} repairs it.
+\end{exercise}
+
+\begin{exercise}[Spanner stretch is tight]
+For $t=3$ ($k=2$), construct a graph and a stream order on which
+Algorithm~\ref{ch40:alg-spanner} produces an $H$ where some original edge
+$\set{u,v}$ has $\dist_H(u,v)=3$ exactly. Conclude the stretch bound $2k-1$ is
+achieved, not merely upper-bounded.
+\end{exercise}
+
+\begin{exercise}[Moore bound, the details]
+Fill in the cleaning step of Lemma~\ref{ch40:lem-moore}: prove that any graph
+with average degree $d$ contains a subgraph with minimum degree $\ge d/2$
+(repeatedly delete vertices of degree $< d/2$ and bound how many edges leave).
+Then complete the BFS-ball counting to get $\abs{E}=\Oh(n^{1+1/k})$.
+\end{exercise}
+
+\begin{exercise}[$1$-sparse recovery]
+A vector $x\in\R^N$ has at most one nonzero coordinate. You are told only
+$P=\sum_i x_i$ and $Q=\sum_i i\,x_i$. Show how to recover the index and value
+of the nonzero coordinate, and explain what goes wrong if the support has size
+two. Then describe how a random fingerprint slot detects (whp) a support of
+size $\ge 2$ so the sampler can reject.
+\end{exercise}
+
+\begin{exercise}[Why fresh sketches per round]
+In Algorithm~\ref{ch40:alg-agm}, suppose you reuse a single $L_0$ sketch
+across all $R$ Bor\r{u}vka rounds. Construct (or carefully argue) a scenario
+where reuse causes a correlated failure: the round-$r$ query set
+$\set{S\in\mathcal{C}}$ depends on the sketch's own randomness from earlier
+rounds, breaking the uniformity guarantee. How many independent sketches are
+truly necessary, and why $\Th(\log n)$?
+\end{exercise}
+
+\begin{exercise}[Triangle estimator variance]
+For Algorithm~\ref{ch40:alg-tri}, compute $\mathrm{Var}[\widehat T]$ for a
+single copy in terms of $m,n,T$, and the maximum number $\Delta$ of triangles
+sharing an edge. Deduce the number of parallel copies needed for a
+$(1\pm\eps)$ estimate with probability $1-\delta$, and verify it matches the
+$\widetilde\Oh(m\Delta/(\eps^2 T))$ figure quoted in
+Section~\ref{ch40:triangles}.
+\end{exercise}
+
+\begin{exercise}[Lower bound from \textsc{Index}]
+Write out the reduction behind Theorem~\ref{ch40:thm-lb-conn} in full: define
+the edge gadget encoding $y\in\set{0,1}^N$, specify Bob's query edges for
+index $k$, and prove the final graph is connected iff $y_k=1$. State exactly
+where the one-way communication lower bound of $\Om(N)$ enters.
+\end{exercise}
+
+\begin{exercise}[Passes vs.\ space]
+Show that with $\Oh(\log n)$ passes and $\Oh(n)$ space you can compute exact
+single-source BFS distances in an unweighted streamed graph (one BFS layer per
+pass). Contrast with the one-pass $\Om(n^2)$ bound of
+Theorem~\ref{ch40:thm-lb-dist} and explain, in your own words, what extra
+passes buy.
+\end{exercise}
+
+\begin{exercise}[Extend: connectivity sketch to MST weight]
+Sketch (informally) how to extend the AGM connectivity sketch of
+Algorithm~\ref{ch40:alg-agm} to estimate the weight of a minimum spanning
+tree of a turnstile-streamed weighted graph, using the
+``count components at each weight threshold'' telescoping identity
+$w(\mathrm{MST}) = \sum_{i} \bigl(\,\text{\#components using only edges of
+weight} \le i\,\bigr) - (\,\dots\,)$. Which pieces of this chapter does it
+reuse?
+\end{exercise}

@@ -1,0 +1,927 @@
+\chapter{Dynamic Graph Algorithms}
+
+Every algorithm we have built so far assumes the graph holds still. You hand the
+solver a fixed $\Gph=(V,E)$, it computes the connected components, the minimum
+spanning tree, the shortest paths -- and then it is done. But real graphs rarely
+hold still. A social network gains and loses friendships; a road map closes a
+bridge for repair; a circuit simulator toggles wires; a chess-like search adds
+and removes pieces on a board encoded as a graph. Recomputing from scratch after
+each change is the obvious thing to do, and for a single static query it is
+exactly right. The moment changes come in a long stream, recomputation is a
+disaster: an $\Oh(m)$ rebuild after each of $q$ updates costs $\Oh(qm)$, and for
+$q\approx m$ that is quadratic.
+
+\emph{Dynamic graph algorithms} ask the sharper question. Given a graph that
+changes by small local edits -- insert an edge, delete an edge, sometimes change
+a weight -- maintain some property (connectivity, a spanning forest, the MST
+weight, the number of components, reachability, shortest-path distances) so that
+each \textbf{update} and each \textbf{query} is fast, ideally polylogarithmic.
+The art is to store just enough auxiliary structure that a local change touches
+only a local, provably small part of it.
+
+This chapter develops the core of the field. We fix vocabulary
+(incremental, decremental, fully dynamic; amortized versus worst-case), then
+build the two pillars that every practitioner should own: Euler-tour trees for
+connectivity in a \emph{forest}, and the Holm--de~Lichtenberg--Thorup
+(\textsc{HdLT}) logarithmic-level structure that promotes forest connectivity to
+\emph{fully dynamic} connectivity on general graphs in $\Oh(\log^2 n)$ amortized
+time. We extend the same machinery to the dynamic minimum spanning tree. We trace
+a small graph through every structure by hand. Finally we confront the wall:
+conditional lower bounds, organized around the Online Matrix--Vector (OMv)
+conjecture, that explain why so many dynamic problems are stuck at roughly
+$\sqrt{n}$ or polylog and not better.
+
+\chapterline
+
+\section{A taxonomy of ``dynamic''}
+\label{ch39:taxonomy}
+
+\begin{focusbox}
+Three update models, in increasing generality.
+\begin{itemize}
+  \item \textbf{Incremental}: edges are only \emph{inserted} (the graph grows).
+  \item \textbf{Decremental}: edges are only \emph{deleted} (the graph shrinks).
+  \item \textbf{Fully dynamic}: both insertions and deletions, interleaved
+        arbitrarily.
+\end{itemize}
+Two cost models, with different promises.
+\begin{itemize}
+  \item \textbf{Amortized}: the bound holds \emph{on average} over a sequence of
+        operations; an individual operation may be slow as long as the running
+        total is controlled.
+  \item \textbf{Worst-case}: the bound holds for \emph{every single} operation,
+        no exceptions.
+\end{itemize}
+\end{focusbox}
+
+The split matters. Incremental connectivity is essentially free: a union-find
+(disjoint-set) forest answers ``are $u,v$ connected?'' under edge insertions in
+$\Oh(\alpha(n))$ amortized per operation, where $\alpha$ is the inverse Ackermann
+function (Chapter~6). Deletions are the hard direction, because union-find has no
+un-union; once two components merge, splitting them back apart on an edge deletion
+is exactly the operation the structure cannot do. Fully dynamic is hardest of all,
+and most of the cleverness in this chapter exists to survive deletions.
+
+\begin{intuitionbox}
+Why are deletions so much harder than insertions? An insertion can only
+\emph{merge} information -- two components become one, a smaller MST weight
+appears -- and merging is monotone and easy to memoize. A deletion can
+\emph{shatter} information: cutting one tree edge may or may not disconnect the
+graph, depending on whether some \emph{other} edge, currently sitting idle,
+happens to reconnect the two halves. To answer that you must, in effect, search
+for a replacement edge, and doing so without scanning the whole graph is the
+entire game.
+\end{intuitionbox}
+
+\begin{historybox}
+The systematic study of dynamic graphs took off in the 1980s with Frederickson's
+\emph{topology trees} (1985), which gave $\Oh(\sqrt{m})$ per operation for
+dynamic connectivity and MST. Eppstein, Galil, Italiano and Nissenzweig's
+\emph{sparsification} (1992) turned many $\Oh(\sqrt{m})$ bounds into
+$\Oh(\sqrt{n})$. The polylogarithmic era opened with Henzinger and King (1995),
+who used randomization and Euler-tour trees to reach $\Oh(\log^3 n)$ expected
+amortized, and culminated in Holm, de~Lichtenberg and Thorup (1998/2001), whose
+deterministic $\Oh(\log^2 n)$ amortized structure we build below. Worst-case
+polylog connectivity -- Kapron, King and Mountjoy (2013), then Wulff-Nilsen and
+others -- came much later and is genuinely harder.
+\end{historybox}
+
+\section{Warm-up: incremental connectivity and the limits of union-find}
+\label{ch39:incremental}
+
+Start where it is easy. We maintain connected components under insertions only.
+
+\begin{algorithm}[H]
+\caption{Incremental connectivity via union-find}
+\label{ch39:alg-unionfind}
+\SetKwFunction{Find}{Find}\SetKwFunction{Union}{Union}\SetKwFunction{Conn}{Connected}
+\SetKwProg{Fn}{Function}{:}{}
+\Fn{\Union{$u,v$}}{
+  $r_u \gets \Find{u}$; \quad $r_v \gets \Find{v}$\;
+  \lIf{$r_u = r_v$}{\Return}
+  attach the smaller-rank root under the larger (union by rank)\;
+}
+\Fn{\Conn{$u,v$}}{
+  \Return $\Find{u} = \Find{v}$\;
+}
+\Fn{\Find{$x$}}{
+  \If{$\mathrm{par}[x]\neq x$}{
+    $\mathrm{par}[x]\gets\Find{$\mathrm{par}[x]$}$ \tcp*[r]{path compression}
+  }
+  \Return $\mathrm{par}[x]$\;
+}
+\end{algorithm}
+
+With union by rank and path compression, any sequence of $m$ operations runs in
+$\Oh(m\,\alpha(n))$ total, so $\Oh(\alpha(n))$ amortized each. That is effectively
+constant. Done -- for insertions.
+
+\begin{trapbox}
+The temptation is to ``support deletion'' by storing a \texttt{rank} and undoing
+the last union. That works only for a stack-like \emph{rollback} pattern
+(union-find with rollback: no path compression, union by rank, undo in
+LIFO order, $\Oh(\log n)$ per op). It does \emph{not} give fully dynamic
+deletion of an \emph{arbitrary} earlier edge, because the component that edge
+helped form may now be held together by many other edges, and removing the wrong
+internal pointer corrupts the forest. Rollback union-find is the right tool for
+\emph{offline} dynamic connectivity (segment-tree-on-time, below), not for the
+online fully dynamic problem.
+\end{trapbox}
+
+\begin{connectionbox}
+Rollback union-find plus a ``segment tree over the timeline'' solves
+\emph{offline} fully dynamic connectivity: each edge is alive on a time interval
+$[t_\text{in},t_\text{out})$; place it on the $\Oh(\log q)$ canonical nodes of a
+segment tree over time, DFS the segment tree performing unions on entry and
+rollbacks on exit, and answer each query at its leaf. Total
+$\Oh((m+q)\log q\,\log n)$. This is the dynamic-connectivity analogue of the
+offline trick in Chapter~21 (Euler tours) and is worth knowing because online
+methods are strictly harder. Online is what the rest of this chapter is about.
+\end{connectionbox}
+
+\section{Euler-tour trees: connectivity in a forest}
+\label{ch39:ett}
+
+Before we can do general graphs, we need to do \emph{forests} dynamically: support
+\textsc{Link}, \textsc{Cut}, and connectivity queries on a forest where the answer
+to a query never has to search for a replacement edge (there are no spare edges in
+a forest). Chapter~22's link-cut trees already do this, but for connectivity we
+prefer a structure that also makes \emph{subtree} aggregates and ``pick any edge
+incident to this tree'' easy: the \emph{Euler-tour tree} (ETT) of Henzinger and
+King, and Tarjan.
+
+\begin{intuitionbox}
+Recall the Euler tour of a tree (Chapter~21): walk the tree depth-first and write
+down each vertex every time you touch it. A tree with $n$ vertices has $n-1$
+edges; the closed Euler tour visits $2(n-1)$ edges and lists $2n-1$ vertex
+occurrences. The key move is to forget the tree shape and keep only this
+\emph{sequence}. Then:
+\begin{itemize}
+  \item ``Are $u$ and $v$ in the same tree?'' $\Leftrightarrow$ ``do their
+        occurrences lie in the same sequence?''
+  \item \textsc{Link} and \textsc{Cut} become \emph{splits and concatenations} of
+        sequences.
+\end{itemize}
+Store each sequence in a balanced BST keyed by position (a \emph{balanced BST as a
+sequence}, i.e. an order-statistic / implicit-key treap or splay tree), and
+splits and concatenations are $\Oh(\log n)$.
+\end{intuitionbox}
+
+\subsection*{The Euler tour as a sequence}
+
+Represent the Euler tour as a list of \emph{half-edges} and vertex visits. A clean
+encoding: for a tree, store the sequence of directed edges of the tour, plus one
+self-loop occurrence $\langle v,v\rangle$ per vertex so isolated vertices and
+endpoints have an anchor. Each undirected tree edge $\{u,v\}$ appears as two
+directed occurrences, $\langle u,v\rangle$ and $\langle v,u\rangle$. We keep, for
+each such occurrence, a pointer to its node in the balanced BST.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[every node/.style={circle,draw=nodeblue,thick,minimum size=7mm,
+   inner sep=0pt,font=\small}, level distance=11mm, sibling distance=15mm]
+\node (a) {a}
+  child {node (b) {b}}
+  child {node (c) {c}
+    child {node (d) {d}}};
+\begin{scope}[xshift=5.6cm, yshift=-1.0cm]
+  \node[draw=none,font=\small\bfseries] at (0,1.4) {Euler tour (rooted at $a$)};
+  \node[draw=none,font=\ttfamily\small] at (0,0.6)
+    {a\,b\,a\,c\,d\,c\,a};
+  \node[draw=none,font=\small] at (0,-0.1)
+    {as occurrences: $a_0\,b\,a_1\,c_0\,d\,c_1\,a_2$};
+  \node[draw=none,font=\small,align=left] at (0,-1.1)
+    {edge $\{a,c\}$ $\to$ occurrences\\ $\langle a,c\rangle$ (enter $c$),
+     $\langle c,a\rangle$ (leave $c$)};
+\end{scope}
+\end{tikzpicture}
+\caption{A 4-node tree and one Euler tour. The tour string has $2n-1=7$ vertex
+occurrences. Connectivity of $u,v$ is decided by whether their occurrences sit in
+the same balanced BST.}
+\label{ch39:fig-ett}
+\end{figure}
+
+\subsection*{Link and Cut as sequence surgery}
+
+\begin{whybox}
+\textbf{Reroot.} It is convenient to be able to make any vertex $u$ the start of
+its tour. If the tour reads $S = X\,u\,Y$ where the marked $u$ is some occurrence
+of $u$, then the rerooted tour is $u\,Y\,X\,u$. So rerooting at $u$ is: split the
+sequence at $u$, swap the two halves, and reattach an occurrence of $u$ at the
+end. One split, one concatenate.
+
+\textbf{Link$(u,v)$} (join two different trees by edge $\{u,v\}$). Reroot $u$'s
+tour at $u$ and $v$'s tour at $v$. Now $u$'s tour starts with $u$ and $v$'s starts
+with $v$. The merged tour is
+\[
+  \underbrace{u\,\cdots}_{\text{tour}(u)}\; \langle u,v\rangle \;
+  \underbrace{v\,\cdots}_{\text{tour}(v)}\; \langle v,u\rangle \; .
+\]
+Concatenate tour$(u)$, the new occurrence $\langle u,v\rangle$, tour$(v)$, the new
+occurrence $\langle v,u\rangle$. A handful of splits/concatenations.
+
+\textbf{Cut$(\{u,v\})$.} The edge contributes occurrences $\langle u,v\rangle$ and
+$\langle v,u\rangle$; between them sits exactly the Euler tour of $v$'s subtree.
+Splitting the sequence just before $\langle u,v\rangle$ and just after
+$\langle v,u\rangle$ isolates that subtour as one piece; concatenating the
+outside two pieces removes the edge. Two splits, one concatenate.
+\end{whybox}
+
+\begin{algorithm}[H]
+\caption{Euler-tour tree operations (balanced-BST-as-sequence)}
+\label{ch39:alg-ett}
+\SetKwFunction{Reroot}{Reroot}\SetKwFunction{Link}{Link}\SetKwFunction{Cut}{Cut}
+\SetKwFunction{Conn}{Connected}\SetKwFunction{Root}{TourRoot}
+\SetKwFunction{Split}{Split}\SetKwFunction{Cat}{Concat}
+\SetKwProg{Fn}{Function}{:}{}
+\Fn{\Reroot{$u$}}{
+  let $p$ be the BST node of any occurrence of $u$\;
+  $(A,B)\gets \Split$ the sequence just before $p$ \tcp*[r]{$A=X,\;B=u\,Y$}
+  \Return $\Cat(B,\,A,\,\text{new occ. }u)$\;
+}
+\Fn{\Link{$u,v$}}{
+  $T_u\gets\Reroot{u}$; \quad $T_v\gets\Reroot{v}$\;
+  \Return $\Cat(T_u,\,\langle u,v\rangle,\,T_v,\,\langle v,u\rangle)$\;
+}
+\Fn{\Cut{$u,v$}}{
+  locate occurrences $\langle u,v\rangle$ and $\langle v,u\rangle$\;
+  split out the contiguous block from $\langle u,v\rangle$ to $\langle v,u\rangle$ inclusive\;
+  concatenate the two outside blocks; discard the two edge occurrences\;
+}
+\Fn{\Conn{$u,v$}}{
+  \Return $\Root{u} = \Root{v}$ \tcp*[r]{root of the BST containing an occurrence}
+}
+\end{algorithm}
+
+\begin{complexitybox}
+Each ETT operation does $\Oh(1)$ splits/concatenations on balanced sequences of
+length $\Oh(n)$, hence $\Oh(\log n)$ time (worst-case with a treap/red-black
+sequence; amortized with splay trees). Space is $\Oh(n)$: there are $2n-1$
+occurrences per tree, summed to $\Oh(n)$ over the forest. \textsc{Connected} is a
+``find the root of my BST'' query, $\Oh(\log n)$.
+\end{complexitybox}
+
+\begin{labbox}
+Trace \textsc{Link}$(b,d)$ on Figure~\ref{ch39:fig-ett} as if $b$ and $d$ were in
+\emph{separate} trees (pretend the $c$--$d$ side is its own tree containing $d$).
+Reroot tour$(b)=b$ at $b$: still $b$. Reroot the tour $c\,d\,c$ at $d$: it becomes
+$d\,c\,d$. Then the merged tour is
+$b\,\langle b,d\rangle\,d\,c\,d\,\langle d,b\rangle$. Write out the BST node
+sequence and confirm $\textsc{Connected}(b,c)$ now returns true while it was false
+before. Doing this once cements why connectivity is just ``same BST.''
+\end{labbox}
+
+\begin{aestheticbox}
+ETT also maintains \emph{subtree} aggregates trivially, because a subtree is a
+contiguous range of the tour (the block between $\langle u,v\rangle$ and
+$\langle v,u\rangle$). Augment the balanced BST with subtree sums and you get
+dynamic subtree-sum on a forest for free. What ETT does \emph{not} give you, and
+link-cut trees do, are \emph{root-to-node path} aggregates -- a path is not a
+contiguous range of an Euler tour. Pick ETT for subtree/connectivity, LCT for
+path. This is the cleanest way to remember which dynamic-tree structure to reach
+for.
+\end{aestheticbox}
+
+\section{Fully dynamic connectivity: the HdLT logarithmic levels}
+\label{ch39:hdlt}
+
+Now the centerpiece. We want fully dynamic connectivity on a \emph{general} graph:
+insert edge, delete edge, query ``connected?'' We maintain a spanning forest $F$
+of the current graph. An insertion is easy. The hard case is deleting a
+\emph{tree} edge of $F$: we must decide whether some non-tree edge can replace it,
+and if so install that replacement, all without scanning everything.
+
+\begin{intuitionbox}
+Keep a spanning forest $F$ inside the graph $G$. Non-tree edges are
+``\emph{spares}'': they connect two vertices already connected through $F$.
+\begin{itemize}
+  \item \textbf{Insert $\{u,v\}$}: if $u,v$ already connected in $F$, store
+        $\{u,v\}$ as a spare; else \textsc{Link} it into $F$ as a tree edge.
+  \item \textbf{Query}: connectivity in $F$ (an ETT query).
+  \item \textbf{Delete a spare}: just remove it.
+  \item \textbf{Delete a tree edge $\{u,v\}$}: \textsc{Cut} it, splitting $F$'s
+        tree into parts $T_u\ni u$ and $T_v\ni v$. Search for a spare edge with
+        one endpoint in $T_u$ and the other in $T_v$. If found, promote it to a
+        tree edge (\textsc{Link}); if none exists, the deletion genuinely
+        disconnected the graph.
+\end{itemize}
+Everything hinges on finding that replacement spare cheaply. A naive search scans
+all spares incident to the smaller side, which can be $\Th(m)$. The HdLT idea is a
+charging scheme that guarantees each spare is scanned a bounded number of times
+over its whole life.
+\end{intuitionbox}
+
+\subsection*{Levels and the smaller-half rule}
+
+\begin{focusbox}
+Assign every edge a \textbf{level} $\ell(e)\in\{0,1,\dots,L\}$ with
+$L=\floor{\log_2 n}$. Maintain, for each level $i$, a spanning forest $F_i$ of the
+subgraph $G_i$ formed by edges of level $\geq i$. Two invariants:
+\begin{enumerate}
+  \item[(I1)] $F_0\supseteq F_1\supseteq\cdots\supseteq F_L$; each $F_i$ is a
+        spanning forest of $G_i$, and $F:=F_0$ is a spanning forest of all of $G$.
+  \item[(I2)] Every connected component of the subgraph induced by level-$\geq i$
+        edges has at most $\floor{n/2^i}$ vertices.
+\end{enumerate}
+A tree edge of $F$ at level $i$ is also a tree edge of $F_i,F_{i-1},\dots,F_0$.
+We keep an ETT for each level's forest $F_i$, augmented so each tour node knows
+whether its vertex has any incident \emph{non-tree} edge at that level.
+\end{focusbox}
+
+Invariant (I2) is the engine (Figure~\ref{ch39:fig-levels}). Because a level-$i$
+component has $\leq n/2^i$ vertices and levels go up to $\log n$, an edge can be
+\emph{promoted} (its level raised) at most $\log n$ times before its component
+would be too small to hold it.
+Each promotion is what pays for the work of scanning it. That is the whole
+amortized argument in one sentence; the rest is bookkeeping.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small]
+  \foreach \i/\y in {0/0, 1/-1.1, 2/-2.2}{
+    \node[draw=none,anchor=east] at (-0.4,\y) {level \i:};
+    \draw[nodeblue,thick,rounded corners] (0,\y-0.32) rectangle (8,\y+0.32);
+  }
+  % level 0: one big component spanning the row
+  \draw[nodeblue!50,thick] (0.3,0) -- (7.7,0);
+  \node[draw=none,anchor=west] at (8.2,0) {comp.\ $\leq n$ vtcs};
+  % level 1: two components, each at most n/2
+  \draw[quotientorange,thick] (0.3,-1.1) -- (3.6,-1.1);
+  \draw[quotientorange,thick] (4.4,-1.1) -- (7.7,-1.1);
+  \node[draw=none,anchor=west] at (8.2,-1.1) {each $\leq n/2$};
+  % level 2: four components, each at most n/4
+  \foreach \x in {0.3,2.2,4.4,6.3}{
+    \draw[targetgreen,thick] (\x,-2.2) -- (\x+1.5,-2.2);}
+  \node[draw=none,anchor=west] at (8.2,-2.2) {each $\leq n/4$};
+\end{tikzpicture}
+\caption{The leveled forests $F_0\supseteq F_1\supseteq F_2\supseteq\cdots$ Higher
+levels keep fewer, lighter edges, so their connected components shrink by a factor
+of two per level (invariant (I2)). A promotion moves an edge up one band, and an
+edge can climb at most $\floor{\log_2 n}$ bands before its component would be too
+small to hold it -- the cap that makes the amortized argument go through.}
+\label{ch39:fig-levels}
+\end{figure}
+
+\begin{algorithm}[H]
+\caption{HdLT fully dynamic connectivity}
+\label{ch39:alg-hdlt}
+\SetKwFunction{Ins}{Insert}\SetKwFunction{Del}{Delete}\SetKwFunction{Conn}{Connected}
+\SetKwFunction{Replace}{Replace}\SetKwFunction{Link}{Link}\SetKwFunction{Cut}{Cut}
+\SetKwProg{Fn}{Function}{:}{}
+\Fn{\Conn{$u,v$}}{\Return $u,v$ in same tree of $F_0$ (ETT query at level $0$)\;}
+\Fn{\Ins{$u,v$}}{
+  $\ell(\{u,v\})\gets 0$\;
+  \lIf{\Conn{$u,v$}}{store $\{u,v\}$ as a non-tree edge at level $0$}
+  \lElse{add $\{u,v\}$ to $F_0$ as a tree edge (ETT \Link\ at level $0$)}
+}
+\Fn{\Del{$u,v$}}{
+  $i\gets \ell(\{u,v\})$\;
+  \uIf{$\{u,v\}$ is a non-tree edge}{remove it from the level-$i$ adjacency\;}
+  \Else{
+    remove $\{u,v\}$ from $F_i,F_{i-1},\dots,F_0$ (ETT \Cut\ at each level)\;
+    \Replace{$u,v,i$}\;
+  }
+}
+\Fn{\Replace{$u,v,i$}}{
+  \For{$j\gets i$ \textbf{\emph{downto}} $0$}{
+    let $T_u,T_v$ be the two pieces of the level-$j$ forest split by the cut\;
+    let $T$ be the \emph{smaller} of $T_u,T_v$ (fewer vertices, via ETT subtree size)\;
+    \ForEach{level-$j$ tree edge $e$ inside $T$}{
+      raise $\ell(e)$ to $j{+}1$; add $e$ to $F_{j+1}$ \tcp*[r]{promote tree edges}
+    }
+    \ForEach{level-$j$ non-tree edge $e=\{x,y\}$ with $x\in T$}{
+      \uIf{$y$ on the other side}{
+        add $e$ to $F_j,\dots,F_0$ as the replacement tree edge\;
+        \Return \tcp*[r]{reconnected}
+      }
+      \Else{raise $\ell(e)$ to $j{+}1$ \tcp*[r]{both endpoints in $T$: promote}}
+    }
+  }
+  \tcp{no replacement at any level: $u,v$ are now genuinely disconnected}
+}
+\end{algorithm}
+
+\subsection*{Why \textsc{Replace} is correct}
+
+\begin{whybox}
+When we cut a level-$i$ tree edge, we look for a replacement starting at the
+\emph{highest} level $i$ and descend. At level $j$ we have split the level-$j$
+forest into $T_u,T_v$. We scan from the smaller side $T$. Two things can happen to
+each scanned edge:
+\begin{itemize}
+  \item It is a non-tree edge crossing to the other side: it reconnects the two
+        pieces. Use it, at level $j$, and stop. Correct because any spare crossing
+        $T_u\!:\!T_v$ at this level restores connectivity, and a crossing edge of
+        the \emph{highest} possible level is safe to install without violating
+        (I1)/(I2) below it.
+  \item It is fully inside $T$ (a tree edge of $T$, or a non-tree edge with both
+        endpoints in $T$): we \emph{promote} it to level $j{+}1$. This is allowed
+        because $T$ is the smaller half, so after the cut $\abs{T}\leq
+        \floor{\tfrac12\abs{T_u\cup T_v}}\leq \floor{\tfrac12\floor{n/2^j}} =
+        \floor{n/2^{j+1}}$, which is exactly the size budget (I2) demands at level
+        $j{+}1$ (the last step is the integer identity
+        $\floor{\floor{x}/2}=\floor{x/2}$). Promotion never breaks (I2).
+\end{itemize}
+If level $j$ yields no crossing spare, every level-$j$ spare touching $T$ has been
+promoted, so none crosses; descend to $j{-}1$ and repeat on the coarser forest.
+If we exhaust level $0$ without a crossing edge, then no edge of the graph crosses
+$T_u\!:\!T_v$ at all -- the deletion truly disconnected the graph.
+\end{whybox}
+
+\begin{formalbox}
+\textbf{Theorem (HdLT).} Fully dynamic connectivity is maintainable in
+$\Oh(\log^2 n)$ amortized time per update and $\Oh(\log n /\log\log n)$ time per
+query, using $\Oh(m+n\log n)$ space.
+
+\textbf{Cost of a promotion.} Each edge starts at level $0$ and can be promoted at
+most $L=\Oh(\log n)$ times, by (I2). Charge the cost of \emph{scanning} an edge
+during \textsc{Replace} to a promotion: every edge we scan and keep is promoted
+one level (the only scanned edge we do \emph{not} promote is the single crossing
+replacement, which we charge to the deletion that caused it). So the total number
+of edge-scan events over the whole run is $\Oh(m\log n)$ scans, each costing an
+ETT update of $\Oh(\log n)$ to move the edge between levels. That is
+$\Oh(m\log^2 n)$ total promotion work, i.e. $\Oh(\log^2 n)$ amortized per
+operation. Insertions and the $L$-fold \textsc{Cut}/\textsc{Link} along the level
+forests add only $\Oh(\log^2 n)$ each. The query bound uses a slightly cleverer
+ETT root-marking; the simple version gives $\Oh(\log n)$.
+\end{formalbox}
+
+\begin{whybox}
+\textbf{Finding a vertex of $T$ that still has a level-$j$ non-tree edge.}
+We do not literally iterate all vertices of $T$ to find incident spares. Augment
+each level-$j$ ETT so every BST subtree records ``does my range contain an
+occurrence whose vertex has a level-$j$ non-tree edge?'' Then ``find any non-tree
+edge incident to $T$'' is a single $\Oh(\log n)$ descent into the BST of $T$. We
+pop edges from a per-vertex adjacency list one at a time, which is what lets us
+charge each examined edge to its promotion. This augmentation is the bridge
+between ``ETT supports subtree aggregates'' and ``HdLT finds replacement edges
+fast.''
+\end{whybox}
+
+\subsection*{Worked example}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[every node/.style={circle,draw=nodeblue,thick,minimum size=7mm,
+   inner sep=0pt,font=\small}, node distance=14mm]
+\node (a) {a}; \node (b) [right=of a] {b}; \node (c) [right=of b] {c};
+\node (d) [below=of a] {d}; \node (e) [below=of b] {e}; \node (f) [below=of c] {f};
+% tree edges (level 0, solid thick)
+\draw[very thick,nodeblue] (a)--(b); \draw[very thick,nodeblue] (b)--(c);
+\draw[very thick,nodeblue] (a)--(d); \draw[very thick,nodeblue] (b)--(e);
+\draw[very thick,nodeblue] (c)--(f);
+% spare edges (dashed)
+\draw[dashed,trapred,thick] (d)--(e); \draw[dashed,trapred,thick] (e)--(f);
+\node[draw=none,font=\small,trapred] at (1.7,-3.2) {dashed = non-tree (spare) edges};
+\node[draw=none,font=\small,nodeblue] at (1.7,-3.8) {thick blue = spanning forest $F_0$};
+\end{tikzpicture}
+\caption{A graph on $\{a,\dots,f\}$. Spanning forest $F_0$ is the five blue tree
+edges; $\{d,e\}$ and $\{e,f\}$ are spares (level $0$).}
+\label{ch39:fig-hdlt}
+\end{figure}
+
+\begin{labbox}
+Delete the tree edge $\{a,b\}$ in Figure~\ref{ch39:fig-hdlt}. It is a level-$0$
+tree edge, so \textsc{Cut} it; $F_0$ splits into $T_a=\{a,d\}$ and
+$T_b=\{b,c,e,f\}$. The smaller side is $T_a$ (2 vertices). Scan level-$0$ edges
+touching $T_a$:
+\begin{itemize}
+  \item tree edge $\{a,d\}$: inside $T_a$, promote it to level $1$;
+  \item spare $\{d,e\}$: endpoint $e\in T_b$ -- \emph{crossing}. Install it as the
+        replacement tree edge.
+\end{itemize}
+$F_0$ becomes $\{a,d\},\{d,e\},\{b,e\},\{b,c\},\{c,f\}$, one connected tree again:
+the deletion did \emph{not} disconnect the graph, and we found the replacement
+after touching just two edges from the smaller side. Now \emph{also} delete
+$\{d,e\}$ and $\{e,f\}$ and then $\{a,b\}$ again, and watch a deletion finally
+report a real disconnection. Tracing this by hand is the fastest way to internalize
+the smaller-half charging.
+\end{labbox}
+
+\begin{trapbox}
+Three places people get HdLT wrong. (1) Scanning the \emph{larger} half: the
+size-halving budget (I2) only holds for the smaller half; scan the wrong side and
+promotions can violate the level cap, destroying the amortized bound. (2)
+Forgetting to also promote the level-$j$ \emph{tree} edges of $T$, not just the
+spares -- if tree edges are left behind, $F_{j+1}$ stops being a spanning forest
+of $G_{j+1}$ and (I1) breaks. (3) Installing a replacement at the wrong level: the
+replacement edge must enter $F_j,\dots,F_0$ (all levels at and below where it was
+found), or the lower forests lose connectivity.
+\end{trapbox}
+
+\begin{historybox}
+The smaller-half ``promotion'' charging is a recurring jewel. It is the same
+argument behind union by size, behind the
+$\Oh(n\log n)$ ``small-to-large'' merging of sets on a tree, and behind
+Euler-tour--based heavy-path methods. HdLT's contribution was to weld it to
+Euler-tour trees so that ``scan the smaller half and find a crossing edge''
+becomes a logarithmic-time BST descent rather than a linear scan, turning
+$\Oh(\sqrt n)$ into $\Oh(\log^2 n)$.
+\end{historybox}
+
+\section{Dynamic minimum spanning tree}
+\label{ch39:dynamic-mst}
+
+Maintaining a minimum spanning forest under insertions and deletions is the same
+skeleton with one extra idea: replacement edges must be chosen by \emph{weight}.
+
+\begin{intuitionbox}
+Two classical facts (Chapter~6) drive everything.
+\begin{itemize}
+  \item \textbf{Cycle rule.} Inserting edge $e$ creates a cycle in the current MST
+        $T$ iff its endpoints are already connected. If so, $e$ replaces the
+        \emph{maximum-weight} edge on the tree path between its endpoints, but only
+        when $e$ is lighter than that maximum; otherwise $e$ becomes a spare.
+  \item \textbf{Cut rule.} Deleting a tree edge $e$ splits $T$ into two sides; the
+        correct replacement is the \emph{minimum-weight} spare crossing the cut.
+\end{itemize}
+\end{intuitionbox}
+
+\subsection*{Insertion: the cycle rule with path-max}
+
+\begin{algorithm}[H]
+\caption{Dynamic MST -- edge insertion}
+\label{ch39:alg-dmst-ins}
+\SetKwFunction{InsMST}{InsertMST}\SetKwFunction{Link}{Link}\SetKwFunction{Cut}{Cut}
+\SetKwProg{Fn}{Function}{:}{}
+\Fn{\InsMST{$u,v,w$}}{
+  \uIf{$u,v$ in different trees of $T$}{\Link{$u,v$} with weight $w$ \tcp*[r]{forest grows}}
+  \Else{
+    $e^\star\gets$ maximum-weight edge on the $u$--$v$ tree path \tcp*[r]{$\Oh(\log n)$ via LCT path-max}
+    \uIf{$w < \mathrm{weight}(e^\star)$}{
+      \Cut{$e^\star$}; demote $e^\star$ to a spare; \Link{$u,v$} with weight $w$\;
+    }
+    \lElse{store $\{u,v\}$ as a spare of weight $w$}
+  }
+}
+\end{algorithm}
+
+The path-max query and the cut/link are exactly the link-cut tree primitives of
+Chapter~22: a link-cut tree stores the represented MST and answers ``heaviest edge
+on the path $u$--$v$'' in $\Oh(\log n)$ amortized. So \emph{incremental} MST is
+$\Oh(\log n)$ per insertion -- clean, and worth contrasting with the deletion
+case, which is the hard one.
+
+\subsection*{Deletion: weighted replacement via leveled HdLT}
+
+Deleting a tree edge needs the \emph{minimum-weight} crossing spare, which the
+plain HdLT replacement search does not order by weight. The fix (Holm--de
+Lichtenberg--Thorup, same paper) keeps the leveled-forest structure but, when
+searching for a replacement at a given level, takes the lightest crossing spare
+found. To make ``lightest crossing'' efficient, the levels are organized so that
+the search examines candidate spares in nondecreasing weight, and a careful
+argument shows the amortized cost remains $\Oh(\log^2 n)$ per update for the
+minimum spanning \emph{forest}.
+
+\begin{focusbox}
+\textbf{Dynamic MSF result.} The minimum spanning forest of a fully dynamic graph
+is maintainable in $\Oh(\log^2 n)$ amortized time per insertion \emph{and} per
+deletion (with the same leveled-ETT machinery, replacement edges chosen by
+weight). The MST \emph{weight} is then available in $\Oh(1)$ by keeping a running
+sum that is updated on every \textsc{Link}/\textsc{Cut}.
+\end{focusbox}
+
+\begin{whybox}
+\textbf{Why weight-ordered replacement is correct.} After cutting tree edge $e$,
+the two sides are $T_u,T_v$. By the cut rule, the unique correct replacement is the
+minimum-weight edge of $G$ crossing $T_u\!:\!T_v$. Any \emph{tree} edge of the old
+$T$ other than $e$ stays in the MST (removing $e$ does not change which side those
+edges connect), so the only candidates are spares plus possibly nothing. Taking
+the lightest crossing spare therefore reproduces what Kruskal/Prim would pick on
+the reduced graph. The leveled structure only changes \emph{how} we find that
+lightest crosser efficiently; correctness is the cut rule, full stop.
+\end{whybox}
+
+\begin{labbox}
+On Figure~\ref{ch39:fig-hdlt}, attach weights:
+$ab{=}1,bc{=}2,ad{=}3,be{=}4,cf{=}5$ (tree), $de{=}6,ef{=}7$ (spares). Delete
+tree edge $be$ (weight 4). Sides: the part containing $e$ versus the rest.
+Crossing spares: $de$ (6) and $ef$ (7). The cut rule installs the lighter,
+$de=6$. New MSF weight $=1+2+3+5+6=17$. Now instead delete $ab$ (weight 1).
+Crossing spares across $\{a,d\}\!:\!\{b,c,e,f\}$: only $de=6$. Replace; weight
+becomes $2+3+4+5+6=20$. Verify by recomputing the MST from scratch each time --
+they must match, and they do.
+\end{labbox}
+
+\begin{connectionbox}
+Dynamic MST is where Chapter~22 (link-cut trees, for the cheap incremental side
+and path-max) and this chapter's leveled ETT (for the hard decremental side) meet.
+The same path-max primitive powers Sleator--Tarjan dynamic-tree speedups of
+blocking-flow max-flow (Chapter~12--13). And the offline ``segment tree over the
+timeline'' from \S\ref{ch39:incremental}, combined with rollback union-find that
+tracks the maximum edge on each merge, gives an elegant offline dynamic-MST that
+is often the practical choice when all updates are known in advance.
+\end{connectionbox}
+
+\section{Sparsification: trading \texorpdfstring{$m$}{m} for \texorpdfstring{$n$}{n}}
+\label{ch39:sparsification}
+
+Many bounds above are stated in $n$, yet a graph can have $m=\Th(n^2)$ edges. The
+reason updates do not degrade to $m$ is \emph{sparsification}, the
+Eppstein--Galil--Italiano--Nissenzweig technique that deserves a paragraph because
+it is the general-purpose lever.
+
+\begin{intuitionbox}
+For a property decided by a spanning forest (connectivity, MSF, bipartiteness,
+$k$-edge-connectivity for small $k$), the answer depends only on $\Oh(n)$
+\emph{certificate} edges, not all $m$. Build a balanced binary tree over the edge
+set. Each leaf holds $\Oh(n)$ edges; each internal node stores a \emph{sparse
+certificate} of the union of its children's certificates -- itself only $\Oh(n)$
+edges. An edge update touches one leaf and the $\Oh(\log m)$ certificates on the
+path to the root, recomputing each from two $\Oh(n)$-edge inputs. The dynamic
+structure then runs on a graph that always has $\Oh(n)$ edges, so an
+$\Oh(\sqrt m)$ per-operation method becomes $\Oh(\sqrt n)$, and $m$ disappears from
+polylog bounds entirely.
+\end{intuitionbox}
+
+\begin{complexitybox}
+Sparsification multiplies the per-operation cost by $\Oh(\log m)$ but replaces
+every $m$ inside the base structure by $n$. It is the reason Frederickson's
+$\Oh(\sqrt m)$ topology trees became the $\Oh(\sqrt n)$ worst-case bound, and a
+clean way to keep $m$ out of the polylog connectivity bounds even on dense graphs.
+\end{complexitybox}
+
+\section{Worst-case versus amortized, and a glance at harder problems}
+\label{ch39:worstcase}
+
+HdLT is \emph{amortized}: a single deletion can trigger an avalanche of promotions
+and run in $\Th(n)$ time, even though the average is $\Oh(\log^2 n)$. For
+real-time systems (an individual operation must never stall) that is unacceptable,
+and worst-case bounds are genuinely harder to obtain.
+
+\begin{focusbox}
+\textbf{The landscape for fully dynamic connectivity.}
+\begin{itemize}
+  \item Amortized: $\Oh(\log^2 n)$ (HdLT, deterministic), improved to
+        $\Oh(\log^2 n/\log\log n)$ (Wulff-Nilsen) and below with refinements.
+  \item Worst-case: $\Oh(\sqrt n)$ deterministic (Frederickson + sparsification);
+        $\Oh(\poly\log n)$ worst-case \emph{randomized} via cut-set / XOR
+        sketching (Kapron--King--Mountjoy 2013 and successors).
+  \item Lower bound: $\Om(\log n)$ per operation (Patrascu--Demaine), so no
+        dynamic-connectivity structure can be truly constant-time.
+\end{itemize}
+\end{focusbox}
+
+\begin{aestheticbox}
+\textbf{The cut-set sketch}, in one idea. Give each edge $\{u,v\}$ a random
+$\Oh(\log n)$-bit id, and store at each vertex the XOR of ids of its incident
+edges. For a vertex set $S$, the XOR of the stored values over $S$ cancels every
+edge with both endpoints inside $S$ (each such id appears twice) and leaves the
+XOR of edges crossing the cut $(S,\bar S)$. If exactly one edge crosses, that XOR
+\emph{is} its id -- you have recovered a crossing edge with no search at all.
+Layer $\Oh(\log n)$ independent samplings to handle ``more than one crosser,'' and
+you get a replacement edge in worst-case polylog time, with high probability. This
+is the seed of worst-case dynamic connectivity and a beautiful instance of
+linear-sketching meeting graphs (Chapter~40).
+\end{aestheticbox}
+
+\section{Conditional lower bounds: the OMv wall}
+\label{ch39:omv}
+
+Why do so many dynamic problems plateau at $\sqrt n$ or polylog and refuse to go
+faster despite decades of effort? Because, conjecturally, they cannot. The cleanest
+explanation is the \emph{Online Matrix--Vector multiplication} (OMv) conjecture of
+Henzinger, Krinninger, Nanongkai and Saranurak (2015).
+
+\begin{focusbox}
+\textbf{OMv problem.} Fix an $n\times n$ Boolean matrix $M$ (preprocessing
+allowed). Then receive vectors $v_1,\dots,v_n\in\{0,1\}^n$ \emph{online}: you must
+output $Mv_t$ (Boolean matrix--vector product, $\vee/\wedge$) before seeing
+$v_{t+1}$.
+
+\textbf{OMv conjecture.} No algorithm solves OMv in total time
+$\Oh(n^{3-\eps})$ for any constant $\eps>0$. (Even with arbitrary polynomial
+preprocessing of $M$.)
+\end{focusbox}
+
+The naive algorithm computes each $Mv_t$ in $\Oh(n^2)$ for a total of $\Oh(n^3)$;
+the conjecture says you cannot shave a polynomial factor off that when the queries
+are online. Why believe it? Because offline (all $v_t$ known at once) it
+\emph{is} beatable via fast matrix multiplication, yet decades of effort have not
+produced a truly subcubic \emph{online} algorithm -- the online constraint seems
+to forbid exactly the batching that fast matrix multiplication needs.
+
+\begin{whybox}
+\textbf{From OMv to a dynamic lower bound: the reduction pattern}
+(Figure~\ref{ch39:fig-omv}). Encode the
+matrix $M$ as a directed bipartite graph $H$ on parts $A=\{a_1,\dots,a_n\}$,
+$B=\{b_1,\dots,b_n\}$ with a directed edge $b_j\!\to\!a_i$ iff $M_{ij}=1$. To
+answer an online query vector $v_t$:
+\begin{enumerate}
+  \item \emph{Update phase}: for each $j$ with $(v_t)_j=1$, insert a directed edge
+        from a fresh source $s$ to $b_j$ (``activate'' column $j$). That is
+        $\Oh(n)$ edge insertions.
+  \item \emph{Query phase}: for each $i$, a single dynamic query ``is $a_i$
+        reachable from $s$?'' reveals whether $\bigvee_j (M_{ij}\wedge (v_t)_j)$,
+        i.e. the $i$-th entry of $Mv_t$. That is $\Oh(n)$ queries.
+  \item \emph{Cleanup}: delete the $\Oh(n)$ inserted $s$-edges to reset for
+        $v_{t+1}$.
+\end{enumerate}
+So one online matrix--vector product becomes $\Oh(n)$ updates and $\Oh(n)$ queries.
+If a dynamic reachability structure had $u(n)$ update and $q(n)$ query time, the
+whole OMv instance (with $n$ query vectors) would run in
+$\Oh(n\cdot n\cdot(u(n)+q(n)))=\Oh(n^2(u+q))$. For this to beat $n^{3-\eps}$ we
+would need $u(n)+q(n)=\Oh(n^{1-\eps})$. Hence: \emph{under OMv, fully dynamic
+$s$--$t$ reachability cannot have both update and query in $\Oh(n^{1-\eps})$.}
+\end{whybox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[every node/.style={circle,draw=nodeblue,thick,minimum size=7mm,
+   inner sep=0pt,font=\small},
+   >={Stealth[length=2mm]}, node distance=12mm]
+% source
+\node (s) at (-2.4,-1.5) {$s$};
+% B column (activated by v_t)
+\node (b1) at (0,0) {$b_1$};
+\node (b2) at (0,-1.5) {$b_2$};
+\node (b3) at (0,-3.0) {$b_3$};
+% A column
+\node (a1) at (3,0) {$a_1$};
+\node (a2) at (3,-1.5) {$a_2$};
+\node (a3) at (3,-3.0) {$a_3$};
+% activation edges (v_t = (1,0,1)): s->b1, s->b3
+\draw[->,trapred,thick] (s)--(b1);
+\draw[->,trapred,thick] (s)--(b3);
+% matrix edges b_j -> a_i for M_{ij}=1
+\draw[->,nodeblue] (b1)--(a1);
+\draw[->,nodeblue] (b1)--(a2);
+\draw[->,nodeblue] (b3)--(a2);
+\draw[->,nodeblue] (b2)--(a3);
+\node[draw=none,font=\small,trapred,anchor=west] at (-2.0,-3.4)
+  {red: $s\!\to\!b_j$ when $(v_t)_j{=}1$};
+\node[draw=none,font=\small,nodeblue,anchor=west] at (4.0,-1.5)
+  {blue: $b_j\!\to\!a_i$ when $M_{ij}{=}1$};
+\end{tikzpicture}
+\caption{The OMv gadget for $v_t=(1,0,1)$. A directed query ``is $a_i$ reachable
+from $s$?'' returns the $i$-th bit of $Mv_t$: here $a_1$ and $a_2$ are reachable
+(via $b_1$, and via $b_1$ or $b_3$), while $a_3$ is not, since its only in-edge is
+from the inactive $b_2$. So $Mv_t=(1,1,0)$.}
+\label{ch39:fig-omv}
+\end{figure}
+
+\begin{formalbox}
+\textbf{Consequences (all conditional on OMv).} There is no fully dynamic
+algorithm with $\Oh(n^{1-\eps})$ per operation (for constant $\eps>0$) for, among
+others:
+\begin{itemize}
+  \item single-source / $s$--$t$ \textbf{reachability} in directed graphs;
+  \item \textbf{strong connectivity} (is the whole digraph one SCC?);
+  \item maintaining whether the graph has a \textbf{perfect matching};
+  \item $\Oh(\poly\log)$-approximate shortest paths and many distance problems;
+  \item subgraph-detection / triangle-type counting under updates.
+\end{itemize}
+The $\eps$ matters: these bounds rule out genuinely sublinear-per-operation
+algorithms, which is exactly why $\Oh(\sqrt n)$ (for the undirected, easier
+problems that escape the reduction) or $\Oh(n)$ (for the directed ones it traps)
+are the natural ceilings people hit.
+\end{formalbox}
+
+\begin{intuitionbox}
+The moral. \emph{Undirected} connectivity escapes OMv -- the reduction needs the
+asymmetry of reachability, and undirected connectivity's spanning-forest structure
+is too well-behaved to encode matrix--vector products -- which is precisely why we
+\emph{can} do it in polylog. \emph{Directed} reachability, exact shortest paths,
+and matching get caught in the OMv net, which is why their dynamic versions are
+stuck near $\Oh(n)$ per update. When a dynamic problem refuses to go below
+$\sqrt n$ or $n$ after serious effort, suspect an OMv (or the related 3SUM / APSP)
+hardness reduction lurking underneath.
+\end{intuitionbox}
+
+\begin{historybox}
+Conditional lower bounds reorganized the whole field around 2015. Before OMv, a
+stuck dynamic problem was just ``open.'' After, the community could \emph{prove}
+(modulo a clean, widely-believed conjecture) that whole families of dynamic
+problems share a single barrier, turning scattered failures into a coherent
+hardness theory. OMv sits alongside the Strong Exponential Time Hypothesis (SETH),
+the 3SUM conjecture, and the APSP conjecture as one of the load-bearing axioms of
+fine-grained complexity.
+\end{historybox}
+
+\begin{connectionbox}
+The OMv barrier is the dynamic-graph face of \emph{fine-grained complexity}
+(Chapter~37 covers NP-hardness; this is the polynomial-time analogue). It also
+explains the design of \S\ref{ch39:sparsification} and \S\ref{ch39:hdlt}: we lean
+so hard on undirected, spanning-forest-based properties precisely because they are
+the ones that slip past the wall. The streaming and sketching world of Chapter~40
+attacks the same problems under a different resource (space), and the cut-set
+sketch of \S\ref{ch39:worstcase} is the crossover point.
+\end{connectionbox}
+
+\section{Putting it together}
+\label{ch39:summary}
+
+\begin{complexitybox}
+\renewcommand{\arraystretch}{1.25}
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Problem & Model & Per-operation cost \\
+\midrule
+Connectivity & incremental & $\Oh(\alpha(n))$ amortized (union-find) \\
+Connectivity (forest) & fully dynamic & $\Oh(\log n)$ (Euler-tour tree) \\
+Connectivity & fully dynamic & $\Oh(\log^2 n)$ amortized (HdLT) \\
+Connectivity & fully dynamic, w.c. & $\Oh(\sqrt n)$ det.; polylog rand. (sketch) \\
+MST weight & incremental & $\Oh(\log n)$ (link-cut, cycle rule) \\
+Min spanning forest & fully dynamic & $\Oh(\log^2 n)$ amortized (leveled ETT) \\
+$s$--$t$ reachability (dir.) & fully dynamic & $\Om(n^{1-\eps})$ under OMv \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{complexitybox}
+
+The throughline: maintain a \emph{spanning forest}, store everything else as
+spares, and survive deletions by a smaller-half charging argument that bounds how
+often any one edge is touched. Euler-tour trees make ``connectivity = same
+sequence'' and ``find an incident spare'' both logarithmic; the leveled-forest
+wrapper turns the expensive replacement search into a bounded number of
+promotions. Where the spanning-forest idea has no purchase -- directed
+reachability, exact distances, matching -- the OMv conjecture tells us, with high
+confidence, that no polylog method exists, and $\sqrt n$ or $n$ is the best we can
+hope for.
+
+\section{Exercises}
+\label{ch39:exercises}
+
+\begin{exercise}[Offline beats online]
+Implement offline fully dynamic connectivity using a segment tree over the
+timeline plus rollback union-find (union by rank, no path compression, LIFO undo).
+Each edge is alive on an interval of operations; place it on the canonical segment
+nodes, DFS unioning on entry and rolling back on exit, and answer each query at its
+leaf. Prove the total time is $\Oh((m+q)\log q\,\log n)$ and explain precisely why
+this technique fails when queries are \emph{online}.
+\end{exercise}
+
+\begin{exercise}[Euler-tour subtree sums]
+Augment an Euler-tour tree so that each vertex carries a value and you support
+\textsc{SubtreeSum}$(v)$ = sum of values in $v$'s subtree, under \textsc{Link},
+\textsc{Cut}, and point updates, all in $\Oh(\log n)$. Argue why a subtree is a
+contiguous range of the tour, and explain why the same trick does \emph{not} give
+you path sums (so you would need a link-cut tree for those).
+\end{exercise}
+
+\begin{exercise}[The smaller-half budget]
+In HdLT \textsc{Replace}, prove invariant (I2) is preserved: when you promote every
+level-$j$ edge inside the smaller side $T$ to level $j{+}1$, every level-$(j{+}1)$
+component still has at most $\floor{n/2^{j+1}}$ vertices. Then show that if
+you mistakenly scanned and promoted the \emph{larger} half instead, (I2) can fail,
+and exhibit a sequence of operations whose amortized cost then degrades to
+$\Om(\sqrt n)$.
+\end{exercise}
+
+\begin{exercise}[Counting components]
+Extend HdLT so that \textsc{NumComponents}() returns the current number of
+connected components in $\Oh(1)$. (Hint: a forest on $n$ vertices with $k$ trees
+has exactly $n-k$ tree edges; maintain the count of tree edges across all
+\textsc{Link}/\textsc{Cut}.) State exactly which lines of
+Algorithm~\ref{ch39:alg-hdlt} must update the counter.
+\end{exercise}
+
+\begin{exercise}[Incremental MST, the easy side]
+Using a link-cut tree with path-max, implement \textsc{InsertMST} (cycle rule) so
+that inserting an edge updates the MST in $\Oh(\log n)$ amortized. Prove
+correctness from the cycle rule, and explain in one sentence why the \emph{deletion}
+side cannot be handled by the link-cut tree alone (what does the cut rule need that
+a single tree cannot provide?).
+\end{exercise}
+
+\begin{exercise}[Break the weight order]
+Construct a small fully dynamic graph and a deletion where the HdLT replacement
+search, if it returns the \emph{first} crossing spare it finds rather than the
+\emph{minimum-weight} one, produces a spanning forest that is not minimum. Then fix
+the search to restore the cut rule and re-verify on your example.
+\end{exercise}
+
+\begin{exercise}[The cut-set sketch]
+Give each edge a uniformly random $2\ceil{\log n}$-bit id and store at each
+vertex the XOR of incident edge ids. Prove that for any vertex set $S$ with exactly
+one edge crossing $(S,\bar S)$, the XOR of stored values over $S$ equals that
+edge's id. Then design an $\Oh(\log n)$-layer scheme that, with high probability,
+recovers a crossing edge even when the number of crossers is unknown. Where does
+the failure probability come from?
+\end{exercise}
+
+\begin{exercise}[OMv reduction, in full]
+Write out the reduction of \S\ref{ch39:omv} for fully dynamic $s$--$t$
+reachability completely: specify the gadget graph, the update sequence per query
+vector $v_t$, how the $n$ reachability queries reconstruct $Mv_t$, and the cleanup.
+Conclude that an $\Oh(n^{1-\eps})$-per-operation structure would refute OMv. Then
+identify exactly which step of your reduction breaks if the graph is
+\emph{undirected} -- and connect this to why undirected connectivity escapes the
+barrier.
+\end{exercise}
+
+\begin{exercise}[Decremental only]
+Suppose edges are only ever deleted (decremental connectivity), starting from a
+known graph. Show how to preprocess so that the \emph{total} time over \emph{all}
+deletions plus connectivity queries is $\Oh(m\log^2 n)$, and argue why the
+decremental setting can sometimes beat the fully dynamic bound (hint: levels never
+need to go back down, so part of the bookkeeping disappears).
+\end{exercise}
+
+\begin{exercise}[Worst-case via lazy rebuilding]
+Sketch how to convert an amortized $\Oh(\log^2 n)$ structure into one with
+$\Oh(\sqrt n)$ worst-case per operation by combining sparsification with periodic
+rebuilding of overloaded levels. Identify the trade-off: what do you give up in the
+amortized total to buy the worst-case guarantee?
+\end{exercise}

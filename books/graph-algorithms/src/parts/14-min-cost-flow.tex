@@ -1,0 +1,592 @@
+\chapter{Minimum-Cost Flow}
+
+The maximum-flow problem asked a yes/no-flavored question dressed up as a number: how much stuff can I push from $s$ to $t$? Once you can answer that, a second question pushes back almost immediately. Pushing flow is rarely free. Each pipe has a toll, a price per unit, a latency, an unhappiness. Among the many ways to route the same amount of flow, which one is \emph{cheapest}? That is the minimum-cost flow problem (MCMF), and it is the workhorse behind transportation planning, assignment, scheduling, image segmentation with smoothness priors, and a surprising fraction of operations-research models that never mention the word ``graph.''
+
+This chapter builds MCMF from two complementary engines. The first, \emph{negative-cycle canceling}, starts from any feasible flow and repeatedly drains money out of negative-cost cycles in the residual graph until none remain. The second, \emph{successive shortest paths} (SSP), builds the flow up from zero, each time routing the next unit (or batch) along the cheapest residual path. SSP needs shortest paths in a graph with negative edges, so we resurrect Johnson's potentials from the shortest-path chapters to keep Dijkstra alive. We prove both correct through a single clean optimality criterion, work a small graph by hand twice, sketch the cost-scaling speedup, and then watch transportation and assignment fall out as special cases. The chapter closes on the linear-programming duality that explains \emph{why} potentials are the natural language for the whole subject.
+
+\begin{focusbox}
+The one idea to keep in your pocket: \textbf{a flow of given value is minimum cost if and only if its residual graph has no negative-cost cycle.} Everything else --- the two algorithms, the potentials, the duality --- is machinery for finding such a flow or certifying you already have one.
+\end{focusbox}
+
+\chapterline
+
+\section{The problem, stated cleanly}
+\label{ch14:problem}
+
+We work with a directed graph $\Gph=(V,E)$. Every arc $(u,v)\in E$ carries two numbers:
+\begin{itemize}
+  \item a \textbf{capacity} $c(u,v)\ge 0$, the most flow the arc can hold, and
+  \item a \textbf{cost} $w(u,v)\in\R$, the price per unit of flow on that arc.
+\end{itemize}
+A \textbf{flow} is a function $f:E\to\R_{\ge 0}$ with $0\le f(u,v)\le c(u,v)$ (capacity) and, at every vertex except two distinguished ones $s$ (source) and $t$ (sink), inflow equals outflow (conservation). The \textbf{value} of the flow is the net amount leaving $s$, written $\abs{f}$. Its \textbf{cost} is
+\[
+  \mathrm{cost}(f) \;=\; \sum_{(u,v)\in E} w(u,v)\, f(u,v).
+\]
+
+There are two standard ways to phrase the optimization, and you should hold both in mind.
+
+\begin{definition}[Min-cost max-flow]\label{ch14:def-mcmf}
+Among all flows of \emph{maximum} value, find one of minimum cost.
+\end{definition}
+
+\begin{definition}[Min-cost flow of value $F$]\label{ch14:def-fixedval}
+Given a target value $F$, among all flows with $\abs{f}=F$, find one of minimum cost (or report that no such flow exists).
+\end{definition}
+
+These two are interchangeable in practice. To get min-cost max-flow, first compute the max value $F^\star$ with any max-flow routine, then solve the fixed-value problem at $F=F^\star$. Conversely, to pin the value to a chosen $F$, add an arc from $t$ back to $s$ with capacity $F$ and a cost low enough to force it full, or simply stop the build-up algorithm once it has pushed $F$ units. We will mostly reason about the fixed-value form because its optimality condition is the cleanest.
+
+\begin{intuitionbox}
+Think of capacity as the width of each road and cost as the per-car toll. Max-flow asked how many cars per minute the road network can deliver downtown. Min-cost flow asks: now that we know we can deliver $F$ cars, route them so the city collects the smallest total toll. The roads with cheap tolls fill first; expensive detours are used only when the cheap roads are saturated.
+\end{intuitionbox}
+
+\subsection{The residual graph carries the cost too}
+
+Recall the residual construction from the max-flow chapters. For an arc $(u,v)$ with flow $f(u,v)$:
+\begin{itemize}
+  \item a \textbf{forward} residual arc $(u,v)$ with residual capacity $c(u,v)-f(u,v)$ and cost $w(u,v)$, meaning ``you may still push more here, at the listed price'';
+  \item a \textbf{backward} residual arc $(v,u)$ with residual capacity $f(u,v)$ and cost $-w(u,v)$, meaning ``you may cancel a unit already sent, getting the toll \emph{refunded}.''
+\end{itemize}
+The sign flip on the backward cost is the whole reason this works. Sending a unit forward costs $w$; un-sending it must credit $-w$, so that pushing flow around a residual cycle changes the total cost by exactly the sum of the residual costs along that cycle. We write $\Gph_f$ for the residual graph and let it inherit these signed costs. A \textbf{negative cycle} in $\Gph_f$ is a directed cycle whose residual costs sum to a negative number: free money you have left on the table.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Latex,node distance=22mm,
+  V/.style={circle,draw=nodeblue,very thick,fill=blue!4,minimum size=8mm,font=\small},
+  every edge/.style={draw=edgegray,thick}]
+  \node[V] (s) {$s$};
+  \node[V] (a) [above right=8mm and 26mm of s] {$a$};
+  \node[V] (b) [below right=8mm and 26mm of s] {$b$};
+  \node[V] (t) [below right=8mm and 26mm of a] {$t$};
+  \draw[->] (s) edge node[above left,font=\scriptsize] {$c{=}3,\,w{=}1$} (a);
+  \draw[->] (s) edge node[below left,font=\scriptsize] {$c{=}2,\,w{=}2$} (b);
+  \draw[->] (a) edge node[above right,font=\scriptsize] {$c{=}2,\,w{=}1$} (t);
+  \draw[->] (b) edge node[below right,font=\scriptsize] {$c{=}3,\,w{=}1$} (t);
+  \draw[->] (a) edge node[right,font=\scriptsize] {$c{=}2,\,w{=}1$} (b);
+\end{tikzpicture}
+\caption{A small instance. Each arc shows capacity $c$ and per-unit cost $w$. We will route flow from $s$ to $t$ and ask for the cheapest way.}
+\label{ch14:fig-instance}
+\end{figure}
+
+\section{The optimality criterion}
+\label{ch14:optimality}
+
+Before any algorithm, we want a test: \emph{given} a flow, is it minimum cost for its value? The answer is the cleanest theorem in the subject, and both algorithms are just two ways of reaching the state it describes.
+
+\begin{theorem}[Negative-cycle optimality]\label{ch14:thm-negcycle}
+A feasible flow $f$ has minimum cost among all flows of the same value $\abs{f}$ if and only if its residual graph $\Gph_f$ contains no negative-cost cycle.
+\end{theorem}
+
+\begin{whybox}
+The proof rests on one structural fact: the difference of two flows of equal value, viewed in the residual graph, decomposes into cycles. So if $f$ is not optimal, the gap to a cheaper flow $f'$ is realized by residual cycles, and at least one of them must be negative. Conversely a negative cycle is an explicit recipe for improvement, so its absence means no improvement exists. This is the flow analogue of ``a potential is shortest-path-optimal iff no edge can be relaxed.''
+\end{whybox}
+
+\begin{proof}
+($\Rightarrow$, by contrapositive.) Suppose $\Gph_f$ has a negative cycle $C$ with minimum residual capacity $\delta>0$ along it. Push $\delta$ units around $C$. Because $C$ is a cycle, conservation is preserved at every vertex and the value $\abs{f}$ is unchanged; capacities are respected because $\delta$ is the bottleneck. The cost changes by $\delta\cdot(\text{sum of residual costs on }C) < 0$. So $f$ was not minimum cost.
+
+($\Leftarrow$.) Suppose $\Gph_f$ has no negative cycle; we show $f$ is optimal. Let $f'$ be any flow with $\abs{f'}=\abs{f}$. Consider the arc-wise difference $g=f'-f$. At every vertex, $g$ satisfies conservation \emph{including} at $s$ and $t$, because $f$ and $f'$ have equal value, so the net out of $s$ cancels. A conservative (circulation) vector on a graph decomposes into a sum of flows around directed cycles, each cycle using only arcs where $g$ moves flow in a feasible residual direction: wherever $g(u,v)>0$, $f'$ sends more than $f$, so $(u,v)$ has positive residual capacity in $\Gph_f$; wherever $g(u,v)<0$, $f'$ sends less, so the backward residual arc $(v,u)$ is available. Thus the decomposition uses only arcs of $\Gph_f$, giving cycles $C_1,\dots,C_k$ in $\Gph_f$ with positive multipliers $\lambda_i$ such that
+\[
+  \mathrm{cost}(f') - \mathrm{cost}(f) \;=\; \sum_{i=1}^{k} \lambda_i \cdot \mathrm{cost}(C_i),
+\]
+where $\mathrm{cost}(C_i)$ is the sum of residual costs around $C_i$. Since $\Gph_f$ has no negative cycle, every $\mathrm{cost}(C_i)\ge 0$, so the right side is $\ge 0$ and $\mathrm{cost}(f')\ge\mathrm{cost}(f)$. Hence $f$ is optimal.
+\end{proof}
+
+\begin{trapbox}
+The cycle-decomposition step quietly uses that the difference of two equal-value flows is a \emph{circulation} --- it conserves at $s$ and $t$ as well. If $\abs{f'}\ne\abs{f}$ the decomposition picks up $s$--$t$ paths in addition to cycles, and the clean ``cost difference $=$ sum over cycles'' identity fails. That is exactly why Theorem~\ref{ch14:thm-negcycle} is a statement about flows \emph{of the same value}.
+\end{trapbox}
+
+\section{Negative-cycle canceling}
+\label{ch14:cancel}
+
+Theorem~\ref{ch14:thm-negcycle} suggests an algorithm so direct it barely needs explaining: get \emph{a} flow of the right value by any means, then keep finding negative cycles and canceling them until none remain.
+
+\begin{intuitionbox}
+You have already routed $F$ units somehow --- maybe wastefully. Walk the residual graph looking for a loop that, if you shuffle flow around it, lowers the bill. Push as much as the loop allows. Repeat. Each shuffle keeps the value fixed (it is a cycle) and strictly cuts the cost (the cycle was negative). When no money-losing loop is left, Theorem~\ref{ch14:thm-negcycle} certifies you are done.
+\end{intuitionbox}
+
+\begin{algorithm}[H]
+\caption{Negative-Cycle Canceling}
+\label{ch14:alg-cancel}
+\KwIn{graph $\Gph$ with capacities $c$, costs $w$; a feasible flow $f$ of the desired value $F$.}
+\KwOut{a minimum-cost flow of value $F$.}
+\While{$\Gph_f$ contains a negative-cost cycle}{
+  find a negative cycle $C$ (Bellman--Ford / SPFA on residual costs)\;
+  $\delta \gets \min_{(u,v)\in C}\, c_f(u,v)$ \tcp*{bottleneck residual capacity on $C$}
+  \ForEach{arc $(u,v)\in C$}{
+    push $\delta$ units along $(u,v)$ in $\Gph_f$ (update $f$ and the paired residual arc)\;
+  }
+}
+\Return $f$\;
+\end{algorithm}
+
+How do you get the initial feasible flow of value $F$? Run any max-flow algorithm ignoring costs; that gives a max-value flow, and if you only need value $F<F^\star$ you can cap it. The costs do not affect feasibility, only quality, so starting feasibility is free.
+
+\begin{whybox}
+Finding a negative cycle is the standard Bellman--Ford byproduct. Run $\abs{V}-1$ relaxation passes over the residual arcs using $w$ as edge length; if a further pass still relaxes some arc, that arc lies on (or downstream of) a negative cycle, and following predecessor pointers backward recovers an actual cycle. Each search is $\Oh(VE)$.
+\end{whybox}
+
+\subsection{Termination and complexity}
+
+With integer costs, every cancellation drops the total cost by at least $1$ (each push moves $\delta\ge 1$ units around a cycle of total cost $\le -1$). The cost is bounded below --- it cannot fall past the optimum --- so the loop halts.
+
+\begin{complexitybox}
+Let $U$ bound capacities and $W$ bound $\abs{w}$. The initial cost lies in $[-mWU,\,mWU]$ where $m=\abs E$, so there are at most $\Oh(mWU)$ cancellations, each costing $\Oh(VE)$ for the cycle search. The naive bound is $\Oh(VE\cdot mWU)$ --- correct but pseudopolynomial. The cure (Goldberg--Tarjan) is to cancel the cycle of \emph{minimum mean cost} each time; that choice forces termination in $\Oh(VE)$ cancellations, giving a strongly polynomial $\Oh(V^2E^2\log V)$ overall. Plain ``any negative cycle'' is fine for small inputs and a great teaching tool; minimum-mean canceling is the version you cite in a complexity table.
+\end{complexitybox}
+
+\begin{historybox}
+Klein introduced cycle canceling in 1967. For two decades it was viewed as correct-but-slow until Goldberg and Tarjan (1989) showed that always canceling the \emph{minimum-mean} cycle makes it strongly polynomial --- the running time depends only on $V$ and $E$, not on the magnitudes of capacities or costs. The minimum-mean cycle itself is found by Karp's classic $\Oh(VE)$ dynamic program, another small gem worth knowing.
+\end{historybox}
+
+\subsection{Canceling by hand}
+\label{ch14:cancel-trace}
+
+The fastest way to trust the canceler is to watch it repair a deliberately bad flow. Reuse the instance of Figure~\ref{ch14:fig-instance}, but route value $5$ stupidly on purpose. Send $3$ units down $s\!\to\!a$, but instead of pushing two of them straight to $t$ over the cheap $a\!\to\!t$ arc, divert one of those through $a\!\to\!b\!\to\!t$; then send $2$ down $s\!\to\!b\!\to\!t$. Concretely the starting flow is
+\[
+  f_{sa}=3,\quad f_{at}=2,\quad f_{ab}=1,\quad f_{sb}=2,\quad f_{bt}=3 ,
+\]
+which is feasible (every arc within capacity, conservation holds, value $=5$). Its cost is
+\[
+  3(1)+2(1)+1(1)+2(2)+3(1) = 3+2+1+4+3 = 13 .
+\]
+That happens to already be the optimum, so to make the canceler do visible work we first \emph{wound} the flow.
+
+\begin{labbox}
+Perturb the flow: move one unit off the cheap path and onto the expensive one. Drop $f_{at}$ to $1$ and raise $f_{ab}$ to $2$, then to conserve at $b$ raise $f_{bt}$ to $4$ --- but $b\!\to\!t$ has capacity $3$, so instead keep $f_{bt}=3$ and reduce $f_{sb}$ to $1$ so that $b$ still balances ($\text{in}=f_{ab}+f_{sb}=2+1=3=f_{bt}$). The wounded flow is $f_{sa}=3,\ f_{at}=1,\ f_{ab}=2,\ f_{sb}=1,\ f_{bt}=3$, still value $5$. Its cost is $3+1+2+2+3=11$? Recount with the true costs.
+\end{labbox}
+
+Recounting carefully with $w_{sa}=1,w_{at}=1,w_{ab}=1,w_{sb}=2,w_{bt}=1$:
+\[
+  3(1)+1(1)+2(1)+1(2)+3(1) = 3+1+2+2+3 = 11 .
+\]
+That is \emph{cheaper} than $13$, which is impossible for a flow of value $5$ on this instance --- so the wounded flow is infeasible somewhere. Check conservation at $a$: inflow $=f_{sa}=3$, outflow $=f_{at}+f_{ab}=1+2=3$. Good. At $b$: inflow $=f_{ab}+f_{sb}=2+1=3$, outflow $=f_{bt}=3$. Good. At $s$: outflow $=f_{sa}+f_{sb}=3+1=4\ne 5$. There is the bug: this flow has value $4$, not $5$. The lesson is worth the detour --- when you hand-build a flow it is easy to break conservation at the source, and the value drops silently. We therefore take a genuinely value-$5$ but suboptimal flow instead.
+
+\textbf{A clean suboptimal start.} Route all $5$ units but pay too much on the last one: $f_{sa}=3,\ f_{at}=2,\ f_{ab}=1,\ f_{sb}=2,\ f_{bt}=3$ is the optimum at cost $13$. Swap the role of one unit so it takes a strictly worse residual loop. Push one unit around the cycle $a\!\to\!b\!\to\!t \to (\text{reverse of }a\!\to\!t)\to a$: that is, increase $f_{ab}$ by $1$ (now $2$), increase $f_{bt}$ --- but $b\!\to\!t$ is already at $3$, its capacity. So that loop is blocked, confirming the optimum is locally rigid. Instead start from a different feasible value-$5$ flow that routes through $b$ wastefully:
+\[
+  f_{sa}=3,\ f_{at}=1,\ f_{ab}=2,\ f_{sb}=2,\ f_{bt}=4 .
+\]
+But $f_{bt}=4>3=c_{bt}$ violates capacity. The instance is tight enough that value $5$ has an essentially unique feasible routing, which is itself optimal --- a fine fact to notice, but unhelpful for demonstrating canceling.
+
+To get room to be wasteful, \emph{raise} a capacity: temporarily set $c_{bt}=5$. Now a clearly suboptimal value-$5$ flow exists:
+\[
+  f_{sa}=3,\ f_{at}=1,\ f_{ab}=2,\ f_{sb}=2,\ f_{bt}=4,\qquad
+  \mathrm{cost}=3+1+2+4+4=14 .
+\]
+(Conservation: $a$ has $3$ in, $1+2=3$ out; $b$ has $2+2=4$ in, $4$ out; $s$ sends $3+2=5$. Value $5$.) This pays $14$, one more than necessary, because it ships a unit over $a\!\to\!b\!\to\!t$ (cost $1+1=2$) that could have gone over the now-saturated-in-the-optimum $a\!\to\!t$ (cost $1$).
+
+\textbf{Cancellation.} Build $\Gph_f$ and look for a negative cycle. The forward arc $a\!\to\!t$ still has residual capacity ($c_{at}-f_{at}=2-1=1$), cost $+1$. The backward arc $b\!\to\!a$ exists (since $f_{ab}=2>0$), cost $-w_{ab}=-1$. The backward arc $t\!\to\!b$ exists ($f_{bt}=4>0$), cost $-1$. Consider the cycle
+\[
+  C:\quad a \xrightarrow{+1} t \xrightarrow{-1} b \xrightarrow{-1} a ,
+\]
+using forward $a\!\to\!t$, backward $t\!\to\!b$ (un-shipping a unit of $b\!\to\!t$), backward $b\!\to\!a$ (un-shipping a unit of $a\!\to\!b$). Residual cost $=1+(-1)+(-1)=-1<0$: a negative cycle (Figure~\ref{ch14:fig-residual}). Bottleneck $\delta=\min(c_f(a,t),f_{bt},f_{ab})=\min(1,4,2)=1$. Push $1$ around $C$: $f_{at}\!:\!1\to2$, $f_{bt}\!:\!4\to3$, $f_{ab}\!:\!2\to1$. New flow $f_{sa}=3,f_{at}=2,f_{ab}=1,f_{sb}=2,f_{bt}=3$, cost $14+(-1)=13$. Another Bellman--Ford pass finds no negative cycle, so by Theorem~\ref{ch14:thm-negcycle} we are optimal --- and the answer matches the SSP build-up below. Restoring $c_{bt}=3$ leaves this flow feasible and still optimal.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Latex,node distance=22mm,
+  V/.style={circle,draw=nodeblue,very thick,fill=blue!4,minimum size=8mm,font=\small},
+  neg/.style={draw=trapred,very thick}]
+  \node[V] (a) {$a$};
+  \node[V] (t) [right=34mm of a] {$t$};
+  \node[V] (b) [below right=14mm and 17mm of a] {$b$};
+  \draw[neg,->] (a) to[bend left=12] node[above,font=\scriptsize]{$+1$} (t);
+  \draw[neg,->] (t) to[bend left=12] node[below right,font=\scriptsize]{$-1$} (b);
+  \draw[neg,->] (b) to[bend left=12] node[below left,font=\scriptsize]{$-1$} (a);
+\end{tikzpicture}
+\caption{The negative residual cycle $C$ in the wounded flow ($c_{bt}$ temporarily raised to $5$). Forward arc $a\!\to\!t$ costs $+1$; the two backward arcs $t\!\to\!b$ and $b\!\to\!a$ refund $-1$ each. Total $-1$: pushing one unit around $C$ saves a dollar.}
+\label{ch14:fig-residual}
+\end{figure}
+
+\begin{trapbox}
+The false starts above are not filler --- they are the two mistakes everyone makes the first time. (1) Hand-building a flow and breaking conservation at $s$ so the ``value'' is wrong; always re-derive $\abs f$ from the source arcs, never assume it. (2) Trying to demonstrate improvement on an instance whose optimum is forced, where no negative cycle exists to cancel. When you want to \emph{see} the algorithm move, give it slack (a raised capacity, an extra parallel arc) so a suboptimal flow can exist at all.
+\end{trapbox}
+
+\section{Successive shortest paths}
+\label{ch14:ssp}
+
+Cycle canceling fixes a wasteful flow. The successive-shortest-paths (SSP) algorithm never makes a wasteful one: it grows the flow from zero, and \emph{each} augmentation goes along a cheapest residual $s$--$t$ path. The invariant it maintains is exactly the certificate we want.
+
+\begin{intuitionbox}
+Augmenting paths in plain max-flow could be any $s$--$t$ path with spare capacity. Here we are pickier: always take the \emph{cheapest} such path. Sending the next unit along the globally cheapest route can never create a negative cycle, so the flow stays optimal at its current value at every step. When the value reaches $F$, optimality at value $F$ is automatic.
+\end{intuitionbox}
+
+\begin{lemma}[SSP invariant]\label{ch14:lem-ssp-inv}
+If $f$ is a min-cost flow of value $\abs f$, and $P$ is a minimum-cost $s$--$t$ path in $\Gph_f$, then augmenting $f$ along $P$ (by its bottleneck) yields a min-cost flow of the new value $\abs f + \delta$.
+\end{lemma}
+
+\begin{proof}
+Suppose not: the augmented flow $f'$ has a negative cycle $C$ in $\Gph_{f'}$. The arcs of $\Gph_{f'}$ differ from those of $\Gph_f$ only along $P$ (forward arcs of $P$ may have shrunk, their reverses appeared). So $C$ must use at least one reverse arc of $P$; otherwise $C$ already existed in $\Gph_f$, contradicting optimality of $f$. Take such a $C$. Splicing $C$ with $P$ --- cancel the shared reverse-of-$P$ arcs --- produces an $s$--$t$ walk in $\Gph_f$ of cost $\mathrm{cost}(P)+\mathrm{cost}(C) < \mathrm{cost}(P)$, hence a cheaper $s$--$t$ path than $P$ in $\Gph_f$ (after removing any incidental cycles, which are nonnegative by optimality of $f$). That contradicts $P$ being a minimum-cost path. Therefore no negative cycle exists and $f'$ is optimal. The base case $f=0$ is trivially optimal (empty residual cost). By induction the invariant holds throughout.
+\end{proof}
+
+\begin{whybox}
+Lemma~\ref{ch14:lem-ssp-inv} is the SSP analogue of Theorem~\ref{ch14:thm-negcycle}: instead of certifying optimality after the fact, it \emph{preserves} optimality across one augmentation. The slick part is that a hypothetical new negative cycle would have to thread through the reverse arcs of $P$, and that immediately hands you a cheaper path than the one Dijkstra/Bellman--Ford just declared shortest --- a contradiction.
+\end{whybox}
+
+\begin{algorithm}[H]
+\caption{Successive Shortest Paths (with potentials)}
+\label{ch14:alg-ssp}
+\KwIn{graph $\Gph$, capacities $c$, costs $w$, source $s$, sink $t$, target value $F$ (or $\infty$ for max-flow).}
+\KwOut{a min-cost flow of value $\min(F,\,F^\star)$.}
+$f \gets 0$\;
+initialize potentials $\pi(v)$ for all $v$ \tcp*{Bellman--Ford once if costs may be negative; else $0$}
+$\mathrm{val}\gets 0$\;
+\While{$\mathrm{val} < F$ \textbf{and} $t$ reachable from $s$ in $\Gph_f$}{
+  run Dijkstra from $s$ in $\Gph_f$ with reduced costs $\bar w(u,v)=w(u,v)+\pi(u)-\pi(v)$\;
+  let $d(v)$ be the resulting shortest reduced distances\;
+  \lForEach{$v$ with $d(v)<\infty$}{$\pi(v)\gets \pi(v)+d(v)$}
+  let $P$ be the shortest-path tree path from $s$ to $t$\;
+  $\delta \gets \min\bigl(F-\mathrm{val},\ \min_{(u,v)\in P} c_f(u,v)\bigr)$\;
+  augment $f$ by $\delta$ along $P$; \quad $\mathrm{val}\gets \mathrm{val}+\delta$\;
+}
+\Return $f$\;
+\end{algorithm}
+
+\subsection{Why Dijkstra needs help: potentials and Johnson reweighting}
+
+Residual graphs have negative arcs --- every backward arc carries a negated cost. Dijkstra refuses to run with negative edges. We could fall back to Bellman--Ford on every iteration at $\Oh(VE)$ per path, but there is a far better way, lifted straight from Johnson's all-pairs algorithm in the shortest-path chapters.
+
+Maintain a \textbf{potential} $\pi(v)$ at each vertex and define the \textbf{reduced cost}
+\[
+  \bar w(u,v) \;=\; w(u,v) + \pi(u) - \pi(v).
+\]
+Two facts make this work:
+
+\begin{lemma}[Reduced costs are path-invariant up to endpoints]\label{ch14:lem-reduced}
+For any $s$--$t$ path $P$, $\;\sum_{(u,v)\in P}\bar w(u,v) = \mathrm{cost}(P) + \pi(s) - \pi(t)$. The $\pi$-terms telescope, so the path \emph{minimizing} reduced cost also minimizes true cost. A shortest path is unchanged by the reweighting.
+\end{lemma}
+
+\begin{lemma}[Reduced costs stay nonnegative]\label{ch14:lem-nonneg}
+Set $\pi(v)$ equal to the true shortest-path distance from $s$ to $v$ in the current residual graph. Then for every residual arc $(u,v)$, $\;\bar w(u,v)=w(u,v)+\pi(u)-\pi(v)\ge 0$, because shortest-path distances satisfy the triangle inequality $\pi(v)\le \pi(u)+w(u,v)$.
+\end{lemma}
+
+So after each Dijkstra run, we \emph{update} $\pi(v)\mathrel{+}=d(v)$ (where $d$ is the reduced-cost distance found this round). The crucial claim is that this update keeps reduced costs nonnegative even on the arcs that just appeared in the residual graph.
+
+\begin{lemma}[Potentials remain valid after augmentation]\label{ch14:lem-newarcs}
+After updating potentials and augmenting along a shortest path $P$, every residual arc --- including the newly created reverse arcs along $P$ --- has nonnegative reduced cost under the new $\pi$.
+\end{lemma}
+
+\begin{proof}
+Let $\pi'(v)=\pi(v)+d(v)$ be the updated potential, where $d$ solves the single-source shortest paths under reduced costs $\bar w$. For any arc $(u,v)$ that existed and was used by Dijkstra, $d(v)\le d(u)+\bar w(u,v)$, i.e.\ $d(v)\le d(u)+w(u,v)+\pi(u)-\pi(v)$, which rearranges to $w(u,v)+\pi'(u)-\pi'(v)\ge 0$. For a reverse arc $(v,u)$ newly created because $(u,v)$ lay on the shortest path $P$: on $P$ the inequality is tight, $d(v)=d(u)+\bar w(u,v)$, so $w(u,v)+\pi'(u)-\pi'(v)=0$, and the reverse arc has cost $-w(u,v)$ with reduced cost $-w(u,v)+\pi'(v)-\pi'(u)=0\ge 0$. Hence validity is preserved.
+\end{proof}
+
+\begin{whybox}
+This is the engine that makes SSP fast. The first potential pass might need Bellman--Ford ($\Oh(VE)$) if the original costs include negatives, but \emph{every subsequent} shortest-path computation is a plain nonnegative-weight Dijkstra at $\Oh(E\log V)$. The potentials are nothing but the running shortest-path distances from $s$; Lemma~\ref{ch14:lem-newarcs} guarantees they keep the residual graph Dijkstra-ready forever.
+\end{whybox}
+
+\begin{trapbox}
+A frequent bug: recomputing $\bar w$ from the \emph{original} $\pi$ after augmenting, instead of accumulating $\pi(v)\mathrel{+}=d(v)$. If you forget the update, the newly created reverse arcs can show negative reduced cost on the next iteration and Dijkstra silently returns wrong distances --- no crash, just a flow that is not minimum cost. Always update potentials before the next Dijkstra, and use $\infty$-distance vertices' potentials with care (leave them unchanged; they are unreachable this round).
+\end{trapbox}
+
+\begin{complexitybox}
+With integer capacities bounded by $U$ and value $F$: each augmentation raises the value by at least $1$, so at most $F$ augmentations, each a Dijkstra at $\Oh(E\log V)$ (or $\Oh(E + V\log V)$ with Fibonacci heaps). Total: $\Oh\!\big(F\cdot E\log V\big)$, plus one $\Oh(VE)$ Bellman--Ford for the initial potentials. Bottleneck (scaling-the-bottleneck) augmentation pushes the largest feasible $\delta$ each time and reduces the count to $\Oh(E\log U)$ phases. For unit-capacity graphs (matching!), $F\le V$, giving the famous $\Oh(VE\log V)$.
+\end{complexitybox}
+
+\subsection{A reference implementation}
+\label{ch14:code}
+
+Pseudocode hides the bookkeeping that bites in practice: paired residual arcs, $\infty$-distance vertices, and the potential update. Here is a compact but complete SSP with potentials, written so the data structures are explicit. Arcs are stored in an array; arc $e$ and its paired reverse arc $e\oplus 1$ sit next to each other, so flipping the low bit jumps between them.
+
+\begin{lstlisting}[language=C++,caption={SSP with Johnson potentials and Dijkstra.},label=ch14:lst-ssp]
+struct Arc { int to, cap, cost; };       // residual cap and per-unit cost
+vector<Arc> arc;                          // arc[e] and arc[e^1] are a pair
+vector<vector<int>> g;                    // g[u] = indices of arcs out of u
+
+void add_arc(int u, int v, int cap, int cost) {
+    g[u].push_back(arc.size()); arc.push_back({v, cap,  cost});
+    g[v].push_back(arc.size()); arc.push_back({u, 0,   -cost}); // reverse
+}
+
+// Returns {flow, cost} of a min-cost flow of value up to F from s to t.
+pair<long long,long long> min_cost_flow(int n, int s, int t, int F) {
+    const long long INF = 1e18;
+    vector<long long> pi(n, 0);
+    // One Bellman-Ford for initial potentials if negative costs may exist.
+    // (Omitted when all costs >= 0: pi stays 0.)
+    long long flow = 0, cost = 0;
+    while (flow < F) {
+        vector<long long> d(n, INF);          // reduced-cost distances
+        vector<int> par_arc(n, -1);
+        priority_queue<pair<long long,int>,
+            vector<pair<long long,int>>, greater<>> pq;
+        d[s] = 0; pq.push({0, s});
+        while (!pq.empty()) {
+            auto [du, u] = pq.top(); pq.pop();
+            if (du > d[u]) continue;          // stale heap entry
+            for (int e : g[u]) {
+                const Arc& a = arc[e];
+                if (a.cap <= 0) continue;     // no residual capacity
+                long long rw = a.cost + pi[u] - pi[a.to];   // reduced cost
+                if (d[u] + rw < d[a.to]) {
+                    d[a.to] = d[u] + rw;
+                    par_arc[a.to] = e;
+                    pq.push({d[a.to], a.to});
+                }
+            }
+        }
+        if (d[t] == INF) break;               // t unreachable: done
+        for (int v = 0; v < n; ++v)           // accumulate potentials
+            if (d[v] < INF) pi[v] += d[v];
+        // Bottleneck along the s->t tree path.
+        long long push = F - flow;
+        for (int v = t; v != s; ) {
+            int e = par_arc[v];
+            push = min<long long>(push, arc[e].cap);
+            v = arc[e ^ 1].to;
+        }
+        for (int v = t; v != s; ) {           // apply the augmentation
+            int e = par_arc[v];
+            arc[e].cap     -= push;
+            arc[e ^ 1].cap += push;
+            v = arc[e ^ 1].to;
+        }
+        flow += push;
+        cost += push * (pi[t] - pi[s]);       // true cost of this path
+    }
+    return {flow, cost};
+}
+\end{lstlisting}
+
+\begin{whybox}
+Three lines carry the whole theory. \texttt{rw = a.cost + pi[u] - pi[a.to]} is Johnson's reduced cost (Lemma~\ref{ch14:lem-reduced}); it is provably $\ge 0$ (Lemma~\ref{ch14:lem-nonneg}), so the priority-queue Dijkstra is valid. \texttt{pi[v] += d[v]} is the potential update that keeps the \emph{next} round Dijkstra-ready (Lemma~\ref{ch14:lem-newarcs}). And \texttt{cost += push * (pi[t] - pi[s])} reads the true path cost straight off the potentials, because after the update $\pi(t)-\pi(s)$ equals the accumulated true shortest distance from $s$ to $t$ --- no need to walk the path summing $w$. Note the reverse arc starts at capacity $0$: it only opens up once forward flow has been pushed, which is exactly when un-shipping should become possible.
+\end{whybox}
+
+\begin{trapbox}
+The branch \texttt{if (du > d[u]) continue;} discards stale heap entries; without it, a vertex can be expanded many times and the running time silently degrades. Equally important: only vertices with $d[v]<\infty$ get their potential updated. Bumping an unreachable vertex's potential by $\infty$ corrupts every future reduced cost. If you ever see Dijkstra return a negative distance, the culprit is almost always a skipped potential update or a potential nudged on an unreachable node.
+\end{trapbox}
+
+\section{Working a graph by hand}
+\label{ch14:trace}
+
+Take the instance of Figure~\ref{ch14:fig-instance} and find a min-cost \emph{max}-flow with SSP. Arcs and their $(c,w)$: $s\!\to\!a\,(3,1)$, $s\!\to\!b\,(2,2)$, $a\!\to\!t\,(2,1)$, $b\!\to\!t\,(3,1)$, $a\!\to\!b\,(2,1)$. All original costs are nonnegative, so initial potentials are $0$ and the first Dijkstra needs no Bellman--Ford.
+
+\begin{labbox}
+Keep three columns as you read: current flow on each arc, the path Dijkstra finds, and the running cost. Recompute reduced costs after each augmentation using updated $\pi$. Try to predict each path before reading on.
+\end{labbox}
+
+\textbf{Iteration 1.} Residual $=$ original. True shortest $s$--$t$ costs: via $a$: $s\!\to\!a\!\to\!t=1+1=2$; via $b$: $s\!\to\!b\!\to\!t=2+1=3$; via $a\!\to\!b$: $1+1+1=3$. Cheapest path $P_1=s\!\to\!a\!\to\!t$, cost $2$/unit. Bottleneck $=\min(c_{sa},c_{at})=\min(3,2)=2$. Push $2$. Now $f_{sa}=2,\ f_{at}=2$. Value $=2$, cost $=2\cdot 2 = 4$. Potentials become the distances: $\pi(s)=0,\pi(a)=1,\pi(b)=2,\pi(t)=2$.
+
+\textbf{Iteration 2.} Residual changes: $a\!\to\!t$ is saturated (gone forward), reverse $t\!\to\!a$ appears (cost $-1$); $s\!\to\!a$ has residual capacity $1$ left. Reduced costs $\bar w=w+\pi(u)-\pi(v)$:
+\[
+\begin{array}{lll}
+ s\!\to\!a:\ 1+0-1=0, & s\!\to\!b:\ 2+0-2=0, & a\!\to\!b:\ 1+1-2=0,\\
+ b\!\to\!t:\ 1+2-2=1, & t\!\to\!a:\ -1+2-1=0. &
+\end{array}
+\]
+All reduced costs are $\ge 0$ --- Dijkstra is happy. Cheapest residual $s$--$t$ route: $s\!\to\!a\!\to\!b\!\to\!t$ has reduced cost $0+0+1=1$, true cost $1+1+1=3$; alternatively $s\!\to\!b\!\to\!t$ reduced $0+1=1$, true $3$. Both cost $3$/unit. Take $P_2=s\!\to\!a\!\to\!b\!\to\!t$. Residual bottleneck: $c_f(s,a)=1$, $c_f(a,b)=2$, $c_f(b,t)=3$, so $\delta=1$. Push $1$. Now $f_{sa}=3,f_{ab}=1,f_{bt}=1$. Value $=3$, cost $=4+3=7$. Update potentials by $d$: $d(s)=0,d(a)=0,d(b)=0,d(t)=1$, so $\pi=(0,1,2,3)$.
+
+\textbf{Iteration 3.} Can we push more? $s\!\to\!a$ is now saturated ($f=3=c$); the only remaining source arc with capacity is $s\!\to\!b$ ($c=2,f=0$, residual $2$). Path $s\!\to\!b\!\to\!t$: $b\!\to\!t$ residual $=3-1=2$. So $P_3=s\!\to\!b\!\to\!t$, true cost/unit $=2+1=3$, bottleneck $=\min(2,2)=2$. Push $2$. Value $=5$, cost $=7+2\cdot 3=13$.
+
+\textbf{Iteration 4.} Now both source arcs are saturated ($s\!\to\!a:3/3$, $s\!\to\!b:2/2$), so $t$ is unreachable from $s$ in $\Gph_f$. Stop. Maximum value $=5$, minimum cost $=13$.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Latex,node distance=22mm,
+  V/.style={circle,draw=nodeblue,very thick,fill=blue!4,minimum size=8mm,font=\small},
+  flow/.style={draw=targetgreen,very thick}]
+  \node[V] (s) {$s$};
+  \node[V] (a) [above right=8mm and 30mm of s] {$a$};
+  \node[V] (b) [below right=8mm and 30mm of s] {$b$};
+  \node[V] (t) [below right=8mm and 30mm of a] {$t$};
+  \draw[flow,->] (s) edge node[above left,font=\scriptsize] {$3/3$} (a);
+  \draw[flow,->] (s) edge node[below left,font=\scriptsize] {$2/2$} (b);
+  \draw[flow,->] (a) edge node[above right,font=\scriptsize] {$2/2$} (t);
+  \draw[flow,->] (b) edge node[below right,font=\scriptsize] {$3/3$} (t);
+  \draw[flow,->] (a) edge node[right,font=\scriptsize] {$1/2$} (b);
+\end{tikzpicture}
+\caption{Final min-cost max-flow, shown as $f/c$ per arc. Value $5$, cost $13$. Cheap arcs ($a\!\to\!t$) filled first; the costly $s\!\to\!b$ used only once the cheaper route saturated.}
+\label{ch14:fig-final}
+\end{figure}
+
+\begin{labbox}
+Now confirm optimality the \emph{other} way. Build $\Gph_f$ for the flow above and run Bellman--Ford looking for a negative cycle. List the residual arcs first: every saturated arc ($s\!\to\!a$, $s\!\to\!b$, $a\!\to\!t$, $b\!\to\!t$) leaves only its reverse, and $a\!\to\!b$ (flow $1$ of $2$) keeps both directions. Now notice $s$ has no outgoing residual arc and $t$ has no incoming one, so no residual cycle can touch $s$ or $t$. The only directed cycle left is $a\!\to\!b\!\to\!a$, with cost $w_{ab}+(-w_{ab})=1+(-1)=0\ge 0$. No negative cycle exists, so Theorem~\ref{ch14:thm-negcycle} certifies the same answer the build-up produced.
+\end{labbox}
+
+\section{Cost scaling: the idea}
+\label{ch14:scaling}
+
+SSP charges once per augmentation, so its running time scales with the flow value $F$ --- pseudopolynomial when capacities are huge. Cost scaling removes that dependence by attacking the costs bit by bit, in the same spirit as capacity scaling for max-flow.
+
+\begin{intuitionbox}
+Relax optimality. Call a flow $\eps$-optimal if every residual arc has reduced cost $\ge -\eps$ (a little negativity is tolerated). Start with $\eps$ large enough that any flow qualifies. Then repeatedly \emph{halve} $\eps$ and ``refine'' the flow back to $\eps$-optimality with push--relabel-style operations on reduced costs. Once $\eps < 1/n$ with integer costs, $\eps$-optimal forces exactly optimal, because a negative cycle would have total reduced cost $\ge -n\eps > -1$, impossible for integers summing to something negative.
+\end{intuitionbox}
+
+\begin{definition}[$\eps$-optimality]\label{ch14:def-eps}
+A flow $f$ with potentials $\pi$ is $\eps$-optimal if every residual arc $(u,v)$ satisfies $\bar w(u,v)=w(u,v)+\pi(u)-\pi(v)\ge -\eps$.
+\end{definition}
+
+\begin{theorem}[Scaling terminates at the optimum]\label{ch14:thm-scaling}
+With integer costs and $n=\abs V$ vertices, any $\eps$-optimal flow with $\eps < 1/n$ is optimal.
+\end{theorem}
+
+\begin{proof}
+Take any residual cycle $C$ ($\abs C \le n$ arcs). The $\pi$-terms telescope around a cycle, so $\sum_{C}\bar w = \sum_C w = \mathrm{cost}(C)$. By $\eps$-optimality each $\bar w \ge -\eps$, so $\mathrm{cost}(C) \ge -\abs C\,\eps > -n\cdot(1/n) = -1$. With integer costs $\mathrm{cost}(C)$ is an integer greater than $-1$, hence $\ge 0$. No negative cycle exists, so by Theorem~\ref{ch14:thm-negcycle} $f$ is optimal.
+\end{proof}
+
+Each scaling phase ($\eps \to \eps/2$) re-establishes $\eps$-optimality using push and relabel operations that admit only arcs with reduced cost below $-\eps/2$, mirroring the max-flow push--relabel machinery you saw earlier. Goldberg and Tarjan proved each phase costs $\Oh(V^2E)$ (or $\Oh(V^3)$ with the right implementation), and there are $\Oh(\log(nW))$ phases, for a strongly competitive $\Oh(V^2 E \log(nW))$ or better.
+
+\begin{complexitybox}
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Algorithm & Running time & Notes \\
+\midrule
+Cycle canceling (any cycle) & $\Oh(VE\cdot mWU)$ & pseudopolynomial, simple \\
+Min-mean cycle canceling & $\Oh(V^2E^2\log V)$ & strongly polynomial \\
+SSP (Dijkstra+potentials) & $\Oh(F\cdot E\log V)$ & scales with value $F$ \\
+SSP, bottleneck scaling & $\Oh(E\log U\cdot E\log V)$ & weakly polynomial \\
+Cost scaling (push--relabel) & $\Oh(V^2E\log(nW))$ & method of choice in practice \\
+\bottomrule
+\end{tabular}
+\end{center}
+$m=\abs E$, $U=\max$ capacity, $W=\max\abs{w}$, $F=$ flow value.
+\end{complexitybox}
+
+\begin{historybox}
+The successive-shortest-paths idea traces to Ford and Fulkerson and to Jewell, Iri, and Busacker--Gowen in the late 1950s. Edmonds and Karp (1972) added potentials so Dijkstra could replace Bellman--Ford --- the same paper that gave us capacity scaling. Tomizawa (1971) noted the potential trick independently. Cost scaling is Goldberg and Tarjan (1987--1990), descended directly from their push--relabel max-flow work. The current theoretical frontier runs through interior-point and Laplacian-based solvers (see the electrical-flow chapters): near-linear-time min-cost flow was achieved by Chen, Kyng, Liu, Peng, Probst Gutenberg, and Sachdeva in 2022.
+\end{historybox}
+
+\section{Transportation and assignment as special cases}
+\label{ch14:special}
+
+Two classical problems are just min-cost flow wearing different hats. Recognizing the reduction lets you solve them with the machinery above instead of bespoke code.
+
+\subsection{The transportation problem}
+
+You have warehouses $1,\dots,p$ with supplies $a_i$ and stores $1,\dots,q$ with demands $b_j$ ($\sum a_i = \sum b_j$). Shipping one unit from warehouse $i$ to store $j$ costs $w_{ij}$. Minimize total shipping cost while meeting all demands.
+
+Model it as a bipartite flow. Add a super-source $s$ with arc $(s,i)$ of capacity $a_i$, cost $0$; a super-sink $t$ with arc $(j,t)$ of capacity $b_j$, cost $0$; and arcs $(i,j)$ of capacity $\infty$ (or $\min(a_i,b_j)$), cost $w_{ij}$. A min-cost max-flow saturates all supply/demand arcs and routes goods at minimum cost.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Latex,
+  V/.style={circle,draw=nodeblue,thick,fill=blue!4,minimum size=7mm,font=\scriptsize},
+  S/.style={circle,draw=sourceblue,very thick,fill=blue!8,minimum size=8mm,font=\small}]
+  \node[S] (s) {$s$};
+  \node[V] (w1) [above right=4mm and 18mm of s] {$1$};
+  \node[V] (w2) [below right=4mm and 18mm of s] {$2$};
+  \node[V] (st1) [right=24mm of w1] {$1$};
+  \node[V] (st2) [right=24mm of w2] {$2$};
+  \node[S] (t) [below right=4mm and 18mm of st1] {$t$};
+  \draw[->,edgegray,thick] (s) -- (w1) node[midway,above,font=\tiny]{$a_1$};
+  \draw[->,edgegray,thick] (s) -- (w2) node[midway,below,font=\tiny]{$a_2$};
+  \draw[->,structurepurple,thick] (w1) -- (st1) node[midway,above,font=\tiny]{$w_{11}$};
+  \draw[->,structurepurple,thick] (w1) -- (st2);
+  \draw[->,structurepurple,thick] (w2) -- (st1);
+  \draw[->,structurepurple,thick] (w2) -- (st2) node[midway,below,font=\tiny]{$w_{22}$};
+  \draw[->,edgegray,thick] (st1) -- (t) node[midway,above,font=\tiny]{$b_1$};
+  \draw[->,edgegray,thick] (st2) -- (t) node[midway,below,font=\tiny]{$b_2$};
+\end{tikzpicture}
+\caption{Transportation as a flow: capacities on the source/sink arcs encode supplies and demands; middle-arc costs are shipping prices.}
+\label{ch14:fig-transport}
+\end{figure}
+
+\subsection{The assignment problem}
+
+Assignment is transportation with all $a_i=b_j=1$ and $p=q=n$: match $n$ workers to $n$ jobs, one-to-one, minimizing total cost $\sum w_{i,\sigma(i)}$ over permutations $\sigma$. As a flow it is a bipartite graph with unit capacities everywhere; a min-cost max-flow of value $n$ is a minimum-cost perfect matching.
+
+\begin{applicationbox}
+This is precisely the problem the Hungarian algorithm solves, and SSP on the unit-capacity bipartite graph \emph{is} the Hungarian algorithm in disguise: the potentials $\pi$ are the dual variables (the ``labels''), each shortest-path augmentation matches one more worker, and Lemma~\ref{ch14:lem-newarcs} is the statement that labels stay feasible. The weighted-bipartite-matching chapter develops this view fully; here it is one instantiation of a general engine. Because $F=n$ and capacities are $1$, SSP runs in $\Oh(n\cdot E\log n)=\Oh(n^3\log n)$, matching the classical bound.
+\end{applicationbox}
+
+\begin{connectionbox}
+Unit capacities make the integrality of min-cost flow shine: every basic optimal solution is integral, so the min-cost flow LP \emph{automatically} returns a 0/1 matching with no rounding. This is the totally-unimodular structure of the node-arc incidence matrix --- the same property that makes max-flow integral. See the bipartite-matching chapters and the LP appendix for total unimodularity.
+\end{connectionbox}
+
+\section{The linear-programming view}
+\label{ch14:lp}
+
+Min-cost flow is a linear program, and its dual is exactly the potentials we have been carrying around. Making that precise explains every reduced cost in the chapter.
+
+For the fixed-value problem with node demands $d(v)$ (with $d(s)=-F$, $d(t)=+F$, $d(v)=0$ else), the primal is
+\[
+\begin{array}{ll}
+\text{minimize} & \displaystyle\sum_{(u,v)\in E} w(u,v)\,f(u,v) \\[4pt]
+\text{s.t.} & \displaystyle\sum_{v} f(u,v) - \sum_{v} f(v,u) = -d(u) \quad \forall u \quad (\text{conservation, dual var } \pi_u) \\[6pt]
+& 0 \le f(u,v) \le c(u,v) \quad \forall (u,v) \quad (\text{capacity, dual var } \rho_{uv}\ge 0).
+\end{array}
+\]
+Assigning dual variable $\pi_u$ to each conservation constraint and $\rho_{uv}\ge 0$ to each upper bound, the dual is
+\[
+\begin{array}{ll}
+\text{maximize} & \displaystyle\sum_u d(u)\,\pi_u - \sum_{(u,v)} c(u,v)\,\rho_{uv} \\[4pt]
+\text{s.t.} & \pi_v - \pi_u - \rho_{uv} \le w(u,v),\qquad \rho_{uv}\ge 0 .
+\end{array}
+\]
+Rearranged, the dual constraint says $\rho_{uv} \ge -\,\bar w(u,v)$ where $\bar w(u,v)=w(u,v)+\pi_u-\pi_v$ is exactly our reduced cost. Complementary slackness then reads:
+
+\begin{theorem}[Optimality via complementary slackness]\label{ch14:thm-cs}
+A feasible flow $f$ and potentials $\pi$ are jointly optimal iff for every arc $(u,v)$:
+\begin{itemize}
+  \item if $\bar w(u,v) > 0$ then $f(u,v)=0$ (too expensive: do not use it);
+  \item if $\bar w(u,v) < 0$ then $f(u,v)=c(u,v)$ (a bargain: saturate it);
+  \item if $0 < f(u,v) < c(u,v)$ then $\bar w(u,v)=0$ (interior flow only on tight arcs).
+\end{itemize}
+\end{theorem}
+
+\begin{whybox}
+These three conditions are the same statement as ``no negative residual cycle,'' viewed through duality. An arc with $\bar w<0$ and unsaturated flow, or $\bar w>0$ with positive flow, is precisely a residual arc of negative reduced cost --- the seed of an improving cycle. So Theorem~\ref{ch14:thm-cs} and Theorem~\ref{ch14:thm-negcycle} are two dialects of one fact. The potentials $\pi$ that SSP accumulates are an \emph{optimal dual solution} being built incrementally; at termination they satisfy complementary slackness against the flow.
+\end{whybox}
+
+\begin{connectionbox}
+Strong LP duality guarantees primal optimum $=$ dual optimum, which here specializes to a min-cost-flow analogue of max-flow min-cut. For pure max-flow ($w\equiv 0$, value-maximizing) the dual collapses to the min-cut, recovering the theorem of the previous chapters. The potentials reappear in the Laplacian and electrical-flow chapters as \emph{voltages}: an electrical flow minimizes energy $\sum r_{uv} f_{uv}^2$ subject to conservation, and the optimality condition is again ``potential differences drive the flow,'' now via Ohm's law $f_{uv}=(\pi_u-\pi_v)/r_{uv}$. Min-cost flow is the linear cousin of that quadratic story.
+\end{connectionbox}
+
+\begin{aestheticbox}
+The whole chapter is one diagram drawn three ways. \emph{Combinatorially}: cancel negative cycles. \emph{Algorithmically}: route cheapest paths and let potentials track distances. \emph{Analytically}: solve an LP whose dual variables are those very potentials. Each view validates the others, and each becomes the natural tool in a different regime --- canceling for certifying, SSP for matching and assignment, scaling and interior-point for raw speed.
+\end{aestheticbox}
+
+\section{Exercises}
+\label{ch14:exercises}
+
+\begin{exercise}[Trace the canceler]
+Take the flow of Figure~\ref{ch14:fig-final} but \emph{perturb} it: reroute one unit from $s\!\to\!a\!\to\!t$ to $s\!\to\!a\!\to\!b\!\to\!t$ and one unit of $b\!\to\!t$ correspondingly, keeping value $5$ but raising cost. Build $\Gph_f$, find the negative cycle Bellman--Ford reports, cancel it, and confirm you return to cost $13$.
+\end{exercise}
+
+\begin{exercise}[Potentials by hand]
+Re-run the SSP trace of Section~\ref{ch14:trace} but introduce a negative cost: set $w(a\!\to\!b)=-2$. Compute the initial potentials with one Bellman--Ford pass, then run Dijkstra with reduced costs for each augmentation. Verify Lemma~\ref{ch14:lem-newarcs} numerically at every step.
+\end{exercise}
+
+\begin{exercise}[Why same value]
+Give a two-vertex example of flows $f,f'$ with $\abs f\ne\abs{f'}$ where $\mathrm{cost}(f')-\mathrm{cost}(f)$ is \emph{not} a sum of residual-cycle costs, illustrating why Theorem~\ref{ch14:thm-negcycle} restricts to equal values.
+\end{exercise}
+
+\begin{exercise}[Break Dijkstra]
+Construct a residual graph with a negative arc on which running Dijkstra \emph{without} potentials returns an incorrect shortest path, then show the potential reweighting fixes it. State the smallest such graph you can find.
+\end{exercise}
+
+\begin{exercise}[Bottleneck scaling]
+Implement the bottleneck-scaling variant of SSP: maintain a threshold $\Delta$, augment only along paths whose bottleneck is $\ge\Delta$, then halve $\Delta$. Prove the number of phases is $\Oh(\log U)$ and bound the augmentations per phase.
+\end{exercise}
+
+\begin{exercise}[Assignment $=$ flow]
+Encode a $3\times 3$ assignment problem (your choice of $w_{ij}$) as a unit-capacity min-cost flow, run SSP, and read off the optimal permutation. Then identify which potentials correspond to the Hungarian algorithm's row and column labels.
+\end{exercise}
+
+\begin{exercise}[Lower bounds on arcs]
+Extend the model to arcs with a lower bound $\ell(u,v)\le f(u,v)\le c(u,v)$. Show how to reduce to a standard min-cost flow by sending $\ell$ units along each arc up front and adjusting supplies/demands, and prove feasibility is preserved.
+\end{exercise}
+
+\begin{exercise}[Convex costs]
+Suppose an arc's cost is a \emph{convex} piecewise-linear function of its flow (the more you ship, the more each extra unit costs). Show how to model this with parallel arcs of increasing cost and prove that SSP fills them in the correct order. Where does convexity become essential?
+\end{exercise}
+
+\begin{exercise}[Min-mean cycle]
+Implement Karp's $\Oh(VE)$ minimum-mean-cycle algorithm and plug it into Algorithm~\ref{ch14:alg-cancel}. Empirically compare the number of cancellations against ``any negative cycle'' on a few random graphs; relate your counts to the Goldberg--Tarjan bound.
+\end{exercise}
+
+\begin{exercise}[Dual reading]
+For the final flow of Section~\ref{ch14:trace}, write down the potentials $\pi$ at termination and verify all three complementary-slackness conditions of Theorem~\ref{ch14:thm-cs} arc by arc. Confirm the dual objective equals the primal cost $13$.
+\end{exercise}
+
+\begin{exercise}[Cancel vs.\ SSP]
+Prove that running negative-cycle canceling to completion and running SSP to the same value both yield flows of identical cost (the optimum), even though the intermediate flows differ. Which algorithm can revisit and \emph{undo} earlier routing decisions, and which never does?
+\end{exercise}
+
+\begin{exercise}[Slack to be wasteful]
+Section~\ref{ch14:cancel-trace} had to raise a capacity before a suboptimal value-$5$ flow even existed. Characterize exactly when an instance has a unique feasible flow of a given value (hint: think about the residual graph having no cycle at all). Construct the smallest instance where two distinct flows of equal value exist, one strictly cheaper, and trace one cancellation between them.
+\end{exercise}
+
+\begin{exercise}[Read the code]
+In Listing~\ref{ch14:lst-ssp}, the cost of each augmentation is computed as \texttt{push * (pi[t] - pi[s])} rather than by summing $w$ along the path. Prove this equals the true path cost after the potential update. Then break it deliberately: remove the \texttt{if (d[v] < INF)} guard on the potential update and exhibit a small graph where the reported cost becomes wrong.
+\end{exercise}
+
+\begin{exercise}[Paired arcs]
+The reference implementation pairs arc $e$ with arc $e\oplus 1$. Explain why \texttt{add\_arc} must push the forward and reverse arcs consecutively for the bit trick to work, and what breaks if you instead store reverse arcs in a separate array indexed by a map. Reimplement with an explicit \texttt{rev[]} index array and argue the two are equivalent.
+\end{exercise}

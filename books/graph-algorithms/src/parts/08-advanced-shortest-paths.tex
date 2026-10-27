@@ -1,0 +1,1074 @@
+\chapter{Advanced Shortest Paths}
+
+The previous chapter built the classical machinery: Dijkstra for nonnegative
+weights, Bellman--Ford for negative edges, the relaxation invariant, and the
+priority-queue bookkeeping that makes Dijkstra run in $\Oh((m+n)\log n)$. That
+machinery answers a single question optimally: \emph{what is the distance from a
+source to every vertex?} On a continental road network with $n \approx 2\cdot
+10^7$ vertices, ``every vertex'' is the wrong question. A navigation app issues
+millions of point-to-point queries per second, and each one wants
+\emph{this} $s$-to-$t$ distance, now, ideally in microseconds. Plain Dijkstra
+settles a ball of vertices whose radius is $\dist(s,t)$; on a road graph that
+ball can hold most of a country before $t$ is reached. We need to be cleverer.
+
+This chapter is about being cleverer. We keep the relaxation framework intact --
+every algorithm here is, underneath, a correct shortest-path computation -- but
+we change \emph{which vertices we touch} and \emph{how much we precompute}. Four
+ideas, in increasing sophistication:
+
+\begin{itemize}
+  \item \textbf{Goal-directed search ($A^*$).} Bias the search toward $t$ using
+        a heuristic lower bound on the remaining distance. No preprocessing;
+        correctness rests on a clean algebraic condition (admissibility /
+        consistency).
+  \item \textbf{Bidirectional search.} Grow two Dijkstra balls, one from $s$ and
+        one backward from $t$, and stop when they meet. The two small balls
+        together are far cheaper than one big one.
+  \item \textbf{Landmarks (ALT).} Precompute distances to a handful of landmark
+        vertices; the triangle inequality turns them into sharp $A^*$ heuristics.
+        A little preprocessing buys a lot of pruning.
+  \item \textbf{Contraction hierarchies (CH).} Heavy preprocessing -- order the
+        vertices by ``importance'' and add shortcut edges -- so that queries
+        become a tiny bidirectional Dijkstra over an upward graph. This is the
+        method behind modern road routing, with query times in the
+        \emph{microsecond} range on continental graphs.
+\end{itemize}
+
+Throughout, $\Gph=(V,E)$ is a directed graph with nonnegative edge weights
+$w:E\to\R_{\ge 0}$, $n=\abs{V}$, $m=\abs{E}$. We write $\dist(u,v)$ for the true
+shortest-path distance and reserve $d[\cdot]$ for tentative distances held by an
+algorithm. For backward search we use the \emph{reverse graph} $\Gph^{R}$, which
+has an edge $(v,u)$ of weight $w(u,v)$ for every edge $(u,v)$ of $\Gph$;
+distances in $\Gph^{R}$ from $t$ are exactly distances in $\Gph$ \emph{to} $t$.
+
+\begin{intuitionbox}
+Plain Dijkstra is a blind, expanding circle: it has no idea where $t$ is, so it
+grows equally in all directions. Every method in this chapter is a way of
+\emph{telling the search where the target is} -- with a geometric guess
+($A^*$), with two circles instead of one (bidirectional), with precomputed
+distances to anchors (ALT), or by precomputing a road-hierarchy so highways are
+preferred automatically (CH). Same destination, far fewer vertices touched.
+\end{intuitionbox}
+
+\section{The cost of being blind: a motivating picture}
+\label{ch08:motivation}
+
+Consider Dijkstra from $s$ on a roughly uniform planar graph (a road map is
+close enough). By the time $t$ is settled, every vertex $v$ with
+$\dist(s,v)\le\dist(s,t)$ has been settled too. The settled set is a disk of
+radius $r=\dist(s,t)$, and on a planar graph with bounded density it contains
+$\Th(r^2)$ vertices. If $s$ and $t$ are far apart, that is an enormous fraction
+of the map.
+
+\begin{center}
+\begin{tikzpicture}[scale=1.0]
+  % Dijkstra disk
+  \begin{scope}
+    \fill[blue!8] (0,0) circle (1.7);
+    \draw[blue!50!black,thick] (0,0) circle (1.7);
+    \node[circle,fill=sourceblue,inner sep=1.6pt,label=below left:{$s$}] (s) at (0,0) {};
+    \node[circle,fill=targetgreen,inner sep=1.6pt,label=right:{$t$}] (t) at (1.55,0.6) {};
+    \node at (0,-2.2) {\small plain Dijkstra: one big disk};
+  \end{scope}
+  % Bidirectional / A* shape
+  \begin{scope}[xshift=6cm]
+    \fill[blue!8] (0,0) circle (0.95);
+    \draw[blue!50!black,thick] (0,0) circle (0.95);
+    \fill[green!10] (1.7,0.6) circle (0.95);
+    \draw[green!45!black,thick] (1.7,0.6) circle (0.95);
+    \node[circle,fill=sourceblue,inner sep=1.6pt,label=below left:{$s$}] (s2) at (0,0) {};
+    \node[circle,fill=targetgreen,inner sep=1.6pt,label=right:{$t$}] (t2) at (1.7,0.6) {};
+    \node at (0.85,-2.2) {\small bidirectional: two small disks meet};
+  \end{scope}
+\end{tikzpicture}
+\end{center}
+
+Two half-radius disks have total area $2\cdot\pi(r/2)^2 = \pi r^2/2$, half the
+area of the full disk. That is the bidirectional win in one line. $A^*$ deforms
+the single disk into an ellipse hugging the $s$--$t$ axis; with a perfect
+heuristic it collapses to a thin corridor of $\Th(r)$ vertices. CH abandons the
+disk picture entirely: it climbs a precomputed hierarchy so the search reaches
+$t$ after touching only a few hundred vertices, independent of $r$.
+
+\section{Goal-directed search: \texorpdfstring{$A^*$}{A*}}
+\label{ch08:astar}
+
+\subsection{From Dijkstra to \texorpdfstring{$A^*$}{A*}}
+
+Dijkstra orders its priority queue by $d[v]$, the best-known distance from $s$.
+$A^*$ adds a \emph{potential} $h(v)$, an estimate of the remaining distance
+$\dist(v,t)$, and orders by
+\[
+  f(v) \;=\; d[v] + h(v).
+\]
+The quantity $f(v)$ estimates the length of the best $s$--$t$ path that is forced
+to pass through $v$. Vertices that look like they lie on a good route to $t$ get
+small $f$ and are explored first; vertices pointing away from $t$ get large $f$
+and wait. When $h\equiv 0$, $A^*$ is exactly Dijkstra.
+
+\begin{intuitionbox}
+Think of $h(v)$ as a ``crow-flies'' estimate of how far $v$ still is from $t$.
+Dijkstra asks ``who is closest to where I started?''. $A^*$ asks ``who is on the
+most promising total route to where I am going?''. The promise is
+already-paid distance $d[v]$ plus the optimistic guess $h(v)$ of what remains.
+\end{intuitionbox}
+
+\subsection{Admissibility and consistency}
+
+For $A^*$ to return correct distances, $h$ cannot lie in the optimistic
+direction too aggressively. Two conditions matter.
+
+\begin{definition}[Admissible heuristic]
+\label{ch08:def-admissible}
+$h$ is \emph{admissible} (for target $t$) if $h(v)\le \dist(v,t)$ for every $v$,
+and $h(t)=0$. It never overestimates the true remaining distance.
+\end{definition}
+
+\begin{definition}[Consistent heuristic]
+\label{ch08:def-consistent}
+$h$ is \emph{consistent} (or \emph{monotone}) if for every edge $(u,v)$,
+\[
+  h(u) \;\le\; w(u,v) + h(v),
+\]
+and $h(t)=0$. Equivalently, the \emph{reduced cost}
+$w_h(u,v) := w(u,v) - h(u) + h(v)$ is nonnegative on every edge.
+\end{definition}
+
+\begin{lemma}[Consistency implies admissibility]
+\label{ch08:lem-cons-adm}
+If $h$ is consistent then $h$ is admissible.
+\end{lemma}
+\begin{proof}
+Take any $v$ and a shortest path $v=x_0,x_1,\dots,x_k=t$ of length
+$\dist(v,t)$. Summing consistency over its edges telescopes:
+\[
+  h(v)=h(x_0)\le \sum_{i=0}^{k-1} w(x_i,x_{i+1}) + h(x_k)
+       = \dist(v,t) + h(t) = \dist(v,t).
+\]
+So $h(v)\le\dist(v,t)$.
+\end{proof}
+
+The reduced-cost view is the key to everything. Define the potential function
+$\pi(v)=h(v)$ and rewrite each edge weight as $w_h(u,v)=w(u,v)-\pi(u)+\pi(v)$.
+For \emph{any} path $P$ from $s$ to $z$, the reduced length telescopes:
+\[
+  w_h(P) \;=\; \sum_{(u,v)\in P}\bigl(w(u,v)-\pi(u)+\pi(v)\bigr)
+         \;=\; w(P) - \pi(s) + \pi(z).
+\]
+The two endpoint potentials are the same for all $s$--$z$ paths, so $w_h$ and $w$
+rank paths identically: shortest paths are preserved. Consistency says
+$w_h\ge 0$, which means \textbf{$A^*$ on $w$ is precisely Dijkstra on the
+reduced weights $w_h$}. Every guarantee Dijkstra enjoys -- in particular,
+settling vertices in nondecreasing key order and finalizing each correctly --
+transfers verbatim. This single observation is the cleanest correctness proof of
+$A^*$ available, and we will reuse it for ALT and for CH's potentials.
+
+\begin{whybox}
+$A^*$ is not a new algorithm; it is Dijkstra wearing a disguise. The disguise is
+a node potential $\pi=h$ that re-weights every edge to $w-\pi(u)+\pi(v)$. If the
+potential is consistent the re-weighted graph has no negative edges, so Dijkstra
+is correct on it, and because re-weighting shifts every $s$--$t$ path's length by
+the same constant $\pi(t)-\pi(s)$, the shortest path is unchanged. Goal-direction
+is just a smart choice of potential -- one that is small near $t$.
+\end{whybox}
+
+\subsection{The algorithm}
+
+\begin{algorithm}[H]
+\DontPrintSemicolon
+\SetKwInOut{Input}{input}\SetKwInOut{Output}{output}
+\Input{graph $\Gph$, source $s$, target $t$, consistent heuristic $h$}
+\Output{$\dist(s,t)$}
+$d[v]\gets\infty$ for all $v$; \quad $d[s]\gets 0$\;
+priority queue $Q$ keyed by $f(v)=d[v]+h(v)$; insert $s$ with key $h(s)$\;
+\While{$Q$ not empty}{
+  $u\gets \textsc{ExtractMin}(Q)$\;
+  \If{$u=t$}{\Return $d[t]$ \tcp*{$t$ settled with final distance}}
+  \ForEach{edge $(u,v)\in E$}{
+    \If{$d[u]+w(u,v) < d[v]$}{
+      $d[v]\gets d[u]+w(u,v)$\;
+      $\textsc{DecreaseKeyOrInsert}(Q,\,v,\,d[v]+h(v))$\;
+    }
+  }
+}
+\Return $\infty$ \tcp*{$t$ unreachable}
+\caption{$A^*$ search with a consistent heuristic}
+\label{ch08:alg-astar}
+\end{algorithm}
+
+The only structural change from Dijkstra is the key: $d[v]+h(v)$ instead of
+$d[v]$, plus an early return the moment $t$ is extracted. With a consistent $h$,
+no vertex is ever reopened (it is plain Dijkstra on $w_h$), so the early stop is
+safe: when $t$ comes off the queue its distance is final.
+
+\begin{trapbox}
+\textbf{Admissible but not consistent.} If $h$ is only admissible, $A^*$ still
+returns the correct $\dist(s,t)$, but a settled vertex may later be found via a
+cheaper path and must be \emph{reopened} (reinserted into $Q$). Skipping the
+reopen check -- treating an extracted vertex as final, as you safely do under
+consistency -- can then yield a wrong, too-large distance. Implementations that
+assume consistency but are fed a merely-admissible heuristic produce silent
+errors on a small fraction of queries. Use consistent heuristics, or keep the
+reopen logic.
+\end{trapbox}
+
+\subsection{A worked trace}
+\label{ch08:astar-trace}
+
+Take this small weighted graph. Edge labels are weights; the dashed number under
+each vertex is the heuristic $h(v)$ (a straight-line lower bound to $t$).
+
+\begin{center}
+\begin{tikzpicture}[->,>=Stealth,node distance=2.0cm,thick,
+  every node/.style={circle,draw,fill=white,minimum size=7mm,inner sep=0pt,font=\small}]
+  \node (s) {$s$};
+  \node (a) [above right=0.8cm and 2.2cm of s] {$a$};
+  \node (b) [below right=0.8cm and 2.2cm of s] {$b$};
+  \node (c) [right=2.2cm of a] {$c$};
+  \node (t) [below right=0.8cm and 2.2cm of c] {$t$};
+  \path
+    (s) edge node[fill=white,draw=none,inner sep=1pt] {$2$} (a)
+    (s) edge node[fill=white,draw=none,inner sep=1pt] {$3$} (b)
+    (a) edge node[fill=white,draw=none,inner sep=1pt] {$3$} (c)
+    (b) edge node[fill=white,draw=none,inner sep=1pt] {$5$} (c)
+    (c) edge node[fill=white,draw=none,inner sep=1pt] {$2$} (t)
+    (b) edge[bend right=12] node[fill=white,draw=none,inner sep=1pt] {$6$} (t);
+  % heuristic labels
+  \node[draw=none,fill=none,below=2pt of s,font=\scriptsize\itshape] {$h=7$};
+  \node[draw=none,fill=none,above=2pt of a,font=\scriptsize\itshape] {$h=5$};
+  \node[draw=none,fill=none,below=2pt of b,font=\scriptsize\itshape] {$h=5$};
+  \node[draw=none,fill=none,above=2pt of c,font=\scriptsize\itshape] {$h=2$};
+  \node[draw=none,fill=none,below=2pt of t,font=\scriptsize\itshape] {$h=0$};
+\end{tikzpicture}
+\end{center}
+
+You can check $h$ is consistent: e.g. edge $(s,a)$ needs $h(s)\le w+h(a)$, i.e.
+$7\le 2+5$, true; edge $(a,c)$ needs $5\le 3+2$, tight with equality; edge
+$(b,t)$ needs $5\le 6+0$; and so on for every edge. The true distances to $t$ are
+$\dist(s,t)=7$ (via $s,a,c,t$), $\dist(a,t)=5$, $\dist(b,t)=6$, $\dist(c,t)=2$;
+note $h\le\dist(\cdot,t)$ everywhere, so it is admissible too.
+
+Run Algorithm~\ref{ch08:alg-astar}. The queue holds $(v: f=d+h)$ pairs;
+\textbf{bold} marks the extracted minimum.
+
+\begin{center}\small
+\begin{tabular}{r l l}
+\toprule
+step & extract & queue after relaxing (key $=d+h$)\\
+\midrule
+0 & --        & $\{\,\mathbf{s\!:\!0\!+\!7\!=\!7}\,\}$\\
+1 & $s$ ($f=7$) & $a\!:\!2\!+\!5\!=\!7,\quad b\!:\!3\!+\!5\!=\!8$\\
+2 & $a$ ($f=7$) & $b\!:\!8,\quad c\!:\!5\!+\!2\!=\!7$\\
+3 & $c$ ($f=7$) & $b\!:\!8,\quad t\!:\!7\!+\!0\!=\!7$\\
+4 & $t$ ($f=7$) & return $d[t]=7$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+$A^*$ extracted $s,a,c,t$ and \emph{never expanded $b$}: vertex $b$ sat in the
+queue with key $8>7$ and was pruned by the early stop at $t$. The three on-route
+vertices $s,a,c$ all carry $f=7$: along the shortest path every edge is tight
+($w_h=0$), so $f$ holds steady at $\dist(s,t)$, which is exactly the behaviour a
+consistent heuristic guarantees. Plain Dijkstra,
+keyed by $d$ alone, would have settled $b$ ($d=3$) before $c$ ($d=5$) -- one
+extra expansion. On a real map with thousands of off-route vertices, that
+``never touched $b$'' multiplies into the elliptical-corridor savings from
+Section~\ref{ch08:motivation}.
+
+\begin{labbox}
+Redo the trace with $h\equiv 0$ (plain Dijkstra) and confirm $b$ is extracted at
+$d=3$, between $a$ and $c$. Then inflate the heuristic of a vertex \emph{on} the
+shortest route -- set $h(c)=20$ (now \emph{inadmissible}, since $\dist(c,t)=2$) --
+and watch $A^*$ return the wrong answer $9$: vertex $c$ gets key $f=5+20=25$ and
+is buried, so $b$ is expanded, $t$ comes off the queue at $f=9$ via $s,b,t$, and
+the early stop declares it final before the true path through $c$ is ever
+explored. (Inflating an \emph{off}-route vertex like $b$ does no harm -- the
+damage comes only when you over-estimate a vertex the optimal path needs.)
+Constructing the failing query by hand is the fastest way to feel why
+admissibility is not optional.
+\end{labbox}
+
+\begin{historybox}
+$A^*$ was introduced by Hart, Nilsson, and Raphael in 1968 at the Stanford
+Research Institute, as the navigation brain of \emph{Shakey} the robot -- the
+first mobile robot to reason about its own actions. Their paper proved the
+optimality of $A^*$ among admissible algorithms: no search that is guaranteed to
+find shortest paths can expand fewer nodes than $A^*$ does with the same
+heuristic (up to tie-breaking). The reduced-cost reading we used here is folklore
+now but ties the AI lineage of $A^*$ to the operations-research lineage of
+Dijkstra and Johnson's potentials.
+\end{historybox}
+
+\section{Bidirectional search}
+\label{ch08:bidir}
+
+\subsection{Two balls meeting in the middle}
+
+Run one Dijkstra forward from $s$ in $\Gph$ and, simultaneously, one Dijkstra
+backward from $t$ in $\Gph^{R}$. Each maintains its own distance arrays $d_f$ and
+$d_b$ and its own queue. Alternate steps between them. The instant a vertex has
+been \emph{settled by both} searches, we have enough information to recover
+$\dist(s,t)$ -- though, as we will see, the meeting vertex is not always on the
+shortest path, and the stopping rule needs care.
+
+\begin{intuitionbox}
+If the shortest path is $s\rightsquigarrow x \rightsquigarrow t$, then $x$ lies
+at forward-distance $\dist(s,x)$ and backward-distance $\dist(x,t)$ with
+$\dist(s,x)+\dist(x,t)=\dist(s,t)$. The forward ball grows to radius about
+$\dist(s,t)/2$, the backward ball likewise, and they touch near the path's
+midpoint. Two radius-$r/2$ balls instead of one radius-$r$ ball: on a planar
+graph that is roughly half the vertices, and the saving grows with dimension.
+\end{intuitionbox}
+
+\subsection{The stopping rule (and the classic bug)}
+
+Let $\mu$ be the best $s$--$t$ path length found so far through any vertex
+relaxed by both sides; initialize $\mu=\infty$. Whenever a search relaxes an edge
+$(u,v)$ and $v$ is already settled by the \emph{other} search, update
+\[
+  \mu \;\gets\; \min\bigl(\mu,\; d_f[u]+w(u,v)+d_b[v]\bigr)
+\]
+(symmetrically for the backward search). Let $\mathrm{top}_f$ and
+$\mathrm{top}_b$ be the current minimum keys of the two queues. \textbf{Stop when}
+\[
+  \mathrm{top}_f + \mathrm{top}_b \;\ge\; \mu .
+\]
+
+\begin{trapbox}
+\textbf{Do not stop at first touch.} The tempting rule ``halt as soon as some
+vertex is settled by both searches'' is \emph{wrong}. The first commonly-settled
+vertex may not lie on a shortest path. The classic counterexample: a graph where
+the two frontiers first meet on a slightly-too-long detour while the true
+shortest path passes through a vertex each side settles a step later. You must
+keep going until $\mathrm{top}_f+\mathrm{top}_b\ge\mu$, which certifies that no
+unexplored path can beat the best $\mu$ already recorded.
+\end{trapbox}
+
+\begin{theorem}[Correctness of bidirectional Dijkstra]
+\label{ch08:thm-bidir}
+When the rule $\mathrm{top}_f+\mathrm{top}_b\ge\mu$ first holds, $\mu=\dist(s,t)$.
+\end{theorem}
+\begin{proof}
+$\mu$ is always the length of some genuine $s$--$t$ path (it is a sum of a real
+forward distance, a real edge, and a real backward distance), so $\mu\ge
+\dist(s,t)$ at all times.
+
+For the reverse inequality, fix a shortest $s$--$t$ path
+$P: s=p_0,\dots,p_k=t$. Walk along $P$ and let $p_i$ be the last vertex settled by
+the forward search at the moment we stop, $p_{i+1}$ the first not settled
+forward. Because $p_i$ is settled forward, $d_f[p_i]=\dist(s,p_i)$, and the edge
+$(p_i,p_{i+1})$ was relaxed, so the forward queue holds $p_{i+1}$ with key
+$d_f[p_{i+1}]\le \dist(s,p_{i+1})$; hence $\mathrm{top}_f\le \dist(s,p_{i+1})$.
+
+Now consider the suffix $p_{i+1},\dots,t$. If \emph{every} vertex of the suffix
+is settled by the backward search, then in particular $p_{i+1}$ is, and at the
+moment it was settled backward the forward side had already settled $p_i$ and
+relaxed the edge into $p_{i+1}$, so $\mu$ was updated to at most
+$d_f[p_i]+w(p_i,p_{i+1})+d_b[p_{i+1}]=\dist(s,t)$. Then $\mu=\dist(s,t)$, done.
+Otherwise let $p_{j}$ ($j\ge i+1$) be the last suffix vertex \emph{not} settled
+backward; the backward queue holds it with key $\mathrm{top}_b\le\dist(p_j,t)$.
+Combining, using that $P$ is shortest so subpath lengths add up,
+\[
+  \mathrm{top}_f+\mathrm{top}_b
+  \;\le\; \dist(s,p_{i+1})+\dist(p_j,t)
+  \;\le\; \dist(s,p_{i+1})+\dist(p_{i+1},t)
+  \;=\;\dist(s,t)\;\le\;\mu .
+\]
+But the stopping condition is $\mathrm{top}_f+\mathrm{top}_b\ge\mu$, so all the
+inequalities are equalities, forcing $\mu=\dist(s,t)$.
+\end{proof}
+
+\begin{algorithm}[H]
+\DontPrintSemicolon
+\SetKwInOut{Input}{input}\SetKwInOut{Output}{output}
+\Input{$\Gph$, $\Gph^{R}$, source $s$, target $t$}
+\Output{$\dist(s,t)$}
+$d_f[\cdot]\gets\infty,\ d_b[\cdot]\gets\infty$;\quad $d_f[s]\gets0,\ d_b[t]\gets0$;\quad $\mu\gets\infty$\;
+forward queue $Q_f\gets\{s\}$, backward queue $Q_b\gets\{t\}$\;
+\While{$Q_f\ne\emptyset$ \textbf{and} $Q_b\ne\emptyset$ \textbf{and} $\mathrm{top}(Q_f)+\mathrm{top}(Q_b)<\mu$}{
+  \tcp{alternate; here: expand whichever queue has the smaller top key}
+  \eIf{$\mathrm{top}(Q_f)\le \mathrm{top}(Q_b)$}{
+    $u\gets\textsc{ExtractMin}(Q_f)$; settle $u$ forward\;
+    \ForEach{$(u,v)\in E$}{
+      relax: \textbf{if} $d_f[u]+w(u,v)<d_f[v]$ \textbf{then} update $d_f[v]$, push $v$\;
+      \If{$d_b[v]<\infty$}{$\mu\gets\min(\mu,\ d_f[u]+w(u,v)+d_b[v])$}
+    }
+  }{
+    $u\gets\textsc{ExtractMin}(Q_b)$; settle $u$ backward\;
+    \ForEach{$(v,u)\in E$ \tcp*{in-edges of $u$ = out-edges in $\Gph^{R}$}}{
+      relax: \textbf{if} $d_b[u]+w(v,u)<d_b[v]$ \textbf{then} update $d_b[v]$, push $v$\;
+      \If{$d_f[v]<\infty$}{$\mu\gets\min(\mu,\ d_f[v]+w(v,u)+d_b[u])$}
+    }
+  }
+}
+\Return $\mu$\;
+\caption{Bidirectional Dijkstra}
+\label{ch08:alg-bidir}
+\end{algorithm}
+
+\subsection{A worked trace}
+
+Reuse the graph from Section~\ref{ch08:astar-trace} (ignore the $h$ labels).
+Forward distances from $s$: $d_f[s]=0$. Backward distances from $t$ in $\Gph^R$:
+$d_b[t]=0$. Alternate, expanding the smaller top key; ties go forward.
+
+\begin{center}\small
+\begin{tabular}{r l l l}
+\toprule
+step & side & extract & effect \\
+\midrule
+1 & F & $s$ ($0$)  & $d_f[a]=2,\ d_f[b]=3$\\
+2 & B & $t$ ($0$)  & $d_b[c]=2,\ d_b[b]=6$; $b$ labelled by F $\Rightarrow \mu=3+6+0=9$\\
+3 & F & $a$ ($2$)  & $d_f[c]=5$; $c$ labelled by B $\Rightarrow \mu=\min(9,5+2)=7$\\
+4 & B & $c$ ($2$)  & $d_b[a]=5,\ d_b[b]=\min(6,2+5)=6$; $a$ labelled by F $\Rightarrow \mu=\min(7,2+3+2)=7$\\
+5 & -- & --        & $\mathrm{top}_f{=}3\ (b),\ \mathrm{top}_b{=}5\ (a)$: $3+5=8\ge\mu=7$, stop \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+After step 4, $\mathrm{top}_f=3$ (vertex $b$) and $\mathrm{top}_b=5$ (vertex
+$a$), so $\mathrm{top}_f+\mathrm{top}_b=8\ge\mu=7$ and we stop, returning
+$\mu=7=\dist(s,t)$, matching $A^*$. Notice that the first value of $\mu$ recorded
+(at step~2, $\mu=9$, via the detour $s\to b\to t$) was \emph{not} the answer; the
+sum-of-tops rule kept the search alive until the true path through $c$ was
+certified. Correctness depended on that rule, not on first contact.
+
+\begin{whybox}
+The stopping certificate is an LP-duality flavored bound. Any $s$--$t$ path that
+$\mu$ has not yet seen must leave the forward-settled region across a
+queued forward vertex (cost $\ge \mathrm{top}_f$) and enter the backward-settled
+region across a queued backward vertex (cost $\ge \mathrm{top}_b$), so its length
+is at least $\mathrm{top}_f+\mathrm{top}_b$. Once that lower bound reaches $\mu$,
+no unseen path can improve on $\mu$, and we are provably done.
+\end{whybox}
+
+\subsection{Bidirectional \texorpdfstring{$A^*$}{A*}: a subtlety}
+\label{ch08:bidir-astar}
+
+Combining bidirection with $A^*$ is tempting but tricky. If the forward search
+uses potential $h_f$ (estimating distance to $t$) and the backward uses $h_b$
+(estimating distance from $s$), the two re-weight edges differently, and the
+clean ``Dijkstra on $w_h$'' picture breaks: a vertex's forward reduced distance
+and backward reduced distance no longer add up to a quantity you can threshold.
+The standard fix is the \emph{consistent potential pair} of Ikeda et al.: use
+$p_f(v)=\tfrac12(h_f(v)-h_b(v))$ forward and $p_b(v)=-p_f(v)$ backward. These
+satisfy $p_f(v)+p_b(v)=0$, which makes the two reduced-weight graphs agree on the
+shared meeting condition, restoring a valid stopping rule at a (usually mild)
+cost in heuristic sharpness. We will not need the symmetric $A^*$ below, because
+CH gives a cleaner bidirectional structure, but the lesson -- \emph{two
+potentials must be reconciled} -- recurs there.
+
+\section{Landmarks and the ALT algorithm}
+\label{ch08:alt}
+
+$A^*$ is only as good as its heuristic. On a road network the Euclidean
+straight-line distance is admissible (roads cannot be shorter than crow-flies),
+but it is loose: detours, mountains, and one-way systems make true distances far
+longer than the geometric guess, so the corridor stays wide. ALT
+(\textbf{A}$^*$, \textbf{L}andmarks, \textbf{T}riangle inequality) replaces the
+geometric guess with a graph-aware one, computed from a few precomputed distance
+tables.
+
+\subsection{Triangle-inequality bounds}
+
+Pick a small set $L\subseteq V$ of \emph{landmarks}. For each landmark
+$\ell$, precompute (one Dijkstra each, forward and backward) the vectors
+$\dist(\ell,\cdot)$ and $\dist(\cdot,\ell)$. The triangle inequality on the
+nonnegative-weight metric gives, for any vertex $v$ and target $t$ and any
+landmark $\ell$,
+\[
+  \dist(v,t) \;\ge\; \dist(v,\ell) - \dist(t,\ell)
+  \qquad\text{and}\qquad
+  \dist(v,t) \;\ge\; \dist(\ell,t) - \dist(\ell,v).
+\]
+Each is a valid \emph{lower} bound on $\dist(v,t)$. Take the best over all
+landmarks and both forms:
+\[
+  h_L(v) \;=\; \max_{\ell\in L}\,
+  \max\Bigl(\dist(v,\ell)-\dist(t,\ell),\ \ \dist(\ell,t)-\dist(\ell,v)\Bigr).
+\]
+
+\begin{center}
+\begin{tikzpicture}[thick,>=Stealth]
+  \node[circle,draw,fill=white,inner sep=1.5pt,label=left:{$v$}] (v) at (0,0) {};
+  \node[circle,draw,fill=targetgreen,inner sep=1.5pt,label=right:{$t$}] (t) at (3.4,0) {};
+  \node[circle,draw,fill=quotientorange,inner sep=1.5pt,label=above:{$\ell$ (landmark)}] (l) at (1.7,2.0) {};
+  \draw[->,dashed,blue!50!black] (v) -- node[below,font=\scriptsize] {$\dist(v,t)\ge ?$} (t);
+  \draw[->] (v) -- node[left,font=\scriptsize] {$\dist(v,\ell)$} (l);
+  \draw[->] (t) -- node[right,font=\scriptsize] {$\dist(t,\ell)$} (l);
+  \node[font=\scriptsize] at (1.7,-0.9) {$\dist(v,t)\ \ge\ \dist(v,\ell)-\dist(t,\ell)$};
+\end{tikzpicture}
+\end{center}
+
+\begin{lemma}[$h_L$ is feasible for $A^*$]
+\label{ch08:lem-alt-consistent}
+For nonnegative weights, $h_L$ is admissible, and each per-landmark term is
+consistent; the pointwise maximum of consistent heuristics with the same value at
+$t$ is consistent, so $h_L$ is consistent.
+\end{lemma}
+\begin{proof}
+Admissibility is the triangle inequality above. For consistency of a single
+forward term $g_\ell(v)=\dist(v,\ell)-\dist(t,\ell)$, take an edge $(u,v)$. By the
+triangle inequality $\dist(u,\ell)\le w(u,v)+\dist(v,\ell)$, so
+$g_\ell(u)=\dist(u,\ell)-\dist(t,\ell)\le w(u,v)+\dist(v,\ell)-\dist(t,\ell)
+=w(u,v)+g_\ell(v)$. The backward term is symmetric. Finally, if $h_1,h_2$ are
+consistent with $h_i(t)=0$, then for edge $(u,v)$,
+$\max(h_1(u),h_2(u))\le \max(w+h_1(v),w+h_2(v))=w+\max(h_1(v),h_2(v))$, and the
+max is $0$ at $t$. Induction over $\abs{L}$ terms finishes it.
+\end{proof}
+
+So ALT is just $A^*$ (Algorithm~\ref{ch08:alg-astar}) with $h=h_L$, evaluated
+lazily: computing $h_L(v)$ costs $\Oh(\abs{L})$ table lookups per vertex
+touched.
+
+\subsection{Preprocessing and the query split}
+
+\begin{algorithm}[H]
+\DontPrintSemicolon
+\SetKwInOut{Input}{input}\SetKwInOut{Output}{output}
+\textbf{Preprocessing (once):}\;
+choose landmark set $L$ (see below)\;
+\ForEach{$\ell\in L$}{
+  run Dijkstra from $\ell$ in $\Gph$ to store $\dist(\ell,\cdot)$\;
+  run Dijkstra from $\ell$ in $\Gph^{R}$ to store $\dist(\cdot,\ell)$\;
+}
+\textbf{Query $(s,t)$:}\;
+run $A^*$ from $s$ to $t$ with heuristic $h_L(v)=\max_{\ell}\max(\dots)$ above\;
+\caption{ALT: preprocessing and query}
+\label{ch08:alg-alt}
+\end{algorithm}
+
+Preprocessing is $\Oh(\abs{L}\cdot(m+n)\log n)$ time and $\Oh(\abs{L}\cdot n)$
+space -- two distance vectors per landmark. With $\abs{L}=16$ landmarks the
+tables for a continental graph fit comfortably in memory and queries speed up by
+one to two orders of magnitude over plain Dijkstra.
+
+\subsection{Choosing landmarks}
+
+Random landmarks are mediocre. The heuristic $h_L(v)$ is sharp when $t$ lies
+``behind'' a landmark as seen from $v$ -- when $\ell, v, t$ are nearly collinear
+with the landmark beyond $t$. The widely used \emph{avoid} and \emph{farthest}
+heuristics place landmarks at the corners of the map and at hard-to-reach
+peripheral points, so that for most query pairs some landmark sits behind the
+target.
+
+\begin{itemize}
+  \item \textbf{Farthest:} start with a random vertex; repeatedly add the vertex
+        maximizing its distance to the current landmark set. Spreads landmarks to
+        the boundary.
+  \item \textbf{Avoid:} grow a shortest-path tree from a random root, score each
+        vertex by how much shortest-path ``weight'' is poorly covered by existing
+        landmarks, and place the next landmark in the worst-covered region.
+\end{itemize}
+
+\begin{labbox}
+On the trace graph, put a single landmark at $b$. Precompute
+$\dist(b,\cdot)=\{b\!:\!0, c\!:\!5, t\!:\!6\}$ and $\dist(\cdot,b)=\{s\!:\!3,
+b\!:\!0\}$. Compute $h_{\{b\}}(s)=\max(\dist(s,b)-\dist(t,b),\,
+\dist(b,t)-\dist(b,s))$. With $\dist(t,b)=\infty$ (no path $t\to b$ here) the
+first term is $-\infty$; the second is $6-\dist(b,s)$, and $\dist(b,s)=\infty$,
+so $h_{\{b\}}(s)=-\infty$, i.e. useless. Add a landmark at $c$ instead and
+recompute -- you will see why landmarks behind the target dominate, and why one
+poorly placed landmark contributes nothing.
+\end{labbox}
+
+\begin{historybox}
+ALT is due to Goldberg and Harrelson (2005), who showed that triangle-inequality
+landmark bounds turn $A^*$ from a marginal road-routing trick into a serious
+contender, cutting Dijkstra's settled-vertex count by orders of magnitude. It sat
+at the frontier for only a couple of years: contraction hierarchies (2008) and
+the broader ``route planning'' line at Karlsruhe soon pushed query times lower.
+ALT survives as the method of choice when the graph \emph{changes} (live
+traffic), since its landmarks degrade gracefully under edge-weight perturbations,
+whereas CH's shortcuts must be partially rebuilt.
+\end{historybox}
+
+\section{Contraction hierarchies}
+\label{ch08:ch}
+
+ALT trims the search; CH redesigns the graph so the search barely has to run.
+It is the dominant exact method for static road networks: minutes of
+preprocessing buy queries that settle a few hundred vertices regardless of how
+far apart $s$ and $t$ are.
+
+\subsection{The idea: shortcut the unimportant vertices}
+
+Road networks are hierarchical. A trip from a rural house to another rural house
+climbs onto residential streets, then arterials, then a motorway, cruises the
+motorway, then descends symmetrically. The vast middle of any long trip uses a
+small set of ``important'' roads. CH makes this hierarchy explicit.
+
+Order the vertices by an \emph{importance} rank $\mathrm{rank}:V\to\{1,\dots,n\}$.
+Now \emph{contract} vertices one at a time in increasing rank order. To contract
+$v$ means: remove $v$, and for every pair of neighbors $u,w$ such that the path
+$u\to v\to w$ was a shortest path among the remaining vertices, insert a
+\emph{shortcut} edge $u\to w$ with weight $w(u,v)+w(v,w)$ -- but only if no other
+path of equal or smaller length already connects $u$ to $w$ in the current graph
+(a \emph{witness}). The shortcut preserves all shortest-path distances among the
+not-yet-contracted vertices.
+
+\begin{center}
+\begin{tikzpicture}[thick,>=Stealth,node distance=1.6cm,
+  every node/.style={circle,draw,fill=white,minimum size=6mm,inner sep=0pt,font=\small}]
+  % before
+  \node (u) {$u$};
+  \node (v) [right=of u] {$v$};
+  \node (w) [right=of v] {$w$};
+  \path (u) edge node[draw=none,fill=white,inner sep=1pt,font=\scriptsize]{$3$} (v)
+        (v) edge node[draw=none,fill=white,inner sep=1pt,font=\scriptsize]{$4$} (w);
+  \node[draw=none,fill=none,below=4mm of v,font=\footnotesize] {before: contract $v$};
+  % after
+  \begin{scope}[xshift=6cm]
+    \node (u2) {$u$};
+    \node[draw,dashed,fill=gray!12] (v2) [right=of u2] {$v$};
+    \node (w2) [right=of v2] {$w$};
+    \path (u2) edge[bend left=35,red!60!black] node[draw=none,fill=white,inner sep=1pt,font=\scriptsize]{$7$ (shortcut)} (w2);
+    \node[draw=none,fill=none,below=4mm of v2,font=\footnotesize] {after: $u\to w$ skips $v$};
+  \end{scope}
+\end{tikzpicture}
+\end{center}
+
+\begin{intuitionbox}
+Contracting a vertex is ``routing around'' it: if the only reason a path used $v$
+was to get from $u$ to $w$, replace that little detour with one direct shortcut
+edge and forget $v$ exists. Do this from least-important to most-important
+vertex, and the shortcuts you accumulate are exactly the on-ramps, motorway
+segments, and off-ramps -- the highway skeleton -- expressed as edges. A query
+then only ever needs to drive ``uphill'' in importance from $s$, and ``uphill''
+backward from $t$, meeting at the most important vertex on the route.
+\end{intuitionbox}
+
+\subsection{The augmented graph and the upward/downward split}
+
+After contracting all vertices, let $E^{+}$ be the original edges plus all
+shortcuts. Orient every edge of $E^{+}$ by rank: an edge $(x,y)$ is
+\emph{upward} if $\mathrm{rank}(x)<\mathrm{rank}(y)$ and \emph{downward}
+otherwise. Define
+\[
+  \Gph_\uparrow=(V,\ \{(x,y)\in E^{+}: \mathrm{rank}(x)<\mathrm{rank}(y)\}),
+  \qquad
+  \Gph_\downarrow=(V,\ \{(x,y)\in E^{+}: \mathrm{rank}(x)>\mathrm{rank}(y)\}).
+\]
+The query runs a \emph{forward} Dijkstra from $s$ restricted to upward edges
+$\Gph_\uparrow$, and a \emph{backward} Dijkstra from $t$ restricted to the
+upward edges of $\Gph^{R}$ (equivalently, downward edges of $\Gph_\downarrow$
+traversed backward). Both searches only ever increase rank. They meet at
+candidate vertices; combine $d_f$ and $d_b$ as in bidirectional Dijkstra.
+
+Figure~\ref{ch08:fig-updown} shows the shape every CH query exploits: the
+shortest path in $E^{+}$ climbs in rank to a single peak, then descends, so the
+forward search (climbing from $s$) and the backward search (climbing from $t$)
+each cover one half and meet at the peak.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[thick,>=Stealth,scale=1.0]
+  % rank axis (height = rank)
+  \draw[->,gray!60!black] (-0.3,0) -- (8.6,0) node[right,font=\scriptsize,black]{position along path};
+  \draw[->,gray!60!black] (-0.3,0) -- (-0.3,3.2) node[above,font=\scriptsize,black]{rank};
+  % up-down profile
+  \coordinate (s) at (0,0.0);
+  \coordinate (p1) at (1.3,1.0);
+  \coordinate (p2) at (2.6,2.0);
+  \coordinate (xs) at (4.0,2.9);
+  \coordinate (q2) at (5.4,2.0);
+  \coordinate (q1) at (6.7,1.0);
+  \coordinate (t) at (8.0,0.0);
+  \draw[sourceblue,very thick,->] (s)--(p1)--(p2)--(xs);
+  \draw[targetgreen,very thick,<-] (t)--(q1)--(q2)--(xs);
+  \foreach \pt in {s,p1,p2,xs,q2,q1,t}
+    \fill[black] (\pt) circle (1.6pt);
+  \node[font=\small,below=2pt] at (s) {$s$};
+  \node[font=\small,below=2pt] at (t) {$t$};
+  \node[font=\small,above=2pt] at (xs) {$x^{*}$ (peak rank)};
+  \node[sourceblue,font=\scriptsize] at (1.6,1.9) {forward, up};
+  \node[targetgreen,font=\scriptsize] at (6.4,1.9) {backward, up};
+\end{tikzpicture}
+\caption{The up-down structure of a CH shortest path. Rank increases upward; the
+path strictly climbs from $s$ to the highest-rank vertex $x^{*}$, then strictly
+descends to $t$. Each upward search owns one slope and they meet at $x^{*}$.}
+\label{ch08:fig-updown}
+\end{figure}
+
+\begin{whybox}
+\textbf{Why an up-down path always exists.} Claim: for every $s,t$ there is a
+shortest $s$--$t$ path in $E^{+}$ that first goes strictly up in rank, reaches a
+single highest-rank vertex $x^{*}$, then goes strictly down. Proof sketch by
+induction on contraction order. Take any shortest path $P$ in the current graph
+and let $v$ be its \emph{lowest-rank interior} vertex, with neighbors $u,w$ on
+$P$. When $v$ was contracted, either a witness path of length $\le
+w(u,v)+w(v,w)$ already existed (so we may reroute $P$ off $v$ without increasing
+length), or a shortcut $u\to w$ was added (so we may replace $u\to v\to w$ by the
+single edge $u\to w$, again not increasing length). Either way we obtain a
+shortest path avoiding the lowest interior vertex; repeating removes every
+``valley'', leaving a path that only goes up then down. The peak $x^{*}$ is the
+meeting vertex of the two upward searches.
+\end{whybox}
+
+\begin{theorem}[CH query correctness]
+\label{ch08:thm-ch}
+The bidirectional upward search returns $\dist(s,t)$: there is a vertex $x$
+settled by both the forward upward search and the backward upward search with
+$d_f[x]+d_b[x]=\dist(s,t)$, and no settled pair gives a smaller sum.
+\end{theorem}
+\begin{proof}
+By the up-down lemma in the box, a shortest $s$--$t$ path
+$P$ in $E^{+}$ decomposes as $P_\uparrow$ (from $s$ up to the peak $x^{*}$)
+followed by $P_\downarrow$ (from $x^{*}$ down to $t$). $P_\uparrow$ uses only
+upward edges, so the forward upward Dijkstra -- which is an ordinary correct
+Dijkstra on the subgraph $\Gph_\uparrow$ -- settles $x^{*}$ with
+$d_f[x^{*}]=w(P_\uparrow)$. Reversing $P_\downarrow$ gives an upward path in
+$\Gph^{R}$ from $t$ to $x^{*}$, so the backward upward Dijkstra settles
+$x^{*}$ with $d_b[x^{*}]=w(P_\downarrow)$. Hence $d_f[x^{*}]+d_b[x^{*}]=
+w(P)=\dist(s,t)$. No common vertex can give a smaller sum, because every common
+vertex $x$ yields a real $s$--$t$ walk of length $d_f[x]+d_b[x]\ge\dist(s,t)$
+(distances in $\Gph_\uparrow,\Gph^R_\uparrow$ are upper bounds realized by actual
+paths in $E^+$, which preserves true distances).
+\end{proof}
+
+\subsection{Query algorithm}
+
+\begin{algorithm}[H]
+\DontPrintSemicolon
+\SetKwInOut{Input}{input}\SetKwInOut{Output}{output}
+\Input{augmented graph $E^{+}$ with ranks, source $s$, target $t$}
+\Output{$\dist(s,t)$}
+$d_f[\cdot]\gets\infty,\ d_b[\cdot]\gets\infty$;\ $d_f[s]\gets 0,\ d_b[t]\gets 0$;\ $\mu\gets\infty$\;
+forward queue $Q_f\gets\{s\}$ (upward edges of $E^{+}$)\;
+backward queue $Q_b\gets\{t\}$ (upward edges of $E^{+}$ in $\Gph^{R}$)\;
+\While{$Q_f\ne\emptyset$ \textbf{or} $Q_b\ne\emptyset$}{
+  \ForEach{direction $\mathrm{dir}\in\{f,b\}$ with nonempty queue and $\mathrm{top}(Q_{\mathrm{dir}})\le\mu$}{
+    $u\gets\textsc{ExtractMin}(Q_{\mathrm{dir}})$\;
+    \If{$d_f[u]<\infty$ \textbf{and} $d_b[u]<\infty$}{$\mu\gets\min(\mu,\ d_f[u]+d_b[u])$}
+    \ForEach{\textbf{upward} edge $(u,y)$ in the relevant graph}{
+      relax $y$: \textbf{if} $d_{\mathrm{dir}}[u]+w(u,y)<d_{\mathrm{dir}}[y]$ \textbf{then} update and push\;
+    }
+  }
+}
+\Return $\mu$\;
+\caption{Contraction-hierarchy query}
+\label{ch08:alg-ch}
+\end{algorithm}
+
+The pruning rule $\mathrm{top}(Q_{\mathrm{dir}})\le\mu$ stops each direction once
+its frontier key exceeds the best meeting found, by the same certificate as
+Theorem~\ref{ch08:thm-bidir}. Because both searches only climb in rank, their
+queues stay tiny -- a few hundred vertices total on a continental graph -- which
+is why CH queries run in microseconds.
+
+\subsection{Preprocessing: ordering and contraction}
+
+The whole game is the \emph{vertex order}. A bad order (e.g. contract the busiest
+junction first) creates a combinatorial explosion of shortcuts; a good order
+keeps the augmented graph sparse. The standard approach is a lazy priority queue
+keyed by a per-vertex \emph{importance} score, recomputed on demand.
+
+\begin{algorithm}[H]
+\DontPrintSemicolon
+\SetKwInOut{Input}{input}\SetKwInOut{Output}{output}
+\Input{graph $\Gph$}
+\Output{ranks and augmented edge set $E^{+}$}
+$E^{+}\gets E$\;
+priority queue $P$ over all $v$, keyed by $\textsc{Importance}(v)$\;
+$r\gets 0$\;
+\While{$P\ne\emptyset$}{
+  $v\gets\textsc{Min}(P)$\;
+  recompute $\textsc{Importance}(v)$ \tcp*{lazy update}
+  \If{$\textsc{Importance}(v)$ still minimal in $P$}{
+    $r\gets r+1$;\quad $\mathrm{rank}(v)\gets r$;\quad remove $v$ from $P$\;
+    \ForEach{pair of remaining neighbors $(u,w)$ with $u\to v\to w$}{
+      \If{no witness path $u\rightsquigarrow w$ of length $\le w(u,v)+w(v,w)$ avoiding $v$}{
+        add shortcut $(u,w)$ with weight $w(u,v)+w(v,w)$ to $E^{+}$\;
+      }
+    }
+    update $\textsc{Importance}$ of $v$'s former neighbors\;
+  }
+}
+\caption{CH preprocessing (lazy vertex ordering with witness search)}
+\label{ch08:alg-ch-prep}
+\end{algorithm}
+
+\paragraph{Importance terms.} The score blends several quantities, all aimed at
+``contracting this vertex now keeps the graph sparse and balanced'':
+\begin{itemize}
+  \item \textbf{Edge difference} $=$ (shortcuts that would be added) $-$ (edges
+        removed). Negative or small means cheap to contract.
+  \item \textbf{Contracted neighbors / deleted-neighbor count:} prefer to spread
+        contraction over the graph rather than hollow out one region (uniformity).
+  \item \textbf{Search space / hierarchy depth:} penalize contractions that make
+        long upward chains, which would lengthen queries.
+\end{itemize}
+
+\paragraph{Witness search.} Deciding whether a shortcut is necessary is a local
+shortest-path query: from $u$, run a Dijkstra in the current graph (excluding
+$v$) bounded by distance $w(u,v)+w(v,w)$ and a small hop limit. If $w$ is reached
+within that bound, a witness exists and no shortcut is needed. The hop limit
+trades a few unnecessary shortcuts for much faster preprocessing -- a rare
+unnecessary shortcut only slows queries slightly, while an unbounded witness
+search dominates preprocessing time.
+
+\begin{trapbox}
+\textbf{The lazy-queue invalidation bug.} Importance scores depend on neighbors,
+so contracting $v$ changes its neighbors' scores. If you contract by a
+\emph{stale} priority you can pick a vertex that is no longer cheapest, producing
+many extra shortcuts and a slow hierarchy. The fix is the recompute-on-pop check
+in Algorithm~\ref{ch08:alg-ch-prep}: when $v$ is popped, recompute its score; if
+it is no longer the minimum, reinsert it and pop again. Skipping this ``lazy
+deletion'' check is the single most common CH implementation mistake.
+\end{trapbox}
+
+\subsection{A worked contraction}
+\label{ch08:ch-trace}
+
+Take an undirected line-with-a-bypass, weights shown, and contract in the order
+$c, b, d, a, e$ (least to most important; we hand-pick a sensible order).
+
+\begin{center}
+\begin{tikzpicture}[thick,node distance=1.7cm,
+  every node/.style={circle,draw,fill=white,minimum size=6.5mm,inner sep=0pt,font=\small}]
+  \node (a) {$a$};
+  \node (b) [right=of a] {$b$};
+  \node (c) [right=of b] {$c$};
+  \node (d) [right=of c] {$d$};
+  \node (e) [right=of d] {$e$};
+  \path[-]
+    (a) edge node[draw=none,fill=white,inner sep=1pt,font=\scriptsize]{$2$} (b)
+    (b) edge node[draw=none,fill=white,inner sep=1pt,font=\scriptsize]{$2$} (c)
+    (c) edge node[draw=none,fill=white,inner sep=1pt,font=\scriptsize]{$2$} (d)
+    (d) edge node[draw=none,fill=white,inner sep=1pt,font=\scriptsize]{$2$} (e);
+  \path[-] (b) edge[bend left=40] node[draw=none,fill=white,inner sep=1pt,font=\scriptsize]{$5$} (d);
+\end{tikzpicture}
+\end{center}
+
+The chain $a$--$b$--$c$--$d$--$e$ has each edge of weight $2$, plus a
+bypass $b$--$d$ of weight $5$ (a longer ``country road''). True distances are
+along the chain: $\dist(a,e)=8$, $\dist(b,d)=4$ (via $c$, not the weight-$5$
+bypass).
+
+\begin{itemize}
+  \item \textbf{Contract $c$ (rank 1).} Neighbors $b,d$; the path $b\to c\to d$
+        has length $2+2=4$. Witness search from $b$ (excluding $c$): the bypass
+        $b\to d$ has length $5>4$, so \emph{no} witness of length $\le 4$ exists.
+        Add shortcut $b\to d$ of weight $4$. Now there are two $b$--$d$ edges,
+        weights $4$ (new) and $5$ (bypass); the bypass is dominated.
+  \item \textbf{Contract $b$ (rank 2).} Neighbors $a$ and $d$ (via the new
+        shortcut). Path $a\to b\to d$ has length $2+4=6$. No alternative
+        $a\rightsquigarrow d$ avoiding $b$ exists, so add shortcut $a\to d$ of
+        weight $6$.
+  \item \textbf{Contract $d$ (rank 3).} Neighbors $a$ (shortcut, $6$) and $e$
+        ($2$). Path $a\to d\to e=6+2=8$. Add shortcut $a\to e$ of weight $8$.
+  \item \textbf{Contract $a$ (rank 4), then $e$ (rank 5).} No further shortcuts.
+\end{itemize}
+
+The augmented graph carries the shortcut $a\to e$ of weight $8$. A query
+$\dist(a,e)$ now climbs from $a$: its only upward edge of interest leads, after
+the shortcut, directly toward $e$ -- the forward search settles $a$ then jumps,
+and the backward search from $e$ meets it, returning $8$ after touching a
+handful of vertices, never walking the four chain edges. That ``jump'' is the
+highway skeleton in miniature.
+
+\begin{labbox}
+Recompute the contraction with the order reversed -- contract the high-degree
+hub $b$ \emph{first}. Count the shortcuts produced and compare to the four above.
+You should see the bad order create more shortcuts and a deeper hierarchy:
+concrete evidence for why the importance ordering, not the contraction operation,
+is where CH's performance lives.
+\end{labbox}
+
+\begin{historybox}
+Contraction hierarchies were introduced by Robert Geisberger, Peter Sanders,
+Dominik Schultes, and Daniel Delling at Karlsruhe in 2008, distilling a decade of
+``highway hierarchies'' and ``transit-node routing'' work into a strikingly
+simple primitive: contract vertices, add shortcuts, query bidirectionally upward.
+The DIMACS shortest-path challenges of the mid-2000s drove this race; CH won on
+simplicity and remains the backbone of OSRM, GraphHopper, and much of the
+open-source routing world. Customizable Contraction Hierarchies (CCH, Dibbelt--
+Strasser--Wagner, 2014) later decoupled the topology order from edge weights, so
+live-traffic updates re-customize in seconds instead of re-preprocessing.
+\end{historybox}
+
+\section{When each method wins}
+\label{ch08:tradeoffs}
+
+These methods sit on a preprocessing-versus-query curve. More precomputation buys
+faster queries but costs memory and rebuild time when the graph changes.
+
+\begin{center}\small
+\renewcommand{\arraystretch}{1.25}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l l l l l}
+\toprule
+method & preprocessing & query (road graph) & memory & best when \\
+\midrule
+Dijkstra & none & $\Oh((m+n)\log n)$, huge constant & $\Oh(n)$ & one-off / arbitrary graph\\
+$A^*$ (geometric $h$) & none & $<$ Dijkstra, modest gain & $\Oh(n)$ & coordinates available, single query\\
+bidirectional & none & $\approx$ half of Dijkstra & $\Oh(n)$ & no heuristic, want a free 2$\times$\\
+ALT & $\Oh(\abs{L}(m{+}n)\log n)$ & 10--100$\times$ faster & $\Oh(\abs{L}\,n)$ & changing weights, moderate prep\\
+CH & minutes, $\Oh(n\poly\log)$ empirically & microseconds & $\Oh(m{+}\text{shortcuts})$ & static road net, many queries\\
+\bottomrule
+\end{tabular}%
+}
+\end{center}
+
+\begin{focusbox}
+\textbf{Decision guide.}
+\begin{itemize}
+  \item \emph{Single arbitrary query, no coordinates, no time to preprocess:}
+        bidirectional Dijkstra -- a free constant-factor win, nothing to tune.
+  \item \emph{Have geometry, want better single-query pruning:} $A^*$ with the
+        straight-line heuristic; upgrade to ALT if you can afford
+        $\Oh(\abs{L}n)$ tables.
+  \item \emph{Edge weights change often (traffic):} ALT or CCH -- landmark tables
+        and customizable orders survive perturbation; plain CH must re-contract.
+  \item \emph{Static graph, billions of queries (a routing service):} CH (or
+        CRP/transit-node routing). Pay the preprocessing once; queries are
+        essentially free.
+  \item \emph{Truly enormous, edges streamed or graph nonplanar with no
+        hierarchy:} none of these may help; fall back to the foundations and
+        consider the all-pairs and approximate methods of later chapters.
+\end{itemize}
+\end{focusbox}
+
+\begin{connectionbox}
+The reduced-cost trick ($w_h(u,v)=w-\pi(u)+\pi(v)$) that powers $A^*$ is the same
+\emph{potential reweighting} behind Johnson's all-pairs algorithm
+(Chapter on all-pairs shortest paths) and behind the price functions of
+min-cost flow (later chapters): a vertex potential that makes reduced costs
+nonnegative so a Dijkstra-style method applies. The bidirectional stopping
+certificate is a baby version of LP weak duality, which reappears as max-flow
+min-cut. And the ``contract the unimportant vertex, keep distances'' move of CH
+is a metric cousin of the vertex-elimination orderings used in
+nested dissection and in Cholesky/Laplacian solvers: in all of them, eliminating
+a low-degree vertex and adding a clique/shortcut among its neighbors preserves
+the quantity of interest (distance here, the Schur complement there). The
+hierarchy CH discovers is, loosely, a good elimination order on the road metric.
+\end{connectionbox}
+
+\begin{applicationbox}
+Every consumer routing engine you have used runs a variant of this chapter. OSRM
+and GraphHopper ship CH; Google and Bing route with internal descendants of
+transit-node routing and CRP (customizable route planning), which add CH-style
+shortcuts on top of a multilevel partition so that live traffic re-customizes in
+under a second. Game AI and robotics still lean on $A^*$ with hand-built
+heuristics, because their graphs are small and dynamic and preprocessing rarely
+pays off. The same ALT landmarks reappear in social-network distance estimation,
+where a few BFS trees from high-degree hubs give sharp distance lower bounds.
+\end{applicationbox}
+
+\begin{complexitybox}
+\textbf{Cost summary.}
+\begin{itemize}
+  \item $A^*$: $\Oh((m+n)\log n)$ worst case (degenerates to Dijkstra), but
+        settles far fewer vertices with a sharp consistent heuristic. Correct iff
+        $h$ admissible; no reopening iff $h$ consistent.
+  \item Bidirectional Dijkstra: same asymptotics, $\approx 2\times$ fewer
+        vertices settled on planar/road graphs; stop at
+        $\mathrm{top}_f+\mathrm{top}_b\ge\mu$.
+  \item ALT: preprocessing $\Oh(\abs{L}(m+n)\log n)$ time, $\Oh(\abs{L}n)$ space;
+        query is $A^*$ with $\Oh(\abs{L})$-cost heuristic evaluations.
+  \item CH: preprocessing near-linear in practice (no proven bound for general
+        graphs; provable on graphs of bounded highway dimension); query touches
+        $\Oh(\text{search space})$ vertices, hundreds on continental road
+        networks, with microsecond latency.
+\end{itemize}
+\end{complexitybox}
+
+\section{Exercises}
+\label{ch08:exercises}
+
+\begin{exercise}[Consistency by hand]
+\label{ch08:ex-consistency}
+For the trace graph of Section~\ref{ch08:astar-trace}, verify
+$h(u)\le w(u,v)+h(v)$ on \emph{every} edge, then exhibit the reduced weights
+$w_h(u,v)$ and confirm all are nonnegative. Which edge is \emph{tight}
+($w_h=0$)? Explain why tight edges are exactly the edges $A^*$ ``wants'' to
+follow.
+\end{exercise}
+
+\begin{exercise}[Admissible but inconsistent]
+\label{ch08:ex-adm-not-cons}
+Construct a 4-vertex weighted graph and a heuristic $h$ that is admissible but
+not consistent, on which $A^*$ \emph{without} reopening returns a wrong
+$\dist(s,t)$, yet $A^*$ \emph{with} reopening returns the correct value. Trace
+both runs.
+\end{exercise}
+
+\begin{exercise}[$A^*$ optimality]
+\label{ch08:ex-astar-opt}
+Prove that with a consistent heuristic, $A^*$ never expands a vertex $v$ with
+$f(v)=d[v]+h(v) > \dist(s,t)$. Conclude that among algorithms that find shortest
+paths using only the same heuristic, $A^*$ expands a minimal set of vertices (up
+to ties at $f=\dist(s,t)$).
+\end{exercise}
+
+\begin{exercise}[First-touch is wrong]
+\label{ch08:ex-first-touch}
+Give a concrete weighted graph on which bidirectional Dijkstra's first
+commonly-settled vertex is \emph{not} on any shortest $s$--$t$ path, so that the
+naive ``stop at first touch'' rule reports a strictly-too-large distance. Show
+that the $\mathrm{top}_f+\mathrm{top}_b\ge\mu$ rule fixes it.
+\end{exercise}
+
+\begin{exercise}[Path recovery]
+\label{ch08:ex-path}
+Algorithm~\ref{ch08:alg-bidir} returns only the distance $\mu$. Extend it to
+return the actual shortest path. Be careful: the meeting vertex that achieved
+$\mu$ is where you splice the forward and backward parent pointers. Do the same
+for CH (Algorithm~\ref{ch08:alg-ch}), where you must additionally
+\emph{unpack} shortcut edges back into their two constituent edges, recursively,
+to recover the original-graph path.
+\end{exercise}
+
+\begin{exercise}[Landmark sharpness]
+\label{ch08:ex-landmark}
+Prove that the ALT heuristic $h_{\{\ell\}}(v)=\dist(v,\ell)-\dist(t,\ell)$ is
+\emph{exact} ($=\dist(v,t)$) whenever $t$ lies on a shortest path from $v$ to
+$\ell$. Use this to argue informally why ``farthest'' landmark placement, which
+pushes landmarks to the map boundary, makes some landmark nearly collinear-behind
+the target for most queries.
+\end{exercise}
+
+\begin{exercise}[Implement ALT]
+\label{ch08:ex-impl-alt}
+Implement ALT on a road graph (e.g. a DIMACS USA road file). Compare settled-node
+counts against plain Dijkstra and against $A^*$ with the Euclidean heuristic, for
+$\abs{L}\in\{1,4,16,64\}$ landmarks chosen by the farthest heuristic. Plot
+settled nodes versus $\abs{L}$ and find the knee.
+\end{exercise}
+
+\begin{exercise}[CH shortcut count]
+\label{ch08:ex-ch-count}
+For the line-with-bypass graph of Section~\ref{ch08:ch-trace}, compute the total
+number of shortcuts produced under (a) the order $c,b,d,a,e$ used in the text and
+(b) the order $b,d,c,a,e$. Confirm that the worse order produces more shortcuts,
+and explain which importance term would have steered the greedy ordering away
+from it.
+\end{exercise}
+
+\begin{exercise}[Witness hop limit]
+\label{ch08:ex-witness}
+The witness search in Algorithm~\ref{ch08:alg-ch-prep} is bounded by a hop limit.
+Show that lowering the hop limit can only \emph{add} (never remove) shortcuts,
+and argue that adding a spurious shortcut never makes a CH query return an
+\emph{incorrect} distance -- only a (slightly) slower one. Why is preprocessing
+time so sensitive to this limit?
+\end{exercise}
+
+\begin{exercise}[Bidirectional $A^*$ potentials]
+\label{ch08:ex-bidir-astar}
+Verify that the consistent potential pair
+$p_f(v)=\tfrac12(h_f(v)-h_b(v))$, $p_b(v)=-p_f(v)$ from
+Section~\ref{ch08:bidir-astar} satisfies $p_f(v)+p_b(v)=0$ for all $v$, and show
+that under this pair the forward and backward reduced-weight graphs share a valid
+common stopping rule. What sharpness do you lose compared to the one-directional
+$A^*$ that uses $h_f$ directly?
+\end{exercise}
+
+\begin{exercise}[CH versus ALT under traffic]
+\label{ch08:ex-traffic}
+Suppose 1\% of edge weights change every minute (live traffic). Estimate, in
+big-$\Oh$ terms, the per-update maintenance cost of (a) recomputing all ALT
+landmark tables versus (b) re-running CH preprocessing, and explain why
+Customizable Contraction Hierarchies were designed to sit between them. Which
+method would you ship for a live-traffic routing service, and why?
+\end{exercise}

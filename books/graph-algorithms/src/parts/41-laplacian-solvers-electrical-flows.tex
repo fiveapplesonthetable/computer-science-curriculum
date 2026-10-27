@@ -1,0 +1,417 @@
+\chapter{Laplacian Solvers and Max-Flow via Electrical Flows}
+
+The previous chapters taught the Laplacian $\Lap$ to act like a measuring instrument: its quadratic form $x^\top \Lap x$ reads off smoothness, its eigenvalues read off connectivity, its pseudoinverse reads off effective resistance. This chapter turns the instrument into an engine. The single computational primitive
+\[
+  \text{given } b \text{ with } \mathbf{1}^\top b = 0,\quad \text{solve}\quad \Lap x = b
+\]
+is, since the work of Spielman and Teng, solvable in time \emph{nearly linear} in the number of edges --- $\Oh(m \log^c n \log(1/\eps))$ for a fixed constant $c$, to relative accuracy $\eps$. Once you can solve $\Lap x = b$ that fast, a surprising number of graph problems collapse onto it. Computing an electrical flow is one solve. Computing effective resistances between many pairs is a few solves plus a random projection. Sampling a spanning tree, estimating heat kernels, running spectral sparsification --- all reduce to a handful of Laplacian solves. The headline application of this chapter is the most startling of them: \emph{maximum flow}, the combinatorial workhorse of Part III, can be approximated by solving a short sequence of electrical-flow problems, each a single Laplacian solve. That is the Christiano--Kelner--Madry--Spielman--Teng result, and chasing its logic from end to end is the spine of this chapter.
+
+We build in three movements. First, how to solve $\Lap x = b$ quickly: preconditioning, low-stretch spanning trees, and the sparsifiers that make the preconditioner cheap. Second, what an electrical flow \emph{is} as an optimization object, and how one Laplacian solve produces it. Third, how to staple electrical flows together --- reweighting edges that overflow --- to drive a multiplicative-weights scheme toward maximum flow. Throughout, one tiny graph carries the load so that every matrix and every flow can be checked by hand.
+
+\begin{intuitionbox}
+Keep the spring-and-resistor picture from the Laplacian chapter in front of you. Pin a current of $+1$ into vertex $s$ and pull $-1$ out of vertex $t$; the network settles into the unique current that obeys Ohm's and Kirchhoff's laws while minimizing dissipated energy. The vector of vertex potentials $x$ that produces this current is exactly the solution of $\Lap x = b$ with $b = e_s - e_t$. So ``solve a Laplacian'' and ``find the electrical flow'' are the same act viewed from the two ends of Ohm's law: $x$ is potentials, $\Lap x$ is the net current injected. Max-flow re-enters because an electrical flow already routes $1$ unit from $s$ to $t$; it just spreads it badly across edges, overloading some. If we make overloaded edges \emph{stiffer} (raise resistance) and re-solve, current avoids them. Iterate, and the electrical flow is bullied into looking like a true max-flow.
+\end{intuitionbox}
+
+\chapterline
+
+\section{The running network}\label{ch41:running}
+
+Fix one weighted graph for the whole chapter. Take five vertices $\{s,a,b,c,t\}$ and six edges, each with a \emph{conductance} $w_e > 0$ (think: thickness of wire; resistance is $r_e = 1/w_e$). To keep arithmetic clean, start every conductance at $1$.
+
+\begin{center}
+\begin{tikzpicture}[
+  every node/.style={circle,draw=nodeblue,fill=blue!6,minimum size=8mm,inner sep=0pt,font=\small},
+  every edge/.style={draw=edgegray,thick}]
+  \node (s) at (0,0) {$s$};
+  \node (a) at (2.2,1.3) {$a$};
+  \node (b) at (2.2,-1.3) {$b$};
+  \node (c) at (4.4,0) {$c$};
+  \node (t) at (6.6,0) {$t$};
+  \path (s) edge node[above left,draw=none,fill=none] {\scriptsize $e_1$} (a);
+  \path (s) edge node[below left,draw=none,fill=none] {\scriptsize $e_2$} (b);
+  \path (a) edge node[above right,draw=none,fill=none] {\scriptsize $e_3$} (c);
+  \path (b) edge node[below right,draw=none,fill=none] {\scriptsize $e_4$} (c);
+  \path (a) edge node[right,draw=none,fill=none] {\scriptsize $e_5$} (b);
+  \path (c) edge node[above,draw=none,fill=none] {\scriptsize $e_6$} (t);
+\end{tikzpicture}
+\end{center}
+
+Edges are numbered $1$ through $6$: $e_1=\{s,a\}$, $e_2=\{s,b\}$, $e_3=\{a,c\}$, $e_4=\{b,c\}$, $e_5=\{a,b\}$, $e_6=\{c,t\}$. Orient each edge from its lower-numbered endpoint to its higher one in the fixed order $s<a<b<c<t$; orientations are bookkeeping for signs, not directions of flow. With unit conductances the Laplacian $\Lap = \mathbf{D} - \Adjm$ (degree matrix minus adjacency) is, ordering rows/columns $s,a,b,c,t$,
+\[
+  \Lap \;=\;
+  \begin{pmatrix}
+    2 & -1 & -1 & 0 & 0\\
+    -1 & 3 & -1 & -1 & 0\\
+    -1 & -1 & 3 & -1 & 0\\
+    0 & -1 & -1 & 3 & -1\\
+    0 & 0 & 0 & -1 & 1
+  \end{pmatrix}.
+\]
+Every row sums to zero, so $\Lap \mathbf{1} = 0$; the graph is connected, so the null space is exactly $\operatorname{span}\{\mathbf{1}\}$ and $\rank \Lap = 4$. We will inject $b = e_s - e_t = (1,0,0,0,-1)^\top$ and solve $\Lap x = b$.
+
+\begin{focusbox}
+The incidence matrix makes the springs literal. Let $\mathbf{B}\in\R^{m\times n}$ have one row per oriented edge: row $e=(u\to v)$ is $e_u^\top - e_v^\top$. Let $\mathbf{W}=\operatorname{diag}(w_e)$. Then
+\[
+  \Lap \;=\; \mathbf{B}^\top \mathbf{W}\, \mathbf{B},
+  \qquad
+  x^\top \Lap x \;=\; \sum_{e=\{u,v\}} w_e\,(x_u - x_v)^2 .
+\]
+This factorization is the workhorse of the chapter: it shows $\Lap \succeq 0$, exposes its null space ($\mathbf{B}x=0 \iff x$ constant on each component), and --- read right to left --- says a Laplacian quadratic form \emph{is} an electrical energy.
+\end{focusbox}
+
+\section{Electrical flows as energy minimization}\label{ch41:elec}
+
+Before solving anything, pin down what we are solving \emph{for}. A flow is a vector $f\in\R^m$, one real number per oriented edge (negative means flow runs against the orientation). A flow \emph{routes demand} $b$ if it satisfies conservation $\mathbf{B}^\top f = b$: at every vertex, flow in minus flow out equals the injected demand. Among all flows routing $b$, the \emph{electrical flow} is the one of least energy.
+
+\begin{definition}[Electrical flow]\label{ch41:def-elec}
+The energy of a flow $f$ is $\mathcal{E}(f) = \sum_e r_e f_e^2 = f^\top \mathbf{R} f$ where $\mathbf{R}=\mathbf{W}^{-1}=\operatorname{diag}(r_e)$. The \emph{electrical flow} routing $b$ is
+\[
+  f^\star \;=\; \arg\min_{f:\ \mathbf{B}^\top f = b}\ \sum_e r_e f_e^2 .
+\]
+\end{definition}
+
+This is a convex quadratic with linear constraints; it has a unique minimizer. The Lagrangian conditions are exactly the laws of physics.
+
+\begin{theorem}[Ohm + Kirchhoff $=$ a Laplacian solve]\label{ch41:thm-ohm}
+Let $x$ solve $\Lap x = b$ (any solution; all differ by a multiple of $\mathbf{1}$). Then
+\[
+  f^\star \;=\; \mathbf{W}\mathbf{B}\, x,
+  \qquad\text{i.e.}\qquad
+  f^\star_e \;=\; w_e\,(x_u - x_v)\ \text{ for } e=(u\to v),
+\]
+is the electrical flow routing $b$, and it is unique. Conversely the minimizing flow determines the potentials $x$ up to an additive constant.
+\end{theorem}
+
+\begin{whybox}
+The proof is one line of Lagrange multipliers, and the multipliers are the potentials. Minimize $f^\top \mathbf{R} f$ subject to $\mathbf{B}^\top f = b$. The Lagrangian is $f^\top \mathbf{R} f - 2x^\top(\mathbf{B}^\top f - b)$ with multiplier vector $x\in\R^n$. Stationarity in $f$: $2\mathbf{R}f - 2\mathbf{B}x = 0$, so $f = \mathbf{R}^{-1}\mathbf{B}x = \mathbf{W}\mathbf{B}x$. That is \emph{Ohm's law}: flow on an edge equals conductance times potential drop. Feasibility $\mathbf{B}^\top f = b$ becomes $\mathbf{B}^\top\mathbf{W}\mathbf{B}\,x = \Lap x = b$, which is \emph{Kirchhoff's current law}: the net flow out of each vertex equals its injection. The two physical laws are precisely the two optimality conditions, and together they are the linear system $\Lap x = b$.
+\end{whybox}
+
+\begin{proof}
+The feasible set $\{f:\mathbf{B}^\top f=b\}$ is a nonempty affine subspace (nonempty because $b\perp\mathbf{1}$ lies in the range of $\mathbf{B}^\top$), and $f\mapsto f^\top\mathbf{R}f$ is strictly convex on it after translating to the linear subspace $\ker\mathbf{B}^\top$, since $\mathbf{R}\succ 0$. Hence a unique minimizer exists and is characterized by first-order stationarity of the Lagrangian. As computed above, stationarity gives $f=\mathbf{W}\mathbf{B}x$ and feasibility gives $\Lap x = b$. Since $\Lap x = b$ has a solution (as $b\perp\ker\Lap=\operatorname{span}\mathbf{1}$) unique up to $+\,\tau\mathbf{1}$, and $\mathbf{B}\mathbf{1}=0$, the flow $f=\mathbf{W}\mathbf{B}x$ is independent of the choice of solution. Uniqueness of $f^\star$ follows from strict convexity.
+\end{proof}
+
+\begin{labbox}
+Solve $\Lap x = e_s - e_t$ on the running network by hand. Fix the gauge $x_t = 0$ and drop the last row/column (grounding $t$), leaving the $4\times 4$ system in $(x_s,x_a,x_b,x_c)$:
+\[
+  \begin{pmatrix} 2&-1&-1&0\\ -1&3&-1&-1\\ -1&-1&3&-1\\ 0&-1&-1&3\end{pmatrix}
+  \begin{pmatrix}x_s\\x_a\\x_b\\x_c\end{pmatrix}
+  =\begin{pmatrix}1\\0\\0\\0\end{pmatrix}.
+\]
+By the $a\leftrightarrow b$ symmetry of the network, $x_a = x_b$. Set $x_a=x_b=p$. Row $2$: $-x_s + 3p - p - x_c = 0 \Rightarrow x_s + x_c = 2p$. Row $4$: $-2p + 3x_c = 0\Rightarrow x_c = \tfrac23 p$. Then $x_s = 2p - x_c = \tfrac43 p$. Row $1$: $2x_s - 2p = 1$, i.e. $\tfrac83 p - 2p = \tfrac23 p = 1$, so $p=\tfrac32$, giving $x_a=x_b=\tfrac32$, $x_s=2$, $x_c=1$, $x_t=0$.
+
+Now read off currents by Ohm's law $f_e = w_e\,(x_u-x_v) = x_u - x_v$:
+\[
+  f_{sa}=2-\tfrac32=\tfrac12,\quad f_{sb}=\tfrac12,\quad f_{ab}=0,\quad
+  f_{ac}=\tfrac32-1=\tfrac12,\quad f_{bc}=\tfrac12,\quad f_{ct}=1-0=1.
+\]
+Check Kirchhoff at $s$: out $=\tfrac12+\tfrac12=1=b_s$. At $c$: in $\tfrac12+\tfrac12=1$, out $1$. The symmetric edge $\{a,b\}$ carries \emph{nothing} --- there is no potential difference to push it. Energy $\mathcal{E}=\sum r_e f_e^2 = 4\cdot(\tfrac12)^2 + 0 + 1^2 = 2$. And indeed $\mathcal{E}=b^\top x = x_s - x_t = 2$. That identity --- energy $=$ effective resistance times current$^2$ --- is the next definition.
+\end{labbox}
+
+\subsection{Effective resistance}\label{ch41:reff}
+
+\begin{definition}[Effective resistance]\label{ch41:def-reff}
+For $s\ne t$, the \emph{effective resistance} is $R_{\mathrm{eff}}(s,t) = (e_s-e_t)^\top \Lap^{+}(e_s-e_t)$, where $\Lap^{+}$ is the Moore--Penrose pseudoinverse. It equals the energy of the unit electrical flow from $s$ to $t$, and equals the potential drop $x_s - x_t$ when one unit is injected.
+\end{definition}
+
+In the lab above, $R_{\mathrm{eff}}(s,t)=x_s-x_t=2$. Effective resistance is a genuine metric on vertices (the triangle inequality is a short consequence of energy minimization), it controls hitting and commute times of the random walk (the Laplacian chapter foreshadowed this), and --- the fact we need for sparsification --- the effective resistance of an edge times its weight, $w_e R_{\mathrm{eff}}(u,v)$, is the \emph{leverage score} of that edge: its sampling importance.
+
+\begin{connectionbox}
+Three readings of one quantity, each from a different book. \emph{Linear algebra:} $R_{\mathrm{eff}}(s,t)$ is a quadratic form in $\Lap^{+}$, hence a Schur-complement / Gram quantity. \emph{Random walks:} commute time between $s$ and $t$ equals $2m\,R_{\mathrm{eff}}(s,t)$ in the unweighted case, so resistance \emph{is} round-trip walk time up to scale. \emph{Spanning trees:} by the matrix-tree theorem, $w_e R_{\mathrm{eff}}(e)$ is exactly the probability that edge $e$ appears in a uniformly random (weight-proportional) spanning tree. The same number governs solver preconditioning, walk mixing, and tree sampling --- which is why one fast solver unlocks all three.
+\end{connectionbox}
+
+\section{Solving \texorpdfstring{$\Lap x = b$}{Lx=b} in nearly linear time}\label{ch41:solve}
+
+Gaussian elimination costs $\Oh(n^3)$ and destroys sparsity (fill-in). For graphs we want $\Oh(m\,\poly\log n)$. Two facts make it possible: $\Lap$ is symmetric positive semidefinite, so an \emph{iterative} method converges at a rate set by the condition number; and we can build a cheap \emph{preconditioner} whose condition number relative to $\Lap$ is small. The preconditioner is built from a spanning tree, repaired by sparsification. We assemble the pieces.
+
+\subsection{Preconditioned conjugate gradient}\label{ch41:pcg}
+
+Restrict to the subspace $\mathbf{1}^\perp$ where $\Lap$ is positive definite; write its condition number as $\kappa(\Lap)=\lambda_{\max}/\lambda_{\min}$ over the nonzero eigenvalues. Plain conjugate gradient solves $\Lap x=b$ to relative error $\eps$ in $\Oh(\sqrt{\kappa(\Lap)}\,\log(1/\eps))$ matrix--vector products, each costing $\Oh(m)$. For graphs $\kappa$ can be as large as $\poly(n)$ (a path graph has $\kappa=\Th(n^2)$), so this alone is not near-linear.
+
+Preconditioning replaces $\Lap x = b$ by the equivalent system $\mathbf{P}^{-1}\Lap x = \mathbf{P}^{-1}b$ for an SPD matrix $\mathbf{P}$ that (i) is cheap to apply $\mathbf{P}^{-1}$ to a vector and (ii) \emph{approximates} $\Lap$ spectrally. Spectral approximation is the right notion of ``close.''
+
+\begin{definition}[Spectral approximation]\label{ch41:def-spectral}
+Matrices $\mathbf{P},\Lap\succeq 0$ satisfy $\mathbf{P}\approx_\kappa \Lap$ when
+\[
+  \tfrac{1}{\kappa}\,x^\top \mathbf{P}\,x \ \le\ x^\top \Lap\,x \ \le\ \kappa\,x^\top \mathbf{P}\,x
+  \qquad\text{for all } x .
+\]
+\end{definition}
+
+If $\mathbf{P}\approx_\kappa\Lap$ then the preconditioned operator $\mathbf{P}^{-1}\Lap$ has all eigenvalues in $[1/\kappa,\kappa]$, so preconditioned CG (PCG) converges in $\Oh(\sqrt{\kappa}\,\log(1/\eps))$ iterations, each costing one multiply by $\Lap$ ($\Oh(m)$) plus one \emph{solve} against $\mathbf{P}$. The whole game is: find $\mathbf{P}$ with small $\kappa$ that you can solve against fast.
+
+\begin{algorithm}[H]
+\DontPrintSemicolon
+\caption{\textsc{PreconditionedSolve}$(\Lap,b,\mathbf{P},\eps)$}\label{ch41:alg-pcg}
+\KwIn{Laplacian $\Lap$, demand $b\perp\mathbf{1}$, SPD preconditioner $\mathbf{P}$ with $\mathbf{P}\approx_\kappa\Lap$, accuracy $\eps$.}
+\KwOut{$x$ with $\norm{x-\Lap^{+}b}_{\Lap}\le\eps\norm{\Lap^{+}b}_{\Lap}$.}
+$x\gets 0$;\quad $r\gets b$;\quad $z\gets \textsc{Solve}_{\mathbf{P}}(r)$;\quad $p\gets z$\;
+\For{$k=0,1,2,\dots$ until $\norm{r}\le\eps\norm{b}$}{
+  $q\gets \Lap p$\;
+  $\alpha\gets (r^\top z)/(p^\top q)$\;
+  $x\gets x+\alpha p$;\quad $r_{\mathrm{new}}\gets r-\alpha q$\;
+  $z_{\mathrm{new}}\gets \textsc{Solve}_{\mathbf{P}}(r_{\mathrm{new}})$\;
+  $\beta\gets (r_{\mathrm{new}}^\top z_{\mathrm{new}})/(r^\top z)$\;
+  $p\gets z_{\mathrm{new}}+\beta p$;\quad $r\gets r_{\mathrm{new}}$;\quad $z\gets z_{\mathrm{new}}$\;
+}
+\Return $x$\;
+\end{algorithm}
+
+\subsection{Low-stretch spanning trees: the first preconditioner}\label{ch41:lsst}
+
+The simplest preconditioner is a spanning tree $T$ of $\Gph$, with its tree Laplacian $\Lap_T$. Solving $\Lap_T z = r$ is trivial: a tree Laplacian (grounded at a root) is, after a permutation, triangular --- one upward pass accumulates currents into the root, one downward pass sets potentials, total $\Oh(n)$. So $\textsc{Solve}_{\Lap_T}$ is linear. The question is how well $\Lap_T$ approximates $\Lap$.
+
+Since $T\subseteq\Gph$, dropping edges only lowers the quadratic form: $x^\top\Lap_T x\le x^\top\Lap x$, giving the easy side $\Lap_T\preceq\Lap$. The hard side asks how much energy the missing edges can have that the tree must absorb. The right accounting is \emph{stretch}.
+
+\begin{definition}[Stretch]\label{ch41:def-stretch}
+For a non-tree edge $e=\{u,v\}$ with resistance $r_e$, let $P_T(u,v)$ be the unique tree path. Its stretch is $\operatorname{st}_T(e)=\big(\sum_{f\in P_T(u,v)} r_f\big)/r_e$, the tree-path resistance over the edge's own resistance. The total stretch is $\operatorname{st}_T(\Gph)=\sum_{e\in E}\operatorname{st}_T(e)$ (tree edges contribute $1$ each).
+\end{definition}
+
+\begin{lemma}[Tree preconditioning bound]\label{ch41:lem-stretch}
+$\Lap_T\preceq\Lap\preceq\big(1+\operatorname{st}_T(\Gph)\big)\,\Lap_T$, so $\Lap_T\approx_\kappa\Lap$ with $\kappa\le 1+\operatorname{st}_T(\Gph)$.
+\end{lemma}
+
+\begin{whybox}
+Why stretch is the multiplier. Route each non-tree edge $e=\{u,v\}$, carrying a unit of ``demand'' $e_u-e_v$, along its tree path. This embeds $\Gph$ into $T$ as a flow. The congestion this puts on a tree edge, summed and weighted by resistances, is captured by stretch: a non-tree edge of small resistance whose tree detour is long forces a lot of current through the tree, so the tree must be ``soft'' enough to carry it, which is precisely a large ratio in the spectral inequality. Summing the contribution of all non-tree edges, the worst blow-up of $x^\top\Lap x$ over $x^\top\Lap_T x$ is bounded by $1+\operatorname{st}_T(\Gph)$. The bound is loose (it is a sum, not a max), but it is exactly what makes the next idea --- sampling --- pay off.
+\end{whybox}
+
+\begin{labbox}
+Compute stretch on the running network. Take the spanning tree $T=\{e_1,e_2,e_4,e_6\}=\{\{s,a\},\{s,b\},\{b,c\},\{c,t\}\}$ (four edges, five vertices --- a tree). All resistances are $1$. The two non-tree edges are $e_3=\{a,c\}$ and $e_5=\{a,b\}$.
+\begin{itemize}
+  \item $e_5=\{a,b\}$: tree path $a\to s\to b$ uses $\{s,a\},\{s,b\}$, resistance $2$, so $\operatorname{st}_T(e_5)=2/1=2$.
+  \item $e_3=\{a,c\}$: tree path $a\to s\to b\to c$ uses $\{s,a\},\{s,b\},\{b,c\}$, resistance $3$, so $\operatorname{st}_T(e_3)=3$.
+\end{itemize}
+The four tree edges contribute $1$ each, so $\operatorname{st}_T(\Gph)=4+2+3=9$ and Lemma~\ref{ch41:lem-stretch} gives $\kappa\le 1+9=10$. Now try the better-balanced tree $T'=\{e_1,e_3,e_4,e_6\}=\{\{s,a\},\{a,c\},\{b,c\},\{c,t\}\}$: non-tree edges are $e_2=\{s,b\}$ (path $s\to a\to c\to b$, resistance $3$, stretch $3$) and $e_5=\{a,b\}$ (path $a\to c\to b$, resistance $2$, stretch $2$), so $\operatorname{st}_{T'}(\Gph)=4+3+2=9$ again --- this tiny graph is too symmetric to separate the trees, but on a path or grid the choice of $T$ swings stretch by orders of magnitude, which is the whole point of Theorem~\ref{ch41:thm-lsst}.
+\end{labbox}
+
+\begin{center}
+\begin{tikzpicture}[
+  every node/.style={circle,draw=nodeblue,fill=blue!6,minimum size=8mm,inner sep=0pt,font=\small},
+  treeedge/.style={draw=sourceblue,line width=1.8pt},
+  nontree/.style={draw=trapred,dashed,thick}]
+  \node (s) at (0,0) {$s$};
+  \node (a) at (2.4,1.3) {$a$};
+  \node (b) at (2.4,-1.3) {$b$};
+  \node (c) at (4.8,0) {$c$};
+  \node (t) at (7.2,0) {$t$};
+  \draw[treeedge] (s) -- (a);
+  \draw[treeedge] (s) -- (b);
+  \draw[treeedge] (b) -- (c);
+  \draw[treeedge] (c) -- (t);
+  \draw[nontree] (a) -- (c) node[draw=none,fill=none,font=\scriptsize,midway,above right] {$e_3$};
+  \draw[nontree] (a) -- (b) node[draw=none,fill=none,font=\scriptsize,midway,left] {$e_5$};
+\end{tikzpicture}
+\end{center}
+
+\noindent The spanning tree $T=\{e_1,e_2,e_4,e_6\}$ (solid blue) of the running network; the two non-tree edges $e_3=\{a,c\}$ and $e_5=\{a,b\}$ (dashed red) are the ones that get stretched along their tree paths. Edge $e_3$ detours $a\to s\to b\to c$ (resistance $3$) and $e_5$ detours $a\to s\to b$ (resistance $2$), for total stretch $9$.
+
+A breadth-first or shortest-path tree can have stretch $\Th(n^2)$. The breakthrough is that \emph{low-stretch} trees exist and are constructible.
+
+\begin{theorem}[Low-stretch spanning trees]\label{ch41:thm-lsst}
+Every weighted graph has a spanning tree $T$ with $\operatorname{st}_T(\Gph)=\Oh(m\log n\log\log n)$, constructible in $\Oh(m\log n\log\log n)$ time. (Alon--Karp--Peleg--West first achieved $m^{\Oh(\sqrt{\log\log n})}$; Abraham--Bartal--Neiman and Abraham--Neiman drove it to the near-linear bound.)
+\end{theorem}
+
+These trees come from recursively partitioning the graph into low-diameter clusters (a ``star decomposition'') and recursing, so that on average no edge is stretched by more than a $\poly\log$ factor. With such a tree, $\kappa\le 1+\Oh(m\log n\log\log n)$ and PCG needs $\Oh(\sqrt{m}\,\poly\log)$ iterations --- better than nothing, still not near-linear because of the $\sqrt m$. The fix is to add a few well-chosen non-tree edges back, sampled by stretch, and to do so \emph{recursively}.
+
+\subsection{From a tree to an ultrasparsifier}\label{ch41:ultra}
+
+The plan that closes the gap (Spielman--Teng, streamlined by Koutis--Miller--Peng) is: take the low-stretch tree $T$, then \emph{sample} non-tree edges with probability proportional to their stretch, scaling kept edges up to stay unbiased. Adding $t$ sampled edges produces an \emph{ultrasparsifier} $H$: a graph with only $n-1+t$ edges that nonetheless satisfies $\Lap_H\approx_\kappa\Lap$ with a condition number you control by choosing $t$.
+
+\begin{theorem}[Ultrasparsifier]\label{ch41:thm-ultra}
+For any $\kappa>1$ there is a graph $H$ with $n-1+\Oh\!\big(\tfrac{\operatorname{st}_T(\Gph)}{\kappa}\log n\big)$ edges and $\Lap_H\approx_\kappa\Lap$, computable in near-linear time.
+\end{theorem}
+
+Why this matters: $H$ is a tree plus a near-tree, so its own Laplacian system can be solved by \emph{eliminating} all degree-$1$ and degree-$2$ vertices (a partial Cholesky that does not fill in), shrinking $H$ to a graph on $\Oh\!\big(\tfrac{\operatorname{st}_T}{\kappa}\log n\big)$ vertices, and recursing the entire solver on that smaller graph. Each recursion level multiplies the vertex count by a factor $<1$, so the recursion has $\Oh(\log n)$ depth and the total work telescopes to near-linear.
+
+\begin{algorithm}[H]
+\DontPrintSemicolon
+\caption{\textsc{LaplacianSolve}$(\Lap,b,\eps)$ --- recursive preconditioned solver}\label{ch41:alg-solver}
+\KwIn{Laplacian $\Lap$ of $\Gph=(V,E)$, $b\perp\mathbf{1}$, accuracy $\eps$.}
+\KwOut{$x\approx\Lap^{+}b$.}
+\If{$\abs V \le c_0$}{\Return direct dense solve of $\Lap x=b$\;}
+$T\gets$ \textsc{LowStretchTree}$(\Gph)$ \tcp*{Theorem~\ref{ch41:thm-lsst}}
+$H\gets$ \textsc{Ultrasparsify}$(\Gph,T,\kappa)$ \tcp*{tree $+$ stretch-sampled edges, Thm.~\ref{ch41:thm-ultra}}
+$\Gph'\gets$ \textsc{GreedyEliminate}$(H)$ \tcp*{remove deg-$1$/deg-$2$ vertices, no fill-in}
+build $\mathbf{P}=\Lap_H$; let $\textsc{Solve}_{\mathbf{P}}(r)$ recurse via \textsc{LaplacianSolve}$(\Lap_{\Gph'},\cdot)$ on the reduced system\;
+\Return \textsc{PreconditionedSolve}$(\Lap,b,\mathbf{P},\eps)$ \tcp*{Algorithm~\ref{ch41:alg-pcg}}
+\end{algorithm}
+
+\begin{complexitybox}
+With $\kappa$ chosen at each level so that PCG needs $\Oh(\sqrt\kappa)$ inner iterations and the reduced graph shrinks by a constant factor, the recursion solves to accuracy $\eps$ in
+\[
+  \Oh\!\big(m\,\log^{c} n\,\log(1/\eps)\big)
+\]
+time for a small constant $c$. The original Spielman--Teng bound had a large $c$; Koutis--Miller--Peng brought it to $c\approx 1$--$2$ and made the constants practical; later work (Cohen--Kyng--Miller--Pachocki--Peng--Rao--Xu and others) sharpened it further and gave the simpler ``sparsified Cholesky'' route. For this book treat the solver as a black box returning $\tilde x$ with $\norm{\tilde x-\Lap^{+}b}_\Lap\le\eps\norm{\Lap^{+}b}_\Lap$ in time $\Oh(m\,\poly\log n\,\log(1/\eps))$.
+\end{complexitybox}
+
+\begin{trapbox}
+The accuracy is \emph{relative in the $\Lap$-norm}, not entrywise, and the answer is defined only modulo $\mathbf{1}$. Two traps follow. First, always project $b$ onto $\mathbf{1}^\perp$ before solving; a stray component along $\mathbf{1}$ has no solution and CG will wander. Second, when you chain solves (as max-flow does), $\eps$-errors can compound: a downstream routine that divides by a small potential difference will amplify the residual. The cure throughout is to demand $\eps$ \emph{polynomially small} ($\eps=1/\poly(n)$) --- the $\log(1/\eps)$ cost makes this almost free --- and to re-project onto the feasible flow space after each solve.
+\end{trapbox}
+
+\section{Spectral sparsification}\label{ch41:sparsify}
+
+Ultrasparsifiers keep a tree intact. A \emph{spectral sparsifier} is the unconstrained version: replace $\Gph$ (with $m$ edges) by a reweighted subgraph $\widetilde\Gph$ with only $\Oh(n\log n/\eps^2)$ --- or even $\Oh(n/\eps^2)$ --- edges such that $\Lap_{\widetilde\Gph}\approx_{1+\eps}\Lap$. Spectral sparsifiers are the reason ``Laplacian solver'' and ``cut/flow algorithm'' became near-linear at all: sparsify once, then run anything on $\Oh(n)$ edges.
+
+\begin{theorem}[Spielman--Srivastava: sample by effective resistance]\label{ch41:thm-ss}
+Sample $q=\Oh(n\log n/\eps^2)$ edges i.i.d., each edge $e$ chosen with probability $p_e\propto w_e R_{\mathrm{eff}}(e)$ (its leverage score), and give a sampled edge weight $w_e/(q\,p_e)$. With high probability the resulting $\widetilde\Gph$ satisfies $\Lap_{\widetilde\Gph}\approx_{1+\eps}\Lap$.
+\end{theorem}
+
+\begin{whybox}
+Write $\Lap=\mathbf{B}^\top\mathbf{W}\mathbf{B}=\sum_e w_e\,b_e b_e^\top$ as a sum of rank-one terms, $b_e=\mathbf{B}^\top e_e$. Conjugate by $\Lap^{+/2}$: the matrix $\Pi=\Lap^{+/2}\Lap\Lap^{+/2}$ is a projection (it equals $\sum_e v_e v_e^\top$ with $v_e=\sqrt{w_e}\,\Lap^{+/2}b_e$), and crucially $\norm{v_e}^2 = w_e\,b_e^\top\Lap^{+}b_e = w_e R_{\mathrm{eff}}(e)$ --- the leverage score. So sparsifying $\Lap$ is exactly the matrix problem ``approximate a sum of rank-one projections $\sum v_ev_e^\top$ by sampling few terms,'' and the textbook answer is to sample each term proportional to $\norm{v_e}^2$. A matrix Chernoff bound then gives concentration with $\Oh(n\log n/\eps^2)$ samples. The leverage scores $w_eR_{\mathrm{eff}}(e)$ sum to exactly $n-1$ (the trace of a rank-$(n-1)$ projection), which is why a near-linear number of samples suffices.
+\end{whybox}
+
+Computing all $m$ effective resistances exactly would need $m$ solves --- too slow. The escape is a Johnson--Lindenstrauss projection: $R_{\mathrm{eff}}(e)=\norm{\mathbf{W}^{1/2}\mathbf{B}\,\Lap^{+}b_e}^2$ is the squared length of a vector; project the $m\times n$ matrix $\mathbf{W}^{1/2}\mathbf{B}\,\Lap^{+}$ down to $\Oh(\log n/\eps^2)$ random rows, preserving all pairwise lengths. Each projected row is computed with one Laplacian solve. So $\Oh(\log n)$ solves estimate \emph{all} leverage scores, and sparsification is itself near-linear --- closing the loop, since the solver used inside needs only a crude preconditioner to bootstrap.
+
+\begin{historybox}
+Spielman and Teng (2004) proved the first near-linear Laplacian solver in a famously long three-paper sequence, introducing spectral sparsification, local clustering, and low-stretch trees as a package. Batson--Spielman--Srivastava (2009) then showed the optimal $\Oh(n/\eps^2)$ sparsifiers exist (twice-Ramanujan sparsifiers), via a deterministic barrier-function argument. Spielman--Srivastava's effective-resistance sampling (2008) made sparsifiers \emph{practical} and tied them to leverage scores. Koutis--Miller--Peng simplified the solver; Lee--Sidford and Cohen et al. pushed flow and regression on top of it. The arc of the field is one long lesson in how a continuous, spectral relaxation can beat purely combinatorial methods on combinatorial problems.
+\end{historybox}
+
+\section{Maximum flow via a sequence of electrical flows}\label{ch41:maxflow}
+
+Now the payoff. We approximate maximum $s$--$t$ flow in an \emph{undirected, capacitated} graph using only electrical-flow computations --- each a single Laplacian solve. Capacities $u_e>0$ are given; we want the largest $F$ such that $F$ units can be routed from $s$ to $t$ with $\abs{f_e}\le u_e$ on every edge. We describe the Christiano--Kelner--Madry--Spielman--Teng (CKMST, 2011) algorithm, which computes a $(1-\eps)$-approximate max-flow in $\Oh(m^{4/3}\,\poly(\eps^{-1},\log n))$ time --- at the time, the first sub-$m^{1.5}$ undirected max-flow, and the template for the later almost-linear-time results.
+
+\subsection{Why electrical flow is the right relaxation}\label{ch41:why-elec}
+
+A feasible flow must obey $\abs{f_e}\le u_e$ --- an $\ell_\infty$ constraint, the natural home of combinatorial flow. Electrical flow instead minimizes $\sum r_e f_e^2$ --- an $\ell_2$ objective, the natural home of linear algebra. The strategy is the classic one for turning $\ell_\infty$ feasibility into a sequence of $\ell_2$ solves: \emph{multiplicative weights}. Run an electrical flow; wherever it exceeds capacity, raise that edge's resistance so the next electrical flow shies away; repeat; average the flows. The average is nearly feasible and nearly maximum.
+
+\begin{intuitionbox}
+Picture the running network with $s$ and $t$. The electrical flow of Section~\ref{ch41:elec} already sent $1$ unit from $s$ to $t$, splitting it $\tfrac12/\tfrac12$ across the two paths $s\to a\to c\to t$ and $s\to b\to c\to t$. Suppose every edge had capacity $1$ except $\{c,t\}$, which carries the full unit and so is at capacity. If we wanted to push $1.2$ units, the bottleneck $\{c,t\}$ would overflow. Multiplicative weights says: make $\{c,t\}$ more resistive, but there is only one way to $t$, so the scheme cannot route around it --- it instead discovers that $\{c,t\}$ is a true min-cut edge. Electrical flow, by spreading current to minimize energy, automatically finds \emph{where} the bottlenecks are: congested edges are exactly the high-energy ones, and reweighting turns that signal into an algorithm.
+\end{intuitionbox}
+
+\subsection{The multiplicative-weights outer loop}\label{ch41:mwu}
+
+Fix a target flow value $F$ (binary-search it, or scale so the optimum is near $1$). Maintain a weight $w_e\ge 1$ per edge; the resistance fed to the electrical solver is $r_e=w_e/u_e^2$, so that an edge carrying its full capacity $u_e$ contributes a fixed unit of ``congestion energy'' $r_e u_e^2=w_e$. Each round, compute the electrical flow routing $F$ units $s\to t$ under current resistances, measure each edge's \emph{congestion} $\rho_e=\abs{f_e}/u_e$, and bump weights multiplicatively by congestion. Average the rounds.
+
+\begin{algorithm}[H]
+\DontPrintSemicolon
+\caption{\textsc{ElectricalMaxFlow}$(\Gph,u,s,t,F,\eps)$}\label{ch41:alg-maxflow}
+\KwIn{Undirected graph $\Gph$, capacities $u$, source/sink $s,t$, target value $F$, accuracy $\eps$.}
+\KwOut{A flow of value $F$ with congestion $\le 1+\Oh(\eps)$, or a certificate that $F$ exceeds the max-flow.}
+$w_e\gets 1$ for all $e$;\quad $\bar f\gets 0$;\quad $N\gets \Th(\eps^{-2}\sqrt{m}\,\log m)$ \tcp*{rounds; $\Th(\mu\eps^{-2}\log m)$ with width $\mu\le\sqrt m$}
+\For{$i=1$ \KwTo $N$}{
+  $r_e\gets w_e/u_e^2$ for all $e$;\quad $W\gets \sum_e w_e$\;
+  $x\gets \textsc{LaplacianSolve}(\Lap_r,\, F(e_s-e_t),\, \text{poly small } \eps)$ \tcp*{one solve, $\Lap_r=\mathbf{B}^\top\mathbf{R}^{-1}\mathbf{B}$}
+  $f^{(i)}_e\gets (x_u-x_v)/r_e$ \tcp*{electrical flow routing $F$}
+  \If{$\mathcal{E}(f^{(i)})=\sum_e r_e (f^{(i)}_e)^2 > (1+\eps)\,W$}{
+     \Return ``$F$ is infeasible'' \tcp*{energy too high $\Rightarrow$ no flow of value $F$ fits}
+  }
+  $\rho_e\gets \abs{f^{(i)}_e}/u_e$ for all $e$\;
+  $w_e\gets w_e\,\big(1+\tfrac{\eps}{\,\mu\,}\,\rho_e\big)$ for all $e$ \tcp*{$\mu=\max_e\rho_e$ controls the step}
+  $\bar f\gets \bar f + \tfrac1N f^{(i)}$\;
+}
+\Return $\bar f$ \tcp*{average flow: value $F$, congestion $\le 1+\Oh(\eps)$}
+\end{algorithm}
+
+\begin{whybox}
+Two invariants drive the analysis. \emph{(1) Electrical energy lower-bounds congestion.} The electrical (minimum-energy) flow $f^{(i)}$ has energy $\mathcal{E}(f^{(i)})\le \mathcal{E}(g)$ for every flow $g$ routing $F$ units. If a feasible flow of value $F$ exists with all $\abs{g_e}\le u_e$, then $\mathcal{E}(g)=\sum_e (w_e/u_e^2)g_e^2\le \sum_e w_e=W$. So whenever the electrical energy exceeds $(1+\eps)W$, \emph{no} capacity-respecting flow of value $F$ exists --- that is the infeasibility certificate. \emph{(2) Weights track congestion.} The potential $W=\sum_e w_e$ grows by a factor $(1+\tfrac{\eps}{\mu}\rho_e)$ per edge per round, so $\log W$ accumulates total congestion. The standard MWU regret bound forces the time-average congestion on every edge toward the best achievable, i.e. toward $1$. Averaging the per-round electrical flows yields $\bar f$ whose congestion is $1+\Oh(\eps)$, and rescaling by $1/(1+\Oh(\eps))$ gives a feasible flow of value $(1-\Oh(\eps))F$.
+\end{whybox}
+
+\subsection{The width problem and the \texorpdfstring{$m^{1/3}$}{m^1/3} fix}\label{ch41:width}
+
+The catch is \emph{width} $\mu=\max_e\rho_e$: with the width-scaled step size $\eps/\mu$ used in Algorithm~\ref{ch41:alg-maxflow}, MWU needs $\Th(\mu\,\eps^{-2}\log m)$ rounds, and a single electrical flow can overload one edge by a factor as large as $\sqrt m$ (all the current funnels through a low-resistance bottleneck). That would force $\Th(\sqrt m\,\eps^{-2}\log m)$ rounds --- too many. CKMST's key idea controls width by \emph{removing} the worst offenders: any edge whose electrical congestion exceeds a threshold $\rho^\star$ has, by an energy argument, large effective resistance, so it must lie near a sparse cut. Delete such edges (only $\Oh(m/\rho^{\star 2})$ of them across the run, charged to energy) and re-solve. Setting $\rho^\star=m^{1/3}$ balances ``few rounds'' against ``few deletions,'' giving $\Oh(m^{1/3}\,\poly(\eps^{-1},\log m))$ rounds and total time $\Oh(m^{4/3}\,\poly(\eps^{-1},\log m))$.
+
+\begin{theorem}[CKMST]\label{ch41:thm-ckmst}
+Algorithm~\ref{ch41:alg-maxflow}, augmented with the width-reduction step (delete edges of congestion $>m^{1/3}$ and re-solve), computes a $(1-\eps)$-approximate maximum $s$--$t$ flow in an undirected capacitated graph in time $\Oh(m^{4/3}\,\poly(\eps^{-1},\log m))$, using $\Oh(m^{1/3}\,\poly(\eps^{-1},\log m))$ Laplacian solves.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Correctness of the inner loop is the MWU regret bound together with invariant (1) above: with the width-scaled step $\eps/\mu$, after $N=\Th(\mu\,\eps^{-2}\log m)$ rounds the averaged flow $\bar f$ has congestion $\le 1+\Oh(\eps)$, or some round certified infeasibility. For width, observe that in any single electrical flow the energy is $\mathcal{E}=\sum_e r_e f_e^2\le (1+\eps)W$, while an edge of congestion $\rho_e$ contributes $r_e f_e^2 = w_e\rho_e^2 \ge \rho_e^2$. Hence the number of edges with $\rho_e>\rho^\star$ in a given round is at most $(1+\eps)W/\rho^{\star 2}$, and a charging argument over all rounds bounds the \emph{total} deletions by $\Oh(m/\rho^{\star2}\cdot\poly\log)$. Each deleted edge can be shown to lie across an $s$--$t$ cut of value $\le (1+\eps)F$, so deleting it loses at most a $(1+\eps)$ factor in feasibility, absorbed into $\eps$. With $\rho^\star=m^{1/3}$: rounds $=\Oh(m^{1/3}\eps^{-2}\poly\log)$, each a solve at near-linear cost, total $\Oh(m^{4/3}\,\poly(\eps^{-1},\log m))$ after the balanced charging. The careful bookkeeping is in the CKMST paper; the takeaway is that the only oracle used is a Laplacian solve.
+\end{proof}
+
+\begin{labbox}
+Run two rounds on the running network with all capacities $u_e=1$, target $F=1$, step $\eps$ moderate. Round $1$: weights $w_e=1$, resistances $r_e=1$, so this is the electrical flow we already computed --- congestions $\rho_{sa}=\rho_{sb}=\rho_{ac}=\rho_{bc}=\tfrac12$, $\rho_{ab}=0$, $\rho_{ct}=1$. Energy $\mathcal{E}=2$; with $W=6$ the test $\mathcal{E}\le(1+\eps)W$ passes, so $F=1$ is feasible. The bottleneck $\{c,t\}$ is at congestion $1$, every other edge at $\le\tfrac12$, so the weight bump raises $w_{ct}$ the most. Round $2$: now $r_{ct}>1$, so the next electrical flow finds $\{c,t\}$ stiffer --- but $\{c,t\}$ is the \emph{only} edge into $t$, so its current cannot drop below $1$; what changes is upstream, where current keeps splitting evenly because $a,b$ stay symmetric. The averaged flow $\bar f$ converges to: $\tfrac12$ on each of $\{s,a\},\{s,b\},\{a,c\},\{b,c\}$, $0$ on $\{a,b\}$, $1$ on $\{c,t\}$ --- a feasible unit flow, which is in fact the max-flow here (min-cut $=\{c,t\}$ alone, value $1$). The point: the bottleneck announced itself as the unique congestion-$1$ edge in round $1$.
+\end{labbox}
+
+\begin{center}
+\begin{tikzpicture}[
+  every node/.style={circle,draw=nodeblue,fill=blue!6,minimum size=8mm,inner sep=0pt,font=\small},
+  flowlbl/.style={draw=none,fill=none,font=\scriptsize\itshape},
+  cur/.style={draw=sourceblue,line width=1.6pt,-{Latex[length=2.2mm]}},
+  zero/.style={draw=edgegray,dashed,thick}]
+  \node (s) at (0,0) {$s$};
+  \node (a) at (2.4,1.3) {$a$};
+  \node (b) at (2.4,-1.3) {$b$};
+  \node (c) at (4.8,0) {$c$};
+  \node (t) at (7.2,0) {$t$};
+  \draw[cur] (s) -- (a) node[flowlbl,midway,above left] {$\tfrac12$};
+  \draw[cur] (s) -- (b) node[flowlbl,midway,below left] {$\tfrac12$};
+  \draw[cur] (a) -- (c) node[flowlbl,midway,above right] {$\tfrac12$};
+  \draw[cur] (b) -- (c) node[flowlbl,midway,below right] {$\tfrac12$};
+  \draw[zero] (a) -- (b) node[flowlbl,midway,right] {$0$};
+  \draw[cur,line width=2.6pt,draw=trapred] (c) -- (t) node[flowlbl,midway,above] {$1$};
+\end{tikzpicture}
+\end{center}
+
+\noindent The electrical flow routing one unit from $s$ to $t$: arrow thickness tracks current. The symmetric edge $\{a,b\}$ (dashed) carries nothing, and the lone edge $\{c,t\}$ (red) carries the full unit at congestion $1$ --- the bottleneck the multiplicative-weights loop will hammer first.
+
+\begin{historybox}
+CKMST (Christiano, Kelner, Madry, Spielman, Teng, STOC 2011) broke the $\Oh(m^{3/2})$ barrier for undirected approximate max-flow that had stood since the 1970s, and did it by treating max-flow as a sequence of regressions. The flood that followed reads like a victory lap for the continuous viewpoint: Sherman and independently Kelner--Lee--Orecchia--Sidford reached $\Oh(m\,\poly(\eps^{-1},\log n))$ for undirected max-flow; Lee--Sidford built faster interior-point methods on Laplacian solves; Madry pushed exact \emph{unit-capacity} max-flow to $\Oh(m^{10/7}\poly\log)$ via electrical flows inside an interior-point method; and Chen--Kyng--Liu--Peng--Probst Gutenberg--Sachdeva (2022) finally reached \emph{almost-linear} $m^{1+o(1)}$ time for general min-cost flow --- still resting, at bottom, on the ability to solve $\Lap x=b$ fast.
+\end{historybox}
+
+\section{Why the Laplacian solver became a hammer}\label{ch41:hammer}
+
+Step back and catalog what one near-linear $\Lap x=b$ oracle buys. The pattern is always the same: express a graph quantity as a quadratic optimization in the Laplacian, then read it off from a solve.
+
+\begin{itemize}
+  \item \textbf{Electrical flow / effective resistance.} One solve (Theorem~\ref{ch41:thm-ohm}); the bedrock primitive.
+  \item \textbf{Spectral sparsification.} $\Oh(\log n)$ solves via JL leverage-score estimation (Section~\ref{ch41:sparsify}); then \emph{everything} runs on $\Oh(n)$ edges.
+  \item \textbf{Max-flow / min-cut (undirected, approximate).} $\Oh(m^{1/3}\poly\log)$ solves (Theorem~\ref{ch41:thm-ckmst}); generalizes to min-cost flow.
+  \item \textbf{Random spanning tree sampling.} Reductions to effective-resistance estimates (matrix-tree connection in the box of Section~\ref{ch41:reff}).
+  \item \textbf{Graph semi-supervised learning / heat diffusion.} Solving $(\Lap+\tau I)x=b$ is label propagation; a single regularized solve.
+  \item \textbf{Spectral clustering bootstrap.} Approximate Fiedler vectors via inverse power iteration, each step a solve.
+  \item \textbf{Interior-point methods for flows and matchings.} Each Newton step is a re-weighted Laplacian solve; this is how almost-linear-time flow is achieved.
+\end{itemize}
+
+\begin{aestheticbox}
+The deeper lesson is methodological. Classical graph algorithms are \emph{combinatorial}: they make discrete local moves (augment a path, relax an edge, contract a blossom) and argue by potential functions over those moves. The Laplacian paradigm is \emph{continuous}: it relaxes the discrete problem to a convex program over $\R^n$, solves the program with linear algebra, and rounds back. The relaxation that works is almost always the \emph{electrical} one --- $\ell_2$ energy --- because $\ell_2$ minimization is a linear solve, and the linear solve is the thing we made fast. Max-flow is the showcase precisely because it is so combinatorial: that even \emph{it} yields to a stack of electrical flows is the strongest evidence that ``solve $\Lap x=b$'' deserves to sit beside ``sort an array'' as a foundational subroutine.
+\end{aestheticbox}
+
+\begin{applicationbox}
+These ideas are not only theoretical trophies. Resistance-based sampling underlies practical graph-sparsification libraries used to speed up GNN training and large-scale spectral clustering. Combinatorial-multigrid and lean algebraic-multigrid solvers --- direct descendants of the tree-preconditioner idea --- solve Laplacian and SDD systems in production for image segmentation, mesh processing, and circuit simulation (the original electrical-network application, come full circle). And the interior-point-over-Laplacian-solves template is now the standard route to state-of-the-art running times for min-cost flow, bipartite matching, and optimal transport.
+\end{applicationbox}
+
+\section*{Exercises}
+\addcontentsline{toc}{section}{Exercises}
+
+\begin{exercise}[Hand-solve a second demand]
+On the running network of Section~\ref{ch41:running} with unit conductances, solve $\Lap x = e_a - e_b$ (inject at $a$, extract at $b$). Use symmetry to guess $x_s,x_c,x_t$ first, then verify. Compute the electrical flow and $R_{\mathrm{eff}}(a,b)$. Explain why $R_{\mathrm{eff}}(a,b)<1$ even though edge $\{a,b\}$ has resistance $1$.
+\end{exercise}
+
+\begin{exercise}[Energy equals resistance]
+Prove that for the unit flow from $s$ to $t$, the minimum energy equals $R_{\mathrm{eff}}(s,t)=(e_s-e_t)^\top\Lap^{+}(e_s-e_t)$, and that this equals the potential drop $x_s-x_t$. (Hint: plug $f^\star=\mathbf{W}\mathbf{B}x$ into $\mathcal{E}$ and use $\Lap x = e_s-e_t$.)
+\end{exercise}
+
+\begin{exercise}[Stretch of a cycle]
+For the unweighted cycle $C_n$, let $T$ be $C_n$ minus one edge $e$. Compute $\operatorname{st}_T(\Gph)$ exactly, and the resulting condition-number bound from Lemma~\ref{ch41:lem-stretch}. Compare to the true $\kappa(\Lap_{C_n})=\Th(n^2)$ and comment on how loose the stretch bound is for this single graph.
+\end{exercise}
+
+\begin{exercise}[Leverage scores sum to $n-1$]
+Prove $\sum_{e} w_e R_{\mathrm{eff}}(e) = n-1$ for any connected graph on $n$ vertices. (Hint: $w_e R_{\mathrm{eff}}(e)=\operatorname{tr}(\Lap^{+}\,w_e b_e b_e^\top)$; sum over $e$ and recognize the trace of a projection.) Explain why this makes $\Oh(n\log n)$ samples enough in Theorem~\ref{ch41:thm-ss}.
+\end{exercise}
+
+\begin{exercise}[PCG iteration count]
+Suppose $\mathbf{P}\approx_\kappa\Lap$. Show that the eigenvalues of $\mathbf{P}^{-1}\Lap$ (restricted to $\mathbf{1}^\perp$) lie in $[1/\kappa,\kappa]$, and conclude that PCG (Algorithm~\ref{ch41:alg-pcg}) reaches relative $\Lap$-norm error $\eps$ in $\Oh(\sqrt\kappa\log(1/\eps))$ iterations. Where does the $\sqrt\kappa$, rather than $\kappa$, come from?
+\end{exercise}
+
+\begin{exercise}[Width is the bottleneck]
+Construct an undirected unit-capacity graph and an $s,t$ pair where a single unit electrical flow puts congestion $\Th(\sqrt m)$ on one edge. (Hint: one short low-resistance edge in parallel with many long paths.) Explain why this forces fixed-step MWU (unit step, round count $\Th(\mu^2\eps^{-2}\log m)$) to use $\Th(m)$ rounds, and how the CKMST edge-deletion step rescues the count.
+\end{exercise}
+
+\begin{exercise}[Infeasibility certificate]
+In Algorithm~\ref{ch41:alg-maxflow}, prove that if some round has electrical energy $\mathcal{E}(f^{(i)})>(1+\eps)W$ then no capacity-respecting flow of value $F$ exists. (Hint: any feasible $g$ has $\mathcal{E}(g)\le W$ and the electrical flow minimizes energy.) What min-cut lower bound does this give?
+\end{exercise}
+
+\begin{exercise}[Implement the solver loop]
+Implement Algorithm~\ref{ch41:alg-pcg} with $\mathbf{P}=\Lap_T$ for a spanning tree $T$, where $\textsc{Solve}_{\Lap_T}$ is the two-pass tree solve. Test on a random grid graph and plot iteration count versus grid size for (a) a BFS tree and (b) a low-stretch tree from a star-decomposition heuristic. Confirm the $\sqrt{\operatorname{st}_T}$ scaling.
+\end{exercise}
+
+\begin{exercise}[Effective resistance is a metric]
+Prove that $R_{\mathrm{eff}}$ satisfies the triangle inequality: $R_{\mathrm{eff}}(s,t)\le R_{\mathrm{eff}}(s,u)+R_{\mathrm{eff}}(u,t)$. (Hint: a unit flow $s\to t$ can be built by composing unit flows $s\to u$ and $u\to t$; energy is convex, and Thomson's principle says the electrical flow has least energy among all routings.)
+\end{exercise}
+
+\begin{exercise}[From electrical flow to a cut]
+Given the electrical potentials $x$ from a unit $s$--$t$ solve, describe a sweep-cut rounding: sort vertices by potential and threshold. Show on the running network that the best threshold cut recovers $\{c,t\}$ as the min-cut. State (without full proof) why a single electrical flow already gives a constant-factor cut approximation, and why iterating is needed for $(1+\eps)$.
+\end{exercise}
+
+\begin{exercise}[Regularized solve as diffusion]
+Show that $(\Lap+\tau I)x=b$ has a unique solution for any $\tau>0$ and any $b$ (no $\mathbf{1}^\perp$ restriction). Interpret $x$ as one step of heat diffusion / a personalized-PageRank-like vector, and argue that the same near-linear solver applies because $\Lap+\tau I$ is SDD. Relate $\tau\to 0$ to the pure Laplacian solve.
+\end{exercise}
