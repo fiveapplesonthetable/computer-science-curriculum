@@ -1,0 +1,563 @@
+\chapter{Side-Channel and Timing Attacks}
+
+Every chapter before this one lived in a clean world. We proved that AES is a strong pseudorandom permutation, that RSA rests on factoring, that ECDSA rests on the elliptic-curve discrete log, and we drew threat models in which the adversary sees ciphertexts and signatures and nothing else. In that world a scheme is secure when the underlying math is hard and the reductions go through. The catch is that nobody runs math. They run code, on a processor, in a box that draws power, radiates electromagnetic fields, heats up, takes time, shares a cache with other programs, and occasionally glitches. The clean abstraction $c = \Enc_k(m)$ hides a physical machine, and that machine leaks.
+
+A \emph{side channel} is any observable behavior of an implementation that depends on the secret, but that the security proof never accounted for because the proof reasoned about inputs and outputs, not about the machine in between. How long did the comparison take? How much current did the chip draw on that clock cycle? Did a memory access hit the cache or miss it? Did decryption return ``bad padding'' or ``bad MAC''? None of these are part of the ciphertext. All of them can carry the key out of the box, one bit at a time, while the proof on paper remains perfectly valid. The cipher was never broken. The implementation was.
+
+This chapter is about that gap, and it is the most humbling subject in the book. We will start with timing -- the cleanest, most teachable channel -- and build a working mental model of why an `if` statement on a secret is a leak. We will write a tiny string comparison that leaks a MAC byte by byte, then learn to write the constant-time version. From there we widen out: cache attacks that recover AES keys from a process that never shares memory with you, power and electromagnetic analysis that read a smart card's key off an oscilloscope, fault attacks that extract an RSA key from a \emph{single} corrupted signature, and the two padding-oracle disasters that defined a decade of TLS bugs -- Bleichenbacher against RSA and Lucky 13 against CBC. The unifying lesson is blunt: \textbf{secure on paper is necessary and nowhere near sufficient}, and the discipline that closes the gap -- constant-time programming -- is a craft you have to learn deliberately, because every instinct a normal programmer has runs against it.
+
+\chapterline
+
+\section{The Shape of the Problem}
+\label{ch37:shape}
+
+Let us fix the cast. Alice runs a server holding a secret key $k$. Eve is a client. She cannot read Alice's memory, cannot see $k$, cannot break AES or RSA. What she \emph{can} do is interact with Alice's implementation and measure something about how it behaves: how long a response takes, how much the machine's shared cache got disturbed, how much power the chip drew. The question of this chapter is whether those measurements, none of which are ``the ciphertext,'' leak $k$.
+
+\begin{intuitionbox}
+Think of a safe with a perfect lock -- uncrackable, no combination can be guessed faster than brute force. Now suppose the safe clicks a little louder when you dial a correct digit. You no longer need to crack the lock; you listen. Each correct digit announces itself, so a lock that should take $10^{6}$ tries falls in about $10 \times 6 = 60$. The lock's mathematics never changed. The safe simply had a \emph{side channel} -- the click -- that turned a multiplicative search into an additive one. Every attack in this chapter is a version of that click: some physical behavior, correlated with the secret, that collapses an exponential search into a feasible one.
+\end{intuitionbox}
+
+That collapse, from multiplicative to additive search, is the recurring mathematical signature of a side channel and worth stating sharply. A secret with $n$ independent components, each from a set of size $s$, has $s^{n}$ possible values. Guessing it blind costs $O(s^{n})$. But if the implementation leaks, for each component, whether your guess of that component is right -- independently of the others -- then you can fix the components one at a time, paying $O(s)$ per component and $O(s \cdot n)$ total. For a 16-byte MAC that is the difference between $256^{16} \approx 10^{38}$ and $256 \times 16 = 4096$. The leak does not shave a few bits off the search; it changes the exponent into a coefficient.
+
+\begin{focusbox}
+The threat model is the whole game. ``Secure'' in the earlier chapters meant: an adversary who sees inputs and outputs learns nothing. The side-channel threat model adds observables the proof omitted -- time, power, EM, cache state, error messages, fault behavior. A scheme can be IND-CCA secure in the standard model and still hand Eve the key through one of these channels, because IND-CCA never promised anything about \emph{how long} decryption takes. Widening the threat model is not pedantry. It is the difference between a proof that describes your deployed system and a proof that describes a fictional one.
+\end{focusbox}
+
+\begin{historybox}
+The discipline was born in 1996 when Paul Kocher published a timing attack on implementations of RSA, Diffie-Hellman, and DSS, showing that the time to compute a modular exponentiation $g^{d} \bmod N$ leaks the private exponent $d$ bit by bit. The community's first reaction was disbelief that something so abstractly secure could fall to a stopwatch. Two years later Kocher, Jaffe, and Jun introduced \emph{differential power analysis}, pulling DES and later AES keys off smart cards by averaging power traces. By the 2000s cache attacks (Bernstein, Osvik--Shamir--Tromer, Percival) recovered AES keys across process boundaries on commodity CPUs, and by the 2010s padding oracles (Bleichenbacher 1998, the BEAST/CRIME/Lucky~13/POODLE parade) were breaking TLS in the field. Spectre and Meltdown in 2018 showed the CPU itself -- speculative execution -- was a side channel. The throughline across thirty years: the math held every time, and the implementation leaked every time.
+\end{historybox}
+
+\section{Timing Attacks: When Time Is a Variable}
+\label{ch37:timing}
+
+Start with the cleanest channel. A program takes time. If the time it takes depends on a secret, then measuring the time measures a function of the secret. That is the entire principle. The art is in finding code whose running time depends on the key in an exploitable way -- and such code is everywhere, because the most natural way to write almost anything makes the running time data-dependent.
+
+\subsection{The leaky string comparison}
+\label{ch37:strcmp}
+
+Here is the canonical example, and it is so common it is almost a rite of passage. Alice's server receives a message $m$ together with a claimed MAC tag $t'$. It computes the correct tag $t = \MAC_k(m)$ and checks whether $t' = t$. The check is a string comparison. The natural string comparison -- the one in every standard library, the one you would write without thinking -- looks like this:
+
+\begin{lstlisting}[language=Python]
+def insecure_equal(a, b):
+    if len(a) != len(b):
+        return False
+    for i in range(len(a)):
+        if a[i] != b[i]:      # bails out at the FIRST mismatch
+            return False
+    return True
+\end{lstlisting}
+
+Read the loop carefully. It returns the moment it finds the first differing byte. If $t'$ and $t$ disagree in byte 0, the loop runs one iteration. If they agree in bytes 0 through 4 and disagree in byte 5, the loop runs six iterations. \textbf{The running time of the comparison is proportional to the length of the matching prefix.} The comparison was supposed to reveal exactly one bit -- equal or not equal -- but its timing reveals \emph{how much} of the tag is correct. That is the click on the safe.
+
+Now Eve attacks. She wants to forge a tag for a message $m$ of her choosing without knowing $k$. She cannot compute $\MAC_k(m)$, but she can guess it byte by byte using the timing leak.
+
+\begin{attackbox}
+\textbf{Forging a MAC through a timing oracle.} Eve fixes $m$ and will discover the correct 16-byte tag $t = \MAC_k(m)$ one byte at a time.
+
+Step 1: guess byte 0. She sends $(m, t')$ for all 256 values of $t'[0]$, padding the rest arbitrarily, and \emph{times each rejection}. For 255 of the guesses the loop bails at byte 0. For the one correct guess of $t'[0]$, the loop gets to byte 1 before bailing -- so that rejection takes measurably longer. Eve picks the byte value whose rejection was slowest. She has learned $t[0]$ with $256$ queries.
+
+Step 2: with $t[0]$ fixed and correct, she repeats for byte 1: 256 guesses, the correct one makes the loop reach byte 2, slowest wins. And so on.
+
+Total cost: about $256 \times 16 = 4096$ queries to recover the full 16-byte tag, versus the $256^{16} \approx 3.4 \times 10^{38}$ of blind forgery. Once she has $t$, she submits $(m, t)$ and it verifies. She forged a MAC for a message of her choice without the key -- purely from timing.
+\end{attackbox}
+
+\begin{walkbox}
+Why does Eve win each byte by picking the \emph{slowest} response, not the fastest? Because a longer matching prefix means the loop runs more iterations before returning, which costs more time. The correct guess for the current byte is precisely the one that lets the loop advance past it. So at each position the right byte is the one that makes the server work a hair harder, and ``a hair harder'' shows up as ``a hair slower.'' Eve is climbing the tag one rung at a time, and each rung is marked by a small step up in latency.
+\end{walkbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[x=1.05cm,y=1.0cm]
+  % axes
+  \draw[->,thick] (0,0) -- (8.2,0) node[right]{guessed byte $t'[0]$};
+  \draw[->,thick] (0,0) -- (0,3.1) node[above]{rejection time};
+  % baseline bars (wrong guesses: loop bails at byte 0 -> 1 iteration)
+  \foreach \x in {0.4,1.0,1.6,2.2,2.8,4.0,4.6,5.2,5.8,6.4,7.0,7.6}{
+    \draw[fill=sourceblue!35,draw=sourceblue!70] (\x,0) rectangle (\x+0.32,0.9);
+  }
+  % the one correct guess: loop reaches byte 1 -> 2 iterations -> taller
+  \draw[fill=trapred!55,draw=trapred] (3.4,0) rectangle (3.72,2.3);
+  \draw[densely dashed,gray] (0,0.9) -- (8.0,0.9);
+  \node[anchor=west,font=\footnotesize,gray] at (5.0,1.15) {wrong guess: 1 iteration};
+  \draw[->,trapred] (4.6,2.6) node[anchor=west,font=\footnotesize,trapred]
+        {correct $t[0]$: loop reaches byte 1} -- (3.72,2.2);
+\end{tikzpicture}
+\caption{Timing signal of the leaky comparison (Section~\ref{ch37:strcmp}) while Eve probes byte~0.
+Every wrong guess bails at the first byte and takes the same short time; the one correct guess lets
+the loop advance one more iteration, producing a measurably taller bar. Eve picks the slowest.}
+\label{ch37:fig-timing}
+\end{figure}
+
+\subsection{The hard part is the noise}
+\label{ch37:noise}
+
+The objection writes itself: one byte comparison is a handful of nanoseconds, and the network jitter between Eve and Alice is milliseconds -- a million times larger. Surely the signal drowns. It would, if Eve measured once. The defense against noise is the oldest trick in experimental science: \emph{average}. Network delay is (mostly) zero-mean noise added to a fixed signal; averaging $N$ independent samples shrinks the noise's standard deviation by $\sqrt{N}$ while leaving the signal intact.
+
+\begin{connectionbox}
+This is exactly the law-of-large-numbers / central-limit machinery from the probability companion. Suppose the true timing difference between a correct and incorrect byte guess is a constant $\Delta$, and each measurement is corrupted by independent noise with standard deviation $\sigma$. The mean of $N$ samples has standard deviation $\sigma/\sqrt{N}$. To resolve a signal of size $\Delta$ against noise $\sigma$, Eve needs the mean's error well below $\Delta$, i.e.
+\[
+\frac{\sigma}{\sqrt{N}} \ll \Delta \quad\Longrightarrow\quad N \;\gg\; \left(\frac{\sigma}{\Delta}\right)^{2}.
+\]
+The number of samples grows with the \emph{square} of the noise-to-signal ratio. A million-to-one ratio of jitter to signal costs on the order of $10^{12}$ samples per byte if done naively -- but attackers use clever statistics (the ``Box test,'' percentile filtering, comparing distributions rather than means) to cut this dramatically, and researchers have demonstrated remote timing attacks across real networks. The point of the $\sqrt{N}$ law is that noise buys you safety only logarithmically slowly. It does not make the leak go away; it makes it more expensive, and ``more expensive'' is not a security guarantee.
+\end{connectionbox}
+
+\begin{historybox}
+``Surely the network hides it'' was demolished in 2003 by Brumley and Boneh, who recovered an RSA private key from an OpenSSL server \emph{over a network}, exploiting timing differences in the modular reduction inside RSA-CRT decryption. In 2011 Brumley and Tuveri did the same for ECDSA over TLS. The repeated lesson: jitter raises the query count, it does not close the channel. If your security depends on an attacker not being patient, you have no security.
+\end{historybox}
+
+\subsection{Constant-time comparison}
+\label{ch37:ct-compare}
+
+The fix is to make the comparison's running time independent of the data. Never branch on a secret; never return early. Compare \emph{all} bytes every time, accumulating the result without leaking where the first difference was.
+
+\begin{lstlisting}[language=Python]
+def constant_time_equal(a, b):
+    # Assumes len(a) == len(b); leaking the length is usually acceptable,
+    # leaking WHERE bytes differ is not.
+    if len(a) != len(b):
+        return False
+    result = 0
+    for x, y in zip(a, b):
+        result |= x ^ y       # 0 only if every byte matched
+    return result == 0
+\end{lstlisting}
+
+\begin{implementbox}
+\textbf{Why this is constant-time (in the byte count).} The loop always runs the full length -- no early return. Each iteration does the same work: one XOR, one OR. The accumulator \texttt{result} ends at $0$ if and only if every \texttt{x \^{} y} was $0$, i.e. every byte matched; otherwise some bit is set. Crucially, \emph{which} bytes differed and \emph{how many} differed do not change the control flow or the per-iteration work, so the running time carries no information about the matching prefix. The final \texttt{result == 0} is a single comparison on a value that reveals only the one allowed bit.
+
+\textbf{Learning only.} This Python is for understanding the principle. Real Python is the wrong tool: the interpreter, integer caching, and garbage collector add their own timing variation, and \texttt{==} on the final int may itself short-circuit at the C level. In production call a vetted primitive -- \texttt{hmac.compare\_digest} in Python, \texttt{CRYPTO\_memcmp} in OpenSSL, \texttt{subtle.ConstantTimeCompare} in Go, the \texttt{subtle} crate in Rust. Never roll your own for real code.
+\end{implementbox}
+
+\begin{trapbox}
+Constant-time comparison fixes \emph{tag verification}. It does nothing for the dozens of other places a real protocol branches on secrets: the modular exponentiation in RSA, the conditional subtraction in a Montgomery reduction, the table lookup indexed by a key byte in a naive AES, the ``is this padding valid'' check we will dissect later. ``I used \texttt{compare\_digest}'' is the beginning of constant-time discipline, not the end. The leak is wherever the secret steers the machine.
+\end{trapbox}
+
+\subsection{Timing in the math itself: square-and-multiply}
+\label{ch37:sqmul}
+
+The comparison leak is easy to picture; the deeper problem is that the cryptographic \emph{algorithms} themselves are naturally data-dependent. The classic is modular exponentiation by square-and-multiply, the heart of RSA and Diffie-Hellman. To compute $g^{d} \bmod N$ you scan the bits of the secret exponent $d$ from most significant to least:
+
+\begin{lstlisting}[language=Python]
+def modexp_leaky(g, d, N):
+    r = 1
+    for bit in bits_of(d):       # MSB to LSB
+        r = (r * r) % N          # SQUARE, every iteration
+        if bit == 1:
+            r = (r * g) % N      # MULTIPLY, only when the bit is 1
+    return r
+\end{lstlisting}
+
+Look at the branch. Every bit costs a square. A \emph{set} bit costs an additional multiply. So the total time is roughly (number of bits) squarings plus (number of \emph{one}-bits) multiplies -- and the running time leaks the Hamming weight of the private exponent, while finer timing (or the power trace we will meet shortly) can leak the bits in order. Kocher's original 1996 attack worked exactly here.
+
+\begin{example}
+\label{ch37:sqmul-example}
+Take a toy exponent $d = 13 = 1101_2$ and trace the multiplies. Bits MSB to LSB are $1,1,0,1$.
+\[
+\begin{array}{llll}
+\text{bit } 1: & r \leftarrow r^2 = 1, & \text{bit}=1: & r \leftarrow r\cdot g = g \\
+\text{bit } 1: & r \leftarrow r^2 = g^2, & \text{bit}=1: & r \leftarrow r\cdot g = g^3 \\
+\text{bit } 0: & r \leftarrow r^2 = g^6, & \text{bit}=0: & \text{(no multiply)} \\
+\text{bit } 1: & r \leftarrow r^2 = g^{12}, & \text{bit}=1: & r \leftarrow r\cdot g = g^{13}.
+\end{array}
+\]
+Four squarings, three multiplies -- because $d$ has three one-bits. An exponent of the same length but with $d = 8 = 1000_2$ runs four squarings and \emph{one} multiply. Same input size, different running time, and the difference is a direct readout of the secret's bit pattern.
+\end{example}
+
+\begin{whybox}
+The constant-time countermeasure here is the \emph{Montgomery ladder}, which performs one squaring \emph{and} one multiplication on every bit, regardless of the bit's value, using the bit only to choose which of two registers gets updated -- and even that choice is done with a constant-time conditional swap, not a branch. Every iteration looks identical from the outside: same operations, same memory pattern, same time. The exponent no longer modulates the work. You pay a constant factor (you always do the multiply, even for zero bits) in exchange for closing the channel. That trade -- spend cycles to erase data dependence -- is the entire economics of constant-time code.
+\end{whybox}
+
+\begin{applicationbox}
+This is not academic. OpenSSL, BoringSSL, libsodium, and every serious crypto library implement RSA and EC scalar multiplication with constant-time exponentiation ladders and ``blinding'' (multiply the input by a random factor before exponentiating, divide it out after, so the attacker times a randomized input they cannot predict). When a library ships a CVE titled ``timing side channel in $\langle$ECDSA nonce / RSA decryption / $\ldots\rangle$,'' it almost always means some code path slipped back into a data-dependent branch or a non-constant-time modular reduction. The fixes are exactly the ladder-and-blind discipline described here.
+\end{applicationbox}
+
+\section{Cache Attacks: The Memory System Is Watching}
+\label{ch37:cache}
+
+Timing told us \emph{when} the machine did more work. Cache attacks tell us \emph{where} in memory the machine looked -- and for many ciphers, where you look is a function of the key. This channel is more insidious because it works \emph{across processes}: Eve's program and Alice's program can share nothing -- no memory, no key, no files -- and Eve can still extract Alice's AES key purely by watching how Alice's memory accesses disturb a cache they happen to share on the same physical CPU.
+
+\subsection{Why the cache leaks}
+\label{ch37:why-cache}
+
+A CPU cache is a small fast memory that holds recently used lines of main memory. An access to a cached address is fast (a \emph{hit}, a few cycles); an access to an uncached address is slow (a \emph{miss}, hundreds of cycles) and pulls the line into the cache, evicting something else. The cache is shared among programs on the same core (and the last-level cache across cores). That sharing is the channel: by measuring which lines are fast or slow to access, one program infers which lines \emph{another} program recently touched.
+
+Now connect that to a cipher. Many fast AES implementations use precomputed lookup tables (``T-tables'') and index them by key-dependent bytes: a line like \texttt{T[ state[i] \^{} key[i] ]}. The \emph{table index} -- hence which cache line gets loaded -- depends directly on a byte of the key XORed with a byte of state. If Eve can tell which table lines Alice accessed, she learns constraints on \texttt{state \^{} key}, and with known or chosen plaintext she solves for the key.
+
+\begin{attackbox}
+\textbf{Prime+Probe on an AES T-table.} Eve and Alice run on the same machine; they share the last-level cache. Eve has no access to Alice's memory or key.
+\begin{enumerate}
+\item \emph{Prime.} Eve fills the cache sets that the AES tables map to with her own data, so she knows exactly what is cached.
+\item \emph{Trigger.} Eve gets Alice to encrypt a (known) plaintext block. Alice's AES does table lookups \texttt{T[p[i] \^{} k[i]]}, loading those specific lines and \emph{evicting} Eve's data from exactly the cache sets those indices map to.
+\item \emph{Probe.} Eve re-accesses her primed data and times each set. Sets that are now \emph{slow} were evicted -- meaning Alice's lookup landed there -- revealing the high bits of \texttt{p[i] \^{} k[i]} (the bits that pick the cache line). Since Eve knows \texttt{p[i]}, she learns the high bits of \texttt{k[i]}.
+\end{enumerate}
+Repeat over many plaintexts and table positions; the constraints pin down the key bytes. Osvik, Shamir, and Tromer (2006) recovered a full AES-128 key this way in a few hundred encryptions on a stock PC. \texttt{Flush+Reload} is a sharper variant when memory is shared (e.g. a shared library): flush a specific line with \texttt{clflush}, let the victim run, then time reloading that exact line -- fast means the victim used it.
+\end{attackbox}
+
+\begin{intuitionbox}
+Picture a library reading room with a shared shelf of reference books. You cannot see the scholar at the next desk or read his notes. But you arrange all the books neatly (prime), let him work (he pulls down whichever volumes his research needs), then check which books are now out of place (probe). The books he disturbed tell you the topic he is studying -- without ever reading over his shoulder. AES T-table lookups are the disturbed books; the topic is the key.
+\end{intuitionbox}
+
+\begin{whybox}
+\textbf{The defense is to stop indexing memory by secrets.} Three lines of attack: (1) Bit-sliced or vector implementations that compute the S-box with arithmetic/logic instead of a table lookup -- no key-dependent address, no cache footprint. (2) The AES-NI hardware instructions (\texttt{aesenc} and friends on x86, and ARM's crypto extensions), which perform a round in fixed-function silicon with no data-dependent memory access at all; this is why AES-NI is both faster \emph{and} safer than table AES. (3) If you must use tables, ensure the whole table fits in a single cache line or is accessed in a way that touches every line every time -- expensive and fragile. The clean answer that won is AES-NI: when the hardware does the cipher, there is no table to spy on.
+\end{whybox}
+
+\begin{applicationbox}
+Cache attacks are the reason ``use AES-NI'' is not just a performance recommendation but a security one, and the reason cloud providers worry about co-residency: in a shared-tenant cloud, Eve's VM and Alice's VM can land on the same physical core and share the last-level cache. Cross-VM key recovery via Flush+Reload has been demonstrated against real crypto libraries. Mitigations in the field include constant-time / bit-sliced implementations, cache partitioning, disabling memory deduplication (which enabled Flush+Reload across VMs), and core isolation for sensitive workloads. Spectre and Meltdown (2018) are cache attacks at heart: speculative execution touches memory it should not, and the \emph{cache footprint} of that speculation is read out by Flush+Reload, leaking data across security boundaries the architecture promised to keep separate.
+\end{applicationbox}
+
+\section{Power and Electromagnetic Analysis}
+\label{ch37:power}
+
+If Eve has physical access to the device -- a smart card, a hardware security module, a payment terminal, an IoT chip on her bench -- she can measure something even more direct than time or cache state: the \emph{instantaneous power} the chip draws, or the electromagnetic field it radiates, sampled by an oscilloscope at every clock cycle. CMOS logic burns power when its transistors switch, and the amount of switching depends on the data being processed. The power trace is a high-resolution movie of the computation, and the secret is in the frame.
+
+\subsection{Simple power analysis (SPA)}
+\label{ch37:spa}
+
+Sometimes you can just \emph{look} at the trace. Recall square-and-multiply: a squaring and a multiply are different operations taking different amounts of work, so they draw different power signatures. On a naive implementation, a single power trace of one RSA decryption shows a sequence of ``square'' and ``square-multiply'' bumps -- and reading off which bumps have the extra multiply reads off the bits of the private exponent \emph{directly from the picture}. No statistics, no averaging, one trace. That is SPA.
+
+\begin{intuitionbox}
+A squaring is one operation; a square-followed-by-multiply is two. On the oscilloscope the second one is visibly wider -- a double hump instead of a single. Bit $=1$ looks different from bit $=0$ to the naked eye. You read the secret exponent off the screen like Morse code: a long blip is a one, a short blip is a zero. This is why the Montgomery ladder (always square \emph{and} multiply) matters for power as much as for timing: it makes every bit's trace identical, so there is nothing to read.
+\end{intuitionbox}
+
+\subsection{Differential power analysis (DPA)}
+\label{ch37:dpa}
+
+When the per-bit signal is buried in noise too deep for the eye, DPA digs it out statistically, and it is genuinely clever. The attacker does not need to understand the chip's electrical details. She needs only a \emph{leakage model} -- a guess at how power correlates with data -- and many traces.
+
+The standard model: the power a chip draws at the moment it computes an intermediate value $v$ is correlated with the \emph{Hamming weight} of $v$ (number of one-bits), because more one-bits means more transistors charged high. So if Eve can predict an intermediate value $v$ as a function of the known plaintext and a \emph{small piece} of the key, she can split her traces into groups by predicted Hamming weight and look for a power difference. Here is the divide-and-conquer that makes it devastating.
+
+\begin{attackbox}
+\textbf{DPA on the first round of AES.} The first-round S-box output for byte $i$ is $v_i = S(p_i \xor k_i)$, where $p_i$ is a known plaintext byte and $k_i$ is one \emph{unknown key byte}. Eve attacks $k_i$ in isolation -- only 256 possibilities.
+\begin{enumerate}
+\item Collect $T$ power traces, each with its known plaintext $p^{(j)}$, $j = 1 \ldots T$.
+\item For each \emph{guess} $\hat{k}_i \in \{0,\ldots,255\}$, predict the intermediate $\hat{v}^{(j)} = S(p_i^{(j)} \xor \hat{k}_i)$ for every trace, and compute its Hamming weight as the model's predicted power.
+\item Correlate the predicted power against the measured power (at the cycle where the S-box happens) across all $T$ traces -- e.g. Pearson correlation (this is CPA, correlation power analysis, the modern form).
+\item For the \emph{wrong} key guesses, the prediction is decorrelated from reality: correlation $\approx 0$. For the \emph{one correct} guess of $k_i$, the predicted intermediate equals the real one, so the model matches the measurements and the correlation spikes.
+\item The guess with the highest correlation is $k_i$. Repeat for all 16 key bytes \emph{independently}.
+\end{enumerate}
+Total work: $16 \times 256 = 4096$ key-byte hypotheses tested by correlation, instead of $2^{128}$. Smart cards have fallen to a few thousand traces.
+\end{attackbox}
+
+\begin{whybox}
+Why does only the correct key byte light up? Because AES's S-box is a good nonlinear function: $S(p \xor \hat{k})$ for a wrong $\hat{k}$ is, as $p$ varies, statistically unrelated to $S(p \xor k)$ for the true $k$. Their Hamming weights are essentially independent, so the model built on a wrong guess has no correlation with the real power. Only when $\hat{k} = k$ does the predicted intermediate \emph{equal} the actual intermediate the chip computed, at which point the model's Hamming weight tracks the real switching activity and the correlation is large. The S-box's nonlinearity, a strength against cryptanalysis, is what makes the correct key the unique correlation peak -- the cipher's good design sharpens the side channel.
+\end{whybox}
+
+\begin{connectionbox}
+DPA is applied statistics. The correlation peak at the right key emerges from the same signal-in-noise math as the timing attack: each trace is signal plus independent noise, and correlating over $T$ traces makes the true-key peak rise out of the noise floor at a rate governed by $\sqrt{T}$ (see the probability companion on correlation and the central limit theorem). Doubling your trace count does not double your reach -- it improves the signal-to-noise of the peak by $\sqrt{2}$. The defender's job is to lower the per-trace signal (so you need impractically many traces) by masking and shuffling, discussed next.
+\end{connectionbox}
+
+\begin{whybox}
+\textbf{Countermeasures: masking and hiding.} \emph{Masking} randomizes the intermediates: instead of computing on $v$, compute on $v \xor r$ for a fresh random mask $r$ (carried correctly through the cipher and removed at the end). Now the leaked Hamming weight is of $v \xor r$, which to an attacker who does not know $r$ is random -- the correlation with any key-dependent prediction of $v$ collapses. \emph{Hiding} reduces the signal directly: add noise, randomize the \emph{order} of independent operations (shuffling the 16 S-box evaluations so the attacker does not know which cycle is byte $i$), insert random delays, or balance the hardware so every bit switch draws equal power (dual-rail logic). Real secure elements stack several of these, and DPA-resistance is a certification requirement (Common Criteria, FIPS~140) for payment and identity chips.
+\end{whybox}
+
+\begin{applicationbox}
+Power and EM analysis is the threat model for anything an adversary can hold: EMV chip cards, SIM cards, TPMs, hardware wallets, set-top-box and game-console security chips, automotive immobilizers. EM has a nasty advantage over power -- it needs no electrical contact (a near-field probe over the package suffices) and can be \emph{localized} to the region of the die doing the crypto, improving signal. The entire smart-card security industry exists to make these attacks cost more (in traces, equipment, and expertise) than the secret is worth, because you cannot make a physical chip leak \emph{nothing} -- you can only push the attack beyond economic reach.
+\end{applicationbox}
+
+\section{Fault Attacks: Breaking the Machine on Purpose}
+\label{ch37:fault}
+
+The channels so far were \emph{passive}: Eve observed. Fault attacks are \emph{active}: Eve makes the chip \emph{compute wrong} -- by glitching the clock, dropping the supply voltage for a nanosecond, zapping the die with a laser pulse or an EM spike, or heating it -- and then exploits the erroneous output. A surprising amount of cryptography shatters when you can induce one well-placed error, because the difference between a correct and a faulty result is itself a leak of the secret.
+
+\subsection{The Bellcore attack on RSA-CRT}
+\label{ch37:bellcore}
+
+The crown jewel of fault attacks is so sharp it deserves the full computation: a \emph{single} faulty RSA signature factors the modulus.
+
+RSA signing computes $s = m^{d} \bmod N$ where $N = pq$. For speed, virtually every implementation uses the Chinese Remainder Theorem (CRT): compute the signature mod $p$ and mod $q$ separately, then recombine. Define
+\[
+s_p = m^{d} \bmod p, \qquad s_q = m^{d} \bmod q,
+\]
+and recombine with CRT coefficients into $s$ with $s \equiv s_p \pmod p$ and $s \equiv s_q \pmod q$. This is about four times faster than one exponentiation mod $N$, which is why it is universal.
+
+Now suppose Eve induces a fault during the computation of $s_p$ \emph{only} -- a single glitch corrupts the mod-$p$ half -- so the device outputs a wrong signature $\hat{s}$ with
+\[
+\hat{s} \equiv \hat{s}_p \pmod p \quad(\text{garbage}), \qquad \hat{s} \equiv s_q \pmod q \quad(\text{still correct}).
+\]
+The faulty signature is wrong modulo $p$ but \emph{right} modulo $q$. Watch what that hands Eve.
+
+\begin{whybox}
+\textbf{One faulty signature factors $N$.} A correct signature satisfies $s^{e} \equiv m \pmod N$. The faulty one satisfies $\hat{s}^{e} \equiv m \pmod q$ (correct mod $q$) but $\hat{s}^{e} \not\equiv m \pmod p$ (faulted mod $p$). Therefore
+\[
+\hat{s}^{e} - m \equiv 0 \pmod q, \qquad \hat{s}^{e} - m \not\equiv 0 \pmod p.
+\]
+A number that is $\equiv 0 \pmod q$ but $\not\equiv 0 \pmod p$ shares the factor $q$ with $N=pq$ but not the factor $p$. So
+\[
+\boxed{\;q = \gcd\!\left(\hat{s}^{e} - m,\; N\right)\;}
+\]
+and one Euclidean GCD -- microseconds -- yields $q$, hence $p = N/q$, hence the entire private key. Eve needs the public $(N,e)$, the message $m$, and \emph{one} faulty signature $\hat{s}$. The math that should have protected the key is undone by a single induced error. (If Eve also has a correct signature $s$ for the same $m$, an even simpler form works: $q = \gcd(s - \hat{s},\, N)$, since $s - \hat{s} \equiv 0 \pmod q$ but $\not\equiv 0 \pmod p$.)
+\end{whybox}
+
+\begin{example}
+\label{ch37:bellcore-example}
+Toy RSA: $p = 11$, $q = 13$, $N = 143$, $e = 7$. The private exponent is $d = 103$ (since $7 \cdot 103 = 721 = 1 + 6\cdot 120$ and $\varphi(N)=120$). Sign $m = 50$.
+
+Correct CRT halves: $s_p = 50^{103} \bmod 11$ and $s_q = 50^{103} \bmod 13$. Now suppose the mod-$p$ half is faulted to $\hat{s}_p = 3$ (some wrong value) while $s_q$ stays correct. CRT recombination produces some $\hat{s}$ with $\hat{s} \equiv 3 \pmod{11}$ and $\hat{s} \equiv s_q \pmod{13}$. Eve computes
+\[
+\hat{s}^{\,e} - m \pmod N \quad\text{and then}\quad \gcd\!\left(\hat{s}^{e} - m,\ 143\right).
+\]
+Because the result is divisible by $13$ (correct mod $q$) but not by $11$ (faulted mod $p$), the GCD returns $13 = q$. Then $p = 143/13 = 11$. The key falls out of a single bad signature and one GCD -- trace it with these numbers and the mechanism is undeniable.
+\end{example}
+
+\begin{whybox}
+\textbf{The defense is to verify before releasing.} The fix is humble: after computing a signature, \emph{check it} with the public key ($s^{e} \stackrel{?}{=} m \bmod N$) before outputting it. A faulted signature fails this check and is suppressed -- Eve never sees $\hat{s}$, so she has nothing to GCD. More robust schemes compute the CRT halves redundantly and compare, or use ``infective'' computation where a fault scrambles the output into uselessness rather than into something exploitable. The general principle for fault resistance: \textbf{never emit a result you have not checked}, because a wrong output is not random -- it is structured around the secret.
+\end{whybox}
+
+\begin{attackbox}
+\textbf{Fault attacks beyond RSA.} \emph{Differential fault analysis} (DFA) on AES: induce a single-byte fault in an intermediate round, collect the correct and faulty ciphertexts, and the difference propagates through the known final rounds in a way that, after a small search, pins down the last round key (and thus the master key) from as few as one or two faulty encryptions. \emph{Signature-verification skipping}: glitch the branch that checks a signature so it returns ``valid'' regardless -- the classic way to defeat secure boot on game consoles and locked phones, where the goal is not to recover a key but to make the device accept unsigned code. \emph{Safe-error attacks}: induce a fault in a dummy operation; if the output is still correct, the operation was a dummy (so the corresponding secret bit was, say, 0), leaking the bit through whether the fault \emph{mattered}.
+\end{attackbox}
+
+\begin{applicationbox}
+Fault injection is the daily reality of high-security hardware evaluation. Labs maintain laser-fault benches, EM-glitch coils, and voltage/clock glitchers to certify that smart cards and secure elements survive. Countermeasures shipped in real silicon: voltage and clock-frequency sensors that halt on anomaly, light sensors under the package to detect decapping, redundant computation with comparison, error-detecting codes on the datapath, randomized timing so the attacker cannot aim a glitch at the right cycle, and -- for RSA -- the verify-before-output check above. ``Tamper-resistant'' on a datasheet means, in large part, ``fault-resistant.''
+\end{applicationbox}
+
+\section{Padding Oracles: When an Error Message Is the Channel}
+\label{ch37:padding}
+
+The side channels so far were physical or microarchitectural. The last and most consequential class is purely logical: the implementation tells the attacker \emph{why} it rejected a ciphertext, and that ``why'' -- one bit of distinction, ``bad padding'' versus ``bad something-else'' -- is enough to decrypt or forge. These \emph{padding oracle} attacks broke real RSA and real TLS in the field, repeatedly, for twenty years.
+
+\subsection{The AES-CBC padding oracle}
+\label{ch37:cbc-oracle}
+
+Recall CBC decryption. Ciphertext blocks $C_1, C_2, \ldots$ (with IV $= C_0$) decrypt as
+\[
+P_i = D_k(C_i) \xor C_{i-1},
+\]
+where $D_k$ is the block cipher's decryption. Because plaintext must fill whole blocks, it is padded -- the standard is PKCS\#7: if $b$ bytes are needed, append $b$ copies of the byte value $b$. So one missing byte is padded \texttt{01}; two missing bytes \texttt{02 02}; and so on up to a full block \texttt{10 10 ... 10} (sixteen $0x10$ bytes). On decryption the receiver checks that the trailing bytes form valid PKCS\#7 padding and strips them.
+
+Here is the fatal design: an early TLS (and countless homemade protocols) returned a \emph{distinguishable} error -- one message for ``padding invalid,'' another for ``padding valid but MAC failed'' (or it leaked the distinction through timing). That one bit is an oracle: a function $\mathcal{O}(C)$ that returns whether the decryption of $C$ has valid padding. Eve, who cannot break AES, decrypts \emph{any} ciphertext using only this oracle.
+
+\begin{attackbox}
+\textbf{Decrypting one block with a padding oracle.} Eve wants the plaintext $P_2 = D_k(C_2) \xor C_1$ of a captured block $C_2$. Write $I_2 = D_k(C_2)$ (the cipher's raw decryption of $C_2$, which she cannot compute directly), so $P_2 = I_2 \xor C_1$. Eve will recover $I_2$ byte by byte by sending $C_2$ preceded by a \emph{forged} previous block $C'$ that she controls, and asking the oracle whether the padding is valid.
+
+\emph{Last byte first.} Eve sends the two-block ciphertext $(C', C_2)$ for a chosen $C'$. The decrypted plaintext of $C_2$ in this forged message is $P' = I_2 \xor C'$. She tweaks the last byte $C'[15]$ through all 256 values until the oracle says ``valid padding.'' Valid padding almost always means the last byte decrypted to \texttt{01} (a one-byte pad). So at the magic value,
+\[
+I_2[15] \xor C'[15] = \texttt{0x01} \quad\Longrightarrow\quad I_2[15] = C'[15] \xor \texttt{0x01}.
+\]
+She has the last byte of $I_2$ -- and thus $P_2[15] = I_2[15] \xor C_1[15]$, using the \emph{real} previous block $C_1$. About 256 queries (often fewer; on average 128).
+
+\emph{Next byte.} To attack $I_2[14]$, she forces the last byte to pad value \texttt{02} by setting $C'[15] = I_2[15] \xor \texttt{0x02}$ (she knows $I_2[15]$ now), then varies $C'[14]$ until the oracle accepts -- which means the last two bytes are \texttt{02 02}, giving $I_2[14] = C'[14] \xor \texttt{0x02}$. Continue down to byte 0: about $16 \times 256 \approx 4096$ queries to recover the entire block, with \emph{zero} knowledge of the key.
+\end{attackbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\footnotesize,node distance=0.5cm]
+  % forged previous block
+  \node[draw,fill=evered!12,minimum width=3.6cm,minimum height=0.7cm] (Cp) {$C'$ (Eve forges, varies $C'[15]$)};
+  % ciphertext block C2
+  \node[draw,fill=gray!10,minimum width=3.6cm,minimum height=0.7cm,right=1.6cm of Cp] (C2) {$C_2$ (captured)};
+  % block cipher decrypt
+  \node[draw,fill=structurepurple!15,minimum width=3.6cm,minimum height=0.7cm,below=0.9cm of C2] (Dk) {$D_k(C_2) = I_2$};
+  % xor node
+  \node[draw,circle,inner sep=1pt,below=0.9cm of Cp] (xor) {$\oplus$};
+  % result
+  \node[draw,fill=targetgreen!15,minimum width=3.6cm,minimum height=0.7cm,below=0.9cm of xor] (P) {$P' = I_2 \oplus C'$};
+  % oracle
+  \node[draw,fill=quotientorange!18,minimum width=4.0cm,minimum height=0.7cm,below=0.8cm of P] (O) {oracle: is $P'$ valid PKCS\#7 padding?};
+  \draw[->] (C2) -- (Dk);
+  \draw[->] (Dk) -| (xor);
+  \draw[->] (Cp) -- (xor);
+  \draw[->] (xor) -- (P);
+  \draw[->] (P) -- (O);
+  \draw[->,evered,thick] (O.east) -- ++(1.3,0) |- node[pos=0.25,right,align=left,font=\scriptsize]
+       {accept $\Rightarrow$\\ $P'[15]=\mathtt{01}$\\ $\Rightarrow I_2[15]=C'[15]\oplus\mathtt{01}$} (Cp.east);
+\end{tikzpicture}
+\caption{CBC padding oracle (Section~\ref{ch37:cbc-oracle}). Eve feeds the captured block $C_2$ behind a
+forged block $C'$ she fully controls. The decrypted last byte is $I_2[15]\oplus C'[15]$; sweeping
+$C'[15]$ until the oracle reports valid padding forces that byte to the known constant \texttt{01},
+which solves one equation for $I_2[15]$. No key required.}
+\label{ch37:fig-cbc-oracle}
+\end{figure}
+
+\begin{walkbox}
+Why does ``valid padding'' pin down a byte? Because PKCS\#7 padding values are \emph{known constants}. When Eve forces the last decrypted byte to be \texttt{01}, she has set up an equation $I_2[15] \xor C'[15] = \texttt{0x01}$ with exactly one unknown, $I_2[15]$, and she controls $C'[15]$, so she solves it. The oracle is not telling her the plaintext; it is telling her when she has hit a known structural value, and from that known value she back-solves the cipher's internal $I_2$. The masterstroke is that recovering $I_2$ needs no key -- and once she has $I_2 = D_k(C_2)$, the \emph{real} plaintext is just $I_2 \xor C_1$ with the genuine previous block. One ambiguous error message, total decryption.
+\end{walkbox}
+
+\begin{intuitionbox}
+The oracle answers one tiny question -- ``is the padding well-formed?'' -- and you would swear that leaks nothing about the plaintext. It leaks everything, because Eve gets to \emph{choose} the question's context. By controlling the previous block she controls what the last byte decrypts to, and the oracle confirms when she has steered it to a value she already knows (\texttt{01}, then \texttt{02 02}, \ldots). Each confirmation is one solved equation in one unknown. The lesson that should haunt you: \textbf{any} observable that distinguishes ``valid'' from ``invalid'' on attacker-chosen ciphertexts is a decryption oracle waiting to happen.
+\end{intuitionbox}
+
+\begin{implementbox}
+\textbf{Toy padding oracle (learning only).} The skeleton, to make the loop concrete -- never run anything like this on a real channel, and never \emph{be} the server that answers these queries:
+\begin{lstlisting}[language=Python]
+# LEARNING ONLY. Eve has oracle(c) -> True iff CBC-decrypt(c) has valid PKCS#7 padding.
+def recover_block(C1, C2, oracle):       # returns plaintext of C2
+    I2 = bytearray(16)                   # the cipher's raw decrypt D_k(C2)
+    Cp = bytearray(16)                   # forged "previous" block we control
+    for pos in range(15, -1, -1):        # last byte to first
+        pad = 16 - pos                   # target pad value: 1, then 2, ...
+        for j in range(pos + 1, 16):     # set already-known tail to the pad value
+            Cp[j] = I2[j] ^ pad
+        for guess in range(256):
+            Cp[pos] = guess
+            if oracle(bytes(Cp) + bytes(C2)):
+                I2[pos] = guess ^ pad    # solved one byte of I2
+                break
+    return bytes(b ^ c for b, c in zip(I2, C1))   # P2 = I2 XOR real C1
+\end{lstlisting}
+The whole attack is one bit of feedback per query, amplified by attacker-chosen context into full plaintext recovery.
+\end{implementbox}
+
+\begin{whybox}
+\textbf{The structural fix is encrypt-then-MAC.} The disease is that the receiver \emph{decrypts and parses padding on unauthenticated ciphertext}, so the attacker's chosen ciphertext is processed and an oracle answer leaks. In encrypt-then-MAC, the receiver first verifies a MAC over the ciphertext; if the MAC fails, it rejects \emph{before decrypting at all}, so no padding check is ever reached and there is no oracle. This is one of the deep reasons AEAD (Chapter on authenticated encryption) authenticates the ciphertext: a forged or tweaked ciphertext is rejected by the tag check, uniformly, with one error and constant time, long before any structure-dependent processing. Padding oracles are what you get when you decrypt things you have not authenticated.
+\end{whybox}
+
+\subsection{Bleichenbacher: the RSA padding oracle that will not die}
+\label{ch37:bleichenbacher}
+
+CBC was not the first padding oracle. In 1998 Daniel Bleichenbacher found one against \emph{RSA encryption} with PKCS\#1 v1.5 padding, and it is so durable it has been re-broken in TLS roughly once a decade (DROWN in 2016, ROBOT in 2017) because the vulnerable code path keeps coming back.
+
+\begin{attackbox}
+\textbf{Bleichenbacher's ``million message'' attack.} In RSA PKCS\#1 v1.5 encryption, a message is padded to \texttt{00 02 [random nonzero bytes] 00 [message]} before being raised to the public exponent. On decryption the server checks that the result starts with \texttt{00 02}. Many servers (or the TLS handshake's behavior) revealed -- through an error message, a timeout, or a connection reset -- whether a decrypted ciphertext had the correct \texttt{00 02} prefix. That is the oracle: $\mathcal{O}(c)$ returns whether $c^{d} \bmod N$ begins with \texttt{00 02}, i.e. whether the decrypted value lies in the interval $[2B, 3B)$ where $B = 2^{8(\ell - 2)}$ for an $\ell$-byte modulus.
+
+Eve wants to decrypt a target ciphertext $c_0 = m^{e} \bmod N$ without the key. Exploiting RSA's malleability, she sends $c_0 \cdot s^{e} \bmod N$ for chosen multipliers $s$; this decrypts to $m \cdot s \bmod N$. Each oracle hit tells her $m\cdot s \bmod N \in [2B, 3B)$, which is a \emph{linear constraint} narrowing the interval that must contain $m$. By cleverly choosing successive $s$ values she shrinks the candidate interval for $m$ geometrically until a single value remains -- the plaintext (often a TLS pre-master secret, i.e. the session key). The original attack took on the order of a million oracle queries; modern refinements need far fewer.
+\end{attackbox}
+
+\begin{whybox}
+Bleichenbacher is the same shape as the CBC oracle, lifted into RSA's multiplicative structure. There, attacker-chosen \emph{previous blocks} steered a known padding byte; here, attacker-chosen \emph{multipliers} $s$ steer the decrypted value, and ``valid \texttt{00 02} prefix'' replaces ``valid PKCS\#7.'' Both turn a one-bit validity oracle on chosen ciphertexts into full recovery; both exist because the implementation reveals \emph{why} it rejected. The countermeasures are equally telling: PKCS\#1 v1.5 encryption is replaced by RSA-OAEP (which has a security proof against chosen-ciphertext attack), and where v1.5 must persist for compatibility, servers must make the padding-valid and padding-invalid paths \emph{indistinguishable} -- identical timing, identical error, no early-out -- which is exactly the constant-time discipline from the start of this chapter applied to error handling. Even better, modern TLS prefers (EC)DHE key exchange, which never RSA-encrypts a secret to the server at all, deleting the oracle's home.
+\end{whybox}
+
+\subsection{Lucky 13: the padding oracle hiding in the timing}
+\label{ch37:lucky13}
+
+You might think: fine, return the \emph{same} error for ``bad padding'' and ``bad MAC,'' and the oracle is gone. In 2013 Nadhem AlFardan and Kenny Paterson showed it is not gone -- it moved into the \emph{timing}. This is Lucky 13, and it is the elegant, vicious union of every theme in this chapter.
+
+\begin{attackbox}
+\textbf{Lucky 13 against TLS-CBC (MAC-then-encrypt).} Old TLS used MAC-then-encrypt: compute $\text{MAC}$ over the plaintext, append it, pad the result, then CBC-encrypt. On decryption the receiver CBC-decrypts, removes padding, then MACs the rest and compares. The error was unified -- same ``bad\_record\_mac'' alert either way -- so the naive padding oracle was closed. But the \emph{time} to produce that error was not constant.
+
+The MAC is HMAC over the data, and HMAC's running time depends on how many compression-function blocks it processes. After removing padding, the amount of data left to MAC depends on \emph{how many padding bytes were stripped} -- which depends on the (attacker-influenced) decrypted padding. When Eve manipulates a ciphertext so that decryption yields, say, a single \texttt{00} byte interpreted as 1 byte of padding, the MAC runs over more data (and one more compression block) than when it yields a long valid-looking pad. That difference -- a single SHA-1 compression call, a few hundred nanoseconds -- depends on the plaintext bytes. Timing the unified error reconstructs the padding-validity bit, and the CBC padding-oracle attack proceeds as before. The name: it took advantage of a lucky coincidence in the 13-byte TLS header plus MAC arithmetic that placed a compression-block boundary just right.
+\end{attackbox}
+
+\begin{whybox}
+Lucky 13 is the capstone because it fuses two earlier lessons. It is a \emph{padding oracle} (the secret is which padding got stripped) delivered through a \emph{timing channel} (how long HMAC ran), defeating a defense (unify the error message) that addressed only the logical channel and forgot the physical one. The patch had to make decryption time independent of the padding: always process a fixed number of MAC blocks regardless of how much padding was removed, by computing the HMAC over a constant amount of data and discarding the excess in constant time. Read that twice -- the fix is to do \emph{wasted, constant work} so that the running time carries no information. That is the entire philosophy of constant-time code in one sentence, and it is why the real answer was, again, to abandon CBC MAC-then-encrypt for AEAD, where this whole failure mode does not arise.
+\end{whybox}
+
+\begin{trapbox}
+Notice the escalation across the three padding attacks. CBC oracle: a \emph{distinct error message} leaks the bit -- fix by unifying the error. Bleichenbacher: even an error \emph{or a timeout or a reset} leaks the bit -- fix by making every path identical. Lucky 13: even with identical errors, the \emph{time} leaks the bit -- fix by constant-time error handling. Each fix closes one channel and reveals the next one underneath. There is no point at which ``just hide the error'' is enough. The only robust answer is structural: authenticate first (encrypt-then-MAC / AEAD) so the attacker's chosen ciphertexts are rejected uniformly before any secret-dependent processing happens at all.
+\end{trapbox}
+
+\section{Constant-Time Programming: The Discipline}
+\label{ch37:ct-discipline}
+
+Every defense in this chapter converged on one idea: make the implementation's observable behavior independent of secret data. That idea has a name and a set of rules, and it is the single most important practical skill in this chapter. The rules are simple to state and unnatural to follow, because they forbid the exact constructs that make ordinary code fast and readable.
+
+\begin{formalbox}
+\textbf{The constant-time rules.} For any value that depends on a secret (a key, a plaintext under attack, a nonce, a private exponent, an intermediate of these), the implementation must ensure that none of the following \emph{depend on that secret}:
+\begin{enumerate}
+\item \textbf{Control flow.} No branch (\texttt{if}, loop bound, early \texttt{return}, \texttt{switch}) whose condition is a secret. Branches change timing, instruction-cache footprint, and power.
+\item \textbf{Memory access addresses.} No array index, table lookup, or pointer computed from a secret. Addresses change cache footprint (the cache-attack channel) and sometimes timing.
+\item \textbf{Variable-time instructions.} Avoid instructions whose latency depends on operands -- on some CPUs integer division, and historically multiplication, take data-dependent time. Use only fixed-latency operations on secrets.
+\end{enumerate}
+Equivalently: a secret may flow only into operations that take the same time and touch the same memory regardless of its value -- bitwise logic, addition, fixed-latency multiply, and constant-time \emph{selection}.
+\end{formalbox}
+
+The replacement for a secret-dependent branch is a \emph{branchless select}: compute \emph{both} possibilities and pick one with arithmetic on a mask, so the same instructions run every time.
+
+\begin{implementbox}
+\textbf{Branchless conditional, the workhorse of constant-time code (learning only).}
+\begin{lstlisting}[language=Python]
+# Select a or b WITHOUT branching on the secret bit.
+# Build a full-width mask from a 0/1 condition, then blend.
+def ct_select(cond, a, b, width=32):
+    # cond is 0 or 1 (secret). mask = all-ones if cond==1 else all-zeros.
+    mask = -cond & ((1 << width) - 1)   # -1 -> 0xFFFF...; 0 -> 0x0000...
+    return (a & mask) | (b & ~mask & ((1 << width) - 1))
+
+# Constant-time "is x zero?" without `if x == 0`:
+def ct_is_zero(x, width=32):
+    # fold all bits down; result bit 0 is 1 iff x was 0
+    x &= (1 << width) - 1
+    return 1 ^ ((x | (-x & ((1 << width) - 1))) >> (width - 1) & 1)
+\end{lstlisting}
+Both possibilities are evaluated; the secret only chooses the mask, and masking-and-blending runs identically for every secret value. The same trick gives constant-time table lookup: to read \texttt{T[i]} for secret \texttt{i}, read \emph{every} entry and select with a per-index mask -- $O(n)$ work to hide which index you wanted.
+
+\textbf{Learning only.} Real constant-time code is written in C or assembly with great care, because high-level languages and optimizing compilers actively fight you: a compiler is free to ``optimize'' your branchless select back into a branch, or to introduce a data-dependent short-circuit, because the language standard says nothing about timing. Production code uses audited libraries (libsodium, BearSSL, HACL*, fiat-crypto), compiler barriers, and verification tools.
+\end{implementbox}
+
+\begin{trapbox}
+\textbf{The compiler is not your friend here.} Constant-time source code is not the same as constant-time machine code. Optimizing compilers reason about \emph{values}, never about \emph{time}, so they may turn your carefully branchless \texttt{ct\_select} into a conditional move on one target and a predicted branch on another, or replace a constant-time multiply with a shift-and-add that leaks. ``Constant-time'' is a property of the emitted instructions on a specific CPU, not of your C. This is why serious projects verify the binary -- with tools like \texttt{ctgrind} / Valgrind-based taint tracking, \texttt{dudect} (statistically testing whether timing depends on input), \texttt{ct-verif}, or by writing the primitive in assembly and auditing it -- rather than trusting that the source ``looks constant-time.''
+\end{trapbox}
+
+\begin{intuitionbox}
+The mental flip you must make: in ordinary programming, doing less work is a virtue -- bail early, skip the unnecessary, branch around the common case. In constant-time crypto, doing \emph{the same work every time} is the virtue, even when most of it is wasted, because variation \emph{is} the leak. The constant-time comparison reads every byte even after a mismatch. The Montgomery ladder multiplies even for zero bits. The Lucky-13 fix MACs phantom blocks and throws them away. You are deliberately spending cycles to buy silence. ``Wasteful but uniform'' beats ``efficient but talkative'' whenever the data is secret.
+\end{intuitionbox}
+
+\begin{applicationbox}
+Where this lives in the real world: TLS libraries (OpenSSL/BoringSSL/LibreSSL) ship constant-time modular exponentiation, constant-time RSA padding checks (the post-Bleichenbacher ``always do the full work and return a random secret on failure'' pattern), and constant-time CBC-MAC processing (the post-Lucky-13 fix). Curve25519 and Ed25519 were \emph{designed} for constant-time implementation -- their formulas avoid secret-dependent branches and the Montgomery ladder is natural -- which is a large part of why they displaced older curves with awkward special cases. Signal, WireGuard, and modern SSH lean on these constant-time-by-design primitives. The trend in the field is to push correctness further: \texttt{fiat-crypto} machine-generates field arithmetic with a proof of constant-time behavior, and HACL* provides formally verified, constant-time crypto used in Firefox and the Linux kernel. The endgame is to make ``constant-time'' a checked property of the shipped code, not a hopeful comment.
+\end{applicationbox}
+
+\section{Why ``Secure on Paper'' Is Not Enough}
+\label{ch37:paper}
+
+Step back and name the gap precisely. A security proof is a statement about a \emph{model}: in this model the adversary sees these inputs and outputs, the hard problem is hard, therefore the scheme is secure. Every theorem in this book is true. None of them is a lie. The trouble is that the model's adversary is weaker than the real one. The real adversary also sees time, power, EM, cache state, error messages, and the results of induced faults -- observables the model never granted it, and therefore the proof never defended against.
+
+\begin{focusbox}
+A proof of security is conditional: \emph{relative to a threat model}, the scheme is secure. Side channels are observables the threat model left out. So the correct reading of every theorem is, ``secure against an adversary limited to the modeled interface.'' Deployment widens the interface. The discipline of this chapter is the work of either (a) narrowing the real interface back down to the modeled one -- constant-time code removes the timing/cache observables; verify-before-output removes the fault observable; encrypt-then-MAC removes the padding observable -- or (b) widening the \emph{model} to include the leak and proving security against it (leakage-resilient cryptography, masking with proofs in the probing model). You close the gap from one side or the other; you do not get to ignore that it exists.
+\end{focusbox}
+
+\begin{intuitionbox}
+The whole chapter in one image: cryptography on paper is a fortress with perfect walls, and side channels are the fact that the fortress is made of real stone that echoes when you knock, warms in the sun, and crumbles a little when struck. The architect proved the walls cannot be climbed or battered down, and that proof is correct. The attacker never tries. He listens to the echoes, feels the warm spots, and taps for cracks. ``Unbreakable design'' and ``unbreakable building'' are different claims, and the gap between them is measured in nanoseconds, microamps, cache lines, and error messages. Closing that gap is not a footnote to cryptographic engineering. It is most of the job.
+\end{intuitionbox}
+
+\begin{recoverybox}
+Pause and consolidate. A side channel is any secret-dependent observable the security proof omitted. The signature move of every attack is collapsing a multiplicative search ($s^{n}$) into an additive one ($s\cdot n$) by leaking each secret component independently. Timing leaks through data-dependent branches and operations; the fix is constant-time code (compare all bytes, ladder all bits). Cache leaks through secret-dependent memory addresses; the fix is no secret-indexed lookups (bit-slicing, AES-NI). Power/EM leaks through data-dependent switching; the fix is masking and hiding. Faults leak through the difference between correct and corrupted output; the fix is verify-before-output and redundancy. Padding oracles leak through any ``valid/invalid'' distinction on chosen ciphertexts -- message, timeout, or timing; the fix is authenticate-first (AEAD / encrypt-then-MAC) and constant-time error handling. Underneath all of it: secure on paper is necessary, not sufficient, and constant-time programming is the craft that makes the paper proof describe the running machine.
+\end{recoverybox}
+
+\section*{Exercises}
+\addcontentsline{toc}{section}{Exercises}
+\label{ch37:exercises}
+
+\begin{exercise}
+\label{ch37:ex-strcmp}
+Take \texttt{insecure\_equal} from Section~\ref{ch37:strcmp}. Suppose each byte comparison takes exactly $1$ time unit and the function returns immediately on the first mismatch. The true 4-byte tag is $t = (\texttt{A3}, \texttt{17}, \texttt{C9}, \texttt{2E})$. Eve probes byte 0 with all 256 values. Give the running time the server reports for the guess $t'[0] = \texttt{A3}$ versus any wrong guess, and explain how Eve identifies byte 0 from those times. Then state the total number of queries to recover all 4 bytes and compare it to blind forgery ($256^{4}$).
+\end{exercise}
+
+\begin{exercise}
+\label{ch37:ex-noise}
+A timing attack has a true signal of $\Delta = 20$ ns between a correct and incorrect byte guess, and per-measurement noise with standard deviation $\sigma = 5{,}000$ ns. Using $N \gg (\sigma/\Delta)^2$, estimate the order of magnitude of samples needed per byte to resolve the signal by simple averaging. If averaging $10^{4}$ samples takes one second, roughly how long does recovering one byte take? Comment on why attackers invest in better statistics than the plain mean.
+\end{exercise}
+
+\begin{exercise}
+\label{ch37:ex-sqmul}
+Trace \texttt{modexp\_leaky} on exponent $d = 22 = 10110_2$. List, in order, the sequence of squarings and multiplications. How many of each? An attacker watching a \emph{different} run observes the operation sequence (e.g. via SPA) \texttt{SM, SM, S, SM, S} (S = square, SM = square-then-multiply). Reading SM as a one-bit and S as a zero-bit, what is that exponent's bit pattern, and what is its value $d$? Explain why the Montgomery ladder makes both $d=22$ and $d=16$ produce identical observable traces.
+\end{exercise}
+
+\begin{exercise}
+\label{ch37:ex-cache}
+In a Prime+Probe attack on an AES T-table, the table has 256 one-byte entries, and the cache line holds 16 bytes, so accessing entry $j$ loads the line $\floor{j/16}$ -- there are 16 distinct lines. Eve observes that for a known plaintext byte $p_i = \texttt{0x5A}$, the lookup \texttt{T[p\_i XOR k\_i]} landed in cache line $3$. Which 16 values of \texttt{p\_i XOR k\_i} are consistent with line $3$, and what does this tell Eve about the high nibble of $k_i$? How many such observations (with varying $p_i$) does she roughly need to pin $k_i$ to a single value?
+\end{exercise}
+
+\begin{exercise}
+\label{ch37:ex-dpa}
+In a DPA/CPA attack on AES round one, the leakage model is the Hamming weight of $S(p_i \xor k_i)$. Explain why correlating the model against measured power produces a sharp peak only at the correct $\hat{k}_i = k_i$ and near-zero correlation elsewhere. In your answer, use the fact that the AES S-box is highly nonlinear. Then explain precisely how Boolean masking (computing on $S(p_i \xor k_i) \xor r$ for secret random $r$) destroys the correlation, and why the attacker cannot simply also guess $r$.
+\end{exercise}
+
+\begin{exercise}
+\label{ch37:ex-bellcore}
+With toy RSA $p = 11$, $q = 13$, $N = 143$, $e = 7$, message $m = 50$: the correct signature is $s = 50^{103} \bmod 143$. Suppose a fault produces $\hat{s}$ that is correct mod $13$ but wrong mod $11$. Show, with the congruences, why $\gcd(\hat{s}^{7} - 50,\ 143) = 13$. Then suppose instead Eve has both the correct $s$ and the faulty $\hat{s}$; show why $\gcd(s - \hat{s},\ 143) = 13$ as well. State the one-line defense that prevents Eve from ever obtaining $\hat{s}$.
+\end{exercise}
+
+\begin{exercise}
+\label{ch37:ex-cbc-oracle}
+In the CBC padding-oracle attack, Eve is recovering byte 15 (the last byte) of $I_2 = D_k(C_2)$. She varies $C'[15]$ and the oracle accepts at $C'[15] = \texttt{0x8B}$. (i) What is $I_2[15]$? (ii) If the genuine previous block has $C_1[15] = \texttt{0x40}$, what is the plaintext byte $P_2[15]$? (iii) To then attack byte 14, what value must she force $C'[15]$ to, and why? (iv) Explain in one or two sentences why encrypt-then-MAC eliminates the oracle entirely.
+\end{exercise}
+
+\begin{exercise}
+\label{ch37:ex-bleichenbacher}
+Bleichenbacher's oracle returns whether $c^{d} \bmod N$ begins with the bytes \texttt{00 02}, equivalently whether the decrypted integer lies in $[2B, 3B)$ for $B = 2^{8(\ell-2)}$. Eve sends $c_0 \cdot s^{e} \bmod N$ for chosen $s$. (i) What does the decryption of this modified ciphertext equal in terms of the target plaintext $m$? (ii) When the oracle accepts, what interval constraint does Eve learn about $m \cdot s \bmod N$, and hence about $m$? (iii) Explain why RSA-OAEP is not vulnerable to this attack, and why modern TLS sidesteps it entirely by preferring (EC)DHE key exchange.
+\end{exercise}
+
+\begin{exercise}
+\label{ch37:ex-lucky13}
+Lucky 13 defeated a server that returned the \emph{same} error for bad padding and bad MAC. (i) If the error message is identical, what observable still distinguishes the two cases, and why does it differ? (ii) Explain why the difference is tied to the number of HMAC compression-function blocks processed after padding removal. (iii) Describe the constant-time fix in terms of doing fixed, possibly wasted, work. (iv) Why does switching to an AEAD scheme make this entire class of bug impossible?
+\end{exercise}
+
+\begin{exercise}
+\label{ch37:ex-ct-select}
+Constant-time selection without branching. (i) Verify that \texttt{ct\_select} from Section~\ref{ch37:ct-discipline} returns $a$ when \texttt{cond=1} and $b$ when \texttt{cond=0}, by computing the mask in each case for \texttt{width=8}, $a = \texttt{0xF0}$, $b = \texttt{0x0F}$. (ii) Write a constant-time expression for $\max(x, y)$ on $w$-bit unsigned integers that branches on no secret (hint: derive a sign-based mask from $x - y$). (iii) Explain why testing the \emph{source code} for constant-time behavior is insufficient, and name one tool that tests the compiled binary instead.
+\end{exercise}
+
+\begin{exercise}
+\label{ch37:ex-design}
+You are reviewing a homemade protocol: it CBC-encrypts with AES, appends an unkeyed CRC32 for ``integrity,'' returns distinct errors for ``decryption failed'' and ``CRC failed,'' and signs with RSA-CRT without verifying the signature before output. Identify \emph{three} distinct side-channel or implementation vulnerabilities in this design, name the attack each enables (from this chapter), and give the one structural change that fixes the most problems at once.
+\end{exercise}

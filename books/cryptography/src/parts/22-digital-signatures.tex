@@ -1,0 +1,617 @@
+\chapter{Digital Signatures}
+
+A MAC (Chapter~15) proves that a message came from \emph{somebody who holds the shared key}. That is enough when Alice and Bob already share a secret and trust each other. But it has two limits that turn out to matter enormously in the open world. First, the receiver can also \emph{produce} valid tags -- the same key both signs and verifies -- so Bob cannot prove to a third party that Alice, and not Bob himself, made the message. Second, before any of this works, Alice and Bob must already share a secret, which is exactly the bootstrapping problem public-key cryptography was invented to solve.
+
+A \emph{digital signature} fixes both. Alice signs with a \emph{private} key that only she holds; anyone with her \emph{public} key can verify. The verifier cannot forge -- verification and signing use different keys -- so a valid signature is evidence, checkable by the whole world, that the holder of Alice's private key endorsed this exact message. That is \emph{public verifiability}, and it brings with it \emph{non-repudiation}: Alice cannot later credibly deny having signed, because nobody else could have produced the signature.
+
+Signatures are the load-bearing wall of the public-key world. Every time your browser trusts a certificate, every software update your phone installs, every block added to a cryptocurrency ledger, every SSH host key you accept -- a signature was verified. This chapter builds them from the ground up: what they promise and what they do \emph{not}; why ``textbook'' RSA signatures are dangerous and why we always hash-then-sign; the discrete-log signatures DSA, ECDSA, and EdDSA/Ed25519; and the single most catastrophic implementation bug in the field's history -- nonce reuse in ECDSA, the bug that unlocked the Sony PlayStation~3 and emptied Bitcoin wallets. We trace real little numbers throughout.
+
+\chapterline
+
+\section{Signatures Versus MACs}
+\label{ch22:sig-vs-mac}
+
+Both a MAC and a signature attach a short tag to a message so the receiver can detect tampering and confirm origin. The difference is \emph{who can make a valid tag} and \emph{who can check it}.
+
+\begin{itemize}
+  \item \textbf{MAC:} one secret key $k$ does everything. To make a tag you need $k$; to verify a tag you need $k$. Sender and verifier are symmetric -- either can forge against the other.
+  \item \textbf{Signature:} a key \emph{pair} $(pk, sk)$. The private $sk$ makes signatures; the public $pk$ only verifies them. The signer and the verifier are asymmetric -- the verifier provably cannot forge.
+\end{itemize}
+
+That asymmetry is the whole point, and it buys three things a MAC cannot give you.
+
+\begin{itemize}
+  \item \textbf{Public verifiability.} Anyone holding $pk$ -- which is not secret and can be published on a billboard -- can check the signature. A MAC tag is checkable only by the holder of $k$.
+  \item \textbf{No shared-secret setup.} The verifier needs only Alice's public key, which she can hand out freely. No secret channel is required before the first verified message.
+  \item \textbf{Non-repudiation.} Because only Alice could have produced a signature that verifies under her $pk$, she cannot plausibly deny it later. A MAC has no such property: since Bob also holds $k$, a tag ``from Alice'' could just as easily have been forged by Bob, so it proves nothing to a judge.
+\end{itemize}
+
+\begin{intuitionbox}
+A MAC is a wax seal pressed with a signet ring that \emph{both} correspondents own. If you find a sealed letter, you know one of the two ring-holders made it -- but you cannot tell which, and you cannot show anyone else, because you own the ring too and might have faked it.
+
+A signature is more like a handwritten signature backed by a worldwide notary: Alice alone can produce her mark (the private key), but \emph{everyone} carries a reference copy to check it against (the public key). The asymmetry -- easy to verify, impossible to forge -- is what lets a stranger, or a court, rely on it.
+\end{intuitionbox}
+
+\begin{focusbox}
+Non-repudiation is a feature \emph{and} a liability. Signatures are exactly the wrong tool for a casual chat where you might later want deniability. This is why Signal's messaging (Chapter~27) deliberately uses shared-key MACs for per-message authentication and reserves signatures for the long-term identity step -- so that a leaked transcript proves nothing about who said what. ``Deniable authentication'' is a real design goal, and signatures destroy it.
+\end{focusbox}
+
+\subsection{The syntax of a signature scheme}
+\label{ch22:syntax}
+
+\begin{definition}[Signature scheme]
+\label{ch22:def-scheme}
+A \emph{signature scheme} is a triple of algorithms $(\Gen, \Sign, \Vrfy)$:
+\begin{itemize}
+  \item $\Gen(1^n) \to (pk, sk)$: a randomized key generator producing a public verification key $pk$ and a private signing key $sk$.
+  \item $\Sign_{sk}(m) \to \sigma$: takes the private key and a message, returns a signature $\sigma$. May be randomized.
+  \item $\Vrfy_{pk}(m, \sigma) \to \{0,1\}$: takes the public key, a message, and a candidate signature, returns $1$ (accept) or $0$ (reject).
+\end{itemize}
+\emph{Correctness:} for every key pair from $\Gen$ and every message $m$, $\Vrfy_{pk}(m, \Sign_{sk}(m)) = 1$.
+\end{definition}
+
+\subsection{What ``secure'' means: existential unforgeability}
+\label{ch22:euf-cma}
+
+The security target mirrors the MAC definition, with one big change: the attacker is now \emph{given the public key}. She can verify on her own all day long; she does not even need an oracle to verify. What she must not be able to do is produce a \emph{new} valid message--signature pair.
+
+\begin{formalbox}
+\textbf{EUF-CMA (existential unforgeability under chosen-message attack).} Run $\Gen$ to get $(pk, sk)$ and hand $pk$ to the adversary $\Adv$. Give $\Adv$ a signing oracle: she submits messages $m_1, m_2, \dots$ of her choosing and receives $\sigma_i = \Sign_{sk}(m_i)$. Eventually $\Adv$ outputs a pair $(m^*, \sigma^*)$. She \emph{wins} if
+\[
+\Vrfy_{pk}(m^*, \sigma^*) = 1 \quad\text{and}\quad m^* \notin \{m_1, m_2, \dots\}.
+\]
+The scheme is EUF-CMA secure if every $\PPT$ adversary wins with only negligible probability:
+\[
+\Pr[\Adv \text{ wins}] \le \negl(n).
+\]
+\end{formalbox}
+
+``Existential'' means the forgery can be on \emph{any} message $\Adv$ likes -- even meaningless gibberish counts as a break. ``Chosen-message'' means she may first collect signatures on messages she picks. This is a deliberately paranoid bar: we demand that even after seeing signatures on a million chosen documents, she cannot forge on a single fresh one. A scheme that clears EUF-CMA is safe against far weaker real-world attackers.
+
+\begin{trapbox}
+A subtle but important strengthening is \emph{strong} unforgeability (sEUF-CMA): $\Adv$ wins even if $m^*$ \emph{was} queried, as long as $\sigma^*$ is a \emph{new} signature on it. Plain EUF-CMA permits ``signature malleability'' -- producing a different valid signature on an already-signed message. That sounds harmless, but it has caused real damage: Bitcoin's pre-2017 ``transaction malleability'' bug let attackers alter a transaction's signature (and thus its ID) without invalidating it, which was used to confuse exchanges. We will see ECDSA's malleability concretely in Section~\ref{ch22:ecdsa}.
+\end{trapbox}
+
+\section{RSA Signatures}
+\label{ch22:rsa-sig}
+
+RSA (Chapter~19) gives us a trapdoor permutation on $\Zns{N}$: raising to the public exponent $e$ is easy for everyone, and the inverse -- raising to the private exponent $d$ -- is easy only for the key-holder. Encryption used $e$ to scramble and $d$ to unscramble. Signing flips the roles: the signer applies the \emph{private} operation, and verification applies the \emph{public} one. Anyone can run the public map forward; only the key-holder can run it backward; so only the key-holder can produce a value whose public image is what it should be.
+
+\begin{historybox}
+Rivest, Shamir, and Adleman's 1978 paper introduced both encryption and signatures in one stroke. Their observation was almost an afterthought to the encryption scheme: ``a message can be \emph{signed} by deciphering it with the secret deciphering key.'' Diffie and Hellman had already named the goal -- a public-key signature whose forgery is as hard as inverting a one-way function -- in their 1976 paper, but RSA was the first concrete construction. The conceptual leap, that the same trapdoor serves both confidentiality and authenticity by swapping which key goes first, is one of the most elegant in the subject.
+\end{historybox}
+
+\subsection{Textbook RSA, and why it is broken}
+\label{ch22:textbook-rsa}
+
+The naive (``textbook'') scheme is the direct dual of textbook RSA encryption. Keys: $N = pq$, public exponent $e$, private exponent $d$ with $ed \equiv 1 \pmod{\varphi(N)}$.
+\[
+\Sign_{sk}(m) = m^{d} \bmod N, \qquad
+\Vrfy_{pk}(m, \sigma): \text{ accept iff } \sigma^{e} \equiv m \pmod N.
+\]
+Correctness is the same Euler-theorem calculation that makes RSA decryption work: $\sigma^e = (m^d)^e = m^{ed} = m^{1 + k\varphi(N)} \equiv m \pmod N$.
+
+Let us trace it with the textbook tiny primes.
+
+\begin{example}[Textbook RSA signing by hand]
+\label{ch22:ex-textbook}
+Take $p = 61$, $q = 53$, so $N = 3233$ and $\varphi(N) = 60 \cdot 52 = 3120$. Pick $e = 17$; then $d = 2753$ since $17 \cdot 2753 = 46801 = 15\cdot 3120 + 1$.
+
+Sign the ``message'' $m = 100$. The signature is
+\[
+\sigma = 100^{2753} \bmod 3233 = 1391.
+\]
+(Compute by square-and-multiply; the algorithms companion covers the cost.) To verify, the public side computes
+\[
+\sigma^{e} = 1391^{17} \bmod 3233 = 100 = m. \;\checkmark
+\]
+The verifier used only the public $(N, e) = (3233, 17)$ and recovered $m$, confirming the signer knew $d$.
+\end{example}
+
+This works, and it is catastrophically insecure. Three attacks kill it.
+
+\begin{attackbox}
+\textbf{1. Forge on a random ``message''.} The forger does not need to choose the message first. Pick any $\sigma$ you like, compute $m = \sigma^{e} \bmod N$, and announce ``$\sigma$ is my signature on $m$.'' It verifies by construction. The message $m$ is garbage you did not control -- but EUF-CMA says forging on \emph{any} message is a win, and in a system where messages carry meaning (a bank balance, a serial number) a garbage message can still be damaging or can be massaged into something useful.
+
+\textbf{2. Multiplicative forgery (the deadly one).} Textbook RSA is \emph{homomorphic}: $(m_1 m_2)^d \equiv m_1^d \cdot m_2^d \pmod N$. So if Eve gets Alice to sign $m_1$ and $m_2$, she gets a free signature on $m_1 m_2 \bmod N$ that Alice never produced:
+\[
+\sigma_1 = m_1^d,\quad \sigma_2 = m_2^d \;\Longrightarrow\; \sigma_1\sigma_2 \bmod N = (m_1 m_2)^d = \Sign(m_1 m_2 \bmod N).
+\]
+Worse, to forge on a \emph{target} $m^*$, Eve writes $m^* = m_1 \cdot m_2 \bmod N$ for messages $m_1, m_2$ she chooses, asks Alice to sign those two (innocuous-looking) values, and multiplies the results. This is a textbook chosen-message break.
+
+\textbf{3. No binding to one message.} Nothing ties $\sigma$ to a single $m$; the structure is pure algebra, so algebraic relations among messages carry straight over to signatures.
+\end{attackbox}
+
+\begin{example}[Multiplicative forgery with tiny numbers]
+\label{ch22:ex-mult-forge}
+Continue with $N = 3233$, $e = 17$, $d = 2753$. Eve wants a signature on $m^* = 4$ but Alice refuses to sign $4$ directly. Eve factors the target: $4 = 2 \cdot 2 \bmod 3233$. She asks Alice to sign $m_1 = 2$:
+\[
+\sigma_1 = 2^{2753} \bmod 3233 = 1027.
+\]
+Then $\sigma^* = \sigma_1^2 \bmod 3233 = 1027^2 \bmod 3233 = 1054729 \bmod 3233 = 771$. Check: $771^{17} \bmod 3233 = 4 = m^*$. Eve forged a signature on $4$ from a signature on $2$. No knowledge of $d$ required.
+\end{example}
+
+\subsection{Hash-then-sign: the fix}
+\label{ch22:hash-then-sign}
+
+Every attack above exploited \emph{algebraic structure} in the message -- the forger picked $m$'s that multiply nicely or read $m$ off backward from $\sigma$. The fix is to destroy that structure before signing: run the message through a cryptographic hash $\Hash$ first, then sign the digest.
+\[
+\Sign_{sk}(m) = \Hash(m)^{d} \bmod N, \qquad
+\Vrfy_{pk}(m, \sigma): \text{ accept iff } \sigma^{e} \equiv \Hash(m) \pmod N.
+\]
+
+\begin{whybox}
+Hashing breaks all three attacks at once.
+\begin{itemize}
+  \item \textbf{Against the random-$\sigma$ forgery:} given a random $\sigma$, the forger gets a random target $t = \sigma^e \bmod N$. To pass verification she now needs a message $m$ with $\Hash(m) = t$. That is a \emph{preimage} on the hash -- infeasible for SHA-256. She can pick $\sigma$ or pick $m$, but not both consistently.
+  \item \textbf{Against multiplicative forgery:} the homomorphism still holds at the level of integers, but now the forger needs three messages $m_1, m_2, m^*$ with $\Hash(m^*) \equiv \Hash(m_1)\cdot\Hash(m_2) \pmod N$. Hash outputs are effectively random in $\Zns{N}$; finding such a multiplicative relation among hash digests is as hard as a fresh search and provides no leverage.
+  \item \textbf{Bonus -- arbitrary length:} RSA can only sign numbers below $N$. Hashing first compresses any message, however long, to a fixed-size digest.
+\end{itemize}
+\end{whybox}
+
+\begin{trapbox}
+Hash-then-sign with a \emph{bare} hash padded with zeros is still subtle. The deployed standard, \textbf{RSASSA-PKCS1-v1\_5}, sandwiches the digest in a rigid byte structure \texttt{00 01 FF FF ... FF 00 || ASN.1(hashID) || digest}; \textbf{RSA-PSS} adds randomized salt and a mask, with a tight security proof in the random-oracle model. The infamous \emph{Bleichenbacher signature-forgery} attack (2006) hit careless implementations that parsed the PKCS\#1 padding loosely: if a verifier did not check that the \texttt{FF} padding ran all the way to the right edge, an attacker could, for small $e=3$, construct a perfect cube whose low bits encoded a valid-\emph{looking} structure, forging without the private key. The lesson: verification must check the padding \emph{exactly}, byte for byte. Prefer PSS for new designs.
+\end{trapbox}
+
+\begin{applicationbox}
+RSA signatures with $e = 65537$ remain ubiquitous. The majority of TLS certificates in the field (Chapter~24) are RSA-signed; code-signing for Windows drivers and many firmware images uses RSA; DNSSEC, JWT (\texttt{RS256}), and PDF signing all rely on it. New systems increasingly prefer the smaller, faster Ed25519 (Section~\ref{ch22:eddsa}), but RSA's two-decade install base means it will be verified for a long time yet. When you see \texttt{RSASSA-PSS} or \texttt{sha256WithRSAEncryption} in a certificate, this is the machinery behind it.
+\end{applicationbox}
+
+\begin{implementbox}
+A toy RSA signature, hash-then-sign, in Python. \textbf{For learning only -- never use this for anything real.} It uses tiny keys, a truncated hash reduced mod a small $N$, no PKCS\#1/PSS padding, and Python's non-constant-time big-int arithmetic. Every one of those is a fatal flaw in production.
+\begin{lstlisting}[language=Python]
+import hashlib
+
+# Toy keypair (textbook tiny primes -- NOT secure)
+p, q = 61, 53
+N = p * q                      # 3233
+phi = (p - 1) * (q - 1)        # 3120
+e = 17
+d = pow(e, -1, phi)            # 2753
+
+def H(msg: bytes) -> int:
+    # Hash then reduce into Z_N. Real RSA uses full-width PSS padding.
+    digest = hashlib.sha256(msg).digest()
+    return int.from_bytes(digest, "big") % N
+
+def sign(msg: bytes) -> int:
+    return pow(H(msg), d, N)              # private op: ^d
+
+def verify(msg: bytes, sigma: int) -> bool:
+    return pow(sigma, e, N) == H(msg)     # public op: ^e
+
+s = sign(b"Pay Bob 100")
+print(verify(b"Pay Bob 100", s))          # True
+print(verify(b"Pay Eve 9999", s))         # False -- different hash
+\end{lstlisting}
+Tampering with the message changes the digest, so the recomputed $\Hash(m)$ no longer matches $\sigma^e$, and verification fails. That is integrity and authenticity in three lines -- but the warnings above are not optional.
+\end{implementbox}
+
+\section{Discrete-Log Signatures: DSA}
+\label{ch22:dsa}
+
+RSA signatures rest on the hardness of factoring. A second, equally important family rests on \emph{discrete logarithms} (Chapter~20): given $g$ and $g^x$ in a group, recovering $x$ is hard. These signatures are shorter than RSA's and underlie ECDSA and Ed25519, so the structure is worth understanding in detail.
+
+\begin{historybox}
+The first practical discrete-log signature was ElGamal's (1985), but the version that became a U.S. federal standard was the \emph{Digital Signature Algorithm} (DSA), published by NIST in 1991 as part of the Digital Signature Standard (FIPS 186). It was mildly controversial -- some suspected NIST/NSA of pushing a scheme they understood especially well, and unlike RSA it could not also be used for encryption (a feature, to some). Schnorr's elegant 1989 signature was patent-encumbered until 2008; DSA was deliberately designed to sidestep that patent, which is part of why its structure looks slightly awkward next to Schnorr's. Today the elliptic-curve descendant ECDSA is everywhere, and EdDSA (a clean modern Schnorr variant) is winning new deployments.
+\end{historybox}
+
+\subsection{Setup and the algorithm}
+\label{ch22:dsa-algo}
+
+DSA works in a subgroup of $\Zns{p}$. Public parameters: a large prime $p$, a prime $q$ dividing $p-1$, and a generator $g$ of the order-$q$ subgroup (so $g^q \equiv 1 \pmod p$). The private key is $x \getsr \{1,\dots,q-1\}$; the public key is $y = g^{x} \bmod p$.
+
+To sign a message $m$ with digest $h = \Hash(m) \bmod q$:
+\begin{enumerate}
+  \item Choose a fresh random \emph{nonce} $k \getsr \{1, \dots, q-1\}$.
+  \item Compute $r = (g^{k} \bmod p) \bmod q$. If $r = 0$, restart with a new $k$.
+  \item Compute $s = k^{-1}(h + x r) \bmod q$. If $s = 0$, restart.
+  \item The signature is $(r, s)$.
+\end{enumerate}
+
+To verify $(r,s)$ on $m$ (with $h = \Hash(m) \bmod q$), reject unless $0 < r < q$ and $0 < s < q$, then:
+\[
+w = s^{-1} \bmod q,\quad u_1 = h\,w \bmod q,\quad u_2 = r\,w \bmod q,\quad v = \big(g^{u_1} y^{u_2} \bmod p\big)\bmod q.
+\]
+Accept iff $v = r$.
+
+\begin{whybox}
+\textbf{Why verification works.} From step~3, $s = k^{-1}(h + xr) \bmod q$, so $k \equiv s^{-1}(h + xr) \equiv w(h + xr) \equiv wh + wxr \equiv u_1 + x u_2 \pmod q$. Now raise $g$ to both sides, working in the order-$q$ subgroup where exponents only matter mod $q$:
+\[
+g^{k} \equiv g^{u_1 + x u_2} = g^{u_1}(g^{x})^{u_2} = g^{u_1} y^{u_2} \pmod p.
+\]
+Reducing both sides mod $q$ gives $r = v$. The signer's secret $x$ appears on the right only through the public $y = g^x$, so the verifier never needs $x$ -- exactly the asymmetry we want.
+\end{whybox}
+
+\begin{example}[DSA by hand with tiny parameters]
+\label{ch22:ex-dsa}
+Let $p = 23$, $q = 11$ (note $11 \mid 22$). We need $g$ of order $11$. Take $h_0 = 2$ and set $g = h_0^{(p-1)/q} = 2^{2} = 4 \bmod 23$. Check: $4^{11} \bmod 23 = 1$, and $4 \neq 1$, so $\ord(g) = 11$. Good.
+
+Private key $x = 3$; public key $y = g^x = 4^3 = 64 \bmod 23 = 18$.
+
+Sign a message whose digest is $h = 9$. Pick nonce $k = 7$ (with $k^{-1} \bmod 11 = 8$, since $7\cdot 8 = 56 = 5\cdot 11 + 1$).
+\begin{align*}
+r &= (g^{k} \bmod p)\bmod q = (4^{7} \bmod 23)\bmod 11.\\
+4^7 &= 16384,\quad 16384 \bmod 23 = 8,\quad r = 8 \bmod 11 = 8.\\
+s &= k^{-1}(h + x r)\bmod q = 8\,(9 + 3\cdot 8)\bmod 11 = 8\cdot 33 \bmod 11 = 8\cdot 0 = 0.
+\end{align*}
+Here $33 \equiv 0 \pmod{11}$ gives $s = 0$, which DSA forbids -- so we restart. Take $k = 4$ instead (with $k^{-1} \bmod 11 = 3$, since $4\cdot 3 = 12 \equiv 1$).
+\begin{align*}
+r &= (4^{4}\bmod 23)\bmod 11 = (256 \bmod 23)\bmod 11 = 3 \bmod 11 = 3.\\
+s &= 3\,(9 + 3\cdot 3)\bmod 11 = 3\cdot 18 \bmod 11 = 54 \bmod 11 = 10.
+\end{align*}
+Signature: $(r, s) = (3, 10)$.
+
+\textbf{Verify.} $w = s^{-1} = 10^{-1}\bmod 11 = 10$ (since $10\cdot 10 = 100 = 9\cdot 11 + 1$).
+\begin{align*}
+u_1 &= h w = 9\cdot 10 = 90 \bmod 11 = 2,\\
+u_2 &= r w = 3\cdot 10 = 30 \bmod 11 = 8,\\
+v &= (g^{u_1} y^{u_2}\bmod 23)\bmod 11 = (4^{2}\cdot 18^{8} \bmod 23)\bmod 11.
+\end{align*}
+Now $4^2 = 16$. And $18^2 = 324 \bmod 23 = 2$, so $18^4 = 2^2 = 4$, $18^8 = 4^2 = 16 \bmod 23$. Thus $g^{u_1}y^{u_2} = 16\cdot 16 = 256 \bmod 23 = 3$, and $v = 3 \bmod 11 = 3 = r$. Accept. \checkmark
+\end{example}
+
+\begin{trapbox}
+The nonce $k$ is the beating heart of DSA's security, and the most common way to get it lethally wrong. It must be \emph{uniformly random}, \emph{secret}, and \emph{unique per signature}. Reusing it, or letting it be predictable or biased, leaks the private key outright. Section~\ref{ch22:nonce-attack} is devoted to exactly this, because it is not a hypothetical -- it has broken real, shipped systems.
+\end{trapbox}
+
+\section{ECDSA: DSA on an Elliptic Curve}
+\label{ch22:ecdsa}
+
+ECDSA is DSA with the multiplicative group $\Zns{p}$ replaced by the additive group of points on an elliptic curve (Chapter~21). The payoff is the same one elliptic curves always deliver: equivalent security at far smaller key and signature sizes, because the best discrete-log attack on a well-chosen curve is the generic $\sqrt{|\text{group}|}$ square-root attack. A 256-bit curve gives roughly 128-bit security; matching that with DSA over $\Zns{p}$ needs a 3072-bit $p$.
+
+Public parameters: a curve $E$ over $\F_p$, a base point $G$ of large prime order $n$. Private key $d \getsr \{1,\dots,n-1\}$; public key $Q = dG$ (scalar multiplication, the elliptic-curve analogue of $g^x$).
+
+\textbf{Sign} $m$ with $h = \Hash(m) \bmod n$:
+\begin{enumerate}
+  \item Pick a fresh random nonce $k \getsr \{1,\dots,n-1\}$.
+  \item Compute the point $(x_1, y_1) = kG$; set $r = x_1 \bmod n$. If $r = 0$, restart.
+  \item Compute $s = k^{-1}(h + d\,r) \bmod n$. If $s = 0$, restart.
+  \item Signature is $(r, s)$.
+\end{enumerate}
+
+\textbf{Verify} $(r,s)$ on $m$: reject unless $0 < r,s < n$; then
+\[
+w = s^{-1}\bmod n,\quad u_1 = hw \bmod n,\quad u_2 = rw \bmod n,\quad (x_1,y_1) = u_1 G + u_2 Q.
+\]
+Accept iff $x_1 \bmod n = r$.
+
+The correctness argument is identical in shape to DSA's: $k \equiv w(h + dr) \equiv u_1 + d u_2 \pmod n$, so $kG = u_1 G + d u_2 G = u_1 G + u_2 Q$, and the $x$-coordinates match.
+
+\begin{example}[ECDSA on a tiny curve]
+\label{ch22:ex-ecdsa}
+Use the curve $E: y^2 = x^3 + 2x + 2$ over $\F_{17}$, a standard small teaching curve. The point $G = (5, 1)$ has order $n = 19$. (You can verify $19 G = \mathcal{O}$; the group has $19$ points.)
+
+Take private key $d = 7$. Then $Q = 7G$. Doubling and adding on this curve (Chapter~21's point arithmetic) gives the multiples; in particular $7G = (0, 6)$, so $Q = (0,6)$.
+
+Sign a message with digest $h = 11$. Pick nonce $k = 3$. Compute $kG = 3G$. On this curve $3G = (10, 6)$, so $r = x_1 \bmod n = 10 \bmod 19 = 10$.
+
+Now $k^{-1} \bmod 19$: $3\cdot 13 = 39 = 2\cdot 19 + 1$, so $k^{-1} = 13$.
+\[
+s = k^{-1}(h + d r)\bmod n = 13\,(11 + 7\cdot 10)\bmod 19 = 13\cdot 81 \bmod 19.
+\]
+$81 \bmod 19 = 81 - 76 = 5$, so $s = 13\cdot 5 = 65 \bmod 19 = 65 - 57 = 8$. Signature $(r,s) = (10, 8)$.
+
+\textbf{Verify.} $w = s^{-1} = 8^{-1}\bmod 19 = 12$ (since $8\cdot 12 = 96 = 5\cdot 19 + 1$).
+\[
+u_1 = hw = 11\cdot 12 = 132 \bmod 19 = 132 - 114 = 18,\quad u_2 = rw = 10\cdot 12 = 120 \bmod 19 = 6.
+\]
+Compute $u_1 G + u_2 Q = 18G + 6Q$. Since $Q = 7G$, this is $18G + 42G = 60G$. And $60 \bmod 19 = 60 - 57 = 3$, so the result is $3G = (10,6)$, with $x_1 = 10$. Then $x_1 \bmod n = 10 = r$. Accept. \checkmark
+
+The shortcut $Q = 7G \Rightarrow u_2 Q = 42G$ is just for hand-checking; a real verifier does the two scalar multiplications directly without knowing $d$.
+\end{example}
+
+\begin{trapbox}
+\textbf{ECDSA is malleable.} If $(r, s)$ is a valid signature, so is $(r,\, n - s)$: negating $s$ corresponds to negating the nonce point's $y$-coordinate, which leaves $r = x_1 \bmod n$ unchanged. Both verify. This is the source of Bitcoin's transaction-malleability headaches; the fix (BIP~62 / ``low-$s$'' rule) is to canonicalize by requiring $s \le n/2$, rejecting the high-$s$ twin. EdDSA avoids the whole issue by being deterministic and strongly unforgeable.
+\end{trapbox}
+
+\begin{applicationbox}
+ECDSA over the NIST curve P-256 (and increasingly P-384) is the default signature in modern TLS certificates and in the TLS handshake's \texttt{CertificateVerify}. It signs Apple and Android app packages, secures Bluetooth pairing, and -- over the Koblitz curve secp256k1 -- authorizes every Bitcoin and Ethereum transaction. Its compactness (a 64-byte signature for 128-bit security) is why it displaced RSA in size-constrained settings. Its sharp edge is the nonce, which the next section makes vivid.
+\end{applicationbox}
+
+\section{The Catastrophic Nonce Attack}
+\label{ch22:nonce-attack}
+
+DSA and ECDSA share a fragility so severe it deserves its own section: the security of the \emph{long-term private key} rests entirely on the per-signature nonce $k$ being random, secret, and never repeated. Violate any of those and the key falls out with grade-school algebra. We show it for ECDSA; DSA is identical with $G$ replaced by $g$ and $n$ by $q$.
+
+\subsection{Reusing one nonce reveals the key}
+\label{ch22:nonce-reuse}
+
+Suppose Alice signs two \emph{different} messages with digests $h_1 \neq h_2$ using the \emph{same} nonce $k$. Then both signatures share the same $r$, because $r$ depends only on $k$: $r = x\text{-coord}(kG) \bmod n$. The two $s$ values are
+\[
+s_1 = k^{-1}(h_1 + d r)\bmod n,\qquad s_2 = k^{-1}(h_2 + d r)\bmod n.
+\]
+Subtract. The $dr$ term cancels:
+\[
+s_1 - s_2 \equiv k^{-1}(h_1 - h_2) \pmod n \;\Longrightarrow\; k \equiv \frac{h_1 - h_2}{s_1 - s_2} \pmod n.
+\]
+That recovers the nonce. With $k$ in hand, rearrange either signature equation for the private key:
+\[
+s_1 k \equiv h_1 + d r \pmod n \;\Longrightarrow\; d \equiv \frac{s_1 k - h_1}{r} \pmod n.
+\]
+Two signatures, a subtraction, and two modular inverses -- the entire private key, from public data. An attacker who merely \emph{observes} two same-nonce signatures (they are public!) computes $d$ and can forge anything forever.
+
+\begin{center}
+\begin{tikzpicture}[
+  font=\small,
+  box/.style={draw, rounded corners, align=center, minimum height=8mm, inner sep=4pt},
+  >={Stealth[round]}
+]
+  \node[box, fill=evered!8] (s1) at (0,0) {$s_1 = k^{-1}(h_1 + dr)$};
+  \node[box, fill=evered!8] (s2) at (0,-1.4) {$s_2 = k^{-1}(h_2 + dr)$};
+  \node[box, fill=quotientorange!15] (k) at (5,-0.7) {$k = \dfrac{h_1 - h_2}{s_1 - s_2}$};
+  \node[box, fill=trapred!20] (d) at (9.6,-0.7) {$d = \dfrac{s_1 k - h_1}{r}$};
+  \draw[->] (s1.east) .. controls (2.3,0) .. (k.north west);
+  \draw[->] (s2.east) .. controls (2.3,-1.4) .. (k.south west);
+  \draw[->] (k) -- (d) node[midway, above] {then};
+  \node[below=1mm of k, evered] {subtract: $dr$ cancels};
+\end{tikzpicture}
+\end{center}
+
+\begin{center}
+\small Same nonce $\Rightarrow$ same $r$ in both signatures; the subtraction cancels $dr$, leaks $k$, and one more step leaks $d$.
+\end{center}
+
+\begin{example}[Extracting the key from a reused nonce]
+\label{ch22:ex-reuse}
+Use the tiny ECDSA setup of Example~\ref{ch22:ex-ecdsa}: curve over $\F_{17}$, $n = 19$, true secret $d = 7$ (which the attacker does not know). Alice carelessly reuses $k = 3$ (so $r = 10$ in both) on two messages:
+\[
+h_1 = 11:\; s_1 = 8 \ (\text{from Example~\ref{ch22:ex-ecdsa}}),\qquad
+h_2 = 5:\; s_2 = k^{-1}(h_2 + dr) = 13(5 + 70)\bmod 19.
+\]
+$5 + 70 = 75 \equiv 75 - 57 = 18 \pmod{19}$, so $s_2 = 13\cdot 18 = 234 \bmod 19 = 234 - 228 = 6$.
+
+Eve sees $(r, s_1) = (10, 8)$ and $(r, s_2) = (10, 6)$ with the same $r$ -- the red flag. She recovers:
+\[
+k \equiv \frac{h_1 - h_2}{s_1 - s_2} = \frac{11 - 5}{8 - 6} = \frac{6}{2} = 3 \pmod{19}.
+\]
+($2^{-1}\bmod 19 = 10$, so $6\cdot 10 = 60 \bmod 19 = 3$. Indeed $k = 3$.) Then
+\[
+d \equiv \frac{s_1 k - h_1}{r} = \frac{8\cdot 3 - 11}{10} = \frac{13}{10}\bmod 19.
+\]
+$10^{-1}\bmod 19 = 2$ (since $10\cdot 2 = 20 \equiv 1$), so $d = 13\cdot 2 = 26 \bmod 19 = 7$. Eve has recovered the secret key $d = 7$ exactly, from two public signatures.
+\end{example}
+
+\begin{attackbox}
+\textbf{The PlayStation~3 break (2010).} Sony signed PS3 firmware and games with ECDSA. The whole chain of trust rested on those signatures: only Sony-signed code would run. At the Chaos Communication Congress (27C3), the group \texttt{fail0verflow} revealed that Sony's signing implementation used a \emph{constant} nonce $k$ -- the same value for every signature, rather than a fresh random one each time. Every pair of signed binaries therefore shared $r$, and the two-signature subtraction above handed over Sony's master private key.
+
+With the private key, anyone could sign arbitrary code that the PS3 would accept as genuine Sony software -- a complete, unrecoverable break of the platform's root of trust. There was no patch: you cannot un-leak a private key, and the public key was burned into millions of consoles. It is the canonical real-world demonstration that the nonce is not a minor implementation detail but the linchpin of the entire scheme.
+\end{attackbox}
+
+\begin{attackbox}
+\textbf{Android Bitcoin wallet theft (2013).} A flaw in the \texttt{SecureRandom} of certain Android versions caused some Bitcoin wallet apps to generate \emph{repeated} ECDSA nonces across transactions. Because every Bitcoin signature is published forever on the blockchain, anyone scanning the chain for two signatures sharing an $r$ value could apply Example~\ref{ch22:ex-reuse}'s arithmetic, extract the wallet's private key, and sweep its funds. Real coins were stolen. The combination -- public signatures plus a biased RNG -- is uniquely unforgiving: there is nowhere to hide and no second chance.
+\end{attackbox}
+
+\begin{connectionbox}
+You do not even need a full \emph{repeat} to lose the key -- a slight \emph{bias} is enough. If each nonce leaks just a few bits (say its top byte is always zero, or it comes from a too-short range), then each signature gives a noisy linear equation in $d$, and gathering a few hundred such equations turns key recovery into a \emph{lattice} problem (the hidden number problem) that LLL-style lattice reduction solves. The probability companion's view of accumulating a faint statistical signal across many samples is exactly the right lens: each biased nonce is a weak measurement, and enough weak measurements pin down the secret. ``Random enough'' is not a slogan here; it is a hard, quantitative requirement.
+\end{connectionbox}
+
+\subsection{The fix: deterministic nonces (RFC 6979)}
+\label{ch22:rfc6979}
+
+The cleanest defense removes randomness from the nonce entirely. Instead of sampling $k$ from an RNG you may not trust, \emph{derive} it deterministically from the private key and the message:
+\[
+k = \mathrm{HMAC\text{-}derived}(d, \Hash(m)).
+\]
+This is RFC~6979. Because $k$ depends on the message, two different messages get different (and unpredictable, since $d$ is secret) nonces, so reuse is structurally impossible. Because it depends on $d$, an outsider cannot predict it. And because it needs no RNG at signing time, a broken \texttt{SecureRandom} can no longer sink you. The same private key and message always yield the same signature -- which is fine, and even desirable for reproducibility and testing.
+
+\begin{whybox}
+Determinism sounds paradoxical -- did we not say the nonce must be ``random''? The real requirement is weaker and more precise: each nonce must be \emph{unpredictable to the attacker} and \emph{distinct across distinct messages}. A keyed PRF (HMAC) of the message satisfies both: distinct messages give distinct, pseudorandom outputs, and without the key the outputs look uniform. Determinism just means we obtain that unpredictability from a hash of secret data rather than from a hardware RNG -- trading a fragile dependency for a robust one. EdDSA, next, bakes this in by design.
+\end{whybox}
+
+\section{EdDSA and Ed25519}
+\label{ch22:eddsa}
+
+EdDSA (Edwards-curve Digital Signature Algorithm), and its instantiation \emph{Ed25519}, is the modern signature you should reach for first. It is a Schnorr signature over a carefully chosen twisted Edwards curve, engineered from the start to dodge every sharp edge we have catalogued.
+
+\begin{historybox}
+EdDSA comes from a 2011 paper by Bernstein, Duif, Lange, Schwabe, and Yang, ``High-speed high-security signatures.'' It pairs Schnorr's clean signature equation (finally patent-free after 2008) with Bernstein's Curve25519 (recast in Edwards form as edwards25519). The design philosophy is misuse-resistance: no per-signature randomness to mishandle, no point-validation footguns, complete and constant-time curve arithmetic. It was standardized as RFC~8032 and adopted with unusual speed -- SSH, TLS~1.3, Signal, and many others added it within a few years.
+\end{historybox}
+
+\subsection{How Ed25519 signs}
+\label{ch22:ed25519-algo}
+
+Parameters: the twisted Edwards curve edwards25519 over $\F_{2^{255}-19}$, base point $B$ of prime order $\ell \approx 2^{252}$, and the hash $H = $ SHA-512.
+
+\textbf{Keys.} The private key is a 32-byte seed. Hash it with SHA-512 to get 64 bytes; the first 32 (clamped) form the scalar $a$, the second 32 form a secret prefix $\mathrm{pre}$ used for nonce derivation. The public key is $A = aB$.
+
+\textbf{Sign} message $M$:
+\begin{enumerate}
+  \item $r = H(\mathrm{pre} \concat M) \bmod \ell$ -- the nonce, derived deterministically from a secret prefix and the message (no RNG!).
+  \item $R = rB$.
+  \item $k = H(R \concat A \concat M) \bmod \ell$ -- the challenge, binding $R$, the public key, and the message.
+  \item $S = (r + k\,a) \bmod \ell$.
+  \item Signature is $(R, S)$, a fixed 64 bytes.
+\end{enumerate}
+
+\textbf{Verify} $(R, S)$ on $M$: compute $k = H(R\concat A\concat M)\bmod \ell$ and accept iff
+\[
+S\,B = R + k\,A.
+\]
+
+\begin{whybox}
+\textbf{Why verification works.} By definition $S = r + ka \pmod \ell$, and scalars on this curve act mod $\ell$. So
+\[
+S B = (r + ka)B = rB + k(aB) = R + kA.
+\]
+The signer's secret scalar $a$ enters the right side only through the public $A = aB$, so the verifier checks the equation with public data alone. Notice the structure is Schnorr's: a commitment $R$, a challenge $k$ that hashes $R$ together with the message, and a response $S$ that ties them to the secret. Hashing $R$ \emph{into} the challenge is what makes Schnorr/EdDSA cleanly provable and non-malleable, unlike (EC)DSA's bolted-together $s = k^{-1}(h + dr)$.
+\end{whybox}
+
+\begin{focusbox}
+What Ed25519 fixed, point by point:
+\begin{itemize}
+  \item \textbf{Deterministic nonce} ($r = H(\mathrm{pre}\concat M)$): the PS3 and Bitcoin disasters are structurally impossible -- there is no RNG to fail and no way to repeat $r$ across distinct messages.
+  \item \textbf{No modular inversion} in signing: $S = r + ka$ has no $k^{-1}$, so no division-by-zero edge cases and easier constant-time code.
+  \item \textbf{Complete addition formulas} on the Edwards curve: every point addition uses one formula with no exceptional cases, removing a class of implementation bugs and timing leaks.
+  \item \textbf{Strong unforgeability and non-malleability}: the challenge hashes $R$, so the $(r, n-s)$ trick that plagues ECDSA does not apply.
+  \item \textbf{Fast}: tens of thousands of signatures and verifications per second on a laptop core; batch verification is faster still.
+\end{itemize}
+\end{focusbox}
+
+\begin{applicationbox}
+Ed25519 is now the default host-key and user-key type in OpenSSH (\texttt{ssh-keygen -t ed25519}); it authenticates the identity keys in Signal's X3DH handshake (Chapter~27); it signs Git commits and tags, Debian and Arch package metadata, certificate-transparency logs, and many cryptocurrency and DNSSEC deployments; and it is a standard signature algorithm in TLS~1.3. If you are choosing a signature scheme for a new system in the absence of a hard interoperability or post-quantum constraint, Ed25519 is the conservative default.
+\end{applicationbox}
+
+\begin{implementbox}
+A schematic of Ed25519 signing, to show the \emph{shape} of the algorithm. \textbf{For learning only -- do not use.} This sketch omits clamping details, point encoding/decoding, cofactor handling, and constant-time discipline; a real implementation (use \texttt{libsodium} or \texttt{cryptography}) gets all of those exactly right.
+\begin{lstlisting}[language=Python]
+import hashlib
+
+# Assume curve helpers exist: B (base point), L (subgroup order),
+# point_mul(scalar, P), point_add(P, Q), encode(P) -> bytes.
+def H(b: bytes) -> int:
+    return int.from_bytes(hashlib.sha512(b).digest(), "little")
+
+def sign(A_enc: bytes, M: bytes, a: int, prefix: bytes):
+    r = H(prefix + M) % L                 # deterministic nonce -- no RNG
+    R = point_mul(r, B)
+    R_enc = encode(R)
+    k = H(R_enc + A_enc + M) % L           # challenge binds R, A, M
+    S = (r + k * a) % L                    # response: NO inversion
+    return R_enc + S.to_bytes(32, "little")
+
+def verify(A, A_enc: bytes, M: bytes, sig: bytes) -> bool:
+    R_enc, S = sig[:32], int.from_bytes(sig[32:], "little")
+    R = decode(R_enc)
+    k = H(R_enc + A_enc + M) % L
+    # accept iff  S*B == R + k*A
+    return point_mul(S, B) == point_add(R, point_mul(k, A))
+\end{lstlisting}
+The two lines worth memorizing: the nonce $r$ comes from hashing secret prefix plus message (never an RNG), and verification checks $S B = R + kA$ with no inversion in sight.
+\end{implementbox}
+
+\section{What Signatures Guarantee -- and What They Do Not}
+\label{ch22:guarantees}
+
+It is as important to know the limits as the powers. A valid signature is a precise but \emph{narrow} statement, and most real-world signature failures come from expecting it to say more than it does.
+
+\textbf{A valid signature $\sigma$ on $m$ under $pk$ guarantees:}
+\begin{itemize}
+  \item \textbf{Authenticity:} someone holding the private key matching $pk$ produced $\sigma$ for this exact $m$.
+  \item \textbf{Integrity:} $m$ has not changed since it was signed; one flipped bit makes verification fail.
+  \item \textbf{Non-repudiation:} the signer cannot later credibly deny it (modulo key compromise).
+\end{itemize}
+
+\textbf{It does \emph{not} guarantee:}
+\begin{itemize}
+  \item \textbf{That $pk$ belongs to who you think.} A signature ties a message to a \emph{key}, not to a \emph{person}. Binding a key to an identity is the job of \emph{certificates} and PKI (Chapter~24). Verify a perfect signature under the wrong public key and you have authenticated an impostor.
+  \item \textbf{Confidentiality.} Signatures protect integrity and origin, not secrecy. The message is typically sent in the clear alongside $\sigma$. If you need both, sign \emph{and} encrypt -- and be careful how you combine them (Chapter~16).
+  \item \textbf{Freshness.} A signature on ``Pay Bob \$100'' is equally valid today and replayed next year. Signatures say nothing about \emph{when} or \emph{how many times}; defeating replay needs a nonce, timestamp, or counter \emph{inside} the signed message (the same lesson as MACs, Chapter~15).
+  \item \textbf{That the signer read or meant the message.} The key endorsed these bytes; it did not promise the human understood them. ``Blind signing'' of opaque hashes has cost people real money in hardware-wallet phishing.
+  \item \textbf{Anything after key compromise.} If $sk$ leaks (the PS3, the Android wallets), every past and future signature is suspect. This motivates short-lived keys, revocation (Chapter~24), and key-rotation hygiene.
+\end{itemize}
+
+\begin{trapbox}
+\textbf{Sign-then-encrypt vs.\ encrypt-then-sign, and identity confusion.} Naively signing a plaintext and then encrypting it ($\Enc(\Sign(m))$) lets a recipient \emph{strip} your signature and re-encrypt the still-signed message to a third party, who is fooled into thinking you sent it to \emph{them}. Naively encrypting then signing the ciphertext lets an attacker strip your signature and re-sign the ciphertext as their own. The robust fix is to bind identities \emph{inside} the signed/encrypted content -- e.g.\ sign ``\texttt{from Alice to Bob: } $m$'' -- so the message is meaningless out of context. This ``surreptitious forwarding'' problem famously bit early PGP/email designs.
+\end{trapbox}
+
+\begin{intuitionbox}
+Hold two pictures side by side. A \emph{certificate} is a signature whose \emph{message} is ``public key $pk$ belongs to \texttt{example.com}'', signed by a certificate authority. So signatures are the atoms; PKI (Chapter~24) is the molecule that finally connects a key to a name you can trust. Everything in TLS, code-signing, and the web's trust model is built by stacking signatures: a chain of ``this key vouches for that key'' all the way down to a root you decided to trust in advance.
+\end{intuitionbox}
+
+\section{Putting the Family Together}
+\label{ch22:summary}
+
+The three live signature families trade off along the same axes: underlying hard problem, key/signature size, speed, and how much rope they give a careless implementer.
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+\textbf{Scheme} & \textbf{Hard problem} & \textbf{Sig size (128-bit)} & \textbf{Nonce?} & \textbf{Main risk} \\
+\midrule
+RSA-PSS    & Factoring        & 256--384 B & none        & big keys, padding bugs \\
+DSA        & DLP in $\Zns{p}$ & 64 B       & critical    & nonce reuse/bias \\
+ECDSA      & EC-DLP           & 64 B       & critical    & nonce reuse, malleable \\
+Ed25519    & EC-DLP (Schnorr) & 64 B       & built-in    & few; misuse-resistant \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The message flow is the same for all of them, and it is worth fixing in a single picture: the signer applies a private operation to a hash of the message; the verifier applies the matching public operation and checks consistency.
+
+\begin{center}
+\begin{tikzpicture}[
+  font=\small,
+  box/.style={draw, rounded corners, minimum height=8mm, minimum width=20mm, align=center},
+  every node/.style={inner sep=3pt},
+  >={Stealth[round]}
+]
+  % Signer side
+  \node[box, fill=aliceblue!12] (m1) at (0,0) {message $m$};
+  \node[box, fill=aliceblue!12] (h1) at (0,-1.6) {$\Hash(m)$};
+  \node[box, fill=aliceblue!25] (sig) at (0,-3.2) {$\Sign_{sk}$\\ $\to \sigma$};
+  \draw[->] (m1) -- (h1);
+  \draw[->] (h1) -- (sig);
+  \node[above=1mm of m1, aliceblue] {\textbf{Alice (private key $sk$)}};
+
+  % Wire
+  \node[box, fill=gray!8] (wire) at (4.2,-1.6) {send\\ $(m, \sigma)$};
+  \draw[->] (m1) .. controls (2.1,0.2) and (3,-1.0) .. (wire);
+  \draw[->] (sig) .. controls (2.1,-3.4) and (3,-2.2) .. (wire);
+  \node[evered, below=0.5mm of wire] {Eve may read/alter};
+
+  % Verifier side
+  \node[box, fill=bobgreen!12] (h2) at (8.4,-0.6) {$\Hash(m)$};
+  \node[box, fill=bobgreen!25] (vfy) at (8.4,-2.6) {$\Vrfy_{pk}$\\ $\sigma \stackrel{?}{=} \Hash(m)$};
+  \draw[->] (wire) .. controls (6,-0.6) and (7,-0.6) .. (h2);
+  \draw[->] (wire) .. controls (6,-2.6) and (7,-2.6) .. (vfy);
+  \draw[->] (h2) -- (vfy);
+  \node[above=1mm of h2, bobgreen] {\textbf{Bob (public key $pk$)}};
+  \node[box, fill=bobgreen!10, right=6mm of vfy] (out) {accept\\ / reject};
+  \draw[->] (vfy) -- (out);
+\end{tikzpicture}
+\end{center}
+
+Hash to fix the message size and kill algebraic structure; apply the private operation; ship message and signature together; verify with the public key. The schemes differ only in what the ``private operation'' is -- a $d$-th power mod $N$, a discrete-log signature equation, or a Schnorr response on a curve -- and in how much care the nonce demands.
+
+\section{Exercises}
+\label{ch22:exercises}
+
+\begin{exercise}[MAC vs.\ signature, in court]
+Alice sends Bob a money order authenticated with a shared-key MAC. Bob takes the tag to a judge as proof Alice authorized the payment. Explain precisely why the MAC tag is \emph{not} convincing evidence, and why a digital signature would be. Which exact property is doing the work?
+\end{exercise}
+
+\begin{exercise}[Textbook RSA forgery]
+With $N = 3233$, $e = 17$, $d = 2753$ (Example~\ref{ch22:ex-textbook}), an attacker has obtained Alice's textbook-RSA signatures on $m_1 = 3$ and $m_2 = 5$. Produce, with no knowledge of $d$, a valid signature on $m^* = 15 \bmod 3233$. Show the arithmetic and verify your forgery passes $\sigma^e \equiv m^* \pmod N$.
+\end{exercise}
+
+\begin{exercise}[Why hashing stops the forgery]
+Repeat the previous exercise but for \emph{hash-then-sign} RSA. Explain why the multiplicative trick now fails, and state precisely what computational problem the attacker would have to solve instead (name it, and say on which object -- message or digest).
+\end{exercise}
+
+\begin{exercise}[DSA verification by hand]
+Using the DSA parameters of Example~\ref{ch22:ex-dsa} ($p=23$, $q=11$, $g=4$, $y=18$), verify the signature $(r,s) = (3,10)$ on a message with digest $h = 9$ by computing $w, u_1, u_2$, and $v$ independently, and confirming $v = r$.
+\end{exercise}
+
+\begin{exercise}[Sign with ECDSA]
+On the curve of Example~\ref{ch22:ex-ecdsa} ($\F_{17}$, $G=(5,1)$, $n=19$, $d=7$, $Q=(0,6)$), sign a message with digest $h = 4$ using nonce $k = 5$. You are given $5G = (9, 16)$. Compute $r$, then $s$, and write the signature. (You will need $5^{-1}\bmod 19$.)
+\end{exercise}
+
+\begin{exercise}[Recover the key from reuse]
+Continuing the previous setup, suppose Alice also signed a message with digest $h' = 13$ using the \emph{same} nonce $k = 5$, producing $s'$. Without using the known value $d=7$, set up the two-signature equations, solve for $k$, then for $d$, and confirm you recover $d = 7$. (Compute $s'$ first from the signing equation, then pretend you only know $r, s, s', h, h'$.)
+\end{exercise}
+
+\begin{exercise}[Spot the bad nonce]
+You are auditing a batch of ECDSA signatures from one signer. Describe the single cheap check that detects same-nonce reuse across a corpus of signatures, why it works, and what an attacker who runs the same check can then do. Relate this to how the 2013 Android-wallet thefts were carried out on the public blockchain.
+\end{exercise}
+
+\begin{exercise}[ECDSA malleability]
+Show that if $(r, s)$ verifies under public key $Q$ for message digest $h$, then $(r,\, n - s)$ also verifies. (Hint: trace what happens to $w = s^{-1}$, then to $u_1, u_2$, and finally to the recovered point's $x$-coordinate.) State the ``low-$s$'' canonicalization rule that removes the ambiguity.
+\end{exercise}
+
+\begin{exercise}[Why no inversion in EdDSA]
+EdDSA's response is $S = r + ka \bmod \ell$, with no $k^{-1}$, whereas ECDSA's is $s = k^{-1}(h + dr)\bmod n$. Give two concrete engineering advantages of avoiding the modular inverse (think edge cases and side channels), and explain why hashing $R$ into the challenge $k$ makes EdDSA strongly unforgeable where ECDSA is only malleably unforgeable.
+\end{exercise}
+
+\begin{exercise}[The narrow promise]
+For each scenario, say whether a correctly verifying signature defends against it, and if not, name the mechanism that does: (a) an attacker flips a byte of the message in transit; (b) an attacker replays last week's signed ``unlock door'' command; (c) an attacker presents a valid signature under a key that is not actually the bank's; (d) an eavesdropper reads the signed message's contents.
+\end{exercise}
+
+\begin{exercise}[Deterministic but not random]
+RFC~6979 derives $k$ deterministically from the private key and the message. Argue that this satisfies the real security requirement on the nonce even though $k$ is no longer ``random,'' and identify exactly which property of an HMAC-based derivation guarantees that two distinct messages cannot collide on the same $k$ in practice.
+\end{exercise}
+
+\begin{exercise}[Surreptitious forwarding]
+Alice computes $\Enc_{pk_B}(\Sign_{sk_A}(m))$ and sends it to Bob, intending ``$m$, from Alice, for Bob.'' Show how Bob can make Carol believe Alice sent $m$ to \emph{Carol}. Then propose a concrete change to what gets signed that defeats the attack, and explain why it works.
+\end{exercise}

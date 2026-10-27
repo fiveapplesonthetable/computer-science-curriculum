@@ -1,0 +1,514 @@
+\chapter{Authenticated Encryption}
+
+Up to now we have built two kinds of machine and kept them in separate rooms. One kind hides a message: stream ciphers, block ciphers, the modes that turn a block cipher into something that encrypts arbitrary data. The other kind detects tampering: hash functions, and the keyed message authentication codes built on top of them. Encryption protects \emph{confidentiality}; a MAC protects \emph{integrity} and \emph{data-origin authentication}. The natural next question is the one a working engineer actually faces: I have a channel, I have a key, I want to send a message that nobody can read and nobody can secretly alter. Which machine do I use?
+
+The answer, almost always, is ``both, and you must combine them in exactly the right way, or you get neither.'' That last clause is the whole subject of this chapter. Combining encryption and authentication looks like it should be trivial -- encrypt, then also MAC, ship both, done. It is not trivial. There are three obvious ways to glue the two primitives together, two of them are broken in general, and the broken ones were the popular choices for years. Real protocols bled from getting this wrong. The modern resolution is a single primitive, \emph{authenticated encryption with associated data} (AEAD), that does both jobs in one pass with one key and one security definition, and refuses to hand you a fragile pile of parts to assemble yourself.
+
+We will start with why you almost never want confidentiality without integrity, watch a concrete attack on ``encryption alone,'' state the AEAD definition and the associated-data idea, then dissect the two AEAD schemes that carry essentially all of today's secure traffic: AES-GCM (counter mode stapled to a polynomial hash called GHASH) and ChaCha20-Poly1305. GCM has a spectacular failure mode -- reuse a nonce once and the whole thing unravels -- and we will carry out that attack with small numbers so you feel exactly why it happens. By the end you should reach for an AEAD by reflex, know which one and why, and never again write ``encrypt then maybe checksum'' in a real system.
+
+\chapterline
+
+\section{Why Confidentiality Without Integrity Is a Trap}
+\label{ch16:why-both}
+
+Beginners carry a stubborn intuition: if Eve cannot \emph{read} my ciphertext, surely she cannot \emph{change} it into anything meaningful either. It feels right. The ciphertext looks like random noise; how could an attacker who cannot decode it nudge it toward a chosen plaintext? The intuition is wrong, and the reason it is wrong is baked into the structure of the very ciphers we praised for being fast and clean.
+
+Recall the one-time pad and every stream cipher built in its image (Chapter on stream ciphers). Encryption is $c = m \xor k$ where $k$ is the keystream. This is gloriously simple and perfectly confidential when $k$ is used once. But look at what an attacker who never learns $k$ can still do. Suppose Eve knows -- or guesses -- that the plaintext at some position is a particular value, or she just wants to flip specific bits. She picks a difference $\Delta$ and replaces $c$ with $c' = c \xor \Delta$. Bob decrypts:
+\[
+m' = c' \xor k = (m \xor k \xor \Delta) \xor k = m \xor \Delta .
+\]
+The keystream cancels exactly as it did for the legitimate plaintext, and Bob recovers $m \xor \Delta$ -- the original message with Eve's chosen bits flipped. Eve changed the plaintext in a controlled way without knowing a single bit of the key or the message. This property is called \emph{malleability}, and it is fatal whenever integrity matters.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,
+  blk/.style={draw,rounded corners,minimum width=1.5cm,minimum height=0.6cm},
+  xo/.style={draw,circle,inner sep=1.2pt}]
+\node[blk,fill=green!8] (m) at (0,0) {$m$};
+\node[xo] (e) at (1.8,0) {$\xor$};
+\node at (1.8,0.75) {$k$};
+\node[blk,fill=red!6] (c) at (3.6,0) {$c$};
+\node[xo] (tamper) at (5.4,0) {$\xor$};
+\node at (5.4,0.75) {$\Delta$ (Eve)};
+\node[blk,fill=red!6] (cp) at (7.2,0) {$c'$};
+\node[xo] (d) at (9.0,0) {$\xor$};
+\node at (9.0,0.75) {$k$};
+\node[blk,fill=green!8] (mp) at (11.0,0) {$m\xor\Delta$};
+\draw[-Stealth] (m)--(e); \draw[-Stealth] (e)--(c);
+\draw[-Stealth] (c)--(tamper); \draw[-Stealth] (tamper)--(cp);
+\draw[-Stealth] (cp)--(d); \draw[-Stealth] (d)--(mp);
+\draw[decorate,decoration={brace,amplitude=4pt},gray] (2.9,-0.5)--(7.9,-0.5);
+\node[gray] at (5.4,-1.0) {public channel: Eve sees only $c$, never $k$ or $m$};
+\end{tikzpicture}
+\caption{Stream-cipher malleability. Eve XORs a chosen mask $\Delta$ into the ciphertext; the keystream $k$ cancels on both encryption and decryption, so Bob recovers $m\xor\Delta$ -- a controlled change to the plaintext made without knowing the key.}
+\label{ch16:malleability-fig}
+\end{figure}
+
+\begin{intuitionbox}
+Encryption scrambles the \emph{content} of a message; it says nothing about whether the message you received is the one that was sent. Picture a sealed envelope written in a code only Bob can read. Confidentiality means Eve cannot read what is inside. But nothing about the seal stops Eve from steaming it open, scribbling over it (even blindly), and resealing -- or from swapping it for a different sealed envelope entirely. A lock that hides is not a lock that detects. You need a second mechanism whose only job is to scream when a bit changes.
+\end{intuitionbox}
+
+\begin{attackbox}
+\textbf{Flipping a transfer amount under encryption.} A toy banking gateway sends instructions as fixed-format ASCII encrypted with a stream cipher: \texttt{PAY USER 0001 AMOUNT 0000100}. Suppose Eve knows the format (Kerckhoffs: she knows everything but the key) and knows the byte offset of the amount field. She does not know the keystream and cannot read the ciphertext, but she does not need to -- she is just instantiating Figure~\ref{ch16:malleability-fig} with a $\Delta$ aimed at one byte. The ASCII for the digit \texttt{1} is \texttt{0x31}; for \texttt{9} it is \texttt{0x39}. Their XOR difference is $\texttt{0x31} \xor \texttt{0x39} = \texttt{0x08}$. Eve XORs the ciphertext byte at the leading-amount position with \texttt{0x08}. When Bob decrypts, that one plaintext byte changes from \texttt{1} to \texttt{9}: the instruction now reads \texttt{AMOUNT 9000100}. Eve has multiplied the transfer ninety-fold without breaking the encryption at all. She broke \emph{integrity}, which the cipher never promised to protect.
+\end{attackbox}
+
+This is not a quirk of stream ciphers. CBC mode has its own malleability: flipping a bit in ciphertext block $C_{i}$ flips the same bit in plaintext block $P_{i+1}$ (while turning block $P_i$ into garbage), because CBC decryption XORs the previous ciphertext block into the decrypted block. CTR mode is exactly as malleable as a stream cipher, for the same reason -- it \emph{is} a stream cipher. The lesson generalizes: \textbf{encryption schemes that achieve confidentiality say nothing about integrity, and most of them are actively malleable.} If you want Bob to reject a tampered ciphertext, you must add a mechanism that checks integrity. That mechanism is a MAC, and the discipline of bolting it on correctly is authenticated encryption.
+
+\begin{trapbox}
+``It's encrypted, so it can't be forged'' is one of the most expensive false beliefs in applied cryptography. WEP (early WiFi) encrypted with RC4 and ``protected integrity'' with a plain CRC32 checksum -- a linear, unkeyed function. Because both RC4's keystream XOR and CRC32 are linear, an attacker could flip ciphertext bits \emph{and} fix up the checksum to match, forging valid-looking packets without the key. Confidentiality was present; integrity was an illusion. We will return to WEP's wreckage in the WiFi chapter, but hold the shape of the mistake now: a checksum is not a MAC, and encryption is not integrity.
+\end{trapbox}
+
+\section{What ``Secure'' Means Here: AE and AEAD}
+\label{ch16:definitions}
+
+To combine encryption and authentication we first need to say precisely what we want the combination to achieve. We already have a confidentiality goal from earlier chapters -- indistinguishability under chosen-plaintext attack (IND-CPA), the property that ciphertexts leak nothing about plaintexts even to an adversary who can get things encrypted. Integrity gets its own goal.
+
+\begin{definition}[Ciphertext integrity, INT-CTXT]
+\label{ch16:int-ctxt}
+A symmetric encryption scheme $(\Gen,\Enc,\Dec)$ has \emph{ciphertext integrity} if no $\PPT$ adversary, allowed to request encryptions of any messages it likes under the secret key, can produce a \emph{new} ciphertext (one not returned by an encryption query) that $\Dec$ accepts as valid rather than rejecting. Formally, the adversary wins if it outputs a ciphertext $c^{*}$ with $\Dec_k(c^{*}) \neq \bot$ and $c^{*}$ was never an output of the encryption oracle; the scheme is INT-CTXT secure if the winning probability is $\negl$.
+\end{definition}
+
+The $\bot$ symbol (``bottom'') is the decryption routine's way of saying ``reject -- this is not a valid ciphertext.'' A scheme with ciphertext integrity is one where the \emph{only} ciphertexts Bob will accept are ones Alice actually produced. Eve can copy them, but she cannot manufacture a fresh one that decrypts to anything at all.
+
+\begin{definition}[Authenticated encryption]
+\label{ch16:ae-def}
+A scheme is an \emph{authenticated encryption} (AE) scheme if it is both IND-CPA secure (confidentiality) and INT-CTXT secure (integrity).
+\end{definition}
+
+Why is this pairing the right target? Because, remarkably, it implies something stronger that you might have asked for instead: security against chosen-\emph{ciphertext} attacks (IND-CCA), where the adversary may even submit ciphertexts of its choice to a decryption oracle. The following is one of the cleanest results in symmetric crypto.
+
+\begin{theorem}[AE implies CCA security]
+\label{ch16:ae-implies-cca}
+If a scheme is IND-CPA secure and INT-CTXT secure, then it is IND-CCA secure.
+\end{theorem}
+
+\begin{whybox}
+The intuition is short and worth internalizing. In a chosen-ciphertext attack the adversary's extra power is the decryption oracle: it can hand over ciphertexts and learn their plaintexts. But INT-CTXT says the adversary cannot construct \emph{any} new ciphertext that decrypts to something other than $\bot$. So every ciphertext it submits to the decryption oracle is either one it already got from encryption (telling it nothing new) or a forgery that the oracle rejects with $\bot$ (also telling it nothing). The decryption oracle is therefore useless -- integrity has neutralized it -- and we are left with a plain IND-CPA adversary, which by assumption cannot win. Integrity turns CCA back into CPA. This is exactly why we chase authenticated encryption rather than confidentiality alone: it is the property that makes a channel safe against an attacker who can both read and \emph{inject}, which is every real network.
+\end{whybox}
+
+Now the practical refinement. Real messages are not just a blob of plaintext to be hidden. A network packet has a header -- routing addresses, sequence numbers, version tags, packet types -- that must travel \emph{in the clear} (routers need to read it) but must still be \emph{authenticated} (an attacker must not be able to alter it undetected). A TLS record has a content type and a length; a packet has a sequence number you want bound to the payload so it cannot be replayed or reordered. We need a scheme that encrypts some data while authenticating both that data \emph{and} additional unencrypted data, all under one tag.
+
+\begin{definition}[AEAD]
+\label{ch16:aead-def}
+An \emph{authenticated encryption with associated data} (AEAD) scheme is a pair of algorithms
+\[
+\Enc_k(N, A, M) \to C, \qquad \Dec_k(N, A, C) \to M \text{ or } \bot,
+\]
+where $N$ is a \emph{nonce} (a number used once), $A$ is the \emph{associated data} (authenticated but not encrypted), and $M$ is the plaintext (authenticated and encrypted). Decryption returns the plaintext only if the nonce, associated data, and ciphertext are all exactly what encryption produced together; if any of them was altered, it returns $\bot$. Security requires IND-CPA confidentiality of $M$ and INT-CTXT integrity covering $N$, $A$, and $C$ jointly.
+\end{definition}
+
+\begin{intuitionbox}
+Think of AEAD as sealing a shipping crate. The plaintext $M$ is the cargo, sealed inside where no one can see it. The associated data $A$ is the shipping label glued to the outside: everyone can read it (the courier needs the address), but the seal is engineered so that peeling off or editing the label breaks the seal. The nonce $N$ is the unique tracking number stamped on this specific crate so two crates can never be confused or one replayed as another. One operation, one key, one tag, three guarantees: cargo hidden, label fixed, crate unique.
+\end{intuitionbox}
+
+\begin{focusbox}
+The nonce is not a key and not a secret. It can be a counter, it can be sent in the clear, an attacker is allowed to see it. The single rule -- and it is an absolute rule for the schemes in this chapter -- is that a given key must \textbf{never} encrypt two different messages under the \textbf{same nonce}. ``Number used once'' means once per key, forever. We will spend a full section on what happens when this rule is broken for GCM, because the consequence is not a gentle degradation; it is a cliff.
+\end{focusbox}
+
+\section{Three Ways to Glue, Two of Them Broken}
+\label{ch16:composition}
+
+Before the named schemes, settle the generic question: given a secure encryption scheme and a secure MAC \emph{with independent keys} $k_e$ and $k_m$, how do you combine them? There are exactly three natural orderings, and they are not equally good. This is the famous ``generic composition'' analysis of Bellare and Namprempre.
+
+\begin{description}
+  \item[Encrypt-and-MAC (E\&M).] Compute $c = \Enc_{k_e}(m)$ and $t = \MAC_{k_m}(m)$, send $(c, t)$. The tag is computed over the \emph{plaintext}.
+  \item[MAC-then-Encrypt (MtE).] Compute $t = \MAC_{k_m}(m)$, then $c = \Enc_{k_e}(m \concat t)$, send $c$. The tag is hidden inside the ciphertext.
+  \item[Encrypt-then-MAC (EtM).] Compute $c = \Enc_{k_e}(m)$, then $t = \MAC_{k_m}(c)$, send $(c, t)$. The tag is computed over the \emph{ciphertext}.
+\end{description}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,
+  box/.style={draw,rounded corners,minimum width=1.6cm,minimum height=0.7cm}]
+% EtM
+\node at (-3.2,2.3) {\textbf{Encrypt-then-MAC} (use this)};
+\node[box,fill=green!8] (m1) at (-5,1.4) {$m$};
+\node[box,fill=blue!8] (e1) at (-3,1.4) {$\Enc_{k_e}$};
+\node[box,fill=orange!10] (mac1) at (-1,1.4) {$\MAC_{k_m}$};
+\node (out1) at (1.2,1.4) {$(c,\,t)$};
+\draw[-Stealth] (m1)--(e1);
+\draw[-Stealth] (e1)--node[above]{$c$}(mac1);
+\draw[-Stealth] (mac1)--node[above]{$t$}(out1);
+% MtE
+\node at (-3.2,-0.3) {\textbf{MAC-then-Encrypt} (fragile)};
+\node[box,fill=green!8] (m2) at (-5,-1.2) {$m$};
+\node[box,fill=orange!10] (mac2) at (-3,-1.2) {$\MAC_{k_m}$};
+\node[box,fill=blue!8] (e2) at (-1,-1.2) {$\Enc_{k_e}$};
+\node (out2) at (1.0,-1.2) {$c$};
+\draw[-Stealth] (m2)--(mac2);
+\draw[-Stealth] (mac2)--node[above]{$m\|t$}(e2);
+\draw[-Stealth] (e2)--(out2);
+% E&M
+\node at (4.6,2.3) {\textbf{Encrypt-and-MAC} (fragile)};
+\node[box,fill=green!8] (m3) at (3,1.4) {$m$};
+\node[box,fill=blue!8] (e3) at (5,2.0) {$\Enc_{k_e}$};
+\node[box,fill=orange!10] (mac3) at (5,0.8) {$\MAC_{k_m}$};
+\node (out3) at (7,1.4) {$(c,\,t)$};
+\draw[-Stealth] (m3)--(e3);
+\draw[-Stealth] (m3)--(mac3);
+\draw[-Stealth] (e3)--node[above]{$c$}(out3);
+\draw[-Stealth] (mac3)--node[below]{$t$}(out3);
+\end{tikzpicture}
+\caption{The three generic compositions. Only Encrypt-then-MAC is secure for \emph{any} secure cipher and MAC; the other two depend on extra properties and have broken real systems.}
+\label{ch16:composition-fig}
+\end{figure}
+
+Here is the verdict, and then the reasoning.
+
+\textbf{Encrypt-then-MAC is the one that always works.} If $\Enc$ is IND-CPA secure and $\MAC$ is a strongly unforgeable MAC, then EtM is an authenticated encryption scheme -- no matter what the underlying cipher and MAC are, as long as each is individually secure. The reason is clean. The MAC covers the ciphertext $c$. Before Bob decrypts anything, he checks $\MAC_{k_m}(c) \stackrel{?}{=} t$. By unforgeability, the only $c$ values that pass are ones Alice actually sent, so Bob's decryption routine never even runs on an attacker-chosen ciphertext. INT-CTXT falls out directly: a forged ciphertext fails the MAC check and is rejected as $\bot$. Confidentiality is untouched because the tag is computed on $c$, which IND-CPA already says leaks nothing about $m$. Verify before you decrypt, and an attacker's injected ciphertext dies at the door.
+
+\textbf{Encrypt-and-MAC can leak plaintext.} The tag $t = \MAC_{k_m}(m)$ is sent in the clear and is a deterministic function of the plaintext. A standard MAC makes no promise to hide its input -- HMAC of a message is the same every time for the same message. So if Alice sends the same plaintext twice, the tags are identical, and Eve learns ``these two messages are equal'' without breaking the encryption. That violates IND-CPA. E\&M can also fail to give ciphertext integrity, because the MAC says nothing about $c$.
+
+\textbf{MAC-then-Encrypt is secure only for \emph{some} ciphers, and the exceptions bled in practice.} Here the tag is inside the ciphertext, so Bob must \emph{decrypt first} to even see the tag, then check it. Decrypting attacker-controlled bytes before authenticating them is the original sin. If the decryption step leaks any information about \emph{why} a ciphertext was malformed -- a padding error versus a MAC error, or merely a timing difference between them -- the attacker gets an oracle. This is precisely the padding-oracle family of attacks (POODLE, Lucky 13, the original Vaudenay attack), which broke MtE-with-CBC in SSL/TLS for years.
+
+\begin{attackbox}
+\textbf{The padding oracle, in one paragraph.} TLS up through 1.2 used MAC-then-Encrypt with CBC-mode AES. To decrypt, Bob removes CBC padding, \emph{then} checks the MAC. If the padding is malformed he can reject before even computing the MAC -- and if that rejection is observably different (a distinct error, or just faster), the attacker learns ``this ciphertext had valid padding'' for any ciphertext he submits. Vaudenay showed that a valid-padding oracle is enough to decrypt the entire message byte by byte, no key required: you tamper with a ciphertext block, watch whether the padding check passes, and each pass reveals one byte of intermediate state. Lucky 13 (2013) revived the attack through a \emph{timing} side channel even after implementations tried to hide the explicit error. The root cause is structural: MtE forces you to process unauthenticated ciphertext, and any leak from that processing is an oracle. Encrypt-then-MAC has no such step -- a bad ciphertext never reaches the decryptor.
+\end{attackbox}
+
+\begin{trapbox}
+\textbf{Do not separate encryption and authentication if you can avoid it.} Even Encrypt-then-MAC, the safe composition, asks you to manage two keys, two primitives, the right order, constant-time tag comparison, and ``verify before decrypt'' -- and one slip reintroduces a padding oracle or a key-reuse bug. The industry's hard-won conclusion is to not hand engineers a do-it-yourself kit at all. Use a single AEAD primitive that bakes the correct composition in, exposes one function, and makes the dangerous orderings unrepresentable. That is what GCM and ChaCha20-Poly1305 are. Reach for them; do not reinvent EtM by hand unless you have a very specific reason and a cryptographer reviewing it.
+\end{trapbox}
+
+\begin{historybox}
+The generic-composition question was settled theoretically by Mihir Bellare and Chanathip Namprempre in 2000, and independently informed by Hugo Krawczyk's analysis the same year (``The order of encryption and authentication for protecting communications''). Their conclusion -- Encrypt-then-MAC is the robust choice -- was already known when SSL, IPsec, and SSH each picked a \emph{different} ordering. SSL/TLS chose MAC-then-Encrypt; IPsec chose Encrypt-then-MAC; the original SSH chose Encrypt-and-MAC. The protocol that picked the theoretically sound option, IPsec, was the one spared the padding-oracle decade. It is a rare case where the textbook answer and the body count agree precisely.
+\end{historybox}
+
+\section{AES-GCM: Counter Mode Meets a Polynomial Hash}
+\label{ch16:gcm}
+
+Galois/Counter Mode is the AEAD that secures the majority of TLS connections on the planet, and it is the default in IPsec, SSH, and disk encryption. It is fast because both halves parallelize and AES has hardware support (the \texttt{AES-NI} and \texttt{PCLMULQDQ} instructions), and it is an AEAD by construction rather than by hand-assembly. Structurally it is two ideas welded together: CTR mode for confidentiality, and a keyed polynomial hash called GHASH for integrity. Let us build each, then the weld.
+
+\subsection{The confidentiality half: CTR mode}
+\label{ch16:gcm-ctr}
+
+Counter mode turns a block cipher into a stream cipher. Pick a per-message counter block, encrypt successive counter values with AES to produce a keystream, XOR it onto the plaintext. In GCM the counter is derived from the 96-bit nonce $N$: the first counter block is $J_0 = N \concat 0^{31}1$ (the nonce followed by the 32-bit integer $1$), and the blocks that encrypt data use $J_0+1, J_0+2, \dots$, incrementing the low 32 bits. Block $i$ of plaintext is encrypted as
+\[
+C_i = P_i \xor \operatorname{AES}_k(J_0 + i).
+\]
+Counter block $J_0$ itself is reserved -- it encrypts the authentication tag, not data. CTR is IND-CPA secure as long as no counter block ever repeats under the same key, which is exactly why the nonce must be unique: a repeated nonce makes $J_0$ and all the $J_0+i$ repeat, reusing keystream. Hold that thought; it is the seed of the catastrophe in the next section.
+
+\subsection{The integrity half: GHASH over $\F_{2^{128}}$}
+\label{ch16:gcm-ghash}
+
+GHASH is a \emph{universal hash} evaluated in the finite field $\F_{2^{128}}$. Treat every 128-bit block as an element of $\F_{2^{128}}$ -- the field of polynomials over $\F_2$ modulo the irreducible $x^{128} + x^7 + x^2 + x + 1$ (Chapter on finite fields built exactly these objects). Field addition is XOR; field multiplication is carryless polynomial multiplication reduced by that modulus. Let $H = \operatorname{AES}_k(0^{128})$ be the \emph{hash key}: AES applied to the all-zero block. GHASH takes the associated data $A$ and ciphertext $C$, splits the concatenation (with a final block encoding the bit-lengths of $A$ and $C$) into blocks $X_1, X_2, \dots, X_m$, and evaluates
+\[
+\operatorname{GHASH}_H(X_1,\dots,X_m) = X_1 H^{m} \xor X_2 H^{m-1} \xor \cdots \xor X_{m-1} H^{2} \xor X_m H,
+\]
+all arithmetic in $\F_{2^{128}}$. It is a polynomial in the secret point $H$ whose coefficients are the data blocks. The authentication tag is this hash, masked by one block of keystream:
+\[
+T = \operatorname{GHASH}_H(A, C) \xor \operatorname{AES}_k(J_0).
+\]
+
+\begin{whybox}
+Why is a polynomial in a secret point a good integrity check? GHASH is what cryptographers call an \emph{$\eps$-almost-universal} hash: for any two distinct inputs, the probability (over the random hash key $H$) that they collide is tiny -- at most about $m/2^{128}$ for $m$-block messages. The mechanism is the fundamental theorem of algebra in disguise. If an attacker changes the data from blocks $X$ to blocks $X'$, the two GHASH outputs differ by $(X_1{-}X_1')H^m \xor \cdots \xor (X_m{-}X_m')H$, which is a nonzero polynomial in $H$ of degree at most $m$. A nonzero degree-$m$ polynomial over a field has at most $m$ roots, so at most $m$ values of $H$ make the difference vanish. The attacker does not know $H$ (it is locked behind AES of zero), so the chance a blind tampering lands on one of those $\le m$ bad points out of $2^{128}$ is negligible. The keystream mask $\operatorname{AES}_k(J_0)$ then hides the raw hash value so the attacker cannot even see GHASH outputs to learn about $H$. Integrity rests on: you cannot guess a root of a polynomial whose secret evaluation point you cannot see.
+\end{whybox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,
+  blk/.style={draw,rounded corners,minimum width=1.3cm,minimum height=0.6cm},
+  aes/.style={draw,fill=blue!8,minimum width=1.0cm,minimum height=0.6cm},
+  xo/.style={draw,circle,inner sep=1.2pt}]
+\foreach \i/\lbl/\pp/\cc in {0/{$J_0{+}1$}/{$P_1$}/{$C_1$}, 1/{$J_0{+}2$}/{$P_2$}/{$C_2$}, 2/{$J_0{+}3$}/{$P_3$}/{$C_3$}} {
+  \node[aes] (a\i) at (\i*2.4,2.0) {AES$_k$};
+  \node (ctr\i) at (\i*2.4,2.9) {\lbl};
+  \draw[-Stealth] (ctr\i)--(a\i);
+  \node[xo] (xor\i) at (\i*2.4,1.1) {$\xor$};
+  \draw[-Stealth] (a\i)--(xor\i);
+  \node[blk,fill=green!8] (p\i) at (\i*2.4-1.3,1.1) {\pp};
+  \draw[-Stealth] (p\i)--(xor\i);
+  \node[blk,fill=red!6] (c\i) at (\i*2.4,0.2) {\cc};
+  \draw[-Stealth] (xor\i)--(c\i);
+}
+% ghash chain
+\node[draw,fill=orange!10,minimum width=5.6cm,minimum height=0.7cm] (gh) at (2.4,-1.1) {$\operatorname{GHASH}_H(\,A,\;C_1\|C_2\|C_3,\;\text{len}\,)$};
+\draw[-Stealth] (c0)--(gh); \draw[-Stealth] (c1)--(gh); \draw[-Stealth] (c2)--(gh);
+\node[blk,fill=magenta!8] (ad) at (-1.3,0.2) {$A$};
+\draw[-Stealth] (ad) |- (gh.west);
+\node[xo] (tmask) at (6.0,-1.1) {$\xor$};
+\draw[-Stealth] (gh)--(tmask);
+\node[aes] (a0) at (6.0,-0.1) {AES$_k(J_0)$};
+\draw[-Stealth] (a0)--(tmask);
+\node (T) at (7.4,-1.1) {$T$};
+\draw[-Stealth] (tmask)--(T);
+\end{tikzpicture}
+\caption{AES-GCM. CTR mode (top) produces the ciphertext; GHASH over $\F_{2^{128}}$ absorbs the associated data $A$, the ciphertext, and a length block, then is masked by $\operatorname{AES}_k(J_0)$ to form the tag $T$.}
+\label{ch16:gcm-fig}
+\end{figure}
+
+\subsection{A worked GHASH in a toy field}
+\label{ch16:gcm-toy}
+
+The real field $\F_{2^{128}}$ is too big to trace by hand, so we shrink to $\F_{2^4}$, the field of 4-bit blocks modulo the irreducible polynomial $x^4 + x + 1$. Elements are nibbles; we write them as $0$--$\texttt{f}$ in hex and remember each is a polynomial: $\texttt{b} = 1011_2 = x^3 + x + 1$. Addition is XOR. Multiplication is polynomial multiply, then reduce by $x^4 = x + 1$ (the relation that the modulus gives us, since $x^4 + x + 1 = 0$ means $x^4 = x+1$ in this field).
+
+Let the hash key be $H = \texttt{2} = x$. Suppose after splitting we have just two blocks to authenticate, $X_1 = \texttt{3}$ and $X_2 = \texttt{1}$, so we want
+\[
+\operatorname{GHASH}_H(X_1, X_2) = X_1 H^2 \xor X_2 H .
+\]
+Compute the powers of $H = x$:
+\[
+H = x, \qquad H^2 = x^2 = \texttt{4}.
+\]
+Now the two terms.
+\[
+X_1 H^2 = \texttt{3} \cdot \texttt{4} = (x+1)(x^2) = x^3 + x^2 = \texttt{c}.
+\]
+That product has degree $3 < 4$, so no reduction is needed. The second term:
+\[
+X_2 H = \texttt{1} \cdot \texttt{2} = (1)(x) = x = \texttt{2}.
+\]
+XOR them: $\texttt{c} \xor \texttt{2} = 1100_2 \xor 0010_2 = 1110_2 = \texttt{e}$. So $\operatorname{GHASH}_x(\texttt{3},\texttt{1}) = \texttt{e}$.
+
+Now watch the universal-hash property bite. Suppose an attacker flips $X_2$ from $\texttt{1}$ to $\texttt{1}\xor\texttt{1}=\texttt{0}$, a difference of $\Delta = \texttt{1}$ in the last block. The hash changes by $\Delta \cdot H = \texttt{1}\cdot\texttt{2} = \texttt{2}$, so the new hash is $\texttt{e}\xor\texttt{2}=\texttt{c}$. For the attacker's forgery to pass, the tag must not change -- which requires $\Delta \cdot H = 0$, i.e. $H = 0$. But $H = x \neq 0$. To force \emph{any} specific tag change the attacker would need to know $H$ and solve for the right $\Delta$, and $H$ is hidden behind AES. In the full field the same algebra holds with $2^{128}$ possible $H$ values and the chance of a blind hit is $\le m/2^{128}$.
+
+\begin{labbox}
+\textbf{Reduction practice.} In $\F_{2^4}$ with $x^4 = x+1$, compute $H^4$ for $H=x$. You get $x^4 = x+1 = \texttt{3}$. Continue: $H^5 = x \cdot \texttt{3} = x^2 + x = \texttt{6}$, $H^6 = x \cdot \texttt{6} = x^3 + x^2 = \texttt{c}$, $H^7 = x\cdot\texttt{c} = x^4 + x^3 = (x+1)+x^3 = x^3+x+1 = \texttt{b}$. Notice the powers of $x$ cycle through nonzero elements -- $x$ is a generator of the multiplicative group $\F_{2^4}^{*}$ of order $15$. Verify $H^{15} = \texttt{1}$ by extending the table. This cyclic structure is the same machinery that makes GHASH a clean polynomial evaluation.
+\end{labbox}
+
+\begin{implementbox}
+A deliberately tiny GHASH and GCM-style tag over $\F_{2^4}$, to make the algebra runnable. This is a learning toy: a 4-bit field gives \emph{zero} real security, multiplication is not constant-time, and nothing here resists a real attacker. Never use this for anything but understanding.
+\begin{lstlisting}[language=Python]
+# Toy GHASH in GF(2^4), modulus x^4 + x + 1.  LEARNING ONLY -- not secure.
+def gf_mul(a, b):
+    """Carryless multiply of two nibbles, reduced mod x^4 + x + 1."""
+    p = 0
+    for _ in range(4):
+        if b & 1:
+            p ^= a
+        b >>= 1
+        carry = a & 0x8          # bit x^3; shifting it makes x^4
+        a = (a << 1) & 0xF
+        if carry:
+            a ^= 0b0011          # x^4 = x + 1  ->  XOR with 0011
+    return p
+
+def ghash(H, blocks):
+    """Horner evaluation: (((X1*H) ^ X2)*H ^ X3)*H ... all in GF(2^4)."""
+    y = 0
+    for X in blocks:
+        y = gf_mul(y ^ X, H)
+    return y
+
+def gcm_tag(H, mask, A_blocks, C_blocks, lenblock):
+    # Authenticate associated data, ciphertext, and a length block, then mask.
+    data = A_blocks + C_blocks + [lenblock]
+    return ghash(H, data) ^ mask
+
+H = 0x2                                # hash key = x  (= AES_k(0) in the real scheme)
+print(hex(ghash(H, [0x3, 0x1])))       # -> 0xe, matching the hand computation
+
+# Flipping the last block changes the tag predictably by Delta*H:
+print(hex(ghash(H, [0x3, 0x0])))       # -> 0xc  ( = 0xe XOR (0x1 * H) )
+\end{lstlisting}
+The Horner form \texttt{y = (y \^{} X)*H} is the standard streaming way to evaluate the GHASH polynomial one block at a time; expand it for two blocks and you recover $X_1 H^2 \xor X_2 H$ exactly.
+\end{implementbox}
+
+\section{The Nonce-Reuse Catastrophe in GCM}
+\label{ch16:gcm-nonce-reuse}
+
+GCM's speed and elegance come with a brittle spot, and it is the single most important thing to know about deploying it. Reuse a nonce -- encrypt two different messages with the same key and the same $N$ -- and you do not merely leak a little. You leak the confidentiality of \emph{both} messages, and worse, you leak the hash key $H$, which lets the attacker forge \emph{arbitrary} messages from then on. One repeated nonce can destroy the integrity of every message under that key.
+
+\subsection{Why a repeat is so much worse than for a plain stream cipher}
+\label{ch16:gcm-why-worse}
+
+Half the disaster you already know. CTR mode is a stream cipher; reusing the nonce reuses the keystream blocks $\operatorname{AES}_k(J_0+i)$. If $C = P \xor S$ and $C' = P' \xor S$ with the same keystream $S$, then $C \xor C' = P \xor P'$ -- the XOR of two plaintexts, with the keystream cancelled, the classic two-time-pad break that leaks the messages. Bad, but the same as any stream cipher misuse.
+
+The GCM-specific calamity is the second half: the attacker recovers the \emph{authentication key} $H$. The two tags are
+\[
+T = \operatorname{GHASH}_H(A, C) \xor \operatorname{AES}_k(J_0), \qquad
+T' = \operatorname{GHASH}_H(A', C') \xor \operatorname{AES}_k(J_0),
+\]
+and because the nonce repeated, $J_0$ repeated, so the masking block $\operatorname{AES}_k(J_0)$ is \emph{identical} in both. XOR the tags and the mask cancels:
+\[
+T \xor T' = \operatorname{GHASH}_H(A, C) \xor \operatorname{GHASH}_H(A', C').
+\]
+The right side is a known polynomial in the unknown $H$ -- its coefficients are the (known) differences of the ciphertext and associated-data blocks, and it equals the (known) value $T \xor T'$. The attacker now has a single polynomial equation $\Phi(H) = 0$ over $\F_{2^{128}}$ whose roots can be found efficiently (polynomial root-finding over a finite field is a solved problem). A degree-$m$ polynomial has at most $m$ roots; with two distinct message lengths the attacker gets a short list of candidate $H$ values and, with a third reused-nonce message or a single forgery attempt, pins down the real one.
+
+Once $H$ is known, the masking is the only secret left in the tag, and the attacker can do affine algebra on tags: GHASH is linear in its block inputs over $\F_{2^{128}}$, so knowing $H$ lets the attacker compute, for any tampered ciphertext, exactly what tag it must carry to verify -- relative to a known good tag. Integrity is gone for the whole key, not just the two reused messages.
+
+\begin{attackbox}
+\textbf{Recovering $H$ from a reused nonce, in the toy field.} Work in $\F_{2^4}$ again, $H$ unknown, modulus $x^4+x+1$. Say two one-block-ciphertext messages were sent under the same nonce (so $J_0$, hence the mask $\operatorname{AES}_k(J_0)=:L$, repeats), with no associated data and a length block $\ell$ that is the same for both, so it cancels. Their tags are
+\[
+T = (C_1 H^2 \xor \ell H) \xor L, \qquad T' = (C_1' H^2 \xor \ell H) \xor L .
+\]
+XOR: $T \xor T' = (C_1 \xor C_1')\,H^2$. Suppose the attacker observes ciphertext blocks $C_1 = \texttt{5}$, $C_1' = \texttt{6}$ and tags whose XOR is $T \xor T' = \texttt{c}$. Then
+\[
+(C_1 \xor C_1')\,H^2 = (\texttt{5}\xor\texttt{6})\,H^2 = \texttt{3}\,H^2 = \texttt{c}.
+\]
+Solve for $H^2$: divide by $\texttt{3}=x+1$. The inverse of $\texttt{3}$ in $\F_{2^4}$ is $\texttt{e}$ (check: $\texttt{3}\cdot\texttt{e}=(x+1)(x^3+x^2+x)=x^4+x=\texttt{1}$ after $x^4=x+1$), so $H^2 = \texttt{c}\cdot\texttt{e}$. Compute $\texttt{c}\cdot\texttt{e}=(x^3+x^2)(x^3+x^2+x)$; reducing gives $\texttt{4}=x^2$. Finally $H^2 = x^2$ gives $H = x = \texttt{2}$ (the square root in characteristic two is unique). The attacker has pulled the secret hash key out of thin air using nothing but two tags and two ciphertexts. In $\F_{2^{128}}$ the arithmetic is bigger but not harder -- the same single equation, the same root-finding -- and the result is the same total collapse.
+\end{attackbox}
+
+\begin{trapbox}
+\textbf{The 96-bit nonce is small, and random nonces collide.} GCM nonces are only 96 bits. If you generate them \emph{randomly} per message under one key, the birthday bound says a collision becomes likely after about $2^{48}$ messages -- and \emph{one} collision is the catastrophe above. $2^{48}$ sounds large until you are a busy server: it is a real limit, and the safe deployment is a \textbf{counter} nonce (message number, never repeating) rather than a random one, with a hard cap of $2^{32}$ messages per key as a comfortable margin. If you cannot guarantee unique nonces -- say, in a distributed system with no shared counter -- do not use plain GCM; use a nonce-misuse-resistant mode like AES-GCM-SIV, which degrades gracefully (a reused nonce leaks only whether two plaintexts were equal, and never the key).
+\end{trapbox}
+
+\begin{connectionbox}
+The ``$2^{48}$ messages'' figure is the birthday bound from the probability companion: drawing 96-bit values uniformly at random, the expected number of draws before a repeat is about $\sqrt{2^{96}} = 2^{48}$. The same $\sqrt{N}$ law governs hash collisions (Chapter on hash functions) and the meet-in-the-middle attacks on double encryption. Here it sets a hard ceiling on how many messages a single GCM key may protect with random nonces, and it is why ``just randomize the nonce'' is not a safe substitute for ``never repeat the nonce.''
+\end{connectionbox}
+
+\begin{historybox}
+GCM was designed by David McGrew and John Viega in 2004 and standardized by NIST in SP 800-38D. Its nonce-reuse fragility is not a flaw in the math -- the math is exactly as advertised -- but a sharp edge that has cut real systems. A 2016 study found numerous HTTPS servers reusing GCM nonces because of faulty random-number generators or broken nonce-construction code, each one a server whose TLS sessions could be decrypted and forged. The lesson stuck: later designs, including the nonce-misuse-resistant SIV family and the cautious nonce rules in TLS 1.3, treat unique nonces as a property the protocol must \emph{enforce}, not a footnote the implementer must remember.
+\end{historybox}
+
+\section{ChaCha20-Poly1305: The Software-Friendly AEAD}
+\label{ch16:chacha-poly}
+
+AES-GCM is unbeatable when you have AES hardware. On a device without it -- many phones a decade ago, embedded chips, anything where a software AES is slow and, worse, leaks timing through cache-dependent table lookups -- you want an AEAD built from operations that are fast and constant-time in plain software. That is ChaCha20-Poly1305, designed largely by Daniel J. Bernstein and standardized in RFC 8439. Google deployed it to protect Android and Chrome traffic precisely because it runs fast and side-channel-resistant without special instructions.
+
+The shape mirrors GCM: a stream cipher for confidentiality, a one-time universal-hash MAC for integrity, combined the right way.
+
+\textbf{ChaCha20} is a stream cipher built from a 512-bit state (sixteen 32-bit words: constants, the 256-bit key, a 32-bit counter, a 96-bit nonce) churned by twenty rounds of the ARX operations \emph{add, rotate, XOR}. No lookup tables, so no cache-timing leak; just register arithmetic that is the same speed regardless of data. Each block of keystream is the state run through the rounds and added back to itself, then XORed onto plaintext exactly like CTR mode.
+
+\textbf{Poly1305} is the MAC, a polynomial evaluation hash like GHASH but over the prime field $\F_p$ with $p = 2^{130} - 5$ instead of a binary field. The message is chopped into 128-bit chunks $c_1,\dots,c_q$ (each with a high bit set to disambiguate length), and with a secret evaluation point $r$ and a secret additive blinder $s$ the tag is
+\[
+\operatorname{Poly1305}_{r,s}(M) = \Big( \big( c_1 r^{q} + c_2 r^{q-1} + \cdots + c_q r \big) \bmod p \Big) + s \pmod{2^{128}} .
+\]
+Same idea as GHASH -- the data are coefficients of a polynomial in a secret point -- with prime-field arithmetic that is friendly to constant-time software and a $\bmod\,2^{128}$ final addition. Crucially, the key material $(r, s)$ is \emph{derived freshly for each message} from ChaCha20 itself: you run ChaCha20 with counter $0$ on the message's nonce, take the first 32 bytes of keystream as $(r,s)$ (with a few bits of $r$ ``clamped'' to zero for security and speed), and use counter $1$ onward to encrypt the plaintext. Because $(r,s)$ is one-time per nonce, Poly1305 is a secure one-time MAC each time, and the whole construction is Encrypt-then-MAC in disguise: the tag is computed over the ciphertext and associated data, not the plaintext.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,
+  box/.style={draw,rounded corners,minimum height=0.7cm}]
+\node[box,fill=blue!8,minimum width=2.6cm] (cc) at (0,0) {ChaCha20$_k(N)$};
+\node[box,fill=yellow!12,minimum width=1.9cm] (rs) at (-3.0,-1.4) {block $0 \to (r,s)$};
+\node[box,fill=green!8,minimum width=2.4cm] (ks) at (2.8,-1.4) {blocks $1,2,\dots \to$ keystream};
+\draw[-Stealth] (cc.west)-|(rs);
+\draw[-Stealth] (cc.east)-|(ks);
+\node[box,fill=green!8] (m) at (2.8,-2.7) {$M$};
+\node[draw,circle,inner sep=1pt] (xc) at (4.6,-2.0) {$\xor$};
+\draw[-Stealth] (ks)-|(xc); \draw[-Stealth] (m)-|(xc);
+\node[box,fill=red!6] (c) at (4.6,-3.1) {$C$};
+\draw[-Stealth] (xc)--(c);
+\node[box,fill=orange!10,minimum width=3.4cm] (p1305) at (-1.0,-3.3) {Poly1305$_{r,s}(A \concat C \concat \text{len})$};
+\draw[-Stealth] (rs)--(p1305);
+\draw[-Stealth] (c) |- (p1305.east);
+\node (T) at (-4.2,-3.3) {tag $T$};
+\draw[-Stealth] (p1305)--(T);
+\node[box,fill=magenta!8] (A) at (-4.2,-2.0) {$A$};
+\draw[-Stealth] (A) |- (p1305.west);
+\end{tikzpicture}
+\caption{ChaCha20-Poly1305. The first ChaCha20 block yields the one-time Poly1305 key $(r,s)$; later blocks form the keystream that encrypts $M$. Poly1305 authenticates associated data and ciphertext -- Encrypt-then-MAC by construction.}
+\label{ch16:chacha-fig}
+\end{figure}
+
+\begin{whybox}
+The security argument is the same shape as GCM's, with a friendlier failure mode for one specific mistake. Poly1305 is an $\eps$-almost-universal hash: tampering changes the polynomial by a nonzero polynomial of degree $\le q$ in the secret $r$, which vanishes for at most $q$ values of $r$ out of $\approx 2^{128}$, so a blind forgery succeeds with probability about $q/2^{128}$. The additive secret $s$ hides the raw polynomial value. Confidentiality is ChaCha20's IND-CPA security as a stream cipher. And because the construction is Encrypt-then-MAC over the ciphertext, the AE-implies-CCA theorem (Theorem~\ref{ch16:ae-implies-cca}) applies: a forged ciphertext fails Poly1305 and is rejected before any decryption that could leak information.
+\end{whybox}
+
+\begin{labbox}
+\textbf{A worked Poly1305-style tag in a toy prime field.} The real $p = 2^{130}-5$ is unwieldy by hand, so shrink to the prime $p = 17$ and pretend each ``block'' is a single residue (the real scheme uses 128-bit blocks with a set high bit, but the polynomial structure is identical). Take the secret evaluation point $r = \texttt{5}$ and the secret blinder $s = \texttt{9}$, and authenticate two blocks $c_1 = \texttt{3}$, $c_2 = \texttt{7}$. The polynomial is $c_1 r^2 + c_2 r \pmod p$, then add $s$:
+\[
+c_1 r^2 + c_2 r = 3\cdot 25 + 7\cdot 5 = 75 + 35 = 110 \equiv 110 - 6\cdot 17 = 8 \pmod{17}.
+\]
+Add the blinder: tag $= (8 + 9) \bmod 17 = 17 \bmod 17 = \texttt{0}$. Now the forgery test: flip $c_2$ from $\texttt{7}$ to $\texttt{7}+\Delta$. The polynomial value moves by $\Delta\cdot r = 5\Delta \pmod{17}$, a nonzero shift for every $\Delta \neq 0$ because $r \neq 0$ and $17$ is prime (no zero divisors). An attacker who does not know $r$ cannot predict that shift, and $s$ hides the raw value so observed tags reveal nothing about $r$. In $\F_{2^{130}-5}$ the only change is scale: a degree-$q$ polynomial, at most $q$ roots, a $\le q/2^{128}$ chance of a blind hit -- the exact same bound as GHASH, reached through a prime field instead of a binary one.
+\end{labbox}
+
+\begin{focusbox}
+ChaCha20-Poly1305 is \emph{not} magically nonce-misuse resistant -- reuse a nonce and you reuse keystream (two-time pad) \emph{and} reuse the one-time Poly1305 key $(r,s)$, which similarly leaks $r$ and enables forgery. The same iron rule holds: unique nonce per key, always. What ChaCha20-Poly1305 buys you over GCM is not nonce robustness but \emph{software safety}: constant-time by design, fast without hardware, no carryless-multiply instruction needed, and a cleaner implementation surface with fewer ways to introduce a timing leak.
+\end{focusbox}
+
+\begin{implementbox}
+The right way to ``implement'' an AEAD is to call a vetted library. Here is what correct usage looks like with PyCA \texttt{cryptography}; the point is the \emph{interface}, not a reimplementation. Note that the library refuses to let you skip the tag check: a tampered ciphertext raises an exception rather than returning garbage plaintext. This is real library code, but treat the surrounding nonce handling as the lesson -- never reuse a nonce under a key.
+\begin{lstlisting}[language=Python]
+import os
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305, AESGCM
+
+key   = ChaCha20Poly1305.generate_key()      # 256-bit key
+aead  = ChaCha20Poly1305(key)
+
+nonce = os.urandom(12)                        # 96-bit nonce: UNIQUE per key!
+ad    = b"v1|type=transfer|hdr"              # associated data: authenticated, not hidden
+msg   = b"PAY USER 0001 AMOUNT 0000100"
+
+ct = aead.encrypt(nonce, msg, ad)            # ciphertext WITH appended tag
+pt = aead.decrypt(nonce, ct, ad)             # returns msg, or RAISES on any tampering
+assert pt == msg
+
+# Integrity in action: flip one ciphertext byte (the stream-cipher attack from
+# the start of the chapter) and decryption now FAILS instead of silently lying.
+tampered = bytearray(ct); tampered[20] ^= 0x08
+try:
+    aead.decrypt(nonce, bytes(tampered), ad)
+    print("BUG: forgery accepted")
+except Exception:
+    print("rejected forged ciphertext")      # <-- this branch runs
+
+# AES-GCM is a drop-in with the SAME interface and the SAME nonce rule:
+gkey = AESGCM.generate_key(bit_length=256)
+AESGCM(gkey).encrypt(os.urandom(12), msg, ad)
+\end{lstlisting}
+The malleability attack that multiplied a bank transfer ninety-fold at the start of this chapter is exactly the \texttt{tampered[20] \^{}= 0x08} line -- and under AEAD it no longer works, because the altered ciphertext fails the tag check and \texttt{decrypt} refuses to return anything.
+\end{implementbox}
+
+\section{Choosing and Using AEAD in the Real World}
+\label{ch16:real-world}
+
+\begin{applicationbox}
+\textbf{Where AEAD lives.} TLS 1.3 (2018) removed every non-AEAD cipher: the only record-protection algorithms left are AES-GCM, ChaCha20-Poly1305, and AES-CCM. The MAC-then-Encrypt CBC suites that gave us a decade of padding oracles are simply gone. In TLS the record header (content type, version, length) is the associated data, bound to the encrypted payload, and the nonce is built from a per-connection counter so it never repeats. The same primitives appear everywhere: WPA3 and modern WPA2 use AES-GCM/CCM (a clean break from WEP's broken CRC); SSH offers \texttt{aes128-gcm} and \texttt{chacha20-poly1305}; IPsec uses AES-GCM; the Signal protocol and WireGuard VPN use ChaCha20-Poly1305; QUIC uses AEAD for every packet, with the packet number as the nonce. If you transmit a byte over a modern secure channel, an AEAD almost certainly protected it.
+\end{applicationbox}
+
+A short decision guide for the practitioner:
+
+\begin{itemize}
+  \item \textbf{Default to an AEAD, never raw encryption.} If your library offers \texttt{encrypt(key, nonce, plaintext, associated\_data)}, use it. If you find yourself manually composing a cipher and a MAC, stop -- you are about to ship a bug.
+  \item \textbf{AES-GCM} when AES hardware is present (essentially all modern servers and laptops, via AES-NI). Fastest there, and the most widely supported.
+  \item \textbf{ChaCha20-Poly1305} when you lack AES hardware or want guaranteed constant-time software -- mobile, embedded, or any context where a cache-timing leak worries you. Often the better default for portable code.
+  \item \textbf{Nonces: enforce uniqueness structurally.} Prefer a counter you control over a random nonce. If a counter is impossible across a distributed fleet, use a misuse-resistant mode (AES-GCM-SIV) rather than gambling on the $2^{48}$ birthday bound.
+  \item \textbf{Put everything that must not change into the associated data} -- versions, sequence numbers, recipient identities, packet types. Anything an attacker could profitably alter, but that you cannot or need not encrypt, belongs in $A$ so the tag covers it.
+  \item \textbf{Never act on plaintext before the tag verifies.} A correct AEAD library does this for you (decryption returns $\bot$ or raises). If you ever see code that decrypts, uses the result, and checks integrity afterward, it is broken.
+\end{itemize}
+
+\begin{aestheticbox}
+The arc of this chapter is the arc of the field maturing. Early systems treated confidentiality and integrity as separable hobbies, glued primitives together by intuition, and bled from padding oracles and forged WiFi packets for a decade. The fix was not a cleverer cipher but a cleaner \emph{abstraction}: one primitive, one key, one nonce, one tag, with the dangerous choices made unrepresentable. AEAD is what it looks like when cryptographers stop asking ``how do I encrypt?'' and start asking ``what is the smallest interface that an ordinary engineer cannot misuse?'' That second question -- design so the easy path is the safe path -- is the most important idea in applied cryptography, and authenticated encryption is its cleanest victory.
+\end{aestheticbox}
+
+\section*{Exercises}
+\addcontentsline{toc}{section}{Exercises}
+
+\begin{exercise}
+A message is encrypted with a stream cipher as $c = m \xor k$. You do not know $k$ or $m$, but you know $m$ is ASCII and that byte 5 of the plaintext is the digit \texttt{1} (\texttt{0x31}), and you want Bob to decrypt it as \texttt{8} (\texttt{0x38}). Which byte of the ciphertext do you modify, and by what XOR mask? Explain why this works without knowing the key, and name the security property the stream cipher fails to provide.
+\end{exercise}
+
+\begin{exercise}
+State the three generic compositions of an encryption scheme and a MAC. For each of Encrypt-and-MAC and MAC-then-Encrypt, give a concrete reason it can fail to be a secure authenticated-encryption scheme (one confidentiality failure, one integrity/oracle failure). Then prove informally that Encrypt-then-MAC achieves ciphertext integrity, assuming the MAC is strongly unforgeable.
+\end{exercise}
+
+\begin{exercise}
+Prove Theorem~\ref{ch16:ae-implies-cca} in detail: show that IND-CPA plus INT-CTXT implies IND-CCA. Structure the argument as a reduction -- assume a CCA adversary with non-negligible advantage and build either an INT-CTXT forger or an IND-CPA distinguisher. Where exactly does the decryption oracle become useless?
+\end{exercise}
+
+\begin{exercise}
+Work in $\F_{2^4}$ with modulus $x^4 + x + 1$ (so $x^4 = x+1$). Let $H = \texttt{3}$. Compute $\operatorname{GHASH}_H$ of the two-block input $(X_1, X_2) = (\texttt{6}, \texttt{a})$, i.e. evaluate $X_1 H^2 \xor X_2 H$, showing the reduction step. Then determine the new GHASH value if an attacker flips $X_2$ to $\texttt{a} \xor \texttt{4} = \texttt{e}$, and confirm the change equals $\texttt{4} \cdot H$.
+\end{exercise}
+
+\begin{exercise}
+In the toy field $\F_{2^4}$, two one-block GCM-style messages are sent under the \emph{same} nonce (so the tag mask $L$ is identical). You observe ciphertext blocks $C_1 = \texttt{7}$, $C_1' = \texttt{2}$ and tags whose XOR is $T \xor T' = \texttt{5}$ (assume no associated data and that the length block is the same for both, so it cancels). Recover the hash key $H$. (Hint: $T \xor T' = (C_1 \xor C_1')\,H^2$; you will need the inverse of $C_1 \xor C_1'$ in the field and a square root in characteristic two.)
+\end{exercise}
+
+\begin{exercise}
+Explain precisely why reusing a nonce in AES-GCM is strictly worse than reusing a one-time-pad key. Your answer should identify (a) the confidentiality loss common to both, and (b) the integrity loss unique to GCM, including why the masking block $\operatorname{AES}_k(J_0)$ cancels and what equation in $H$ the attacker is left with.
+\end{exercise}
+
+\begin{exercise}
+A server generates GCM nonces by sampling 96 random bits per message under a fixed key. Using the birthday bound, estimate how many messages it can send before a nonce collision becomes likely, and explain why a \emph{single} collision is catastrophic rather than merely a small leak. Propose two concrete fixes and state the trade-off of each.
+\end{exercise}
+
+\begin{exercise}
+In ChaCha20-Poly1305, the one-time MAC key $(r,s)$ is derived from ChaCha20 block $0$ under the message's nonce, and the plaintext is encrypted with blocks $1, 2, \dots$. Explain what goes wrong if an implementer mistakenly uses block $0$ both as the MAC key and as the first keystream block. Which security property breaks, and how could an attacker exploit it?
+\end{exercise}
+
+\begin{exercise}
+You are designing a packet format. Each packet has a cleartext header (\texttt{version}, \texttt{sequence\_number}, \texttt{type}) that routers must read, and an encrypted payload. Show how to use an AEAD so that (i) the payload is confidential, (ii) the header cannot be altered undetected, and (iii) an attacker cannot replay or reorder packets. State exactly what goes in the nonce, the associated data, and the plaintext, and justify each choice.
+\end{exercise}
+
+\begin{exercise}
+(Break a homemade scheme.) An engineer ``saves a key'' by using the \emph{same} AES key for CTR-mode encryption and for a CBC-MAC over the plaintext, sending $(c, t)$ with $c = \operatorname{CTR}_k(m)$ and $t = \operatorname{CBC\text{-}MAC}_k(m)$. Identify at least two distinct problems: one from key reuse across two primitives, and one from the Encrypt-and-MAC structure leaking information. Then describe how a correct AEAD avoids both with a single key and a single pass.
+\end{exercise}
+
+\begin{exercise}
+Work in the toy prime field $\F_{17}$ with Poly1305-style structure: secret point $r = \texttt{4}$, blinder $s = \texttt{6}$. Compute the tag for the two blocks $c_1 = \texttt{2}$, $c_2 = \texttt{5}$, evaluating $c_1 r^2 + c_2 r \pmod{17}$ and then adding $s \pmod{17}$. Next, show that if an attacker flips $c_2$ by $\Delta$ the tag shifts by $r\Delta \bmod 17$, and explain why no nonzero $\Delta$ can leave the tag unchanged in a prime field. How would knowing $r$ (say, from a reused nonce) let the attacker forge the tag for a chosen $c_2$?
+\end{exercise}
+
+\begin{exercise}
+(Design / research.) AES-GCM-SIV is a ``nonce-misuse-resistant'' AEAD: if a nonce repeats, it leaks only whether two plaintexts were identical, and never the authentication key. Read the high-level idea (a synthetic IV derived from the message itself) and explain why this makes nonce reuse a graceful degradation rather than a cliff. What does SIV give up compared to plain GCM, and in what deployment would you prefer it?
+\end{exercise}

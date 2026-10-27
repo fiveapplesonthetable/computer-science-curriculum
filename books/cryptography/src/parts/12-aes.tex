@@ -1,0 +1,1049 @@
+\chapter{The Advanced Encryption Standard (AES)}
+
+When you open a web page over HTTPS, connect to a corporate VPN, unlock an
+encrypted disk, or send a message on Signal, the bytes that actually leave your
+machine are almost always scrambled by one algorithm: the Advanced Encryption
+Standard. AES is the most widely deployed cipher in human history. Every modern
+laptop and phone has hardware instructions that execute it; trillions of blocks
+flow through it every second. It is also, refreshingly, a cipher you can
+understand completely. Unlike DES (with its mysterious S-boxes handed down from
+the NSA), AES was designed in the open, its every constant justified in a public
+document, and its mathematics is finite-field algebra you can do by hand.
+
+This chapter takes AES apart layer by layer. We will see the four operations of
+a round --- \texttt{SubBytes}, \texttt{ShiftRows}, \texttt{MixColumns},
+\texttt{AddRoundKey} --- understand \emph{why} each one exists, trace a single
+round on real bytes, derive the S-box from the multiplicative inverse in
+$\F_{256}$, and grind through the key schedule. By the end you should be able to
+encrypt a block with pencil and paper (slowly), explain to a skeptic why the
+design resists differential and linear attacks, and know where AES sits in TLS,
+WiFi, and disk encryption.
+
+\chapterline
+
+\section{Where AES came from}
+
+DES, the cipher of the 1970s and 1980s, was dying. Its $56$-bit key was small
+enough that by the late 1990s a purpose-built machine (the Electronic Frontier
+Foundation's ``Deep Crack'') could brute-force it in days. Triple-DES patched the
+key size but tripled an already slow algorithm. The world needed a replacement,
+and the U.S. National Institute of Standards and Technology (NIST) did something
+unusual for a cryptographic standard: it held an open, international competition.
+
+\begin{historybox}
+In January 1997 NIST announced a call for a new block cipher to replace DES. The
+requirements: a $128$-bit block, support for $128$-, $192$-, and $256$-bit keys,
+royalty-free worldwide, and fast in both software and hardware. Fifteen
+submissions came from teams around the globe. Over three years cryptographers
+publicly attacked every candidate, and NIST held conferences to compare security,
+speed on everything from smart cards to servers, and resistance to side-channel
+leakage. Five finalists emerged: MARS (IBM), RC6 (RSA Labs), Serpent (Anderson,
+Biham, Knudsen), Twofish (Schneier et al.), and Rijndael (Joan Daemen and
+Vincent Rijmen, two Belgians). Serpent was widely judged the most conservative
+(it had a huge security margin), but Rijndael was nearly as strong and much
+faster across the widest range of platforms. In October 2000 NIST chose
+Rijndael, and in 2001 it became FIPS 197: the Advanced Encryption Standard. The
+name ``Rijndael'' is a portmanteau of the designers' surnames; ``AES'' is the
+standardized profile of it (fixed $128$-bit block, three key sizes).
+\end{historybox}
+
+It is worth dwelling on what the open process bought us. DES's S-boxes looked
+arbitrary, and for years people suspected a backdoor; only in the 1990s was it
+revealed that IBM and the NSA had \emph{strengthened} them against differential
+cryptanalysis, a technique the public would not rediscover until 1990. AES took
+no such leap of faith. Every constant --- the irreducible polynomial, the S-box
+affine map, the MixColumns matrix, the round constants --- is published with a
+design rationale tied to measurable security goals. You can recompute all of them
+yourself. That transparency is a big part of why the cryptographic community
+trusts AES.
+
+\begin{focusbox}
+\textbf{The setting.} AES is a \emph{block cipher}: a keyed, invertible
+permutation on $128$-bit blocks. Fix a key $k$ of $128$, $192$, or $256$ bits and
+AES becomes a bijection $\Enc_k : \{0,1\}^{128} \to \{0,1\}^{128}$ with inverse
+$\Dec_k$. By itself it encrypts exactly one $128$-bit block. To encrypt a message
+of any length --- and to do so securely --- you wrap it in a \emph{mode of
+operation} (CTR, CBC, GCM), the subject of the next chapter. Here we study the
+permutation itself: what $\Enc_k$ does to one block.
+\end{focusbox}
+
+\section{The state: bytes in a $4\times 4$ grid}
+
+AES works on bytes, not bits. A $128$-bit block is $16$ bytes, and AES arranges
+them in a $4\times 4$ matrix called the \textbf{state}. The byte order is
+\emph{column-major}: the first four input bytes fill the first column top to
+bottom, the next four fill the second column, and so on.
+
+If the input block is the byte sequence $b_0, b_1, \dots, b_{15}$, the state is
+
+\[
+\begin{bmatrix}
+b_0 & b_4 & b_8 & b_{12}\\
+b_1 & b_5 & b_9 & b_{13}\\
+b_2 & b_6 & b_{10} & b_{14}\\
+b_3 & b_7 & b_{11} & b_{15}
+\end{bmatrix}.
+\]
+
+Every operation in AES is described as an action on this grid. \texttt{SubBytes}
+replaces each cell independently. \texttt{ShiftRows} permutes within rows.
+\texttt{MixColumns} mixes within columns. \texttt{AddRoundKey} XORs in key
+material cell by cell. The grid shape is not cosmetic: it is exactly what makes
+the diffusion argument (Section~\ref{ch12:security}) work, because ShiftRows
+moves bytes \emph{between} columns and MixColumns spreads \emph{within} a column,
+so the two together touch the whole block in a couple of rounds.
+
+\begin{intuitionbox}
+Picture the state as a $4\times4$ checkerboard of bytes. AES alternates two kinds
+of stirring. One kind scrambles each square in place (confusion). The other kind
+slides squares around and blends neighbors so that a single changed input square
+quickly contaminates the whole board (diffusion). Repeat enough times and the
+output looks like noise, with no usable statistical handle for an attacker. That
+is the entire philosophy; everything below is the precise machinery.
+\end{intuitionbox}
+
+\subsection{Number of rounds}
+
+AES is a \emph{substitution-permutation network} (SPN): there is no Feistel
+split into halves as in DES. Instead every byte is transformed in every round.
+The number of rounds depends on the key size:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Key size & Rounds $N_r$ & Round-key words \\
+\midrule
+AES-128 & 10 & 44 \\
+AES-192 & 12 & 52 \\
+AES-256 & 14 & 60 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The high-level structure for AES-128 is:
+
+\begin{enumerate}
+\item \texttt{AddRoundKey} with round key $0$ (a ``whitening'' step).
+\item Rounds $1$ through $9$, each: \texttt{SubBytes} $\to$ \texttt{ShiftRows}
+$\to$ \texttt{MixColumns} $\to$ \texttt{AddRoundKey}.
+\item Round $10$ (final): \texttt{SubBytes} $\to$ \texttt{ShiftRows} $\to$
+\texttt{AddRoundKey}, with \textbf{no} MixColumns.
+\end{enumerate}
+
+The final round drops MixColumns for a clean reason we will see: it makes
+decryption symmetric in structure with encryption and adds no security (the last
+MixColumns could be undone by the attacker by linear algebra without the key, so
+it would buy nothing).
+
+\section{The field $\F_{256}$: arithmetic on bytes}
+\label{ch12:field}
+
+To understand \texttt{SubBytes} and \texttt{MixColumns} you need to think of a
+byte as an element of the finite field $\F_{256} = \F_{2^8} = \mathrm{GF}(2^8)$.
+We met finite fields earlier; here is the working summary AES needs.
+
+A byte $b_7 b_6 \cdots b_1 b_0$ is read as the polynomial
+\[
+b_7 x^7 + b_6 x^6 + \cdots + b_1 x + b_0
+\]
+with coefficients in $\F_2 = \{0,1\}$. \textbf{Addition} of two bytes is just
+polynomial addition mod $2$, i.e.\ bitwise XOR. There is no carry; addition and
+subtraction are the same operation. So $\mathtt{0x57} \xor \mathtt{0x83} =
+\mathtt{0xD4}$, end of story.
+
+\textbf{Multiplication} is polynomial multiplication followed by reduction modulo
+a fixed irreducible polynomial of degree $8$. AES fixes
+\[
+m(x) = x^8 + x^4 + x^3 + x + 1, \qquad \text{in hex, } \mathtt{0x11B}.
+\]
+This $m(x)$ has no factors over $\F_2$ (it is irreducible), which is exactly what
+makes $\F_2[x]/(m(x))$ a field: every nonzero byte has a multiplicative inverse.
+That is the property \texttt{SubBytes} exploits.
+
+\begin{walkbox}
+\textbf{Multiply $\mathtt{0x57}$ by $\mathtt{0x83}$ in $\F_{256}$.}
+
+As polynomials, $\mathtt{0x57} = x^6 + x^4 + x^2 + x + 1$ and $\mathtt{0x83} =
+x^7 + x + 1$. Multiply them out (over $\F_2$, so combine like terms mod $2$):
+\[
+(x^6 + x^4 + x^2 + x + 1)(x^7 + x + 1).
+\]
+Expanding term by term and cancelling pairs gives
+\[
+x^{13} + x^{11} + x^9 + x^8 + x^6 + x^5 + x^4 + x^3 + 1.
+\]
+This has degree $13 \ge 8$, so reduce modulo $m(x) = x^8+x^4+x^3+x+1$. Each time
+a power $x^{8+i}$ appears, replace $x^8$ by $x^4+x^3+x+1$ (since $x^8 \equiv
+x^4+x^3+x+1 \pmod{m}$) and keep folding down. Carrying out the reduction yields
+$x^7 + x^6 + 1 = \mathtt{0xC1}$. So $\mathtt{0x57} \cdot \mathtt{0x83} =
+\mathtt{0xC1}$. (This is the canonical example from the AES specification; it is
+worth doing once fully by hand.)
+\end{walkbox}
+
+In practice nobody multiplies two arbitrary bytes the long way. The trick AES
+relies on is multiplication by $x$, called \texttt{xtime}, which is a left shift
+plus a conditional XOR with $\mathtt{0x1B}$ (the low byte of $m(x)$):
+
+\[
+\texttt{xtime}(b) =
+\begin{cases}
+b \ll 1 & \text{if the top bit of } b \text{ is } 0,\\
+(b \ll 1) \xor \mathtt{0x1B} & \text{if the top bit of } b \text{ is } 1.
+\end{cases}
+\]
+
+Multiplying by $2$ is \texttt{xtime}; multiplying by $3$ is $\texttt{xtime}(b)
+\xor b$; larger constants are built from these. MixColumns only ever multiplies
+by $1$, $2$, and $3$, so \texttt{xtime} is all the field multiplication you need
+for encryption.
+
+\begin{connectionbox}
+The companion algebra book builds $\F_{2^n}$ from scratch: why $\F_2[x]/(m(x))$
+is a field exactly when $m$ is irreducible, how to find irreducible polynomials,
+and why all fields of size $2^8$ are isomorphic (so AES's particular choice of
+$m(x)$ is a convention, not a deep necessity --- a different irreducible
+polynomial would give an equally good but incompatible cipher). The
+multiplicative group $\F_{256}^{*}$ is cyclic of order $255$; that cyclic
+structure is what guarantees inverses exist for the S-box.
+\end{connectionbox}
+
+\section{SubBytes: the only nonlinear layer}
+\label{ch12:subbytes}
+
+\texttt{SubBytes} replaces every byte of the state by another byte, using a
+single fixed lookup table $S$ of $256$ entries (the \textbf{S-box}). It is the
+sole source of nonlinearity in AES. Everything else --- ShiftRows, MixColumns,
+AddRoundKey --- is linear (or affine) over $\F_2$, meaning it commutes with XOR.
+If AES had no nonlinear step, the whole cipher would be one big affine map, and
+an attacker could solve for the key with linear algebra. The S-box is what stops
+that.
+
+The S-box is built in two stages.
+
+\textbf{Stage 1: the multiplicative inverse in $\F_{256}$.} Map each byte $a$ to
+its inverse $a^{-1}$ in the field, with the convention that $\mathtt{0x00}$ maps
+to itself (it has no inverse, so we just fix the missing point). This inverse map
+is highly nonlinear --- it is, in a precise sense, about as far from linear as a
+byte permutation can be, which is exactly why it resists differential and linear
+cryptanalysis (Section~\ref{ch12:security}).
+
+\textbf{Stage 2: an affine transformation over $\F_2$.} The pure inverse map has
+one cosmetic weakness: it has fixed points (e.g.\ $0\mapsto 0$, $1\mapsto 1$) and
+a clean algebraic description that an attacker might exploit. So AES post-composes
+it with an invertible affine map. Writing the byte after inversion as bits
+$(y_0,\dots,y_7)$, each output bit $s_i$ is
+
+\[
+s_i = y_i \xor y_{(i+4)\bmod 8} \xor y_{(i+5)\bmod 8} \xor y_{(i+6)\bmod 8}
+\xor y_{(i+7)\bmod 8} \xor c_i,
+\]
+
+where the constant byte is $c = \mathtt{0x63} = (c_0,\dots,c_7) =
+(1,1,0,0,0,1,1,0)$. In matrix form, over $\F_2$,
+
+\[
+\begin{bmatrix} s_0 \\ s_1 \\ s_2 \\ s_3 \\ s_4 \\ s_5 \\ s_6 \\ s_7 \end{bmatrix}
+=
+\begin{bmatrix}
+1&0&0&0&1&1&1&1\\
+1&1&0&0&0&1&1&1\\
+1&1&1&0&0&0&1&1\\
+1&1&1&1&0&0&0&1\\
+1&1&1&1&1&0&0&0\\
+0&1&1&1&1&1&0&0\\
+0&0&1&1&1&1&1&0\\
+0&0&0&1&1&1&1&1
+\end{bmatrix}
+\begin{bmatrix} y_0 \\ y_1 \\ y_2 \\ y_3 \\ y_4 \\ y_5 \\ y_6 \\ y_7 \end{bmatrix}
+\xor
+\begin{bmatrix} 1 \\ 1 \\ 0 \\ 0 \\ 0 \\ 1 \\ 1 \\ 0 \end{bmatrix}.
+\]
+
+The matrix is a \emph{circulant}: each row is the previous one rotated, which is
+why the formula above is just ``XOR five rotated copies.''
+
+\begin{whybox}
+Why split SubBytes into inversion-then-affine? The inverse map $a \mapsto a^{-1}$
+gives the cryptographic strength: it has the best known resistance to
+differential attacks (its differential uniformity is $4$, near the theoretical
+minimum of $2$) and to linear attacks. But it is too ``algebraic'' on its own ---
+it is described by a simple equation over $\F_{256}$, and it fixes $0$ and $1$.
+The affine layer is cheap insurance: it breaks the algebraic simplicity over the
+field (the affine map is $\F_2$-linear but \emph{not} $\F_{256}$-linear, so the
+composition has no clean field description), removes fixed points, and ensures
+$S(a) \neq a$ and $S(a) \neq \bar a$ for all $a$. Crucially the affine step is
+linear, so it does not weaken the differential/linear properties the inverse map
+provides --- it only adds structure-hiding.
+\end{whybox}
+
+\begin{walkbox}
+\textbf{Compute $S(\mathtt{0x53})$ from scratch.}
+
+First invert $\mathtt{0x53}$ in $\F_{256}$. One can check (by the extended
+Euclidean algorithm on polynomials, or a log table) that $\mathtt{0x53}^{-1} =
+\mathtt{0xCA}$. Now apply the affine map to $y = \mathtt{0xCA} =
+(y_0,\dots,y_7) = (0,1,0,1,0,0,1,1)$ (bit $0$ is the least significant). Computing
+each $s_i = y_i \xor y_{i+4} \xor y_{i+5} \xor y_{i+6} \xor y_{i+7} \xor c_i$
+(indices mod $8$) gives the byte $\mathtt{0xED}$. And indeed, looking up
+$\mathtt{0x53}$ in the published S-box table returns $\mathtt{0xED}$. The table is
+not magic; it is exactly this computation done $256$ times and cached.
+\end{walkbox}
+
+\begin{implementbox}
+A toy S-box generator in Python. It builds the field inverse with a log/antilog
+table over generator $3$, then applies the affine map. \textbf{For learning only}
+--- real code uses the precomputed table (or hardware) and must avoid the
+data-dependent memory lookups shown here, which leak timing (see the
+side-channel chapter).
+
+\begin{lstlisting}[language=Python]
+def xtime(b):                 # multiply by x (i.e. by 2) in GF(2^8)
+    b <<= 1
+    if b & 0x100:             # overflow past degree 7?
+        b ^= 0x11B            # reduce mod x^8+x^4+x^3+x+1
+    return b & 0xFF
+
+def gmul(a, b):               # full field multiply
+    p = 0
+    for _ in range(8):
+        if b & 1:
+            p ^= a
+        a = xtime(a)
+        b >>= 1
+    return p
+
+# build log / antilog tables using generator g = 3
+antilog = [0] * 256
+x = 1
+for i in range(255):
+    antilog[i] = x
+    x = gmul(x, 3)            # 3 is a generator of GF(2^8)*
+log = [0] * 256
+for i in range(255):
+    log[antilog[i]] = i
+
+def inv(a):                   # multiplicative inverse, 0 -> 0
+    if a == 0:
+        return 0
+    return antilog[(255 - log[a]) % 255]
+
+def rotl8(v, n):
+    return ((v << n) | (v >> (8 - n))) & 0xFF
+
+def sbox(a):
+    y = inv(a)
+    # affine: s = y XOR (y<<<1) XOR (y<<<2) XOR (y<<<3) XOR (y<<<4) XOR 0x63
+    s = y ^ rotl8(y, 1) ^ rotl8(y, 2) ^ rotl8(y, 3) ^ rotl8(y, 4) ^ 0x63
+    return s & 0xFF
+
+assert sbox(0x53) == 0xED
+assert sbox(0x00) == 0x63     # 0 -> 0 under inverse, then +0x63
+print([hex(sbox(i)) for i in range(8)])
+\end{lstlisting}
+\end{implementbox}
+
+\section{ShiftRows: cheap cross-column movement}
+\label{ch12:shiftrows}
+
+\texttt{SubBytes} treats each byte independently --- it never mixes bytes
+together. If that were the whole cipher, byte $0$ of the ciphertext would depend
+only on byte $0$ of the plaintext, and AES would be $16$ tiny independent ciphers.
+We need to spread information across positions. \texttt{ShiftRows} is the first,
+cheapest spreading step: it cyclically rotates the rows of the state.
+
+\[
+\begin{bmatrix}
+a_{0} & a_{4} & a_{8} & a_{12}\\
+a_{1} & a_{5} & a_{9} & a_{13}\\
+a_{2} & a_{6} & a_{10} & a_{14}\\
+a_{3} & a_{7} & a_{11} & a_{15}
+\end{bmatrix}
+\;\xrightarrow{\ \texttt{ShiftRows}\ }\;
+\begin{bmatrix}
+a_{0} & a_{4} & a_{8} & a_{12}\\
+a_{5} & a_{9} & a_{13} & a_{1}\\
+a_{10} & a_{14} & a_{2} & a_{6}\\
+a_{15} & a_{3} & a_{7} & a_{11}
+\end{bmatrix}
+\]
+
+Row $0$ is left unchanged. Row $1$ is rotated left by one byte, row $2$ by two,
+row $3$ by three. It is a pure permutation of byte positions --- no arithmetic,
+no key, just relabeling. On its own it does nothing cryptographically; its job is
+to set up MixColumns. Because MixColumns mixes \emph{within} a column, you need
+something to move bytes \emph{between} columns first, or the four columns would
+evolve as four independent sub-ciphers forever. ShiftRows guarantees that after
+one round the four bytes that were in one column are spread across all four
+columns, so the next MixColumns blends them with bytes from elsewhere.
+
+\begin{intuitionbox}
+ShiftRows and MixColumns are a team. MixColumns mixes up-and-down inside a column;
+ShiftRows mixes left-and-right across columns. Together, each output byte after
+two rounds depends on \emph{every} input byte. Neither alone achieves this:
+MixColumns keeps each column isolated, ShiftRows keeps each byte's value
+untouched. The combination is what gives AES full diffusion in just two rounds.
+\end{intuitionbox}
+
+\section{MixColumns: diffusion inside a column}
+\label{ch12:mixcolumns}
+
+\texttt{MixColumns} is the heavy diffusion step. It treats each column of the
+state as a vector of four bytes and multiplies it by a fixed $4\times4$ matrix
+over $\F_{256}$:
+
+\[
+\begin{bmatrix} a_0' \\ a_1' \\ a_2' \\ a_3' \end{bmatrix}
+=
+\begin{bmatrix}
+\mathtt{02} & \mathtt{03} & \mathtt{01} & \mathtt{01}\\
+\mathtt{01} & \mathtt{02} & \mathtt{03} & \mathtt{01}\\
+\mathtt{01} & \mathtt{01} & \mathtt{02} & \mathtt{03}\\
+\mathtt{03} & \mathtt{01} & \mathtt{01} & \mathtt{02}
+\end{bmatrix}
+\begin{bmatrix} a_0 \\ a_1 \\ a_2 \\ a_3 \end{bmatrix},
+\]
+
+where the multiplications and additions are in $\F_{256}$ (so $+$ is XOR, and the
+constants $\mathtt{01},\mathtt{02},\mathtt{03}$ multiply via \texttt{xtime}).
+Concretely the first output byte is
+\[
+a_0' = (\mathtt{02}\cdot a_0) \xor (\mathtt{03}\cdot a_1) \xor a_2 \xor a_3,
+\]
+and the others are cyclic rotations of this pattern (Figure~\ref{ch12:mixcolumns-fig}).
+The matrix is a circulant
+built from the polynomial $\mathtt{03}\,x^3 + \mathtt{01}\,x^2 + \mathtt{01}\,x +
+\mathtt{02}$ (equivalently, multiplication by a fixed polynomial modulo $x^4+1$
+in the ring of degree-$<4$ polynomials over $\F_{256}$).
+
+\begin{walkbox}
+\textbf{Mix one column.} Take the column $(\mathtt{D4}, \mathtt{BF},
+\mathtt{5D}, \mathtt{30})$, a value that appears in the FIPS-197 worked example.
+Compute the first output byte:
+\[
+a_0' = (\mathtt{02}\cdot \mathtt{D4}) \xor (\mathtt{03}\cdot \mathtt{BF})
+\xor \mathtt{5D} \xor \mathtt{30}.
+\]
+Now $\mathtt{02}\cdot\mathtt{D4} = \texttt{xtime}(\mathtt{D4})$: the top bit of
+$\mathtt{D4} = 11010100$ is set, so shift left to $\mathtt{1A8}$ and XOR
+$\mathtt{1B}$, giving $\mathtt{A8}\xor\mathtt{1B}=\mathtt{B3}$. And
+$\mathtt{03}\cdot\mathtt{BF} = \texttt{xtime}(\mathtt{BF}) \xor \mathtt{BF}$;
+$\texttt{xtime}(\mathtt{BF})$: top bit of $\mathtt{BF}=10111111$ is set, shift to
+$\mathtt{17E}$, XOR $\mathtt{1B}$ gives $\mathtt{65}$, then
+$\mathtt{65}\xor\mathtt{BF} = \mathtt{DA}$. So
+\[
+a_0' = \mathtt{B3} \xor \mathtt{DA} \xor \mathtt{5D} \xor \mathtt{30} = \mathtt{04}.
+\]
+Working out all four rows the same way gives the output column $(\mathtt{04},
+\mathtt{66}, \mathtt{81}, \mathtt{E5})$. The matrix has spread each input byte
+into all four outputs.
+\end{walkbox}
+
+\begin{whybox}
+Why \emph{these} constants ($\mathtt{02},\mathtt{03},\mathtt{01},\mathtt{01}$)?
+Two reasons.
+
+\textbf{Maximal diffusion.} The MixColumns matrix is the generating matrix of a
+\emph{maximum-distance-separable} (MDS) code. The practical consequence is the
+``branch number'' is $5$, the largest possible for a $4\times4$ matrix: if you
+change $d$ input bytes of a column ($1\le d\le 4$), then the number of changed
+input bytes plus changed output bytes is at least $5$. So flipping even a single
+input byte forces all four output bytes to change. This is the strongest possible
+single-column avalanche.
+
+\textbf{Cheapness.} The constants $\mathtt{01},\mathtt{02},\mathtt{03}$ are the
+smallest values that achieve MDS, and they need only \texttt{xtime} and XOR --- no
+general multiplier. A designer who wanted MDS but used bigger constants would pay
+for it in every implementation forever. Daemen and Rijmen searched for the
+cheapest MDS matrix; this is it.
+\end{whybox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\scriptsize, scale=0.9, every node/.style={transform shape}]
+  % input column
+  \foreach \i/\v in {0/$a_0$,1/$a_1$,2/$a_2$,3/$a_3$} {
+    \node[draw, minimum size=0.7cm, fill=sourceblue!12] (in\i) at (0,-\i) {\v};
+  }
+  \node[above=0.15cm of in0] {input column};
+  % matrix label
+  \node (mat) at (2.6,-1.5) [draw, rounded corners, fill=targetgreen!12,
+        minimum width=2.0cm, minimum height=2.4cm, align=center]
+        {MDS\\ matrix\\ $\times$};
+  % output column
+  \foreach \i/\v in {0/$a_0'$,1/$a_1'$,2/$a_2'$,3/$a_3'$} {
+    \node[draw, minimum size=0.7cm, fill=quotientorange!18] (out\i) at (5.2,-\i) {\v};
+  }
+  \node[above=0.15cm of out0] {output column};
+  % arrows: every input touches every output (branch number 5)
+  \foreach \i in {0,1,2,3} {
+    \foreach \j in {0,1,2,3} {
+      \draw[-{Stealth[length=1.4mm]}, gray!55] (in\i.east) -- (out\j.west);
+    }
+  }
+\end{tikzpicture}
+\caption{\texttt{MixColumns} multiplies each $4$-byte column by a fixed MDS
+matrix over $\F_{256}$. Because the branch number is $5$, every input byte
+influences every output byte (all sixteen arrows are live), so changing one input
+byte changes all four outputs.}
+\label{ch12:mixcolumns-fig}
+\end{figure}
+
+\begin{connectionbox}
+The branch-number argument is coding theory: the rows of the MixColumns matrix,
+appended to the identity, generate a $[8,4,5]$ MDS code over $\F_{256}$, whose
+minimum distance $5$ \emph{is} the branch number. The companion algebra book's
+treatment of Reed--Solomon and MDS codes is exactly the machinery that proves an
+attacker cannot find a low-weight differential through MixColumns. That is the
+bridge between ``error-correcting codes'' and ``provable resistance to
+differential cryptanalysis.''
+\end{connectionbox}
+
+\section{AddRoundKey: where the key finally enters}
+\label{ch12:addroundkey}
+
+The three layers so far are fixed and public --- they do not depend on the key at
+all. \texttt{AddRoundKey} is the only step that uses secret material, and it could
+not be simpler: XOR the $128$-bit round key into the $128$-bit state, byte for
+byte (equivalently, column for column).
+
+\[
+\text{state} \;\gets\; \text{state} \;\xor\; \text{RoundKey}_r.
+\]
+
+That is the whole operation. Its own inverse is itself (XOR twice with the same
+key returns the original). It looks trivial, but it is doing the essential work:
+without it, $\Enc_k$ would be a fixed public permutation with no secret, and
+anyone could decrypt. With it, the attacker faces a different permutation for
+every key, and the nonlinear SubBytes layers wrapped around the key additions
+make it computationally infeasible to peel the keys back off.
+
+\begin{trapbox}
+A naive reaction is ``AddRoundKey is just XOR, that is weak, like a one-time pad
+with a reused key.'' Two things save it. First, the key material is fresh per
+round (the key schedule generates a new round key each time). Second, and more
+importantly, AddRoundKey is sandwiched between \emph{nonlinear} SubBytes layers.
+A plain XOR with a repeated key is breakable because the cipher is linear; AES is
+not. The key XOR is the simplest possible way to inject the secret, and the
+nonlinearity around it does the protecting.
+\end{trapbox}
+
+\section{The key schedule}
+\label{ch12:keyschedule}
+
+AES-128 needs eleven $128$-bit round keys (one for the initial whitening plus one
+per round). The \textbf{key schedule} (or key expansion) stretches the
+$128$-bit cipher key into these $11\times16 = 176$ bytes. It is organized as a
+sequence of $4$-byte \emph{words} $W_0, W_1, \dots, W_{43}$. The first four words
+are just the cipher key; each later word is derived from earlier ones.
+
+For AES-128:
+
+\begin{itemize}
+\item $W_0,W_1,W_2,W_3$ = the four words of the cipher key.
+\item For $i = 4,\dots,43$:
+\[
+W_i =
+\begin{cases}
+W_{i-4} \xor \big(\texttt{SubWord}(\texttt{RotWord}(W_{i-1})) \xor \texttt{Rcon}_{i/4}\big)
+& \text{if } 4 \mid i,\\[4pt]
+W_{i-4} \xor W_{i-1} & \text{otherwise.}
+\end{cases}
+\]
+\end{itemize}
+
+Here \texttt{RotWord} rotates a word's four bytes left by one ($[a_0,a_1,a_2,a_3]
+\to [a_1,a_2,a_3,a_0]$), \texttt{SubWord} applies the S-box to each of the four
+bytes, and the \textbf{round constant} $\texttt{Rcon}_j = (\mathrm{rc}_j,0,0,0)$
+has $\mathrm{rc}_1 = \mathtt{01}$ and $\mathrm{rc}_{j} = \texttt{xtime}(\mathrm{rc}_{j-1})$,
+i.e.\ the powers of $x$ in $\F_{256}$:
+\[
+\mathtt{01},\ \mathtt{02},\ \mathtt{04},\ \mathtt{08},\ \mathtt{10},\
+\mathtt{20},\ \mathtt{40},\ \mathtt{80},\ \mathtt{1B},\ \mathtt{36}.
+\]
+Round key $r$ is the concatenation of words $W_{4r}, W_{4r+1}, W_{4r+2},
+W_{4r+3}$.
+
+\begin{whybox}
+Every piece of the key schedule earns its keep.
+
+\textbf{Nonlinearity (\texttt{SubWord}).} Without the S-box in the schedule, the
+round keys would be a linear function of the cipher key, and an attacker who
+learned one round key could solve for the others. SubWord makes the schedule
+nonlinear so round keys cannot be linearly related.
+
+\textbf{Symmetry breaking (\texttt{Rcon}).} The round constants differ every round
+(they are distinct powers of $x$). Without them, the schedule would treat each
+round identically, creating symmetries an attacker could exploit (related-key and
+slide attacks thrive on round-to-round symmetry). Distinct $\texttt{Rcon}$ values
+make every round key structurally different.
+
+\textbf{Rotation (\texttt{RotWord}).} Rotating before substitution diffuses byte
+positions across the word, so a change in one key byte spreads to others.
+\end{whybox}
+
+\begin{walkbox}
+\textbf{Expand the all-zero key, first step.} Let the cipher key be sixteen zero
+bytes, so $W_0=W_1=W_2=W_3 = \mathtt{00000000}$. Compute $W_4$. Since $4\mid 4$:
+\texttt{RotWord}($W_3$)$ = \mathtt{00000000}$, \texttt{SubWord} of that applies
+$S(\mathtt{00})=\mathtt{63}$ to each byte giving $\mathtt{63636363}$, then XOR
+$\texttt{Rcon}_1 = \mathtt{01000000}$ gives $\mathtt{62636363}$. Finally $W_4 =
+W_0 \xor \mathtt{62636363} = \mathtt{62636363}$. Then $W_5 = W_1 \xor W_4 =
+\mathtt{62636363}$, $W_6 = W_2 \xor W_5 = \mathtt{62636363}$, $W_7 = W_3 \xor W_6
+= \mathtt{62636363}$. So round key $1$ is $\mathtt{62636363}$ repeated four times.
+The S-box and Rcon have already injected structure into what was an all-zero key.
+\end{walkbox}
+
+\begin{trapbox}
+The key schedule is the part of AES with the smallest security margin, and it is
+where most academic ``breaks'' live. The known \emph{related-key} attacks on
+AES-256 (Biryukov--Khovratovich, 2009) exploit the simpler key schedule of the
+$256$-bit variant: with $14$ rounds but a schedule that does relatively little
+mixing per round key, an attacker who can query the cipher under keys with chosen
+\emph{differences} can recover the key faster than brute force. This is mostly of
+theoretical concern --- related-key access is a strong and unusual assumption,
+and no attack threatens AES under a single fixed unknown key --- but it is a real
+reminder that the schedule deserves respect. If you ever design a cipher, do not
+skimp on key mixing.
+\end{trapbox}
+
+\section{A full round, traced on bytes}
+\label{ch12:trace}
+
+Let us run one complete round on a concrete state. We will not do all ten rounds
+by hand (that is the FIPS-197 appendix's job and runs for pages), but one round
+shows every gear meshing. Start with the post-whitening state used in the
+standard's example:
+
+\[
+\text{state} =
+\begin{bmatrix}
+\mathtt{19} & \mathtt{A0} & \mathtt{9A} & \mathtt{E9}\\
+\mathtt{3D} & \mathtt{F4} & \mathtt{C6} & \mathtt{F8}\\
+\mathtt{E3} & \mathtt{E2} & \mathtt{8D} & \mathtt{48}\\
+\mathtt{BE} & \mathtt{2B} & \mathtt{2A} & \mathtt{08}
+\end{bmatrix}.
+\]
+
+\textbf{Step 1, SubBytes.} Replace each byte by its S-box value. For example
+$S(\mathtt{19})=\mathtt{D4}$, $S(\mathtt{A0})=\mathtt{E0}$,
+$S(\mathtt{3D})=\mathtt{27}$, and so on. The state becomes
+
+\[
+\begin{bmatrix}
+\mathtt{D4} & \mathtt{E0} & \mathtt{B8} & \mathtt{1E}\\
+\mathtt{27} & \mathtt{BF} & \mathtt{B4} & \mathtt{41}\\
+\mathtt{11} & \mathtt{98} & \mathtt{5D} & \mathtt{52}\\
+\mathtt{AE} & \mathtt{F1} & \mathtt{E5} & \mathtt{30}
+\end{bmatrix}.
+\]
+
+\textbf{Step 2, ShiftRows.} Rotate row $1$ left by $1$, row $2$ by $2$, row $3$
+by $3$:
+
+\[
+\begin{bmatrix}
+\mathtt{D4} & \mathtt{E0} & \mathtt{B8} & \mathtt{1E}\\
+\mathtt{BF} & \mathtt{B4} & \mathtt{41} & \mathtt{27}\\
+\mathtt{5D} & \mathtt{52} & \mathtt{11} & \mathtt{98}\\
+\mathtt{30} & \mathtt{AE} & \mathtt{F1} & \mathtt{E5}
+\end{bmatrix}.
+\]
+
+\textbf{Step 3, MixColumns.} Apply the matrix to each column. The first column is
+$(\mathtt{D4},\mathtt{BF},\mathtt{5D},\mathtt{30})$ --- exactly the column we mixed
+by hand earlier --- giving $(\mathtt{04},\mathtt{66},\mathtt{81},\mathtt{E5})$.
+Mixing all four columns yields
+
+\[
+\begin{bmatrix}
+\mathtt{04} & \mathtt{E0} & \mathtt{48} & \mathtt{28}\\
+\mathtt{66} & \mathtt{CB} & \mathtt{F8} & \mathtt{06}\\
+\mathtt{81} & \mathtt{19} & \mathtt{D3} & \mathtt{26}\\
+\mathtt{E5} & \mathtt{9A} & \mathtt{7A} & \mathtt{4C}
+\end{bmatrix}.
+\]
+
+\textbf{Step 4, AddRoundKey.} XOR in round key $1$, which for this example is
+
+\[
+\text{RoundKey}_1 =
+\begin{bmatrix}
+\mathtt{A0} & \mathtt{88} & \mathtt{23} & \mathtt{2A}\\
+\mathtt{FA} & \mathtt{54} & \mathtt{A3} & \mathtt{6C}\\
+\mathtt{FE} & \mathtt{2C} & \mathtt{39} & \mathtt{76}\\
+\mathtt{17} & \mathtt{B1} & \mathtt{39} & \mathtt{05}
+\end{bmatrix}.
+\]
+
+XORing cell by cell (e.g.\ $\mathtt{04}\xor\mathtt{A0}=\mathtt{A4}$) gives the
+state that enters round $2$:
+
+\[
+\begin{bmatrix}
+\mathtt{A4} & \mathtt{68} & \mathtt{6B} & \mathtt{02}\\
+\mathtt{9C} & \mathtt{9F} & \mathtt{5B} & \mathtt{6A}\\
+\mathtt{7F} & \mathtt{35} & \mathtt{EA} & \mathtt{50}\\
+\mathtt{F2} & \mathtt{2B} & \mathtt{43} & \mathtt{49}
+\end{bmatrix}.
+\]
+
+That is one round. Nine more like it (the last without MixColumns) and the block
+is encrypted. Notice the avalanche already building: the single input byte
+$\mathtt{19}$ in the top-left, after SubBytes/ShiftRows/MixColumns, has influenced
+an entire column of outputs, and the next round's ShiftRows will fling those
+across all four columns. Figure~\ref{ch12:round-fig} summarizes the four layers
+in order, and Figure~\ref{ch12:shiftrows-fig} shows the ShiftRows rotation that
+carries bytes between columns.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,
+  box/.style={draw, rounded corners, minimum width=3.4cm, minimum height=0.85cm, align=center},
+  sub/.style={box, fill=structurepurple!18},
+  shiftr/.style={box, fill=sourceblue!18},
+  mix/.style={box, fill=targetgreen!18},
+  ark/.style={box, fill=quotientorange!22},
+  arr/.style={-{Stealth[length=2.2mm]}, thick}]
+  \node[box, fill=gray!12] (in) {state in};
+  \node[sub, below=0.5cm of in] (sb) {\texttt{SubBytes}\\ \scriptsize confusion (nonlinear)};
+  \node[shiftr, below=0.5cm of sb] (sr) {\texttt{ShiftRows}\\ \scriptsize move across columns};
+  \node[mix, below=0.5cm of sr] (mc) {\texttt{MixColumns}\\ \scriptsize diffuse within columns};
+  \node[ark, below=0.5cm of mc] (ak) {\texttt{AddRoundKey}\\ \scriptsize inject the secret};
+  \node[box, fill=gray!12, below=0.5cm of ak] (out) {state out};
+  \draw[arr] (in) -- (sb);
+  \draw[arr] (sb) -- (sr);
+  \draw[arr] (sr) -- (mc);
+  \draw[arr] (mc) -- (ak);
+  \draw[arr] (ak) -- (out);
+  \node[right=0.9cm of mc, structurepurple, align=left] (key)
+    {\scriptsize round key$_r$};
+  \draw[arr, quotientorange] (key.west) .. controls +(left:0.5cm) and +(right:0.5cm) .. (ak.east);
+\end{tikzpicture}
+\caption{One AES round. The first three layers are fixed and public; only
+\texttt{AddRoundKey} uses the secret. The final round omits \texttt{MixColumns}.}
+\label{ch12:round-fig}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\scriptsize, scale=0.62, every node/.style={transform shape}]
+  \foreach \r in {0,1,2,3} {
+    \foreach \c in {0,1,2,3} {
+      \node[draw, minimum size=0.8cm, fill=sourceblue!10] at (\c, -\r) {};
+    }
+  }
+  \node at (1.5, 1.0) {\normalsize before};
+  \node[draw, minimum size=0.8cm, fill=evered!25] at (0,-1) {$a_1$};
+  \node[draw, minimum size=0.8cm, fill=evered!25] at (1,-1) {$a_5$};
+  \node[draw, minimum size=0.8cm, fill=evered!25] at (2,-1) {$a_9$};
+  \node[draw, minimum size=0.8cm, fill=evered!25] at (3,-1) {$a_{13}$};
+
+  \begin{scope}[xshift=7cm]
+  \foreach \r in {0,1,2,3} {
+    \foreach \c in {0,1,2,3} {
+      \node[draw, minimum size=0.8cm, fill=sourceblue!10] at (\c, -\r) {};
+    }
+  }
+  \node at (1.5, 1.0) {\normalsize after (row $1$ rotated left by $1$)};
+  \node[draw, minimum size=0.8cm, fill=evered!25] at (0,-1) {$a_5$};
+  \node[draw, minimum size=0.8cm, fill=evered!25] at (1,-1) {$a_9$};
+  \node[draw, minimum size=0.8cm, fill=evered!25] at (2,-1) {$a_{13}$};
+  \node[draw, minimum size=0.8cm, fill=evered!25] at (3,-1) {$a_1$};
+  \end{scope}
+  \draw[-{Stealth[length=2mm]}, thick] (3.9,-1.5) -- (4.9,-1.5);
+\end{tikzpicture}
+\caption{\texttt{ShiftRows} on row $1$: a left cyclic rotation by one byte. Rows
+$2$ and $3$ rotate by two and three. This is what carries bytes between columns so
+the next \texttt{MixColumns} blends them.}
+\label{ch12:shiftrows-fig}
+\end{figure}
+
+\section{Decryption: running the gears backward}
+
+Because every layer is invertible, AES decryption simply applies the inverses in
+reverse order. \texttt{InvSubBytes} uses the inverse S-box (apply the inverse
+affine map, then field-invert). \texttt{InvShiftRows} rotates rows right instead
+of left. \texttt{InvMixColumns} multiplies by the inverse of the MixColumns matrix
+(whose entries are $\mathtt{0E},\mathtt{0B},\mathtt{0D},\mathtt{09}$ ---
+deliberately larger, which is why naive decryption is a touch slower than
+encryption). \texttt{AddRoundKey} is its own inverse.
+
+A pleasant fact: with a small reordering trick (the ``equivalent inverse
+cipher''), decryption can be written with the \emph{same} sequence of operations
+as encryption, just with modified round keys, so hardware can share circuitry.
+This symmetry is partly why the final round drops MixColumns --- it makes the
+structure line up.
+
+\begin{focusbox}
+\textbf{AES is not a stream cipher and not its own inverse.} Encryption and
+decryption use \emph{different} routines (inverse S-box, inverse matrix, reversed
+key order). This differs from a Feistel cipher like DES, where decryption is
+encryption with the round keys reversed and no separate inverse round function is
+needed. The SPN structure trades that convenience for the ability to transform
+every byte every round.
+\end{focusbox}
+
+\section{Why AES is secure}
+\label{ch12:security}
+
+``Secure'' for a block cipher means it behaves like a \emph{pseudorandom
+permutation} (PRP): without the key, no efficient adversary can distinguish
+$\Enc_k$ (for a random secret $k$) from a truly random permutation of
+$128$-bit blocks, even given many chosen plaintext/ciphertext pairs. We cannot
+prove AES is a PRP from any standard hardness assumption --- no one can prove that
+of any practical cipher --- but we can show it resists every known general attack
+with a comfortable margin, and that is the working standard of trust.
+
+\begin{whybox}
+\textbf{Confusion and diffusion, made concrete.} Claude Shannon's two design
+goals are realized by specific layers.
+
+\emph{Confusion} means the relationship between key and ciphertext is complicated
+and nonlinear. SubBytes provides it: the only nonlinear step, with the best
+available resistance to algebraic attacks.
+
+\emph{Diffusion} means each plaintext (and key) bit influences many ciphertext
+bits, so statistics smear out. ShiftRows + MixColumns provide it. The
+\emph{wide-trail strategy} of Daemen and Rijmen quantifies this: the MixColumns
+branch number is $5$, and over four rounds any differential or linear trail must
+activate at least $25$ S-boxes. Each active S-box contributes a factor bounding
+the trail's probability (at most $2^{-6}$ for differentials), so any four-round
+trail has probability at most $(2^{-6})^{25} = 2^{-150}$, far below the
+$2^{-128}$ threshold an attacker would need. Stacking ten rounds leaves an
+enormous safety cushion.
+\end{whybox}
+
+\begin{attackbox}
+\textbf{What attacks exist, and why they fall short.}
+
+\emph{Brute force} on AES-128 needs $2^{128}$ trial decryptions --- physically
+impossible (the energy alone exceeds what is available).
+
+\emph{Differential cryptanalysis} tracks how input differences propagate. The
+wide-trail bound above kills it: no usable four-round differential exists, let
+alone ten-round.
+
+\emph{Linear cryptanalysis} looks for biased linear approximations; the same
+$25$-active-S-box bound makes any biased relation vanish below detectability.
+
+\emph{Biclique attack} (Bogdanov, Khovratovich, Rechberger, 2011) is the best
+known key-recovery on full AES-128: it costs about $2^{126.1}$ --- a factor of
+roughly $4$ better than brute force. After two decades of intense scrutiny, that
+is the entire dent. AES's mathematical core is essentially untouched.
+
+\emph{Related-key attacks} on AES-192/256 (cost around $2^{99.5}$ for AES-256 in
+the related-key model) are real but require the attacker to control key
+differences, an assumption that almost never holds in practice.
+
+The lesson: do not expect to break AES's math. The real attacks on AES deployments
+are \emph{implementation} attacks --- below.
+\end{attackbox}
+
+\begin{attackbox}
+\textbf{Cache-timing: the practical break.} The original software AES used a
+$256$-entry table for SubBytes (and combined tables for the round). Table lookups
+take different amounts of time depending on whether the indexed entry is in the
+CPU cache, and the index depends on secret state. In 2005 Daniel Bernstein, and
+independently Osvik--Shamir--Tromer, showed you can recover an AES key by
+measuring timing or by priming and probing the cache from another process on the
+same machine --- no break of the math required, just a leak through the
+implementation. The fix that won: the \textbf{AES-NI} instruction set (Intel 2010,
+now everywhere), which executes a whole round in hardware in constant time, with
+no data-dependent table lookups. If you must do AES in software without AES-NI,
+use a \emph{bitsliced} implementation that has no secret-indexed memory access.
+\textbf{Never} ship the textbook table-lookup version in production.
+\end{attackbox}
+
+\begin{connectionbox}
+The distinguishing game --- ``tell $\Enc_k$ apart from a random permutation'' ---
+is the PRP security definition built in the computational-hardness chapter. The
+$2^{-150}$ trail probabilities are union bounds over many possible trails; the
+companion probability book's treatment of union bounds and tail estimates is the
+exact tool. And the $2^{64}$ ``birthday'' limit on how many blocks you may safely
+encrypt under one key in a chaining mode (next chapter) comes straight from the
+birthday bound on a $128$-bit block size.
+\end{connectionbox}
+
+\section{Performance and where AES runs}
+
+AES was designed to be fast in software \emph{and} cheap in hardware, and it
+delivers. The four layers are byte operations and XORs; the classic software
+trick (Daemen and Rijmen's ``T-tables'') folds SubBytes, ShiftRows, and
+MixColumns into four $1024$-byte lookup tables so a round is sixteen table reads
+and a handful of XORs. With AES-NI, a single \texttt{aesenc} instruction does an
+entire round; modern cores encrypt at several gigabytes per second per core, and
+the constant-time hardware sidesteps the cache-timing problem entirely.
+
+\begin{applicationbox}
+\textbf{AES in the wild.}
+
+\emph{TLS / HTTPS.} The dominant cipher suite is \texttt{AES-GCM}
+(AES in counter mode with a Galois MAC), giving authenticated encryption. On a
+phone without strong AES hardware, TLS 1.3 may instead pick ChaCha20-Poly1305,
+which is faster in pure software --- but on anything with AES-NI, AES-GCM wins.
+
+\emph{WiFi (WPA2 / WPA3).} The CCMP cipher is AES in CCM mode (counter mode plus
+CBC-MAC). When you join a protected network, AES is encrypting your frames.
+
+\emph{Disk encryption.} BitLocker, FileVault, LUKS, and Android/iOS file-based
+encryption all use AES (in XTS mode for full-disk, where ciphertext stealing and
+a tweak handle fixed-size sectors).
+
+\emph{Signal / iMessage / Telegram.} The message payload encryption uses AES
+(typically AES-CBC or AES-CTR with a separate HMAC, or AES-GCM).
+
+\emph{VPNs and SSH.} IPsec, WireGuard's fallback paths, OpenVPN, and SSH all offer
+AES-GCM or AES-CTR transport encryption.
+
+In every case AES encrypts the bulk data; the asymmetric crypto (RSA, ECDH) only
+sets up the AES key. AES is the workhorse, and the public-key math is the
+handshake that hands it the key.
+\end{applicationbox}
+
+\begin{historybox}
+A nice footnote on key sizes: AES-128 offers $128$-bit security against classical
+attackers, which is comfortably beyond brute force forever. Grover's quantum
+search algorithm would, in principle, halve the effective key strength to $64$
+bits of quantum search --- which is why guidance for post-quantum margins often
+recommends AES-256 (leaving $128$ bits of strength even against an idealized
+quantum brute-forcer). Unlike RSA and elliptic curves, which Shor's algorithm
+breaks outright, AES survives the quantum era essentially intact by just using a
+longer key. That robustness is one more reason AES will be with us for decades.
+\end{historybox}
+
+\section{Putting the whole cipher together}
+
+For reference, here is the complete AES-128 encryption in pseudocode, every piece
+of which we have now justified:
+
+\begin{lstlisting}[language=Python]
+# AES-128 encryption, structural pseudocode (LEARNING ONLY).
+# Real use: call a vetted library (which uses AES-NI / constant time).
+def aes128_encrypt(plaintext16, key16):
+    state = to_state(plaintext16)          # 4x4 column-major bytes
+    rk = key_expansion(key16)              # 11 round keys, words W0..W43
+
+    add_round_key(state, rk[0])            # initial whitening
+    for r in range(1, 10):                 # rounds 1..9
+        sub_bytes(state)                   # nonlinear: S-box each byte
+        shift_rows(state)                  # rotate rows 0,1,2,3 by 0,1,2,3
+        mix_columns(state)                 # MDS mix within each column
+        add_round_key(state, rk[r])        # XOR round key
+    sub_bytes(state)                       # round 10: NO MixColumns
+    shift_rows(state)
+    add_round_key(state, rk[10])
+    return from_state(state)
+\end{lstlisting}
+
+Read it against the four \texttt{whybox} arguments: SubBytes is your confusion,
+ShiftRows and MixColumns are your diffusion, AddRoundKey is your secret, the loop
+count is your security margin, and the missing final MixColumns is the symmetry
+that makes decryption tidy without costing anything.
+
+\begin{recoverybox}
+Before the exercises, a quick self-check. Can you (1) state the four round
+operations and which one is nonlinear; (2) explain why ShiftRows and MixColumns
+are useless apart but powerful together; (3) derive an S-box entry from the field
+inverse plus the affine map; (4) say why AES-128 uses ten rounds rather than,
+say, four; and (5) name the real attack class that threatens AES deployments
+(timing/cache side channels, not the math)? If any of these is shaky, reread the
+matching section before moving on.
+\end{recoverybox}
+
+\section{Exercises}
+
+\begin{exercise}
+Compute $\texttt{xtime}(\mathtt{0x80})$, $\texttt{xtime}(\mathtt{0x7F})$, and
+$\mathtt{0x02}\cdot\mathtt{0xFF}$ in $\F_{256}$ with the AES polynomial. Show the
+shift-and-conditional-XOR for each.
+\end{exercise}
+
+\begin{exercise}
+Verify by hand that $\mathtt{0x53}\cdot\mathtt{0xCA} = \mathtt{0x01}$ in
+$\F_{256}$, confirming that $\mathtt{0xCA}$ is the multiplicative inverse of
+$\mathtt{0x53}$ used in the worked S-box example. (Multiply the two polynomials
+and reduce mod $m(x)$.)
+\end{exercise}
+
+\begin{exercise}
+Using the affine formula $s_i = y_i \xor y_{i+4} \xor y_{i+5} \xor y_{i+6} \xor
+y_{i+7} \xor c_i$ with $c=\mathtt{0x63}$, compute $S(\mathtt{0x00})$ and
+$S(\mathtt{0x01})$ from their field inverses ($0^{-1}=0$ by convention,
+$1^{-1}=1$). Confirm the famous values $S(\mathtt{0x00})=\mathtt{0x63}$ and
+$S(\mathtt{0x01})=\mathtt{0x7C}$.
+\end{exercise}
+
+\begin{exercise}
+\textbf{Diffusion.} Take any single column of four bytes, flip exactly one bit of
+one byte, and run both versions through MixColumns. Show that all four output
+bytes change. Explain how this demonstrates the branch number being greater than
+$1$, and why ShiftRows is needed for the change to spread to other columns in the
+next round.
+\end{exercise}
+
+\begin{exercise}
+Run \texttt{ShiftRows} on the state whose rows are
+$(\mathtt{00},\mathtt{01},\mathtt{02},\mathtt{03})$,
+$(\mathtt{10},\mathtt{11},\mathtt{12},\mathtt{13})$,
+$(\mathtt{20},\mathtt{21},\mathtt{22},\mathtt{23})$,
+$(\mathtt{30},\mathtt{31},\mathtt{32},\mathtt{33})$. Write the resulting state.
+\end{exercise}
+
+\begin{exercise}
+\textbf{Key schedule.} Continue the all-zero-key expansion from the worked
+example: compute words $W_8$ through $W_{11}$ (so round key $2$). You will need
+$\texttt{Rcon}_2 = \mathtt{02000000}$ and the S-box value
+$S(\mathtt{0x63}) = \mathtt{0xFB}$. Show each step.
+\end{exercise}
+
+\begin{exercise}
+Explain why AES omits \texttt{MixColumns} in its final round. Argue that if the
+final MixColumns were present, an attacker could strip it off without knowing the
+key, so it would add no security. (Hint: MixColumns is a fixed, public, invertible
+linear map.)
+\end{exercise}
+
+\begin{exercise}
+\textbf{Counting active S-boxes.} The wide-trail argument claims any four-round
+differential trail activates at least $25$ S-boxes. Sketch the argument: one round
+of MixColumns has branch number $5$, so a single active column in one round forces
+at least $5$ active S-boxes across two consecutive rounds; combine across the
+$4\times4$ structure over four rounds to reach $25$. Then estimate the trail
+probability bound using $2^{-6}$ per active S-box.
+\end{exercise}
+
+\begin{exercise}
+\textbf{Break a toy SPN.} Build a one-round ``AES'' with \emph{no} SubBytes (only
+ShiftRows, MixColumns, AddRoundKey). Show that the entire map from plaintext to
+ciphertext is affine over $\F_2$, and describe how an attacker recovers the round
+key from a few known plaintext/ciphertext pairs by solving a linear system. This
+is precisely why the nonlinear SubBytes layer cannot be removed.
+\end{exercise}
+
+\begin{exercise}
+\textbf{Side channel.} Explain why a table-lookup implementation of SubBytes can
+leak the key through cache timing, while an AES-NI hardware round or a bitsliced
+software implementation does not. What property of the memory-access pattern is
+the difference?
+\end{exercise}
+
+\begin{exercise}
+AES-256 uses $14$ rounds and a slightly different key schedule than AES-128.
+Given that the best single-key attack on AES-128 (biclique) is about $2^{126}$ and
+related-key attacks on AES-256 reach about $2^{99.5}$, argue why ``more rounds and
+a longer key'' did not straightforwardly make AES-256 stronger than AES-128 in the
+related-key model, and why this is nonetheless not a practical concern for most
+deployments.
+\end{exercise}
+
+\begin{exercise}
+\textbf{Implementation.} Using the toy S-box generator from this chapter as a
+start, write functions \texttt{shift\_rows}, \texttt{mix\_columns}, and
+\texttt{add\_round\_key}, plus a \texttt{key\_expansion}, and reproduce the
+single-round trace in Section~\ref{ch12:trace} (state in $\to$ state out). Then
+encrypt the FIPS-197 test vector (plaintext
+$\mathtt{00112233445566778899aabbccddeeff}$, key
+$\mathtt{000102030405060708090a0b0c0d0e0f}$) and check you get ciphertext
+$\mathtt{69c4e0d86a7b0430d8cdb78070b4c55a}$. State clearly in a comment that this
+code is for learning, not production.
+\end{exercise}

@@ -1,0 +1,456 @@
+\chapter{RSA}
+
+In the previous chapter Alice and Bob learned to agree on a shared secret across a public wire using Diffie-Hellman. That is a key-\emph{agreement} dance: both parties send a message, and the secret falls out of the interaction. RSA does something that feels more magical the first time you see it. Alice publishes a single number, her \emph{public key}, and then \emph{anyone in the world} can encrypt a message that only Alice can read. No round trip, no prior contact. Bob can write to Alice the way you drop a letter through a mail slot: the slot is public, the key to the box is not.
+
+That asymmetry --- public to lock, private to unlock --- is the whole point of public-key cryptography, and RSA was the first concrete scheme that delivered it for both encryption and signatures. It is built almost entirely out of the number theory you already met in Chapters 3 and 4: modular arithmetic, Euler's theorem, and the stubborn difficulty of factoring a large integer. This chapter takes you from those ingredients to a working (toy) implementation, through a full numeric example with $p=61$ and $q=53$, and then shows you why the ``textbook'' version you just built is dangerously broken and what real systems do instead.
+
+\chapterline
+
+\section{The setup: a one-way operation with a trapdoor}
+\label{ch19:setup}
+
+Recall the shape of a public-key encryption scheme. We need three algorithms:
+
+\begin{itemize}
+  \item $\Gen$: produces a key pair $(pk, sk)$ --- a public key everyone may see and a secret key only the owner holds.
+  \item $\Enc_{pk}(m)$: anyone with $pk$ can turn a message $m$ into a ciphertext $c$.
+  \item $\Dec_{sk}(c)$: only the holder of $sk$ can recover $m$ from $c$.
+\end{itemize}
+
+Figure~\ref{ch19:flow-diagram} shows the asymmetry we are after. For this to be useful, encryption must be easy for everyone but inverting it must be hard for everyone \emph{except} the holder of $sk$. The technical name for the object we want is a \emph{trapdoor one-way permutation}: a function that is easy to compute, hard to invert, but easy to invert if you know one extra piece of information (the trapdoor).
+
+\begin{intuitionbox}
+Think of a padlock you can snap shut with a push --- no key needed to lock it. Snapping it open again requires the key. The ``snap shut'' is encryption with the public key; the ``open'' is decryption with the private key. Diffie-Hellman gave us a one-way function (exponentiation in a group) with no trapdoor; that is why DH needs two messages. RSA's contribution is the \emph{trapdoor}: a way to build the one-way function so that secret knowledge unlocks the inverse.
+\end{intuitionbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,
+  party/.style={draw, rounded corners, minimum width=20mm, minimum height=9mm},
+  alice/.style={party, fill=aliceblue!12, draw=aliceblue},
+  bob/.style={party, fill=bobgreen!12, draw=bobgreen},
+  eve/.style={party, fill=evered!12, draw=evered}]
+  \node[bob] (bob) {Bob};
+  \node[alice, right=58mm of bob] (alice) {Alice};
+  \node[eve, below=14mm of $(bob)!0.5!(alice)$] (eve) {Eve (sees the wire)};
+
+  % public key broadcast
+  \draw[-{Latex}, aliceblue, thick] (alice.north) to[out=120,in=60] node[above]{publishes $pk=(n,e)$} (bob.north);
+  % ciphertext
+  \draw[-{Latex}, bobgreen, thick] (bob) -- node[above]{$c = m^{e}\bmod n$} (alice);
+  % eve taps
+  \draw[-{Latex}, evered, dashed] ($(bob)!0.5!(alice)$) -- (eve);
+
+  \node[align=left, anchor=west] at ($(alice.south)+(-1,-0.9)$) {recovers $m = c^{d}\bmod n$\\ \footnotesize (only Alice knows $d$)};
+\end{tikzpicture}
+\caption{The asymmetric flow. Alice publishes her public key once; anyone can encrypt to her, but only she holds the private exponent $d$ that inverts the operation. Eve, who sees both $pk$ and $c$, cannot recover $m$.}
+\label{ch19:flow-diagram}
+\end{figure}
+
+\begin{historybox}
+The scheme is named for Ron Rivest, Adi Shamir, and Leonard Adleman, who published it at MIT in 1977, a year after Diffie and Hellman described the idea of public-key cryptography without giving a full encryption construction. The story goes that the working version came to Rivest after a Passover dinner; Shamir and Adleman had spent months poking holes in his earlier proposals, and the surviving idea was the one nobody could break. Much later it emerged that Clifford Cocks, working at the British signals agency GCHQ, had discovered essentially the same algorithm in 1973, but it was classified and went unpublished for over two decades.
+\end{historybox}
+
+\section{The number theory you need}
+\label{ch19:numbertheory}
+
+Everything rests on one fact from Chapter 4, Euler's theorem, plus its specialization, Fermat's little theorem. Let me restate them so the chapter stands on its own.
+
+For a positive integer $n$, Euler's totient $\varphi(n)$ counts the integers in $\set{1,2,\dots,n}$ that are coprime to $n$. If $n=pq$ for distinct primes $p,q$, then
+\[
+  \varphi(n) = (p-1)(q-1),
+\]
+because the only numbers below $n$ \emph{not} coprime to $n$ are the multiples of $p$ (there are $q-1$ of them below $n$) and the multiples of $q$ (there are $p-1$), and these two sets do not overlap. So $\varphi(pq) = pq - 1 - (q-1) - (p-1) = (p-1)(q-1)$.
+
+\begin{theorem}[Euler]
+\label{ch19:euler}
+If $\gcd(a,n)=1$ then $a^{\varphi(n)} \equiv 1 \pmod{n}$.
+\end{theorem}
+
+The reason is purely group-theoretic and worth keeping in your head: the units modulo $n$, written $\Zns{n}$, form a group of size $\varphi(n)$ under multiplication. By Lagrange's theorem the order of any element divides the size of the group, so raising any unit to the $\varphi(n)$ power lands you back at the identity, $1$. Fermat's little theorem is the case $n=p$ prime, where $\varphi(p)=p-1$:
+\[
+  a^{p-1}\equiv 1 \pmod p \quad\text{whenever } p\nmid a.
+\]
+
+\begin{connectionbox}
+The cost of actually computing $a^e \bmod n$ is the subject of the modular-exponentiation section in the companion algorithms book. The trick is square-and-multiply: an exponent with $k$ bits costs about $k$ squarings and at most $k$ multiplications, each modulo $n$. So exponentiating a $2048$-bit number takes a few thousand big-integer multiplications --- fast. The asymmetry that makes RSA work is that \emph{forward} exponentiation is cheap while \emph{inverting} it (finding $e$-th roots mod $n$ without the trapdoor) appears to require factoring $n$, for which no comparably fast algorithm is known.
+\end{connectionbox}
+
+\section{Key generation}
+\label{ch19:keygen}
+
+Here is the whole construction. To make a key pair:
+
+\begin{enumerate}
+  \item Choose two large distinct primes $p$ and $q$ (in practice each around $1024$ bits, so $n$ is $2048$ bits).
+  \item Compute the \emph{modulus} $n = pq$ and the totient $\varphi(n) = (p-1)(q-1)$.
+  \item Choose a public exponent $e$ with $1 < e < \varphi(n)$ and $\gcd(e,\varphi(n))=1$. A common choice is $e = 65537$.
+  \item Compute the private exponent $d \equiv e^{-1} \pmod{\varphi(n)}$, the modular inverse of $e$ modulo $\varphi(n)$. This exists precisely because $\gcd(e,\varphi(n))=1$, and you find it with the extended Euclidean algorithm.
+\end{enumerate}
+
+The public key is $pk = (n, e)$. The private key is $sk = (n, d)$. The primes $p,q$ and the totient $\varphi(n)$ must be destroyed or kept as secret as $d$ itself --- anyone who learns $p$ and $q$ can recompute $d$.
+
+\begin{focusbox}
+The defining relation is $ed \equiv 1 \pmod{\varphi(n)}$. Read it as: $e$ and $d$ are inverse operations \emph{in the exponent}. Encryption raises to the $e$, decryption raises to the $d$, and because the exponents multiply to ``1 mod $\varphi(n)$'', doing both in sequence is the identity on the message. The next section makes that precise.
+\end{focusbox}
+
+\section{Encryption, decryption, and why it works}
+\label{ch19:encdec}
+
+A message is encoded as an integer $m$ with $0 \le m < n$. Then:
+\[
+  \Enc_{pk}(m) = m^{e} \bmod n = c, \qquad
+  \Dec_{sk}(c) = c^{d} \bmod n.
+\]
+That is it. Both operations are a single modular exponentiation.
+
+\begin{theorem}[Correctness of RSA]
+\label{ch19:correctness}
+For every $m$ with $0\le m < n$ we have $(m^e)^d \equiv m \pmod n$.
+\end{theorem}
+
+\begin{whybox}
+\textbf{Why decryption undoes encryption.} We need $m^{ed}\equiv m\pmod n$. By construction $ed \equiv 1\pmod{\varphi(n)}$, so $ed = 1 + k\varphi(n)$ for some integer $k\ge 0$. Hence
+\[
+  m^{ed} = m^{1+k\varphi(n)} = m\cdot\bigl(m^{\varphi(n)}\bigr)^{k}.
+\]
+If $\gcd(m,n)=1$, Euler's theorem (\ref{ch19:euler}) says $m^{\varphi(n)}\equiv 1\pmod n$, so the bracket is $1^k=1$ and $m^{ed}\equiv m$. Done --- for units.
+
+But what if $m$ shares a factor with $n$, say $p \mid m$? Then Euler's theorem does not apply directly. We patch this with the Chinese Remainder Theorem. Work modulo $p$ and modulo $q$ separately.
+
+Modulo $q$: since $p\mid m$ and $q\ne p$, we have $\gcd(m,q)=1$, so Fermat gives $m^{q-1}\equiv 1\pmod q$. Now $ed-1 = k(p-1)(q-1)$ is a multiple of $q-1$, so $m^{ed-1}\equiv 1\pmod q$ and therefore $m^{ed}\equiv m\pmod q$.
+
+Modulo $p$: here $p\mid m$, so $m\equiv 0\pmod p$, and likewise $m^{ed}\equiv 0\equiv m\pmod p$ (any positive power of $0$ is $0$).
+
+So $m^{ed}\equiv m$ both mod $p$ and mod $q$. Since $p$ and $q$ are distinct primes, CRT says these two congruences pin down $m^{ed}$ uniquely modulo $pq=n$, giving $m^{ed}\equiv m\pmod n$ for \emph{every} $m$, units or not.
+\end{whybox}
+
+So RSA decryption is exact for all messages in range, not just the coprime ones. (In practice $m$ with $\gcd(m,n)>1$ would mean Bob accidentally encoded one of Alice's secret primes, an event of vanishing probability --- and if it happened, $\gcd(m,n)$ would hand the attacker a factor of $n$.)
+
+\section{A full worked example: $p=61$, $q=53$}
+\label{ch19:worked}
+
+Let me run the entire scheme with tiny primes so every number is checkable by hand.
+
+\textbf{Key generation.}
+\begin{itemize}
+  \item $p = 61$, $q = 53$.
+  \item $n = pq = 61\cdot 53 = 3233$.
+  \item $\varphi(n) = (p-1)(q-1) = 60\cdot 52 = 3120$.
+  \item Choose $e = 17$. Check $\gcd(17,3120)=1$: since $3120 = 17\cdot 183 + 9$, then $17 = 9\cdot 1 + 8$, $9 = 8+1$, $8 = 8\cdot 1$, so the gcd is $1$. Good, $17$ is a valid public exponent.
+  \item Compute $d = 17^{-1}\bmod 3120$ with the extended Euclidean algorithm. Running it back: $1 = 9-8 = 9-(17-9) = 2\cdot 9 - 17 = 2(3120-17\cdot 183) - 17 = 2\cdot 3120 - 367\cdot 17$. So $-367\cdot 17 \equiv 1\pmod{3120}$, i.e. $d \equiv -367 \equiv 3120-367 = 2753\pmod{3120}$.
+\end{itemize}
+Check: $17\cdot 2753 = 46801$, and $46801 = 15\cdot 3120 + 1 = 46800+1$. Indeed $ed\equiv 1\pmod{\varphi(n)}$.
+
+So $pk = (3233, 17)$ and $sk = (3233, 2753)$.
+
+\textbf{Encrypt.} Suppose Bob's message is $m = 65$. He computes
+\[
+  c = 65^{17}\bmod 3233.
+\]
+Do it with square-and-multiply. Build up powers of $65$ modulo $3233$:
+\[
+\begin{aligned}
+  65^1 &\equiv 65, &
+  65^2 &\equiv 4225 \equiv 992, \\
+  65^4 &\equiv 992^2 = 984064 \equiv 984064 - 304\cdot 3233 = 1232, \\
+  65^8 &\equiv 1232^2 = 1517824 \equiv 1517824 - 469\cdot 3233 = 1547, \\
+  65^{16} &\equiv 1547^2 = 2393209 \equiv 2393209 - 740\cdot 3233 = 789.
+\end{aligned}
+\]
+Now $17 = 16 + 1$, so $65^{17} = 65^{16}\cdot 65^{1} \equiv 789\cdot 65 = 51285$. Reduce: $51285 = 15\cdot 3233 + r$, and $15\cdot 3233 = 48495$, so $r = 51285-48495 = 2790$. Thus
+\[
+  c = 2790.
+\]
+
+\textbf{Decrypt.} Alice computes $m = 2790^{2753}\bmod 3233$. Doing the full square-and-multiply by hand is tedious (the exponent $2753 = 101011000001_2$), but the structure is identical. The end result, which you can verify with the toy code below, is $2790^{2753}\equiv 65\pmod{3233}$ --- the original message.
+
+\begin{walkbox}
+Want to sanity-check decryption without grinding all eleven squarings of the full exponent? Use CRT, exactly as in the correctness proof. The decryptor knows $p=61$ and $q=53$, so it precomputes the reduced exponents
+\[
+  d_p = d\bmod(p-1) = 2753\bmod 60 = 53, \qquad
+  d_q = d\bmod(q-1) = 2753\bmod 52 = 49,
+\]
+and the per-prime ciphertext residues $c_p = 2790\bmod 61 = 45$ and $c_q = 2790\bmod 53 = 34$. Then it computes the two small exponentiations
+\[
+  m_p = c_p^{d_p}\bmod 61 = 45^{53}\bmod 61 = 4, \qquad
+  m_q = c_q^{d_q}\bmod 53 = 34^{49}\bmod 53 = 12.
+\]
+Finally it CRT-combines $\set{4\bmod 61,\ 12\bmod 53}$. Writing $m = m_q + q\cdot t = 12 + 53t$ and forcing $12+53t\equiv 4\pmod{61}$ gives $53t\equiv -8\pmod{61}$; since $q^{-1}\equiv 53^{-1}\equiv 38\pmod{61}$ we get $t \equiv 38\cdot(4-12)\equiv 38\cdot(-8)\equiv 1\pmod{61}$, so
+\[
+  m = 12 + 53\cdot 1 = 65.
+\]
+The original message, recovered through two exponentiations on half-width numbers instead of one on the full modulus. Real implementations decrypt this way for a roughly fourfold speedup --- it is called \emph{RSA-CRT}.
+\end{walkbox}
+
+\begin{recoverybox}
+Notice the spot-check $m_q = 34^{49}\bmod 53 = 12$ does not need square-and-multiply at all if you reduce smartly: $34^{49} = 34^{52}\cdot 34^{-3} = 34^{-3}\pmod{53}$ by Fermat, so you invert $34^3$ once. The general lesson is that by-hand RSA arithmetic is error-prone --- it is shockingly easy to drop a factor in a long squaring chain --- so verify against the toy code below, and use Fermat or Euler to collapse exponents whenever a prime modulus lets you. The machine is the source of truth; the hand computation is for building intuition about \emph{why} the answer comes out, not for trusting the digits.
+\end{recoverybox}
+
+\begin{implementbox}
+A complete textbook-RSA in a few lines of Python. \textbf{Learning only --- never deploy this. It is missing padding, constant-time arithmetic, and safe key generation, and is insecure in every real sense.}
+\begin{lstlisting}[language=Python]
+from math import gcd
+
+def egcd(a, b):
+    if b == 0:
+        return (a, 1, 0)
+    g, x, y = egcd(b, a % b)
+    return (g, y, x - (a // b) * y)
+
+def inv_mod(a, m):
+    g, x, _ = egcd(a % m, m)
+    if g != 1:
+        raise ValueError("no inverse")
+    return x % m
+
+def keygen(p, q, e=65537):
+    n = p * q
+    phi = (p - 1) * (q - 1)
+    if gcd(e, phi) != 1:
+        raise ValueError("bad e")
+    d = inv_mod(e, phi)
+    return (n, e), (n, d)        # public, private
+
+def encrypt(pk, m):
+    n, e = pk
+    return pow(m, e, n)          # pow does square-and-multiply
+
+def decrypt(sk, c):
+    n, d = sk
+    return pow(c, d, n)
+
+# Reproduce the chapter's worked example:
+pub, priv = keygen(61, 53, e=17)
+print(pub, priv)                 # (3233, 17) (3233, 2753)
+c = encrypt(pub, 65)
+print(c)                         # 2790
+print(decrypt(priv, c))          # 65
+\end{lstlisting}
+The encryptor and decryptor are one line each --- but the silence on padding is exactly the danger the next section is about.
+\end{implementbox}
+
+\section{The factoring assumption}
+\label{ch19:factoring}
+
+Why can't Eve, who sees $pk=(n,e)$ and ciphertext $c=m^e\bmod n$, just recover $m$? She would need to compute an $e$-th root modulo $n$. The obvious route is to learn $d$, which means learning $\varphi(n)=(p-1)(q-1)$; and since $\varphi(n) = n - (p+q) + 1$, knowing $\varphi$ together with $n=pq$ pins down $p+q$ and $pq$, hence $p$ and $q$. Learning $\varphi(n)$ is equivalent to factoring $n$. So if factoring is hard, the direct attack is out.
+
+\begin{definition}[RSA assumption]
+\label{ch19:rsa-assumption}
+Sample two random large primes $p,q$, set $n=pq$, pick a valid $e$, and pick a uniformly random target $y\in\Zns{n}$. The \emph{RSA problem} is to find $x$ with $x^e\equiv y\pmod n$. The RSA assumption says no $\PPT$ algorithm solves this with non-negligible probability.
+\end{definition}
+
+\begin{definition}[Factoring assumption]
+\label{ch19:factoring-assumption}
+Given $n=pq$ for random large primes $p,q$, no $\PPT$ algorithm outputs $p$ or $q$ with non-negligible probability.
+\end{definition}
+
+Factoring breaks RSA: if you can factor $n$ you recover $\varphi(n)$, then $d$, then everything. The converse --- whether breaking RSA (computing $e$-th roots) requires factoring --- is \emph{not} known to hold. Breaking RSA could conceivably be easier than factoring; there is no proof either way. So the RSA assumption is formally stronger (a stronger thing to assume) than the factoring assumption. In practice we lean on both, and decades of cryptanalysis have left the best general-purpose factoring algorithm, the general number field sieve, running in time
+\[
+  \exp\!\Bigl( \bigl(\tfrac{64}{9}\bigr)^{1/3} (\ln n)^{1/3}(\ln\ln n)^{2/3} \Bigr),
+\]
+which is sub-exponential but still wildly impractical for a well-chosen $2048$-bit $n$.
+
+\begin{historybox}
+The RSA Factoring Challenge (1991--2007) put cash prizes on factoring specific moduli. RSA-129 (a $426$-bit number from a 1977 \emph{Scientific American} column by Martin Gardner, estimated by Rivest to need $40$ quadrillion years) fell in 1994 to a distributed effort across the early internet. RSA-768 ($768$ bits) was factored in 2009 after about two years of computation. RSA-250 ($829$ bits) fell in 2020. No $1024$-bit or larger challenge modulus has been publicly factored, which is why $2048$ bits is today's floor and $3072$+ is recommended for long-lived keys.
+\end{historybox}
+
+\begin{connectionbox}
+The sub-exponential running time of the number field sieve is why RSA keys must be so much larger than symmetric keys for equivalent security: a $128$-bit AES key and roughly a $3072$-bit RSA modulus sit at a comparable security level. The companion algorithms book derives where the $\exp((\ln n)^{1/3}\dots)$ shape comes from --- it is the cost of finding enough ``smooth'' relations to build a congruence of squares. Shor's quantum algorithm, in Chapter 35, factors in polynomial time and would demolish RSA outright; that is the entire motivation for post-quantum cryptography.
+\end{connectionbox}
+
+\section{Why textbook RSA is broken}
+\label{ch19:textbook-broken}
+
+Everything so far defines \emph{textbook RSA}: encrypt as $c=m^e\bmod n$, full stop. It is correct, and the factoring assumption protects the key. Yet as an encryption scheme it fails badly, because correctness and key-secrecy are not the same as message-secrecy. The fatal flaw is that textbook RSA is \emph{deterministic}: the same $m$ always maps to the same $c$. A deterministic public-key scheme can never be semantically secure --- Eve encrypts her guesses herself and compares.
+
+\begin{attackbox}
+\textbf{Several ways textbook RSA leaks.}
+
+\emph{Guess-and-check (the deterministic killer).} Suppose Bob is sending one of two known messages, ``BUY'' or ``SELL''. Eve has $pk$. She computes $\Enc_{pk}(\text{BUY})$ and $\Enc_{pk}(\text{SELL})$ herself and compares to the intercepted $c$. She reads the plaintext without touching the private key. Any low-entropy message space (a PIN, a vote, a yes/no) falls instantly.
+
+\emph{Small-message / small-$e$ attack.} If $e=3$ and the message is small enough that $m^3 < n$, then $c=m^3$ with \emph{no} modular reduction, and Eve just takes an ordinary integer cube root of $c$ over $\Z$. No factoring needed. More generally, short messages (like a $128$-bit AES key being transported) are vulnerable whenever $m^e$ does not wrap around the modulus.
+
+\emph{H\r{a}stad's broadcast attack.} Send the \emph{same} $m$ to three recipients with $e=3$ and distinct moduli $n_1,n_2,n_3$. Eve collects $c_i = m^3\bmod n_i$. By CRT she reconstructs $m^3\bmod n_1 n_2 n_3$; but $m^3 < n_1 n_2 n_3$, so this congruence \emph{is} $m^3$ as an integer, and she takes the cube root. Three ciphertexts, no factoring, full recovery.
+
+\emph{Malleability.} RSA's homomorphic structure, $\Enc(m_1)\cdot\Enc(m_2)=\Enc(m_1 m_2)\bmod n$, lets Eve maul ciphertexts. Given $c=\Enc(m)$ she can produce $\Enc(2m) = c\cdot 2^e\bmod n$ without knowing $m$. In a chosen-ciphertext setting this is devastating: ask the server to decrypt the harmless-looking $c\cdot 2^e$, get back $2m$, divide by $2$.
+\end{attackbox}
+
+\begin{trapbox}
+The lesson is sharp: \textbf{never encrypt a raw message with $m^e\bmod n$.} Determinism alone sinks the scheme regardless of key size. The fix is to inject randomness and structure into $m$ before exponentiating --- a padding scheme --- so that (a) the same plaintext encrypts to different ciphertexts each time, and (b) malformed or mauled ciphertexts are rejected on decryption.
+\end{trapbox}
+
+\section{Padding done right: OAEP}
+\label{ch19:oaep}
+
+The modern fix for RSA encryption is \emph{Optimal Asymmetric Encryption Padding} (OAEP), designed by Bellare and Rogaway in 1994. The idea: before exponentiating, run the message through a randomized, reversible transformation built from two hash functions used as ``random oracles,'' so that the integer you actually raise to the $e$ looks uniformly random and any tampering scrambles it beyond recognition.
+
+Let $n$ be $k$ bits and fix two mask-generating hash functions $G$ and $H$. To encrypt a message $M$ (first extended with a fixed amount of zero bytes and a label hash to a block $M'$ of $n_1$ bits), choose a fresh random seed $r$ of $n_0$ bits and compute a two-round Feistel-like mixing:
+\[
+  X = M' \xor G(r), \qquad Y = r \xor H(X),
+\]
+then set the padded integer to $m = X\concat Y$ and finally $c = m^e\bmod n$. Decryption exponentiates to get $m=X\concat Y$ back, recovers $r = Y\xor H(X)$, then $M' = X\xor G(r)$, and checks that the fixed padding bytes are exactly where they should be --- if not, it rejects. Figure~\ref{ch19:oaep-diagram} traces the mixing.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,
+  box/.style={draw, rounded corners, minimum width=22mm, minimum height=7mm, fill=blue!4},
+  hsh/.style={draw, circle, minimum size=8mm, fill=structurepurple!18},
+  op/.style={draw, circle, minimum size=5mm, inner sep=0pt}]
+  \node[box] (msg) {$M'$ (msg+pad)};
+  \node[box, right=34mm of msg] (seed) {$r$ (random)};
+  \node[hsh, below=12mm of seed] (G) {$G$};
+  \node[op, below=12mm of msg] (x1) {$\xor$};
+  \node[box, below=8mm of x1] (X) {$X$};
+  \node[hsh, right=18mm of X] (H) {$H$};
+  \node[op, below=8mm of G] (x2) {$\xor$};
+  \node[box, below=8mm of x2] (Y) {$Y$};
+  \node[box, below=12mm of $(X)!0.5!(Y)$, minimum width=52mm] (m) {$m = X \concat Y \ \longrightarrow\ c=m^e \bmod n$};
+
+  \draw[-{Latex}] (seed) -- (G);
+  \draw[-{Latex}] (G) -| (x1);
+  \draw[-{Latex}] (msg) -- (x1);
+  \draw[-{Latex}] (x1) -- (X);
+  \draw[-{Latex}] (X) -- (H);
+  \draw[-{Latex}] (H) -- (x2);
+  \draw[-{Latex}] (seed) -- (x2);
+  \draw[-{Latex}] (x2) -- (Y);
+  \draw[-{Latex}] (X) -- (m);
+  \draw[-{Latex}] (Y) -- (m);
+\end{tikzpicture}
+\caption{RSA-OAEP padding. The random seed $r$ and the two hash functions $G,H$ spread the message $M'$ across the full block $m=X\concat Y$ before exponentiation, making encryption probabilistic and tamper-evident.}
+\label{ch19:oaep-diagram}
+\end{figure}
+
+\begin{whybox}
+\textbf{Why OAEP fixes the leaks.} The random seed $r$ makes encryption probabilistic: encrypt the same $M$ twice and the two ciphertexts differ, killing the guess-and-check and broadcast attacks. The Feistel mixing means every bit of $m$ depends on every bit of $M$ and $r$ through the hash functions, so $m$ is spread across the full width of the modulus --- no more small-message cube roots. And the integrity check on the fixed padding bytes makes the scheme reject mauled ciphertexts: flip anything in $c$ and decryption yields a random-looking $m$ whose padding almost surely fails the check, defeating malleability. In the random-oracle model, RSA-OAEP is provably IND-CCA2 secure under the RSA assumption.
+\end{whybox}
+
+\begin{attackbox}
+The padding that came \emph{before} OAEP, called PKCS\#1 v1.5, was not so lucky. In 1998 Daniel Bleichenbacher showed that a server which merely reveals \emph{whether} a decrypted ciphertext has valid v1.5 padding (a one-bit ``padding oracle'') leaks enough to recover an entire RSA-encrypted message in roughly a million adaptively chosen queries. The attack walks the unknown plaintext into a shrinking interval, one valid-padding response at a time. It has haunted TLS for decades: ROBOT (2017) found the same flaw still exploitable in major TLS stacks because they never fully removed v1.5 key transport. The takeaway is that padding is not a detail bolted on for tidiness --- it \emph{is} the security, and getting its error handling subtly wrong reopens the hole.
+\end{attackbox}
+
+\section{Implementation mistakes that have sunk real systems}
+\label{ch19:mistakes}
+
+Even with correct padding, RSA has a long list of foot-guns at key-generation time. These are not theoretical; each has broken deployed systems.
+
+\begin{attackbox}
+\textbf{Small public exponent $e$ on unpadded messages.} As shown, $e=3$ with a small or unpadded $m$ invites cube-root and H\r{a}stad attacks. The community standardized on $e=65537=2^{16}+1$: it is large enough to dodge those low-exponent pitfalls, yet has only two $1$-bits, so encryption is fast. (A small $e$ is safe \emph{with} OAEP; the danger is small $e$ plus no/structured padding.)
+\end{attackbox}
+
+\begin{attackbox}
+\textbf{Small or leaked private exponent $d$.} Tempting to pick a small $d$ to speed up decryption --- but Wiener's attack (1990) recovers $d$ in polynomial time using continued fractions whenever $d < \tfrac13 n^{1/4}$. Boneh and Durfee pushed the bound to $d < n^{0.292}$. Never shrink $d$; speed up decryption with CRT instead.
+\end{attackbox}
+
+\begin{attackbox}
+\textbf{Shared modulus.} A naive organization issues many users key pairs $(n, e_i)$ over the \emph{same} modulus $n$, thinking the distinct exponents keep them separate. Catastrophe in two ways. First, any keyholder knows a $d_i$ with $e_i d_i\equiv 1\pmod{\varphi(n)}$, and from \emph{any} valid $(e,d)$ pair one can factor $n$ in expected polynomial time --- so user A can compute everyone else's private key. Second, if the same message $m$ is sent to two users with coprime exponents $e_1, e_2$, an outsider with $c_1=m^{e_1}$ and $c_2=m^{e_2}$ finds $a,b$ with $ae_1+be_2=1$ (extended Euclid) and computes $c_1^{a}c_2^{b} = m^{ae_1+be_2}=m\bmod n$. Common-modulus is never acceptable.
+\end{attackbox}
+
+\begin{attackbox}
+\textbf{Low-entropy primes (the GCD harvest).} If two different RSA moduli accidentally share a prime factor --- $n_1=p\,q_1$ and $n_2=p\,q_2$ --- then $\gcd(n_1,n_2)=p$ instantly factors both, with a cheap Euclid computation and no number sieve at all. In 2012 two independent teams (Lenstra et al.\ ``Ron was wrong, Whit is right,'' and Heninger et al.) scanned millions of public TLS and SSH keys from the internet and computed pairwise GCDs. Hundreds of thousands of keys shared primes and were trivially factored. The root cause was embedded devices (routers, firewalls) generating keys at first boot before their entropy pools had filled, so their ``random'' primes collided. The fix is boring but essential: never generate keys without a properly seeded CSPRNG (Chapter 17).
+
+Concretely, suppose a batch of devices emits $n_1 = 10403$ and $n_2 = 10807$. Neither factor is obvious by inspection, and factoring a single one in isolation means trial division up to its square root. But one Euclidean GCD reveals the shared prime in microseconds: $\gcd(10403,10807)=101$, whence $n_1 = 101\cdot 103$ and $n_2 = 101\cdot 107$ by a single division each. Both keys are now fully factored. Scale this to a corpus of $N$ moduli: a clever batch-GCD computes \emph{all} pairwise gcds in roughly $O(N\log^2 N)$ time using a product tree, so a few hours of compute over tens of millions of internet keys is enough to harvest every colliding pair --- which is exactly what those 2012 scans did.
+\end{attackbox}
+
+\begin{trapbox}
+A few more sharp edges worth memorizing: $p$ and $q$ must be of similar size but not \emph{too} close (if $\abs{p-q}$ is small, Fermat's factorization $n = (\tfrac{p+q}{2})^2 - (\tfrac{p-q}{2})^2$ cracks $n$ fast); they must be genuinely random, not from a weak prime-generation library (the 2017 ROCA flaw factored Infineon-generated keys due to structured primes); and RSA decryption must run in constant time, or timing and cache differences leak $d$ bit by bit (Chapter 37).
+\end{trapbox}
+
+\section{The other half: RSA signatures}
+\label{ch19:signatures}
+
+The same trapdoor that encrypts also signs, with the roles of the two exponents swapped. To \emph{sign} a message, the holder of the private key applies $d$; to \emph{verify}, anyone applies the public $e$. Where encryption is ``public to lock, private to unlock,'' signing is ``private to stamp, public to check.''
+
+Textbook RSA signatures look symmetric to encryption:
+\[
+  \Sign_{sk}(m) = m^{d}\bmod n = \sigma, \qquad
+  \Vrfy_{pk}(m,\sigma) : \ \text{accept iff } \sigma^{e}\equiv m \pmod n.
+\]
+Correctness is the very same identity $(\,m^d\,)^e \equiv m^{ed}\equiv m\pmod n$ from Theorem~\ref{ch19:correctness}; it does not matter which exponent you apply first.
+
+\begin{whybox}
+\textbf{Why this authenticates.} Only the key owner knows $d$, so only she can produce a $\sigma$ that survives the $e$-th power check. A forger who sees $pk=(n,e)$ and wants to forge a signature on a chosen $m$ must compute an $e$-th root of $m$ modulo $n$ --- precisely the RSA problem of Definition~\ref{ch19:rsa-assumption}. Verification is public because $e$ is public. Encryption hides; signing binds. They are the same arithmetic, read in opposite directions.
+\end{whybox}
+
+But textbook RSA signatures are broken for the same family of reasons as textbook encryption, plus some special to signing.
+
+\begin{attackbox}
+\textbf{Forgeries against raw RSA signatures.}
+
+\emph{Existential forgery.} Pick any $\sigma$ at random and publish the ``message'' $m = \sigma^e\bmod n$. The pair $(m,\sigma)$ verifies by construction. You do not control $m$, but for many protocols a forged signature on \emph{some} value is already damage.
+
+\emph{Multiplicative forgery (the homomorphism strikes again).} Given valid signatures $\sigma_1=m_1^d$ and $\sigma_2=m_2^d$, the product $\sigma_1\sigma_2 = (m_1 m_2)^d\bmod n$ is a valid signature on $m_1 m_2$. An attacker who can get two innocuous messages signed can forge a signature on their product without the key.
+
+\emph{Blinding.} To get a signature on a message $m$ the signer would refuse, an attacker picks random $r$, asks for a signature on the disguised $m' = r^e m\bmod n$ (which looks random), receives $\sigma' = (m')^d = r\,m^d$, and divides out: $\sigma = \sigma'/r\bmod n$ is a valid signature on the original $m$.
+\end{attackbox}
+
+\begin{trapbox}
+As with encryption, the fix is structured, randomized padding before exponentiating --- you never sign a raw $m$. Modern RSA signing means \textbf{RSA-PSS} (Probabilistic Signature Scheme), which hashes the message, mixes in a random salt, and formats a full-width block before applying $d$. The hash destroys the multiplicative structure (you would need a hash collision to exploit it), the salt makes signatures probabilistic, and the fixed format makes existential forgeries fail verification. PSS has a tight security proof in the random-oracle model under the RSA assumption. The older deterministic PKCS\#1 v1.5 signature padding is still widely deployed and not catastrophically broken for signing the way it is for encryption, but PSS is the modern default. Chapter~22 develops signatures in full.
+\end{trapbox}
+
+\section{RSA in the real world}
+\label{ch19:realworld}
+
+\begin{applicationbox}
+\textbf{Where RSA actually shows up.} For most of the internet's history, TLS used RSA for two jobs: the server's certificate carried an RSA public key, and the client encrypted a random pre-master secret to it (RSA key transport). That pattern is now deprecated --- precisely because of Bleichenbacher/ROBOT and because it offers no forward secrecy --- and TLS 1.3 dropped RSA key exchange entirely in favor of ephemeral Diffie-Hellman over elliptic curves. But RSA is far from gone: TLS 1.3 still allows RSA \emph{signatures} (RSA-PSS) for the server to authenticate itself, and the global web PKI is still dominated by RSA certificate keys. SSH host keys and user keys are frequently RSA (\texttt{ssh-rsa}, now with SHA-2 signatures). PGP/GnuPG email encryption and signing has long used RSA. Code-signing, document signing, and smart cards lean on it heavily. So in practice you will meet RSA mostly as a \emph{signature} and \emph{certificate} algorithm today, with encryption duties increasingly handed to ECDH for the key exchange and AES-GCM for the data.
+\end{applicationbox}
+
+\begin{focusbox}
+A practical rule of thumb you can carry out of this chapter: RSA encryption in the wild should always mean \emph{RSA-OAEP}, RSA signatures should always mean \emph{RSA-PSS} (Chapter 22), the modulus should be at least $2048$ bits ($3072$+ for keys meant to last past 2030), the public exponent should be $65537$, and the primes must come from a vetted, well-seeded generator. Anything that encrypts with raw $m^e\bmod n$, uses PKCS\#1 v1.5, or hand-rolls prime generation should be treated as broken until proven otherwise.
+\end{focusbox}
+
+\section{Exercises}
+\label{ch19:exercises}
+
+\begin{exercise}
+With $p=11$, $q=23$, compute $n$ and $\varphi(n)$. Show that $e=3$ is a valid public exponent, and find the corresponding private exponent $d$ using the extended Euclidean algorithm.
+\end{exercise}
+
+\begin{exercise}
+Using your key from the previous exercise, encrypt the message $m=7$ by computing $7^{3}\bmod n$ with square-and-multiply, then decrypt the result and confirm you recover $7$.
+\end{exercise}
+
+\begin{exercise}
+Prove that for RSA, $\Enc_{pk}(m_1)\cdot\Enc_{pk}(m_2)\equiv \Enc_{pk}(m_1 m_2)\pmod n$. Explain in one sentence why this homomorphic property makes textbook RSA malleable, and why OAEP destroys it.
+\end{exercise}
+
+\begin{exercise}
+(Common modulus.) Two users share modulus $n=3233$ with public exponents $e_1=17$ and $e_2=7$ (check that each is coprime to $\varphi(3233)=3120$, so both are valid exponents), and the same message $m$ is sent to both, yielding $c_1$ and $c_2$. Show $\gcd(e_1,e_2)=1$, find integers $a,b$ with $a e_1+b e_2=1$, and write the formula that recovers $m$ from $c_1,c_2$. (One of $a,b$ is negative; how do you handle a negative exponent modulo $n$? Hint: replace $c_1^{a}$ by $(c_1^{-1})^{\abs{a}}$.)
+\end{exercise}
+
+\begin{exercise}
+(H\r{a}stad in miniature.) A message $m=10$ is sent with $e=3$ to three recipients with moduli $n_1=21$, $n_2=143$, $n_3=323$ (each a product of two small distinct primes, and the three are pairwise coprime --- a requirement for CRT). Compute the three ciphertexts $c_i = m^3\bmod n_i$, CRT-combine them to recover $m^3$ modulo $n_1 n_2 n_3$, and take the integer cube root to get $m$. Verify $m^3 < n_1 n_2 n_3$. (You should find $c_1=13$, $c_2=142$, $c_3=31$, and the combined value $1000$.)
+\end{exercise}
+
+\begin{exercise}
+Suppose you are told $n=3233$ and $\varphi(n)=3120$. Recover $p$ and $q$ without trial division, by setting up and solving the quadratic whose roots are $p$ and $q$. (Hint: you know $p+q = n-\varphi(n)+1$ and $pq=n$.)
+\end{exercise}
+
+\begin{exercise}
+Two RSA moduli $n_1 = 5{,}459$ and $n_2 = 5{,}777$ were generated by a device with a broken random source and happen to share a prime. Compute $\gcd(n_1,n_2)$ to find the shared prime, then factor both moduli completely. Explain why this attack is exponentially cheaper than factoring either modulus from scratch.
+\end{exercise}
+
+\begin{exercise}
+Explain precisely why a deterministic public-key encryption scheme can never satisfy IND-CPA security. Frame your answer as a winning strategy for the IND-CPA adversary against textbook RSA.
+\end{exercise}
+
+\begin{exercise}
+(Why $\gcd(m,n)>1$ never matters in practice but is interesting in theory.) Show that if Bob ever encrypts a message $m$ with $\gcd(m,n)=p$, then anyone who sees $m$ can factor $n$. Estimate the probability that a uniformly random $m\in\set{1,\dots,n-1}$ has $\gcd(m,n)>1$ for a $2048$-bit modulus, and argue it is negligible.
+\end{exercise}
+
+\begin{exercise}
+(Wiener's setup.) Look up the statement of Wiener's attack and explain, in your own words, why choosing a small private exponent $d$ to speed up decryption is dangerous, and why using RSA-CRT achieves the same speedup safely. You need not reproduce the continued-fraction machinery; argue at the level of which quantities leak.
+\end{exercise}
+
+\begin{exercise}
+(RSA-CRT by hand.) Using $pk=(3233,17)$, $sk=(3233,2753)$ from the worked example, decrypt the ciphertext $c=2790$ \emph{via CRT}: reduce $c$ modulo $61$ and $53$, reduce $d$ modulo $60$ and $52$, perform the two small exponentiations, and CRT-combine to recover $m$. Check that you get $65$, and count how many modular multiplications you used versus the full $2790^{2753}\bmod 3233$.
+\end{exercise}
+
+\begin{exercise}
+(Signature forgery.) For the public key $pk=(3233,17)$, produce an existential forgery: pick any $\sigma$ you like, compute $m=\sigma^{17}\bmod 3233$, and confirm that $(m,\sigma)$ passes textbook verification. Then, given that $\sigma_1$ signs $m_1$ and $\sigma_2$ signs $m_2$, write the signature on $m_1 m_2 \bmod 3233$ in terms of $\sigma_1,\sigma_2$. Explain in one sentence how hashing the message before signing kills both forgeries.
+\end{exercise}
+
+\begin{exercise}
+(Blinding.) A signer will stamp anything that ``looks random'' but refuses to sign the specific value $m^\star$. Describe precisely the messages an attacker submits, and the post-processing on the returned signatures, to obtain a valid signature on $m^\star$ anyway. Which property of textbook RSA makes this possible, and why does RSA-PSS prevent it?
+\end{exercise}

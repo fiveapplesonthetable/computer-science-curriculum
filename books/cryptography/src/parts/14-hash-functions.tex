@@ -1,0 +1,602 @@
+\chapter{Hash Functions}
+
+A cryptographic hash function takes a message of any length and crushes it down to a short, fixed-length string of bits -- its \emph{digest}. SHA-256 turns the complete works of Shakespeare, or a single byte, or this entire book, into exactly 256 bits. That much is easy: any number of cheap functions can map long inputs to short outputs. What makes a hash function \emph{cryptographic} is a set of promises about how hard it is to find inputs that behave in inconvenient ways -- inputs that collide, or inputs that hit a target you picked in advance.
+
+Those promises are what let a 32-byte digest stand in for a multi-gigabyte file with no loss of trust. They are what let a website store something derived from your password without storing the password. They are what let a blockchain commit to a billion transactions with one number. Hash functions are the most-used primitive in all of cryptography, and they are the connective tissue of nearly every later chapter: MACs (Chapter 15), signatures (Chapter 22), key derivation, commitments (Chapter 32), and the Merkle trees that hold blockchains together (Chapter 36) all sit on top of a good hash.
+
+This chapter builds the idea from the security properties up. We will pin down exactly what ``hard to break'' means, derive the birthday bound that governs collision-finding, dissect the two great construction styles (Merkle--Damgard and the sponge), break a real Merkle--Damgard hash with a length-extension attack, and end with the three workhorse applications: fingerprints, commitments, and password storage with salts.
+
+\chapterline
+
+\section{What a hash function is, and what it must promise}
+\label{ch14:properties}
+
+Formally, a hash function is a function
+\[
+  \Hash : \set{0,1}^{*} \to \set{0,1}^{n},
+\]
+where $\set{0,1}^{*}$ is the set of all finite bit strings and $n$ is the fixed output length (256 for SHA-256, 512 for SHA-512). The input is sometimes called the \emph{message} or \emph{preimage}; the output is the \emph{digest}, \emph{hash}, or \emph{fingerprint}.
+
+Because the domain is infinite and the range is finite, collisions \emph{must} exist: there are infinitely many messages and only $2^{n}$ possible digests, so by the pigeonhole principle countless pairs of distinct messages share a digest. Cryptography never claims collisions do not exist. It claims you cannot \emph{find} one with any feasible amount of work.
+
+There are three security properties, in increasing order of how much they buy you.
+
+\begin{definition}[Preimage resistance]
+\label{ch14:def-preimage}
+$\Hash$ is \emph{preimage resistant} (``one-way'') if, given a target digest $y = \Hash(x)$ for a randomly chosen $x$, no efficient adversary can find \emph{any} message $x'$ with $\Hash(x') = y$, except with negligible probability. For an ideal $n$-bit hash the best attack is brute force, costing about $2^{n}$ evaluations.
+\end{definition}
+
+\begin{definition}[Second-preimage resistance]
+\label{ch14:def-second}
+$\Hash$ is \emph{second-preimage resistant} if, given a specific message $x$, no efficient adversary can find a \emph{different} message $x' \ne x$ with $\Hash(x') = \Hash(x)$, except with negligible probability. The ideal cost is again about $2^{n}$.
+\end{definition}
+
+\begin{definition}[Collision resistance]
+\label{ch14:def-collision}
+$\Hash$ is \emph{collision resistant} if no efficient adversary can find \emph{any} pair $x \ne x'$ with $\Hash(x) = \Hash(x')$, except with negligible probability. Here the adversary picks both messages and has total freedom. As we will prove in Section~\ref{ch14:birthday}, the ideal cost is only about $2^{n/2}$.
+\end{definition}
+
+\begin{intuitionbox}
+A clean way to keep the three straight is to ask \emph{who chooses what}.
+\begin{itemize}
+  \item \textbf{Preimage}: the world hands you an \emph{output} $y$; you must produce \emph{some} input mapping to it. (``Here is a hash. What message made it?'')
+  \item \textbf{Second-preimage}: the world hands you an \emph{input} $x$; you must produce a \emph{different} input with the same hash. (``Here is a contract. Forge a different one that hashes the same.'')
+  \item \textbf{Collision}: the world hands you \emph{nothing}; you produce \emph{any} two inputs that hash alike. (``Just find any clash at all.'')
+\end{itemize}
+More freedom for the attacker means an easier attack, which is why collision resistance is the strongest property and the first to fall.
+\end{intuitionbox}
+
+These properties are not independent. Collision resistance is the strongest of the three in the following precise sense.
+
+\begin{proposition}[Collision resistance implies second-preimage resistance]
+\label{ch14:cr-implies-spr}
+If $\Hash$ is collision resistant then it is second-preimage resistant.
+\end{proposition}
+
+\begin{whybox}
+The argument is a \emph{reduction}: we show that breaking the weaker property would break the stronger one, so the stronger one is at least as hard.
+
+Suppose an adversary $\mathcal{A}$ finds second preimages. Build a collision finder $\mathcal{B}$: sample a random message $x$ yourself, hand it to $\mathcal{A}$, and receive $x' \ne x$ with $\Hash(x') = \Hash(x)$. Then $(x, x')$ is a collision. So if second preimages are easy to find, collisions are too -- contrapositively, if collisions are hard, so are second preimages. The reduction loses nothing here; it is tight.
+\end{whybox}
+
+The relationship between collision resistance and \emph{preimage} resistance is subtler. For a random function with output much shorter than its input they tend to come together, but one can hand-craft contrived functions that are collision resistant yet not one-way, or vice versa. In practice we demand all three from any hash we are willing to call cryptographic, and we design and test for all three.
+
+\begin{trapbox}
+A non-cryptographic hash -- CRC32, the hash behind a Java \texttt{HashMap}, FNV, MurmurHash -- has \emph{none} of these properties and is trivial to collide on purpose. These functions exist to spread inputs evenly for speed, not to resist an adversary. Using \texttt{hashCode()} or a CRC anywhere a security decision depends on the output is a classic, fatal mistake. ``Hash function'' means two completely different things to a systems engineer and to a cryptographer.
+\end{trapbox}
+
+\subsection{The random-oracle ideal}
+
+When cryptographers reason about a hash informally, they often pretend it is a \emph{random oracle}: a magic box that, for each new input, flips $n$ fair coins to produce the output, and thereafter returns that same output whenever the input repeats. A random oracle has every property we could want -- it is one-way, collision resistant, and its outputs look independent and uniform -- because there is simply no structure to exploit; the only way to learn $\Hash(x)$ is to ask.
+
+Real hash functions are deterministic public algorithms, not magic boxes, so the random-oracle \emph{model} is a heuristic, and proofs ``in the random-oracle model'' are weaker than proofs in the standard model. But the heuristic is enormously useful for intuition and for the security arguments behind RSA-OAEP, Fiat--Shamir signatures, and much else. We will lean on it whenever it sharpens the picture, and flag the places where the gap between the ideal and reality has actually bitten people.
+
+\section{The birthday bound: why $n$-bit hashes give $n/2$-bit collision security}
+\label{ch14:birthday}
+
+Brute-forcing a preimage of an $n$-bit hash takes about $2^{n}$ tries: you are searching for one specific output among $2^{n}$. Collisions are far cheaper, and the reason is the same mathematics behind the famous party trick that 23 people suffice for an even chance of two sharing a birthday.
+
+\begin{intuitionbox}
+You are not looking for a message that hashes to one \emph{fixed} target. You are looking for \emph{any} two of your messages that hash to the \emph{same} value -- and the more messages you have, the more \emph{pairs} you have. With $q$ messages there are $\binom{q}{2} \approx q^{2}/2$ pairs, each of which collides with probability about $2^{-n}$. The expected number of colliding pairs crosses $1$ when $q^{2}/2 \approx 2^{n}$, i.e. when $q \approx 2^{(n+1)/2} \approx 2^{n/2}$. Collisions appear after only the \emph{square root} of the naive number of tries.
+\end{intuitionbox}
+
+Let us do the probability carefully.
+
+\begin{theorem}[Birthday bound]
+\label{ch14:thm-birthday}
+Draw $q$ outputs independently and uniformly from a set of size $N = 2^{n}$. The probability that at least two coincide satisfies
+\[
+  p(q) \;=\; 1 - \prod_{j=1}^{q-1}\Bigl(1 - \frac{j}{N}\Bigr)
+        \;\approx\; 1 - e^{-q(q-1)/(2N)}.
+\]
+Consequently $p(q) \ge \tfrac12$ once $q \approx 1.177\sqrt{N} = 1.177 \cdot 2^{n/2}$.
+\end{theorem}
+
+\begin{whybox}
+Number the draws $1, 2, \dots, q$. Given that the first $j$ draws are all distinct, draw $j+1$ avoids those $j$ earlier values with probability $1 - j/N$. Multiplying these conditional probabilities for $j = 1, \dots, q-1$, the chance that \emph{all} $q$ draws are distinct is
+\[
+  \prod_{j=1}^{q-1}\Bigl(1 - \frac{j}{N}\Bigr).
+\]
+Now use $1 - x \le e^{-x}$, valid for all real $x$:
+\[
+  \prod_{j=1}^{q-1}\Bigl(1 - \frac{j}{N}\Bigr)
+   \le \prod_{j=1}^{q-1} e^{-j/N}
+   = \exp\!\Bigl(-\frac{1}{N}\sum_{j=1}^{q-1} j\Bigr)
+   = \exp\!\Bigl(-\frac{q(q-1)}{2N}\Bigr).
+\]
+The collision probability is one minus that. Setting the exponent equal to $\ln 2$ gives $q(q-1) \approx 2N\ln 2$, hence $q \approx \sqrt{2\ln 2}\,\sqrt{N} \approx 1.177\sqrt{N}$.
+\end{whybox}
+
+\begin{connectionbox}
+This is exactly the birthday-collision calculation from the companion probability book, with the 365 days of the year replaced by the $N = 2^{n}$ possible digests. There we found $\approx 1.177\sqrt{365} \approx 22.5$, so 23 people. Here the same constant rides on top of a $2^{n/2}$ that swamps everything. The cube-root variant -- three-way collisions appearing at $N^{1/3}$ -- and the memoryless cycle-finding methods (Pollard's rho, Floyd's tortoise-and-hare, van Oorschot--Wiener parallel collision search) that find collisions in $\approx 2^{n/2}$ time but tiny memory are all developed in the algorithms companion.
+\end{connectionbox}
+
+\begin{example}[A toy 16-bit hash]
+\label{ch14:ex-16bit}
+Take $n = 16$, so $N = 65536$. A preimage costs about $2^{16} = 65{,}536$ evaluations. A collision costs about $1.177\sqrt{65536} = 1.177 \cdot 256 \approx 301$ evaluations -- you would expect a collision after hashing roughly 300 random short strings and watching for a repeat. With $q = 300$ the exponent is $-300\cdot 299/(2\cdot 65536) \approx -0.684$, giving $p \approx 1 - e^{-0.684} \approx 0.495$, almost exactly even odds. The square-root gap between $65{,}536$ and $301$ is the whole story of why output length matters so much.
+\end{example}
+
+\begin{focusbox}
+\textbf{Design consequence.} To resist collision attacks at the ``$b$-bit security level'' (meaning $2^{b}$ work) you need an output of $n = 2b$ bits. That is why a 128-bit security target demands a 256-bit hash. It is why 128-bit-output hashes like MD5 ($2^{64}$ collision work) and 160-bit SHA-1 ($2^{80}$ nominal) are no longer collision-safe: $2^{64}$ is now a weekend on rented hardware, and SHA-1 collisions have actually been computed (see Section~\ref{ch14:realworld}). Preimage attacks on these same functions remain near $2^{n}$ and are still out of reach; it is always \emph{collisions} that fall first.
+\end{focusbox}
+
+\begin{walkbox}
+A protocol truncates SHA-256 to its first 80 bits to save space in a fingerprint. What is the collision security level, and is that wise in 2026? \\[0.3em]
+\textbf{Answer.} Collision work is $2^{80/2} = 2^{40}$, about a trillion evaluations -- a few minutes on a GPU. If the fingerprint is only ever compared to a value a legitimate party computed (a second-preimage setting), security is closer to $2^{80}$, which is borderline. If an attacker can choose \emph{both} sides of the comparison (a collision setting -- e.g. getting two documents to share a fingerprint), $2^{40}$ is catastrophic. Always ask which property your application actually relies on.
+\end{walkbox}
+
+\section{Building a hash from a small component: Merkle--Damgard}
+\label{ch14:md}
+
+We can compress a \emph{fixed} pair of blocks with a carefully designed mixing function. How do we hash a message of \emph{arbitrary} length? The classic answer, used by MD5, SHA-1, and the SHA-2 family, is the \emph{Merkle--Damgard} construction. It iterates a fixed-input \emph{compression function} across the message, carrying a running state called the \emph{chaining value}.
+
+\begin{historybox}
+Ralph Merkle and Ivan Damgard independently proved, around 1989, the theorem that makes this design worth using: if the compression function is collision resistant, then the full iterated hash is collision resistant. That reduction turned hash design into the smaller problem of building one good fixed-size compression function. Nearly every widely deployed hash from 1990 to 2010 -- MD4, MD5, SHA-0, SHA-1, SHA-256, SHA-512 -- is Merkle--Damgard. The structure's one notorious wart, length extension, is the subject of Section~\ref{ch14:length-ext}.
+\end{historybox}
+
+The compression function is
+\[
+  f : \set{0,1}^{n} \times \set{0,1}^{b} \to \set{0,1}^{n},
+\]
+taking an $n$-bit chaining value and a $b$-bit message block to a new $n$-bit chaining value. To hash a message $M$:
+
+\begin{enumerate}
+  \item \textbf{Pad} $M$ so its length is a multiple of the block size $b$. The padding includes the message's original bit-length (``Merkle--Damgard strengthening''), which is what makes the security proof go through. Split the padded message into blocks $M_1, M_2, \dots, M_k$.
+  \item \textbf{Initialize} the chaining value to a fixed constant $H_0 = \mathit{IV}$ baked into the standard.
+  \item \textbf{Absorb} each block: $H_i = f(H_{i-1}, M_i)$ for $i = 1, \dots, k$.
+  \item \textbf{Output} $H_k$ (possibly after a final transform).
+\end{enumerate}
+
+\begin{center}
+\begin{tikzpicture}[
+   box/.style={draw, rounded corners, minimum width=1.05cm, minimum height=0.85cm, fill=blue!6},
+   msg/.style={draw, minimum width=0.95cm, minimum height=0.6cm, fill=green!8},
+   >={Stealth}]
+  \node (iv) {$\mathit{IV}$};
+  \node[box, right=0.85cm of iv] (f1) {$f$};
+  \node[box, right=1.55cm of f1] (f2) {$f$};
+  \node[box, right=1.55cm of f2] (f3) {$f$};
+  \node[right=1.15cm of f3] (out) {$H_3$};
+  \draw[->] (iv) -- (f1) node[midway,above]{\scriptsize $H_0$};
+  \draw[->] (f1) -- (f2) node[midway,above]{\scriptsize $H_1$};
+  \draw[->] (f2) -- (f3) node[midway,above]{\scriptsize $H_2$};
+  \draw[->] (f3) -- (out);
+  \node[msg, above=0.7cm of f1] (m1) {$M_1$};
+  \node[msg, above=0.7cm of f2] (m2) {$M_2$};
+  \node[msg, above=0.7cm of f3] (m3) {$M_3 \| \text{pad}$};
+  \draw[->] (m1) -- (f1);
+  \draw[->] (m2) -- (f2);
+  \draw[->] (m3) -- (f3);
+\end{tikzpicture}
+\end{center}
+
+\begin{theorem}[Merkle--Damgard collision resistance]
+\label{ch14:md-thm}
+If the compression function $f$ is collision resistant, then the Merkle--Damgard hash $\Hash$ built from it (with length-strengthening padding) is collision resistant.
+\end{theorem}
+
+\begin{whybox}
+Suppose someone hands us two distinct messages $M \ne M'$ with $\Hash(M) = \Hash(M')$. We will extract a collision in $f$, contradicting its collision resistance.
+
+Walk the two chains \emph{backwards} from the equal final outputs. The last compression step gives
+\[
+  f(H_{k-1}, M_k) = H_k = H'_{k'} = f(H'_{k'-1}, M'_{k'}).
+\]
+If the two inputs to $f$ differ -- that is, $(H_{k-1}, M_k) \ne (H'_{k'-1}, M'_{k'})$ -- we have found a collision in $f$ and we stop. Otherwise the inputs are equal, so $H_{k-1} = H'_{k'-1}$ and the last blocks match; step back one position and repeat the argument.
+
+If the messages have different lengths, the length-strengthening padding forces the final blocks to differ (they encode different lengths), so the walk produces a collision at the last step. If the lengths are equal but the messages differ, they must differ in some block; the first block (scanning from the end) where they differ yields distinct inputs to $f$ with equal outputs. Either way we manufacture an $f$-collision. So $\Hash$-collisions imply $f$-collisions, and the theorem follows by contrapositive.
+\end{whybox}
+
+\begin{implementbox}
+A toy Merkle--Damgard hash with an 8-bit chaining value, just to watch the machinery move. \textbf{This is for learning only -- its 8-bit state means a collision after $\approx 16$ inputs, and the ``compression function'' has no cryptographic strength. Never use anything like this for real.}
+\begin{lstlisting}[language=Python]
+def compress(h, block):          # h: int in 0..255, block: int in 0..255
+    # A deliberately weak toy mixer. NOT cryptographic.
+    x = (h ^ block) & 0xFF
+    x = ((x << 3) | (x >> 5)) & 0xFF      # rotate left 3
+    x = (x * 167 + 13) & 0xFF             # mix
+    return x ^ ((h + block) & 0xFF)
+
+def md_hash(message: bytes) -> int:
+    h = 0x6A                              # the IV
+    msg = message + bytes([len(message) & 0xFF])   # length strengthening
+    for byte in msg:                     # each byte is one "block"
+        h = compress(h, byte)
+    return h
+
+print(hex(md_hash(b"hello")))            # e.g. 0x..
+print(hex(md_hash(b"world")))
+# Find a collision by brute force -- with only 256 outputs it is instant:
+seen = {}
+i = 0
+while True:
+    d = md_hash(str(i).encode())
+    if d in seen:
+        print("collision:", seen[d], "and", i, "both ->", hex(d))
+        break
+    seen[d] = i
+    i += 1
+\end{lstlisting}
+Run it and you will see a collision pop out after a few hundred tries at most -- exactly the birthday bound for $n = 8$ ($\approx 1.177\cdot 2^{4} \approx 19$, with variance pushing the typical first hit somewhat higher). Scaling the state to 256 bits is what turns this toy into something nobody can collide.
+\end{implementbox}
+
+\section{Length extension: the Merkle--Damgard wart}
+\label{ch14:length-ext}
+
+Merkle--Damgard has a structural leak that is easy to miss and has caused real breaches. The final output $H_k$ \emph{is} the internal chaining value -- there is nothing hiding it. So if you know $\Hash(M)$ and the \emph{length} of $M$, you can resume the iteration from $H_k$ and compute $\Hash(M \concat \text{pad} \concat S)$ for a suffix $S$ of your choosing, \emph{without knowing $M$ itself}.
+
+\begin{attackbox}
+\textbf{The length-extension attack, and how it breaks a homemade MAC.}
+
+A tempting but broken way to authenticate a message with a secret key $k$ is the ``prefix MAC'':
+\[
+  t = \Hash(k \concat M).
+\]
+The idea is that only someone who knows $k$ can produce a valid tag $t$ for $M$. With a Merkle--Damgard hash this is false.
+
+Suppose an attacker sees a legitimate pair $(M, t)$ where $t = \Hash(k \concat M)$, and knows (or guesses) the length of $k$. The tag $t$ is exactly the chaining value after absorbing $k \concat M \concat \text{pad}_1$, where $\text{pad}_1$ is the padding the hash appended. The attacker now:
+\begin{enumerate}
+  \item sets the internal state of a fresh hash object to $t$;
+  \item feeds in any chosen suffix $S$;
+  \item reads off $t' = \Hash(k \concat M \concat \text{pad}_1 \concat S)$.
+\end{enumerate}
+The result is a \emph{valid tag} for the new message $M' = M \concat \text{pad}_1 \concat S$ -- a message the attacker partly chose -- even though they never learned $k$. The notorious instance: a web request signed by appending \verb|&admin=true| after the legitimate padding still verifies.
+\end{attackbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+   box/.style={draw, rounded corners, minimum width=0.95cm, minimum height=0.8cm, fill=blue!6},
+   msg/.style={draw, minimum width=0.9cm, minimum height=0.55cm, font=\scriptsize},
+   >={Stealth}]
+  % legitimate part computed by the server -- shaded green inputs
+  \node (iv) {$\mathit{IV}$};
+  \node[box, right=0.7cm of iv] (f1) {$f$};
+  \node[box, right=1.3cm of f1] (f2) {$f$};
+  \node[box, right=1.3cm of f2] (f3) {$f$};
+  \node[right=1.0cm of f3, font=\scriptsize] (t) {$t$};
+  \draw[->] (iv) -- (f1);
+  \draw[->] (f1) -- (f2);
+  \draw[->] (f2) -- (f3);
+  \draw[->] (f3) -- (t);
+  \node[msg, above=0.55cm of f1, fill=green!10] (b1) {$k$};
+  \node[msg, above=0.55cm of f2, fill=green!10] (b2) {$M$};
+  \node[msg, above=0.55cm of f3, fill=green!10] (b3) {$\text{pad}_1$};
+  \draw[->] (b1) -- (f1); \draw[->] (b2) -- (f2); \draw[->] (b3) -- (f3);
+  % attacker resumes from t
+  \node[box, right=1.0cm of t] (f4) {$f$};
+  \node[right=1.0cm of f4, font=\scriptsize] (t2) {$t'$};
+  \draw[->] (t) -- (f4);
+  \draw[->] (f4) -- (t2);
+  \node[msg, above=0.55cm of f4, fill=red!12] (s) {$S$};
+  \draw[->] (s) -- (f4);
+  \node[font=\scriptsize, below=0.15cm of f2] {server computes (key hidden)};
+  \node[font=\scriptsize, below=0.15cm of f4] {attacker resumes};
+\end{tikzpicture}
+\caption{Length extension against a prefix MAC $t = \Hash(k \concat M)$. The published tag $t$ \emph{is} the chaining value after the server absorbs $k \concat M \concat \text{pad}_1$. The attacker feeds that value straight back into $f$ with a chosen suffix $S$, producing a valid tag $t'$ for $k \concat M \concat \text{pad}_1 \concat S$ without ever seeing $k$.}
+\label{ch14:fig-lenext}
+\end{figure}
+
+\begin{walkbox}
+Why can the attacker resume without $k$ or $M$ (Figure~\ref{ch14:fig-lenext})? Because the only thing the next compression step needs is the \emph{current chaining value}, and that value is the tag $t$ sitting in plain view. Merkle--Damgard never ``closes off'' the state. The attacker does need to reconstruct $\text{pad}_1$, which encodes the length of $k \concat M$ -- hence they must know or brute-force the key length. Keys are short, so that is cheap.
+\end{walkbox}
+
+There are several clean fixes, and you should recognize all of them:
+
+\begin{itemize}
+  \item \textbf{HMAC} (Chapter 15) nests two hash calls, $\Hash(k_{\text{out}} \concat \Hash(k_{\text{in}} \concat M))$. The outer hash hides the inner chaining value, so resuming buys the attacker nothing. This is the right way to key a Merkle--Damgard hash, and the reason you should never roll your own prefix MAC.
+  \item \textbf{Truncation / output transform.} SHA-512/256 runs SHA-512 internally (512-bit state) but outputs only 256 bits, so the full chaining value is never revealed. SHA-224 and SHA-384 are similar.
+  \item \textbf{A different construction.} Sponge-based hashes (SHA-3, next section) are immune to length extension by design, because their output is a \emph{squeeze} of a larger hidden state.
+\end{itemize}
+
+\begin{implementbox}
+Length extension is so mechanical that standard libraries reproduce it in a few lines. The point of showing it is to feel how little the attacker needs. \textbf{Learning only -- the lesson is ``do not build prefix MACs,'' not ``go forge tags.''}
+\begin{lstlisting}[language=Python]
+# Pseudocode against a Merkle-Damgard hash H with block-aligned padding.
+# Attacker knows: message M, tag t = H(secret || M), and len(secret).
+def forge(t, M, secret_len, suffix):
+    glue = md_padding(secret_len + len(M))   # the pad H would have appended
+    forged_message = M + glue + suffix       # what the new tag authenticates
+    # Resume the hash from the leaked internal state == t:
+    h = HashState.from_digest(t)             # set chaining value = t
+    h.set_length(secret_len + len(M) + len(glue))
+    h.update(suffix)
+    forged_tag = h.digest()                  # == H(secret || M || glue || suffix)
+    return forged_message, forged_tag
+\end{lstlisting}
+Real tools (\texttt{hashpump}, the \texttt{hlextend} library) automate exactly this. The defense is never to expose a raw $\Hash(k \concat M)$ as an authenticator.
+\end{implementbox}
+
+\section{The sponge construction and SHA-3}
+\label{ch14:sponge}
+
+In 2007 NIST opened a public competition for a new hash standard, partly hedging against the possibility that the MD-family weaknesses behind the MD5 and SHA-1 breaks might eventually reach SHA-2. The winner, announced in 2012 and standardized as SHA-3 in 2015, was \emph{Keccak}, built on a completely different idea: the \emph{sponge}.
+
+A sponge maintains a wide internal state of $b = r + c$ bits, conceptually split into a \emph{rate} part of $r$ bits (the part that touches the message) and a \emph{capacity} part of $c$ bits (the secret reservoir that never directly meets the input or output). A fixed permutation $\pi$ -- for Keccak this is the 1600-bit permutation Keccak-$f$ -- stirs the whole state. Hashing proceeds in two phases.
+
+\begin{description}
+  \item[Absorbing.] Pad the message and cut it into $r$-bit blocks. For each block, XOR it into the rate part of the state, then apply $\pi$ to the full $b$-bit state. The capacity part is never touched by the message directly; it only changes through $\pi$.
+  \item[Squeezing.] To produce output, read off the first $r$ bits of the state; if more output is needed, apply $\pi$ and read another $r$ bits, repeating until enough bits are out. Truncate to the desired digest length.
+\end{description}
+
+\begin{center}
+\begin{tikzpicture}[
+   perm/.style={draw, rounded corners, minimum width=0.7cm, minimum height=1.5cm, fill=structurepurple!18},
+   blk/.style={draw, minimum width=0.7cm, minimum height=0.55cm, fill=green!9},
+   st/.style={draw, minimum width=0.9cm, minimum height=1.5cm, fill=blue!5},
+   >={Stealth}, node distance=0.6cm]
+  \node[st] (s0) {$0$};
+  \node[perm, right=of s0] (p1) {$\pi$};
+  \node[perm, right=of p1] (p2) {$\pi$};
+  \node[perm, right=1.4cm of p2] (p3) {$\pi$};
+  \node[right=0.8cm of p3] (z) {$Z$};
+  \draw[->] (s0) -- (p1);
+  \draw[->] (p1) -- (p2);
+  \draw[->] (p2) -- (p3) node[midway]{$\cdots$};
+  \draw[->] (p3) -- (z);
+  \node[blk, above=0.55cm of s0] (m1) {$M_1$};
+  \node[blk, above=0.55cm of p1] (m2) {$M_2$};
+  \draw[->] (m1) -- node[right,pos=0.35,font=\scriptsize]{$\xor$} (s0.north);
+  \draw[->] (m2) -- node[right,pos=0.35,font=\scriptsize]{$\xor$} (p1.north);
+  \node[above=1.5cm of p2,font=\scriptsize] {absorb $\;\longrightarrow\;$ squeeze};
+\end{tikzpicture}
+\end{center}
+
+\begin{whybox}
+\textbf{Why the capacity buys security, and why length extension dies.}
+
+The collision and (second-)preimage resistance of a sponge are governed by the \emph{capacity} $c$, not the output length alone: a well-built sponge offers roughly $\min(2^{c/2}, 2^{n/2})$ collision resistance and $\min(2^{c/2}, 2^{n})$ preimage resistance, where $n$ is the digest length. SHA3-256 uses $c = 512$, comfortably above its $2^{128}$ collision target.
+
+Length extension cannot work because the digest is only the \emph{rate} portion that gets squeezed out -- the $c$-bit capacity is never revealed. An attacker who wants to resume the computation would need the full $b$-bit internal state, but the output exposes at most $r$ of those bits per squeeze and \emph{none} of the capacity. There is no leaked chaining value to continue from. This immunity is a clean, structural win over Merkle--Damgard, and it is why protocols can safely use raw $\text{SHA3}(k \concat M)$ as a MAC (KMAC formalizes exactly this).
+\end{whybox}
+
+\begin{focusbox}
+\textbf{The SHA-3 family.} All members share the 1600-bit Keccak-$f$ permutation and differ only in rate/capacity and output length:
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+Function & Output $n$ & Capacity $c$ & Rate $r$ & Collision sec. \\
+\midrule
+SHA3-224 & 224 & 448 & 1152 & $2^{112}$ \\
+SHA3-256 & 256 & 512 & 1088 & $2^{128}$ \\
+SHA3-384 & 384 & 768 & 832  & $2^{192}$ \\
+SHA3-512 & 512 & 1024& 576  & $2^{256}$ \\
+SHAKE128 & any & 256 & 1344 & $2^{128}$ (XOF) \\
+SHAKE256 & any & 512 & 1088 & $2^{256}$ (XOF) \\
+\bottomrule
+\end{tabular}
+\end{center}
+SHAKE128 and SHAKE256 are \emph{extendable-output functions} (XOFs): the squeeze phase can run as long as you like, so a single call produces a stream of any length. XOFs are heavily used in post-quantum schemes (Chapter 35) for deterministic randomness expansion -- Kyber and Dilithium both lean on SHAKE.
+\end{focusbox}
+
+\begin{connectionbox}
+The Keccak-$f$ permutation organizes the 1600-bit state as a $5 \times 5 \times 64$ array of bits and applies five sub-steps per round ($\theta, \rho, \pi, \chi, \iota$) for 24 rounds, all over $\F_2$. The diffusion analysis -- how a one-bit change spreads to touch the whole state -- is linear-algebra-over-$\F_2$ in spirit, the same finite-field toolkit from Chapter 6 that underlies AES's MixColumns.
+\end{connectionbox}
+
+\section{SHA-2 in practice}
+\label{ch14:sha2}
+
+Despite SHA-3's elegance, the workhorse of deployed cryptography in 2026 is still \emph{SHA-2}, specifically SHA-256 and SHA-512. SHA-2 is a Merkle--Damgard hash whose compression function is itself built from a block-cipher-like round function (a Davies--Meyer construction: $H_i = E_{M_i}(H_{i-1}) \xor H_{i-1}$, where the feed-forward XOR is what makes a permutation one-way).
+
+\begin{focusbox}
+\textbf{SHA-256 at a glance.}
+\begin{itemize}
+  \item Output: 256 bits. Block: 512 bits. State: eight 32-bit words $a, b, \dots, h$ (256 bits total).
+  \item Padding: append a \texttt{1} bit, then \texttt{0}s, then the 64-bit message length, to reach a multiple of 512 bits.
+  \item 64 rounds per block, each mixing in one 32-bit ``message schedule'' word $W_t$ and one round constant $K_t$ (the $K_t$ are fractional parts of cube roots of the first 64 primes -- a ``nothing-up-my-sleeve'' choice so no one suspects a planted backdoor).
+  \item Operations per round: modular addition mod $2^{32}$, bitwise XOR/AND, and fixed rotations -- the ``ARX-like'' style, fast in both hardware and software.
+\end{itemize}
+SHA-512 is the same design widened to 64-bit words, an 80-round schedule, a 1024-bit block, and a higher security margin across the board. On 64-bit CPUs SHA-512 is often \emph{faster per byte} than SHA-256 because it digests twice the data per block.
+\end{focusbox}
+
+\begin{applicationbox}
+\textbf{Where SHA-2 actually runs.}
+\begin{itemize}
+  \item \textbf{TLS} (Chapter 25): certificate signatures, the transcript hash in the handshake, and HKDF key derivation all use SHA-256 or SHA-384. The cipher-suite name \texttt{TLS\_AES\_128\_GCM\_SHA256} names the hash explicitly.
+  \item \textbf{Bitcoin} (Chapter 36): block hashing and proof-of-work are double SHA-256, $\text{SHA256}(\text{SHA256}(x))$ -- the double application was Satoshi's reflex defense against length extension.
+  \item \textbf{Git} stores every object under its SHA-1 name and is migrating to SHA-256; \textbf{package managers} (apt, npm, pip) ship SHA-256 digests so you can verify a download was not tampered with.
+  \item \textbf{Signatures} (Chapter 22): RSA, ECDSA, and EdDSA all sign $\Hash(M)$, never $M$ directly. The hash is what lets a fixed-size signature cover an arbitrarily long message, and collision resistance of the hash is load-bearing for signature unforgeability.
+\end{itemize}
+Modern x86 and ARM cores include SHA extensions (\texttt{SHA256RNDS2}, ARMv8 \texttt{SHA256H}) that hash at several gigabytes per second per core.
+\end{applicationbox}
+
+\begin{trapbox}
+\textbf{Do not confuse fast with safe for passwords.} SHA-256's speed is a virtue for fingerprints and signatures and a \emph{liability} for password storage: an attacker can try billions of password guesses per second per GPU against a bare SHA-256. Password hashing needs a deliberately \emph{slow}, memory-hard function -- bcrypt, scrypt, Argon2 -- as Section~\ref{ch14:passwords} explains. ``Hash the password with SHA-256'' is one of the most common and most dangerous half-measures in the wild.
+\end{trapbox}
+
+\section{Application 1: fingerprints and integrity}
+\label{ch14:fingerprints}
+
+The simplest use of a hash is as a \emph{fingerprint}: a short value that stands in for a large object so you can detect any change. Publish $\Hash(\text{file})$ over a trusted channel; anyone who downloads the file over an untrusted channel recomputes the hash and compares. A single flipped bit anywhere in the file changes about half the digest bits (the \emph{avalanche} property), so tampering is caught with overwhelming probability.
+
+This is the backbone of software-update integrity, content-addressed storage (Git, IPFS, Docker image layers -- each object is named by its hash, so the name \emph{is} a verifiable identity), and deduplication. The property that does the work is \emph{second-preimage} resistance: given the published file, an attacker must not be able to craft a \emph{different} file with the same fingerprint.
+
+\begin{attackbox}
+\textbf{When fingerprints rely on the wrong property: the SHA-1 collision and ``evil twins.''}
+
+If an attacker controls \emph{both} the original and the tampered file -- say, a software author who later wants to repudiate, or an attacker who submits a benign file for review then swaps in a malicious twin with the same hash -- then \emph{collision} resistance is what matters, and a 128- or 160-bit hash is too weak. In 2017 the SHAttered attack produced two distinct PDF files with identical SHA-1 digests at a cost of $\approx 2^{63}$ compressions. In 2019--2020 \emph{chosen-prefix} SHA-1 collisions (where the two files can begin with arbitrary attacker-chosen prefixes) became practical, breaking SHA-1's use in PGP web-of-trust certificates. The lesson: a fingerprint is only as trustworthy as the hash's collision resistance whenever the adversary can influence the original, and SHA-1 and MD5 are finished for that role.
+\end{attackbox}
+
+\subsection{Merkle trees: fingerprinting a collection}
+
+To fingerprint not one file but a whole set -- and to let someone verify a single element without downloading the rest -- hash the elements pairwise up a binary tree. Each leaf is the hash of a data block; each internal node is the hash of its two children's hashes; the single \emph{root} hash commits to the entire collection.
+
+\begin{center}
+\begin{tikzpicture}[
+   nd/.style={draw, rounded corners, minimum width=1.1cm, minimum height=0.55cm, font=\scriptsize, fill=blue!6},
+   lf/.style={draw, minimum width=0.95cm, minimum height=0.5cm, font=\scriptsize, fill=green!8},
+   >={Stealth}, level distance=1.0cm,
+   level 1/.style={sibling distance=4.6cm},
+   level 2/.style={sibling distance=2.3cm}]
+  \node[nd] (root) {root $= \Hash(h_{12}\|h_{34})$}
+    child {node[nd] (h12) {$h_{12}=\Hash(h_1\|h_2)$}
+      child {node[lf] (h1) {$h_1=\Hash(d_1)$}}
+      child {node[lf] (h2) {$h_2=\Hash(d_2)$}}
+    }
+    child {node[nd] (h34) {$h_{34}=\Hash(h_3\|h_4)$}
+      child {node[lf] (h3) {$h_3=\Hash(d_3)$}}
+      child {node[lf] (h4) {$h_4=\Hash(d_4)$}}
+    };
+\end{tikzpicture}
+\end{center}
+
+To prove block $d_3$ is in the tree under a known root, you reveal $d_3$ and the \emph{authentication path}: the sibling hashes $h_4$ and $h_{12}$. The verifier recomputes $h_3 = \Hash(d_3)$, then $h_{34} = \Hash(h_3 \concat h_4)$, then $\Hash(h_{12} \concat h_{34})$ and checks it equals the root. A proof for one element among $N$ has only $\log_2 N$ hashes. Collision resistance of $\Hash$ means a cheater cannot present a different $d_3'$ that recomputes to the same root.
+
+\begin{applicationbox}
+Merkle trees are everywhere: Bitcoin and Ethereum commit each block's transactions to a Merkle root in the block header (so a light client verifies one payment with a $\log N$ proof); Certificate Transparency logs are Merkle trees of every issued TLS certificate; Git's tree objects, BitTorrent v2, ZFS and Btrfs block checksums, and the \texttt{rsync}/Dropbox style sync protocols all use the same structure. Chapter 36 develops the blockchain version in full.
+\end{applicationbox}
+
+\section{Application 2: commitments}
+\label{ch14:commitments}
+
+A \emph{commitment scheme} is a cryptographic envelope. You want to lock in a value now and reveal it later, in a way that (a) you cannot change after committing, and (b) reveals nothing in the meantime. Think of sealing a prediction in an envelope and handing it over: \emph{binding} (you cannot swap the contents) and \emph{hiding} (no one can peek).
+
+A hash gives a simple commitment. To commit to a message $m$, choose a random \emph{nonce} $r$ (say 256 bits) and publish
+\[
+  c = \Hash(m \concat r).
+\]
+To open, reveal $m$ and $r$; the verifier recomputes $\Hash(m \concat r)$ and checks it equals $c$.
+
+\begin{whybox}
+\textbf{Why it binds and why it hides.}
+\begin{itemize}
+  \item \textbf{Binding} rests on collision resistance. To open the same $c$ to a different message $m' \ne m$, you would need $(m', r')$ with $\Hash(m' \concat r') = \Hash(m \concat r)$ -- a collision. Find one and you have broken the hash.
+  \item \textbf{Hiding} rests on one-wayness, with help from the random $r$. Without $r$, committing to a low-entropy value (``yes''/``no'', or a chess move from a small set) would let anyone just hash all possibilities and match $c$. The nonce $r$ injects enough entropy that the digest reveals nothing guessable about $m$ -- in the random-oracle model, $c$ is uniform and independent of $m$ until $r$ is revealed.
+\end{itemize}
+The random nonce is not optional. A commitment to a value from a small or guessable set, computed as $\Hash(m)$ with no nonce, is trivially broken by brute force over the possibilities -- the same mistake as unsalted password hashing.
+\end{whybox}
+
+\begin{applicationbox}
+Hash commitments power coin-flipping and fair lotteries (each party commits to a random value, then both open and XOR), sealed-bid auctions, the ``commit--reveal'' pattern in smart contracts, and the Fiat--Shamir transform that turns interactive zero-knowledge proofs into non-interactive signatures (Chapters 22 and 31). When you cannot afford the algebraic, additively-homomorphic Pedersen commitments of Chapter 32, a salted hash commitment is the cheap default.
+\end{applicationbox}
+
+\section{Application 3: password storage with salts}
+\label{ch14:passwords}
+
+A server that checks passwords must \emph{not} store them in the clear -- one database breach and every account is exposed, and users reuse passwords across sites. The fix is to store a hash and compare hashes at login. But naive hashing fails against two specific attacks, and defeating them shaped modern password storage.
+
+\begin{attackbox}
+\textbf{Attack 1: precomputation and rainbow tables.} If the server stores $\Hash(\text{password})$ with a public, fixed hash, an attacker precomputes $\Hash$ of every common password \emph{once}, builds a lookup table (a space-optimized version is a \emph{rainbow table}), and cracks every matching account in every breached database instantly. Worse, two users with the same password get the same stored hash -- visible at a glance.
+
+\textbf{Attack 2: raw speed.} With a fast hash like SHA-256, a single GPU computes billions of guesses per second. An 8-character password from the printable ASCII set ($\approx 95^{8} \approx 2^{52}$ possibilities) falls in hours; any password on a leaked wordlist falls in milliseconds.
+\end{attackbox}
+
+The two defenses map one-to-one onto the two attacks.
+
+\textbf{Salting} defeats precomputation. Generate a random \emph{salt} $s$ (16+ bytes, unique per user) and store $(s, \Hash(s \concat \text{password}))$. Now:
+\begin{itemize}
+  \item A precomputed table is useless -- it would have to be rebuilt for every distinct salt, destroying the one-time amortization that made rainbow tables pay off.
+  \item Identical passwords produce different stored hashes, hiding reuse.
+\end{itemize}
+The salt is not secret; it is stored in plaintext next to the hash. Its only job is to make each user's hash a distinct, un-precomputable target.
+
+\textbf{Slow, memory-hard hashing} defeats raw speed. Replace the single fast hash with a function deliberately tuned to be expensive -- thousands to millions of internal iterations, and (the modern requirement) large memory use so that GPUs and ASICs, which are bottlenecked on memory bandwidth, lose their massive parallel advantage. The accepted functions:
+\begin{itemize}
+  \item \textbf{Argon2} (2015 Password Hashing Competition winner) -- tunable time, memory, and parallelism; \emph{the default recommendation in 2026}. Use the Argon2id variant.
+  \item \textbf{scrypt} -- memory-hard, widely deployed, a solid choice.
+  \item \textbf{bcrypt} -- older, tunable cost factor, no memory hardness but still vastly better than raw SHA; fine for legacy systems.
+  \item \textbf{PBKDF2} -- iterated HMAC, FIPS-approved, but \emph{not} memory-hard, so weakest of the four against GPUs; use only when a standard mandates it, with a high iteration count.
+\end{itemize}
+
+\begin{implementbox}
+The right shape, in pseudocode. \textbf{Use a vetted library (libsodium, \texttt{argon2-cffi}, a maintained bcrypt) for the real thing -- do not hand-roll the KDF.}
+\begin{lstlisting}[language=Python]
+import os, hmac
+from argon2.low_level import hash_secret_raw, Type
+
+def register(password: str):
+    salt = os.urandom(16)                       # unique random salt per user
+    digest = hash_secret_raw(
+        password.encode(), salt,
+        time_cost=3, memory_cost=64*1024,       # 64 MiB: memory-hard
+        parallelism=4, hash_len=32, type=Type.ID)  # Argon2id
+    store(salt, digest)                         # salt is NOT secret
+
+def verify(password: str, salt: bytes, expected: bytes) -> bool:
+    digest = hash_secret_raw(
+        password.encode(), salt,
+        time_cost=3, memory_cost=64*1024,
+        parallelism=4, hash_len=32, type=Type.ID)
+    return hmac.compare_digest(digest, expected)  # constant-time compare!
+\end{lstlisting}
+Two details that are easy to get wrong and that matter: the salt must be \emph{fresh and random per user} (never a global constant, never the username), and the final comparison must be \emph{constant-time} -- a byte-by-byte \texttt{==} that returns early leaks, through timing, how many leading bytes matched, which an attacker can grind into a forgery. Chapter 37 covers timing side channels in depth.
+\end{implementbox}
+
+\begin{focusbox}
+\textbf{Salt vs. pepper.} A \emph{pepper} is a single secret value, identical across all users, mixed into the hash and stored \emph{separately} from the database (in an HSM or app config, not the breached table). A salt is per-user and public; a pepper is global and secret. They are complementary: the salt stops precomputation, the pepper means a database-only breach (with the pepper still secret) leaves the attacker unable to test guesses at all. Defense in depth, not a substitute for slow hashing.
+\end{focusbox}
+
+\section{The real-world status of named hashes}
+\label{ch14:realworld}
+
+\begin{center}
+\begin{tabular}{lccl}
+\toprule
+Hash & Output & Status (2026) & Notes \\
+\midrule
+MD5     & 128 & \textbf{broken} & collisions trivial since 2004; never use \\
+SHA-1   & 160 & \textbf{broken} & chosen-prefix collisions practical; retired \\
+SHA-256 & 256 & strong          & the default workhorse \\
+SHA-512 & 512 & strong          & faster on 64-bit CPUs; higher margin \\
+SHA-512/256 & 256 & strong      & length-extension-safe, 256-bit output \\
+SHA3-256& 256 & strong          & sponge; length-extension-immune \\
+SHAKE128/256 & any & strong     & XOFs; used across post-quantum schemes \\
+BLAKE2/3& var & strong          & very fast; BLAKE3 is tree-based and parallel \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{historybox}
+The march of broken hashes is a useful cautionary timeline. MD4 (1990) was wounded almost immediately. MD5 (1991) was theoretically broken by 2004 (Wang et al.) and weaponized into rogue CA certificates by 2008. SHA-0 fell in 2004; SHA-1 was shown breakable in theory in 2005, and a full collision was computed in 2017 (SHAttered), with chosen-prefix collisions by 2020. Every one of these was Merkle--Damgard with too-short output and an under-analyzed compression function. SHA-2 (2001) has stood for over two decades, and SHA-3 (2015) gives a structurally different backup. The pattern -- collisions first, preimages much later or never, output length and compression-function strength deciding the timeline -- is exactly what the birthday bound and the MD security proof predict.
+\end{historybox}
+
+\begin{aestheticbox}
+Hash functions are the closest thing cryptography has to a universal joint. A single primitive that is one-way, collision resistant, and behaves like a random oracle lets you fingerprint data, commit to secrets, key a MAC, build a signature, store a password, name an object by its content, and anchor a blockchain -- often all in the same system. That is why an attack on a widely used hash is front-page news in the field, and why so much care goes into output length, construction style, and the slow, public scrutiny that earns a hash the right to be trusted.
+\end{aestheticbox}
+
+\section{Exercises}
+\label{ch14:exercises}
+
+\begin{exercise}[Counting pairs]
+A hash has $n = 32$ output bits. Roughly how many random inputs must you hash before you expect a collision? How many before you expect to hit one \emph{specific} target digest by chance? Explain the $2^{16}$ versus $2^{32}$ gap in one sentence using the birthday bound.
+\end{exercise}
+
+\begin{exercise}[Birthday probability]
+Using $p(q) \approx 1 - e^{-q(q-1)/(2N)}$ with $N = 2^{40}$, find the smallest $q$ (to the nearest power of two) for which the collision probability exceeds $1/2$. Compare to the rule of thumb $q \approx 1.177\sqrt{N}$.
+\end{exercise}
+
+\begin{exercise}[Which property?]
+For each application, state which of the three resistance properties it most directly relies on, and give a one-line attack if that property fails: (a) a software-download checksum published by the vendor; (b) a sealed-bid auction using $\Hash(\text{bid}\concat r)$; (c) deduplicating a backup store by content hash; (d) a signature over $\Hash(\text{contract})$ where the signer wrote the contract.
+\end{exercise}
+
+\begin{exercise}[Reduction]
+Prove that if $\Hash$ is collision resistant then the function $\Hash'(x) = \Hash(\Hash(x))$ is also collision resistant. Where exactly does your reduction use collision resistance of $\Hash$?
+\end{exercise}
+
+\begin{exercise}[Length extension by hand]
+A naive server authenticates messages with $t = \Hash(k \concat M)$ for a Merkle--Damgard hash and an 8-byte secret $k$. Given a captured pair $(M = \texttt{"amount=10"}, t)$, describe precisely the bytes of the forged message you can authenticate without knowing $k$, and the one piece of information about $k$ you must know or guess. Then explain in one sentence why HMAC blocks your attack.
+\end{exercise}
+
+\begin{exercise}[Toy collision]
+Run the toy Merkle--Damgard hash from Section~\ref{ch14:md} (8-bit state). Empirically, after how many random inputs does the first collision typically appear? Average over 20 runs and compare to the birthday prediction $1.177 \cdot 2^{4}$. Why is the empirical mean a bit higher than that point estimate?
+\end{exercise}
+
+\begin{exercise}[Sponge security]
+SHA3-256 has capacity $c = 512$ and output $n = 256$. State its collision and preimage security levels and explain, in terms of the rate/capacity split, why an attacker cannot mount a length-extension attack against $\text{SHA3-256}(k \concat M)$.
+\end{exercise}
+
+\begin{exercise}[Salt arithmetic]
+A breached database stores $(\text{salt}, \text{SHA256}(\text{salt}\concat\text{password}))$ for 10 million users with unique 16-byte salts. An attacker has a wordlist of $10^{9}$ candidate passwords and a rig doing $10^{10}$ SHA-256/s. (a) How long to crack \emph{one} target account? (b) Why does the per-user salt mean the total work to crack all 10 million accounts is essentially 10 million times that, rather than amortized? (c) How would switching to Argon2 with a 0.5-second cost per guess change part (a)?
+\end{exercise}
+
+\begin{exercise}[Pepper]
+Explain why a secret pepper stored outside the database renders a database-only breach uncrackable, but does \emph{not} replace per-user salts. Construct a scenario where using only a pepper (no salt) leaks password reuse across users.
+\end{exercise}
+
+\begin{exercise}[Merkle proof]
+A Merkle tree has 8 leaves $d_1, \dots, d_8$. Write out the exact authentication path (the list of sibling hashes, in order) needed to prove $d_5$ is in the tree, and the sequence of hash computations the verifier performs to reach the root. How does the proof size grow with the number of leaves?
+\end{exercise}
+
+\begin{exercise}[Break a homemade commitment]
+A protocol commits to a single decision bit $b \in \set{0,1}$ by publishing $c = \Hash(b)$ with no nonce. Show that this commitment is not hiding by giving the attacker's exact procedure. Then show that adding a 256-bit random nonce $r$ and publishing $\Hash(b \concat r)$ restores hiding, citing the property of $\Hash$ you rely on.
+\end{exercise}

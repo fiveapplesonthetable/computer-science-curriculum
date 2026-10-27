@@ -1,0 +1,587 @@
+\chapter{Modular Arithmetic}
+
+Almost every modern cipher, key-exchange protocol, and signature scheme you will meet in this book runs on a single, deceptively humble idea: do arithmetic, but throw away everything except the remainder. RSA encrypts by raising a number to a power and keeping the remainder modulo a product of two primes. Diffie--Hellman builds a shared secret out of remainders modulo a large prime. The AES key schedule, elliptic curves, hash-based message authentication --- scratch any of them and you find clocks, wrap-around, and remainders underneath.
+
+This chapter builds that machinery from nothing. We start with a wall clock, work tiny examples entirely by hand, and end with the one algorithm --- fast modular exponentiation --- that makes public-key cryptography practical at all. Nothing here is hard. But it has to become \emph{automatic}, because in later chapters we will lean on it without comment.
+
+\chapterline
+
+\section{The Clock Already Taught You This}
+
+If it is 10 o'clock and you wait 5 hours, it is 3 o'clock --- not 15 o'clock. You computed $10 + 5 = 15$, noticed that $15$ is past 12, and subtracted 12 to land back on the dial. You have been doing modular arithmetic since you learned to read a clock.
+
+\begin{intuitionbox}
+Modular arithmetic is ordinary arithmetic on a finite circle of numbers instead of an infinite line. Pick a \emph{modulus} $n$ --- the number of positions on the circle. Count $0, 1, 2, \dots, n-1$, and then wrap back to $0$. Every integer, no matter how large or how negative, lands on exactly one of those $n$ positions. ``Modulo $n$'' just means: tell me \emph{where on the circle}, and forget \emph{how many times around}.
+\end{intuitionbox}
+
+A clock has modulus 12 (or 24, if you are military or European). A week has modulus 7: three days after Saturday is Tuesday, because $\text{Sat} = 6$, and $6 + 3 = 9$, and $9$ wraps to $2 = \text{Tue}$. A byte has modulus $256$: add 1 to $255$ and an unsigned 8-bit register rolls over to $0$. That rollover is not a bug in this chapter --- it is the whole subject.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=1.0]
+  \def\R{2.2}
+  \draw[thick,gray!60] (0,0) circle (\R);
+  \foreach \k in {0,...,11}{
+    \pgfmathsetmacro{\ang}{90 - \k*30}
+    \node[circle,draw=sourceblue,fill=blue!5,inner sep=1.6pt] (n\k) at (\ang:\R) {\small \k};
+  }
+  \draw[->,thick,evered] (n10) to[bend left=18] node[midway,below left,evered,font=\scriptsize] {$+5$} (n3);
+  \node[evered,font=\scriptsize] at (0,-0.1) {$10+5\equiv 3$};
+\end{tikzpicture}
+\caption{Addition modulo 12. Starting at 10 and stepping forward 5 positions wraps past 0 and lands on 3.}
+\label{ch03:clock}
+\end{figure}
+
+\section{The Integers Modulo \texorpdfstring{$n$}{n}}
+
+Let us make this precise. Fix a positive integer $n$, the modulus.
+
+\begin{definition}[Division with remainder]
+\label{ch03:division}
+For any integer $a$ and any positive integer $n$ there is a \emph{unique} pair of integers $q$ (the quotient) and $r$ (the remainder) with
+\[
+  a = qn + r, \qquad 0 \le r < n .
+\]
+We write $a \bmod n$ for that remainder $r$.
+\end{definition}
+
+The constraint $0 \le r < n$ is what makes $q$ and $r$ unique --- it forces the remainder onto exactly one position of the circle. So $17 \bmod 12 = 5$ because $17 = 1\cdot 12 + 5$. And $-1 \bmod 12 = 11$, because $-1 = (-1)\cdot 12 + 11$ and we are required to pick the remainder in $\{0,\dots,11\}$, not the negative one your calculator might hand you.
+
+\begin{trapbox}
+Many programming languages compute the remainder with a sign that follows the \emph{dividend}, so \texttt{-1 \% 12} returns \texttt{-1} in C, but \texttt{11} in Python. Mathematicians always mean the non-negative remainder $0 \le r < n$. When you implement crypto in a language with C-style \texttt{\%}, normalise with \texttt{((a \% n) + n) \% n} or you will eventually leak a sign bit into a place it does not belong.
+\end{trapbox}
+
+\subsection{Congruence: the equality of modular arithmetic}
+
+Two integers that land on the same circle position are, for our purposes, the same. We give that relationship a name and a symbol.
+
+\begin{definition}[Congruence]
+\label{ch03:congruence}
+Integers $a$ and $b$ are \emph{congruent modulo $n$}, written
+\[
+  a \equiv b \pmod{n},
+\]
+if $n$ divides $a - b$. Equivalently, $a$ and $b$ have the same remainder when divided by $n$.
+\end{definition}
+
+So $17 \equiv 5 \pmod{12}$ and $17 \equiv 29 \pmod{12}$ and $17 \equiv -7 \pmod{12}$: all of $5, 17, 29, -7$ sit on position $5$ of the 12-clock, because any two of them differ by a multiple of 12. The symbol $\equiv$ is read ``is congruent to,'' and the $\pmod{n}$ tag tells you which circle you are standing on. Note the difference from the operator $a \bmod n$, which returns a single number in $\{0,\dots,n-1\}$: the relation $\equiv$ compares two numbers, while $\bmod$ \emph{reduces} one.
+
+\begin{intuitionbox}
+Think of $a \equiv b \pmod n$ as ``$a$ and $b$ are interchangeable, as long as we only ever care about remainders mod $n$.'' Everything we build will respect this interchangeability, which is exactly why we are allowed to reduce huge numbers down to small ones at every step --- the small representative behaves identically to the giant one.
+\end{intuitionbox}
+
+\subsection{Congruence is an equivalence relation}
+
+Congruence behaves like equality, and we should check that, because we are about to treat it like equality constantly.
+
+\begin{proposition}[Congruence is an equivalence relation]
+\label{ch03:equiv-rel}
+For all integers $a,b,c$ and a fixed modulus $n$:
+\begin{itemize}
+  \item \textbf{Reflexive:} $a \equiv a \pmod n$.
+  \item \textbf{Symmetric:} if $a \equiv b$ then $b \equiv a \pmod n$.
+  \item \textbf{Transitive:} if $a \equiv b$ and $b \equiv c$ then $a \equiv c \pmod n$.
+\end{itemize}
+\end{proposition}
+
+\begin{proof}
+Reflexivity: $n \mid (a-a) = 0$. Symmetry: if $n \mid (a-b)$ then $n \mid -(a-b) = (b-a)$. Transitivity: if $n \mid (a-b)$ and $n \mid (b-c)$, then $n$ divides their sum $(a-b)+(b-c) = a-c$.
+\end{proof}
+
+Because congruence partitions the integers into $n$ classes (one per circle position), we call each class a \emph{residue class}. The set of all $n$ classes is written $\Zn{n}$, read ``$\Z$ mod $n$,'' and we usually represent each class by its non-negative remainder:
+\[
+  \Zn{n} = \set{0, 1, 2, \dots, n-1}.
+\]
+When we ``compute in $\Zn{n}$,'' we do arithmetic and then immediately reduce the answer back into that set. The deep reason we are allowed to do this --- and to reduce \emph{whenever we like}, even halfway through a calculation --- is the next result.
+
+\section{Addition, Subtraction, Multiplication All Survive Wrap-around}
+
+The single most useful fact in this chapter is that congruence is compatible with the arithmetic operations. If you replace any number by a congruent one, sums and products do not notice.
+
+\begin{theorem}[Congruences add and multiply]
+\label{ch03:compatible}
+If $a \equiv a' \pmod n$ and $b \equiv b' \pmod n$, then
+\[
+  a + b \equiv a' + b' \pmod n,
+  \qquad
+  a - b \equiv a' - b' \pmod n,
+  \qquad
+  a b \equiv a' b' \pmod n .
+\]
+\end{theorem}
+
+\begin{proof}
+By hypothesis $n \mid (a - a')$ and $n \mid (b - b')$. Write $a - a' = kn$ and $b - b' = \ell n$.
+
+For addition, $(a+b) - (a'+b') = (a-a') + (b-b') = (k+\ell)n$, a multiple of $n$. Subtraction is identical with a minus sign.
+
+For multiplication, the trick is to add and subtract a bridging term:
+\[
+  ab - a'b' = ab - a'b + a'b - a'b' = (a-a')\,b + a'\,(b-b') = kn\,b + a'\,\ell n = n\,(kb + a'\ell),
+\]
+again a multiple of $n$.
+\end{proof}
+
+\begin{whybox}
+Theorem~\ref{ch03:compatible} is the permission slip for every shortcut in this book. It says you may reduce mod $n$ \emph{as early and as often as you want}. Want $123 \cdot 456 \bmod 10$? You do not need the full product $56088$. Reduce first: $123 \equiv 3$, $456 \equiv 6$, so the answer is $3\cdot 6 = 18 \equiv 8 \pmod{10}$. Keeping numbers small at every step is the only reason a 2048-bit RSA exponentiation fits in memory.
+\end{whybox}
+
+\begin{example}[Reduce early, reduce often]
+\label{ch03:reduce-early}
+Compute $(38 + 27)\cdot 19 \bmod 7$ two ways.
+
+\emph{The naive way:} $38 + 27 = 65$, then $65 \cdot 19 = 1235$, then $1235 = 176\cdot 7 + 3$, so the answer is $3$.
+
+\emph{Reducing early:} $38 \equiv 3$, $27 \equiv 6$, $19 \equiv 5 \pmod 7$. So $(3 + 6)\cdot 5 = 9 \cdot 5$. Reduce again: $9 \equiv 2$, giving $2 \cdot 5 = 10 \equiv 3 \pmod 7$. Same answer, and the largest number we ever wrote down was $10$ instead of $1235$.
+\end{example}
+
+\subsection{Addition and multiplication tables for a tiny modulus}
+
+Nothing builds intuition like staring at the full operation table of a small ring. Here are the complete addition and multiplication tables for $\Zn{6}$. Read row $a$, column $b$; the entry is $a+b$ (or $ab$) reduced mod 6.
+
+\begin{center}
+\begin{minipage}{0.46\linewidth}
+\centering
+\textbf{Addition mod 6}\\[0.3em]
+\begin{tabular}{c|cccccc}
+$+$ & 0 & 1 & 2 & 3 & 4 & 5 \\ \hline
+0 & 0 & 1 & 2 & 3 & 4 & 5 \\
+1 & 1 & 2 & 3 & 4 & 5 & 0 \\
+2 & 2 & 3 & 4 & 5 & 0 & 1 \\
+3 & 3 & 4 & 5 & 0 & 1 & 2 \\
+4 & 4 & 5 & 0 & 1 & 2 & 3 \\
+5 & 5 & 0 & 1 & 2 & 3 & 4 \\
+\end{tabular}
+\end{minipage}
+\hfill
+\begin{minipage}{0.46\linewidth}
+\centering
+\textbf{Multiplication mod 6}\\[0.3em]
+\begin{tabular}{c|cccccc}
+$\times$ & 0 & 1 & 2 & 3 & 4 & 5 \\ \hline
+0 & 0 & 0 & 0 & 0 & 0 & 0 \\
+1 & 0 & 1 & 2 & 3 & 4 & 5 \\
+2 & 0 & 2 & 4 & 0 & 2 & 4 \\
+3 & 0 & 3 & 0 & 3 & 0 & 3 \\
+4 & 0 & 4 & 2 & 0 & 4 & 2 \\
+5 & 0 & 5 & 4 & 3 & 2 & 1 \\
+\end{tabular}
+\end{minipage}
+\end{center}
+
+The addition table is a perfect Latin square: every row and column is a permutation of $\{0,\dots,5\}$. That is no accident --- adding a fixed number is just a rotation of the circle, which can never collide.
+
+The multiplication table is more interesting, and it hides the central drama of this chapter. Look at the rows for $1$ and $5$: each is a permutation of $\{0,\dots,5\}$, hitting every value. Now look at the rows for $2$, $3$, $4$: they repeat themselves and never produce a $1$. The numbers $1$ and $5$ are special. Hold that thought; it is the difference between numbers you can ``divide by'' and numbers you cannot.
+
+\section{Where Division Goes Wrong}
+
+On the integers you cannot always divide and stay an integer ($7/2$ is not an integer), so you learn early to be careful. Modular arithmetic has its own, sharper version of this caution, and getting it wrong is a classic source of broken cryptography.
+
+The cancellation law you rely on over the rationals --- ``if $ax = ay$ then $x = y$'' --- can \emph{fail} mod $n$. Look at the multiplication table for $\Zn 6$: $2 \cdot 1 = 2$ and $2 \cdot 4 = 8 \equiv 2$. So $2\cdot 1 \equiv 2 \cdot 4 \pmod 6$, yet $1 \not\equiv 4$. We multiplied two different things by 2 and got the same answer. You cannot ``cancel the 2.''
+
+\begin{trapbox}
+$a \equiv b \pmod n$ does \emph{not} let you cancel a common factor freely. From $2\cdot 2 \equiv 2 \cdot 8 \pmod{12}$ (both sides are $4$, since $16 \equiv 4$) you cannot conclude $2 \equiv 8 \pmod{12}$ --- and indeed $2 \not\equiv 8$. Cancellation is only legal when the factor you cancel is \emph{invertible} mod $n$, which is exactly what the next section pins down.
+\end{trapbox}
+
+\subsection{Zero divisors}
+
+The villain is the \emph{zero divisor}: a nonzero element whose product with some other nonzero element is $0$. In $\Zn 6$ we have $2 \cdot 3 = 6 \equiv 0$, even though neither $2$ nor $3$ is zero. Zero divisors are exactly the elements that ruin cancellation, and they appear precisely when $n$ is composite and the element shares a factor with $n$.
+
+This is why, over and over in cryptography, we will insist on a \emph{prime} modulus $p$, or on working only with numbers \emph{coprime} to $n$. Under those conditions, zero divisors vanish and division comes back to life.
+
+\section{Modular Inverses: Division, Reclaimed}
+
+To divide by $a$ means to multiply by the thing that undoes $a$. Over the rationals, ``the thing that undoes 7'' is $1/7$, because $7 \cdot (1/7) = 1$. Modular arithmetic copies this definition exactly.
+
+\begin{definition}[Modular inverse]
+\label{ch03:inverse-def}
+An integer $a$ has a \emph{multiplicative inverse} modulo $n$ if there is an integer $x$ with
+\[
+  a x \equiv 1 \pmod n .
+\]
+When it exists, we write the inverse as $a^{-1} \bmod n$. It is unique modulo $n$.
+\end{definition}
+
+For example, $5^{-1} \bmod 6 = 5$, because $5 \cdot 5 = 25 = 4\cdot 6 + 1 \equiv 1 \pmod 6$. The number 5 is its own inverse on the 6-clock. By contrast, $2$ has \emph{no} inverse mod 6: scan the row for 2 in the table above --- it produces $0,2,4,0,2,4$ and never a $1$. There is simply no $x$ with $2x \equiv 1 \pmod 6$.
+
+When does an inverse exist? The complete answer is clean and is one of the most-used facts in this book.
+
+\begin{theorem}[Existence of inverses]
+\label{ch03:inverse-exists}
+The integer $a$ has a multiplicative inverse modulo $n$ if and only if $\gcd(a, n) = 1$ --- that is, if and only if $a$ and $n$ are \emph{coprime} (share no common factor other than 1).
+\end{theorem}
+
+\begin{proof}
+($\Leftarrow$) Suppose $\gcd(a,n) = 1$. B\'ezout's identity (proved in the number-theory chapter) says there exist integers $x, y$ with $ax + ny = 1$. Reducing this mod $n$ kills the $ny$ term: $ax \equiv 1 \pmod n$. So $x$ is the inverse.
+
+($\Rightarrow$) Conversely, suppose $ax \equiv 1 \pmod n$, so $ax = 1 + kn$ for some integer $k$, i.e. $ax - kn = 1$. Any common divisor $d$ of $a$ and $n$ divides the left side, hence divides $1$, so $d = 1$. Thus $\gcd(a,n) = 1$.
+\end{proof}
+
+\begin{whybox}
+This theorem is why prime moduli are a cryptographer's best friend. If $p$ is prime, then \emph{every} nonzero residue $1,2,\dots,p-1$ is coprime to $p$, so every nonzero element has an inverse. Division by any nonzero number works perfectly. That makes $\Zn p$ a \emph{field} --- the structurally cleanest possible playground --- which is why Diffie--Hellman, ElGamal, and DSA all live mod a large prime. We will give this its proper name (a finite field) in a later chapter; for now, just register that ``prime modulus $\Rightarrow$ division always works.''
+\end{whybox}
+
+\subsection{The group of units}
+
+The coprime residues are important enough to get their own name and symbol.
+
+\begin{definition}[Units mod $n$]
+\label{ch03:units}
+The \emph{units} modulo $n$ are the residues coprime to $n$. They form a set
+\[
+  \Zns{n} = \set{\, a \in \Zn{n} : \gcd(a,n) = 1 \,},
+\]
+and under multiplication mod $n$ they form a group: closed, with identity 1, and every element invertible.
+\end{definition}
+
+For $n = 6$, the units are $\{1, 5\}$ --- exactly the two rows of the multiplication table that were permutations. For a prime $p$, the units are everything nonzero: $\Zns{p} = \{1, 2, \dots, p-1\}$, which has $p-1$ elements. The size of $\Zns{n}$ is written $\varphi(n)$ (Euler's totient), and it will star in the next chapter and again in RSA. For now, the one number to remember: $\abs{\Zns{p}} = p - 1$ for prime $p$.
+
+\subsection{Computing an inverse by hand}
+
+You can always find an inverse for small $n$ by brute force --- just try every residue --- but the principled tool is the \emph{extended Euclidean algorithm}, which produces the B\'ezout coefficients $x, y$ in $ax + ny = \gcd(a,n)$. We develop that algorithm in full in the number-theory chapter; here is the idea on a concrete case so the notion of an inverse feels mechanical rather than magical.
+
+\begin{example}[Inverting 17 modulo 43]
+\label{ch03:inv-17-43}
+We want $x$ with $17x \equiv 1 \pmod{43}$. First run the ordinary Euclidean algorithm to confirm $\gcd(17,43)=1$, recording each quotient:
+\begin{align*}
+  43 &= 2\cdot 17 + 9 \\
+  17 &= 1\cdot 9 + 8 \\
+   9 &= 1\cdot 8 + 1 \\
+   8 &= 8\cdot 1 + 0 .
+\end{align*}
+The last nonzero remainder is $1$, so they are coprime and an inverse exists. Now back-substitute to write $1$ as a combination of 17 and 43:
+\begin{align*}
+  1 &= 9 - 1\cdot 8 \\
+    &= 9 - 1\cdot(17 - 1\cdot 9) = 2\cdot 9 - 1\cdot 17 \\
+    &= 2\cdot(43 - 2\cdot 17) - 1\cdot 17 = 2\cdot 43 - 5\cdot 17 .
+\end{align*}
+So $-5 \cdot 17 + 2\cdot 43 = 1$, which means $17 \cdot (-5) \equiv 1 \pmod{43}$. Normalise the negative: $-5 \equiv 38 \pmod{43}$. Check: $17 \cdot 38 = 646 = 15\cdot 43 + 1$. Indeed $646 \equiv 1$. So $17^{-1} \bmod 43 = 38$.
+\end{example}
+
+\begin{example}[A second inverse, and a sanity ritual]
+\label{ch03:inv-second}
+Find $7^{-1} \bmod 26$ --- the multiplier Bob will need to break the affine cipher later. The Euclidean descent is short:
+\begin{align*}
+  26 &= 3\cdot 7 + 5 \\
+   7 &= 1\cdot 5 + 2 \\
+   5 &= 2\cdot 2 + 1 \\
+   2 &= 2\cdot 1 + 0 .
+\end{align*}
+Back-substitute from the last nonzero remainder:
+\begin{align*}
+  1 &= 5 - 2\cdot 2 \\
+    &= 5 - 2\cdot(7 - 1\cdot 5) = 3\cdot 5 - 2\cdot 7 \\
+    &= 3\cdot(26 - 3\cdot 7) - 2\cdot 7 = 3\cdot 26 - 11\cdot 7 .
+\end{align*}
+So $-11\cdot 7 \equiv 1 \pmod{26}$, and $-11 \equiv 15 \pmod{26}$. The ritual that should follow \emph{every} inverse you compute: multiply it back. $7\cdot 15 = 105 = 4\cdot 26 + 1 \equiv 1$. Confirmed, $7^{-1} \bmod 26 = 15$. If that final product is not $1$, you have an arithmetic slip or a non-coprime input --- never ship an inverse you have not multiplied back.
+\end{example}
+
+\begin{trapbox}
+A widespread implementation bug: code calls an \texttt{inverse(a, n)} routine, gets back \emph{some} number, and uses it without checking $\gcd(a,n)=1$. When $a$ and $n$ share a factor, a naive extended-Euclid routine returns a value satisfying $ax \equiv \gcd(a,n) \pmod n$, \emph{not} $\equiv 1$ --- silently wrong. Downstream the ``decryption'' produces garbage or, worse, a value that happens to pass a weak check. Always either guarantee coprimality by construction (prime modulus, or $a$ drawn from the units) or test that $a\cdot x \equiv 1$ before trusting the result.
+\end{trapbox}
+
+\begin{connectionbox}
+The extended Euclidean algorithm runs in $O(\log n)$ division steps --- it is one of the oldest and fastest algorithms known. The companion \emph{algorithms} book analyses why the number of steps is bounded by the logarithm of the inputs (the worst case is consecutive Fibonacci numbers, which shrink the slowest). That logarithmic cost is what lets us compute inverses on 2048-bit numbers in microseconds, which RSA decryption and signature verification both rely on.
+\end{connectionbox}
+
+\begin{applicationbox}
+Modular inverses are not an exotic corner of crypto; they are everywhere. RSA's private exponent $d$ is the inverse of the public exponent $e$ modulo $\varphi(n)$. Every ECDSA and DSA signature divides by the nonce $k$, i.e. multiplies by $k^{-1}$ modulo the group order; if that inverse step is implemented with a non-constant-time algorithm, the timing leaks bits of $k$ and the long-term key can be recovered (a real, repeatedly-exploited bug class, covered in the side-channels chapter). The unglamorous ``find the inverse'' operation is load-bearing.
+\end{applicationbox}
+
+\section{Modular Exponentiation}
+
+Raising to a power mod $n$ --- compute $a^k \bmod n$ --- is the single operation that public-key cryptography is built on. RSA encryption is $m^e \bmod n$. Diffie--Hellman is $g^x \bmod p$. Get comfortable with it.
+
+Because of Theorem~\ref{ch03:compatible}, exponentiation respects congruence too: if $a \equiv a' \pmod n$ then $a^k \equiv (a')^k \pmod n$ for any non-negative integer $k$ (just multiply the base congruence by itself $k$ times). So once again we may reduce the base mod $n$ first, and reduce after every multiplication, keeping all intermediate numbers below $n^2$.
+
+\begin{example}[Powers of 3 mod 7, by hand]
+\label{ch03:powers-of-3}
+Multiply by 3 and reduce each time:
+\[
+  3^1 = 3,\quad 3^2 = 9 \equiv 2,\quad 3^3 \equiv 2\cdot 3 = 6,\quad 3^4 \equiv 6 \cdot 3 = 18 \equiv 4,
+\]
+\[
+  3^5 \equiv 4\cdot 3 = 12 \equiv 5,\quad 3^6 \equiv 5\cdot 3 = 15 \equiv 1 .
+\]
+The powers cycle: $3, 2, 6, 4, 5, 1$, and then $3^7 \equiv 3$ again, repeating with period 6. Notice we hit every nonzero residue mod 7 before returning to 1 --- so 3 is a \emph{generator} of $\Zns 7$, the engine behind Diffie--Hellman mod 7. Notice too that $3^6 \equiv 1$, with the exponent $6 = p - 1$: that is Fermat's little theorem peeking through, which the next chapter proves.
+\end{example}
+
+\subsection{Order, and why the powers cycle}
+
+The fact that the powers of 3 mod 7 returned to 1 after exactly six steps is not a curiosity --- it is the structural feature cryptography exploits. The smallest positive $k$ with $a^k \equiv 1 \pmod n$ is called the \emph{order} of $a$, written $\ord_n(a)$. For a unit, this $k$ always exists (the powers of a unit cannot run forever without repeating in a finite set, and the first repeat must be a return to 1). Once $a^k \equiv 1$, the sequence repeats with period $k$.
+
+\begin{example}[Orders mod 7, by inspection]
+\label{ch03:orders-mod7}
+We computed the cycle of 3: $3,2,6,4,5,1$, length 6, so $\ord_7(3)=6$. Compare 2: $2^1=2$, $2^2=4$, $2^3=8\equiv 1$ --- order 3, a short cycle hitting only $\{1,2,4\}$. And $6 \equiv -1$ has $6^2 = 36 \equiv 1$, order 2. The orders $1,2,3,6$ that appear are exactly the divisors of $6 = p-1$; no element has order 4 or 5. That every order divides $p-1$ is Lagrange's theorem in miniature, and it is why $a^{p-1}\equiv 1$ (Fermat) holds for \emph{every} nonzero $a$, not just the generators.
+\end{example}
+
+An element whose order is the full $p-1$, like 3 mod 7, is a \emph{generator} (or \emph{primitive root}): its powers sweep out every nonzero residue. Diffie--Hellman needs such a generator so that $g^x$ ranges over the whole group as $x$ varies; an element of small order would confine the shared secret to a tiny, brute-forceable subset. We will return to choosing generators and to the subtle subgroup pitfalls in the key-exchange chapter.
+
+\subsection{Why you cannot just multiply \texorpdfstring{$k$}{k} times}
+
+Computing $g^x \bmod p$ where $x$ is a 256-bit number by doing $x - 1$ multiplications would take roughly $2^{256}$ multiplications --- more operations than there are atoms in the observable universe, by a wide margin. The naive loop is hopeless. We need exponentiation whose cost grows with the \emph{number of bits} in the exponent, not the exponent itself.
+
+\subsection{Square-and-multiply}
+
+The trick is to use the binary expansion of the exponent and the algebraic fact $a^{2k} = (a^k)^2$ and $a^{2k+1} = (a^k)^2 \cdot a$. Squaring doubles the exponent for the price of one multiplication, so we can climb to a huge exponent in a number of steps equal to the bit-length.
+
+\begin{intuitionbox}
+Think of building the exponent in binary, from the most significant bit down. Start with $1$. For each bit of the exponent, \textbf{square} (which shifts your current exponent left by one bit, i.e. doubles it), and if the current bit is a 1, \textbf{multiply} by the base (which adds 1 to the exponent). Reading the exponent's bits left to right and applying ``square, then maybe multiply'' reconstructs exactly the exponent you want.
+\end{intuitionbox}
+
+\begin{example}[$7^{13} \bmod 11$ by square-and-multiply]
+\label{ch03:sqm-example}
+The exponent is $13 = 1101_2$. Read its bits left to right: $1, 1, 0, 1$. Start the accumulator at $r = 1$.
+
+\begin{center}
+\begin{tabular}{c c l l}
+\toprule
+bit & action & accumulator (before reduce) & reduced mod 11 \\
+\midrule
+1 & square, multiply & $1^2 \cdot 7 = 7$            & $7$ \\
+1 & square, multiply & $7^2 \cdot 7 = 343$         & $343 \equiv 2$ \\
+0 & square           & $2^2 = 4$                   & $4$ \\
+1 & square, multiply & $4^2 \cdot 7 = 112$         & $112 \equiv 2$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+So $7^{13} \equiv 2 \pmod{11}$. We used 4 squarings and 3 multiplications --- 7 modular multiplications --- instead of 12. Let us sanity-check against the direct route: $7^2 = 49 \equiv 5$, $7^4 \equiv 5^2 = 25 \equiv 3$, $7^8 \equiv 3^2 = 9$. Then $7^{13} = 7^8 \cdot 7^4 \cdot 7^1 \equiv 9 \cdot 3 \cdot 7 = 189 \equiv 2 \pmod{11}$. Agreed.
+\end{example}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw=structurepurple,fill=structurepurple!8,rounded corners,minimum width=16mm,minimum height=8mm,font=\small},
+  op/.style={font=\scriptsize,structurepurple}]
+  \node[box] (s0) {$r=1$};
+  \node[box,right=15mm of s0] (s1) {$r=7$};
+  \node[box,right=15mm of s1] (s2) {$r=2$};
+  \node[box,right=15mm of s2] (s3) {$r=4$};
+  \node[box,right=15mm of s3] (s4) {$r=2$};
+  \draw[->,thick] (s0) -- node[op,above]{$\times7$} node[op,below]{bit 1} (s1);
+  \draw[->,thick] (s1) -- node[op,above]{$^2\times7$} node[op,below]{bit 1} (s2);
+  \draw[->,thick] (s2) -- node[op,above]{$^2$} node[op,below]{bit 0} (s3);
+  \draw[->,thick] (s3) -- node[op,above]{$^2\times7$} node[op,below]{bit 1} (s4);
+  \node[font=\scriptsize,below=8mm of s2] {exponent $13 = 1101_2$, processed left to right};
+\end{tikzpicture}
+\caption{Square-and-multiply for $7^{13}\bmod 11$. Each step squares the accumulator (and multiplies by the base on a 1-bit), reducing mod 11 after every operation.}
+\label{ch03:sqm-diagram}
+\end{figure}
+
+\subsection{The cost, precisely}
+
+If the exponent $k$ has $b = \floor{\log_2 k} + 1$ bits, square-and-multiply performs at most $b$ squarings and at most $b$ multiplications --- so at most $2b = O(\log k)$ modular multiplications. Each modular multiplication of numbers below $n$ costs $O((\log n)^2)$ bit operations with schoolbook multiplication. The total is therefore
+\[
+  O\big( (\log k)\,(\log n)^2 \big)
+\]
+bit operations. For RSA with a 2048-bit modulus and a 2048-bit exponent, that is on the order of $2^{11} \cdot (2^{11})^2 \approx 2^{33}$ bit operations --- a few billion, a small fraction of a second on commodity hardware. Compare the naive loop's $2^{2048}$ multiplications. The gap between ``logarithmic'' and ``linear'' in the exponent is the entire reason public-key crypto is usable.
+
+\begin{connectionbox}
+This is the same exponential-vs-logarithm story the algorithms book tells about fast exponentiation in general (it works in \emph{any} monoid: integers, matrices, group elements). There, the recurrence $T(k) = T(k/2) + O(1)$ multiplications gives $T(k) = O(\log k)$ by the same logic as binary search. Schoolbook $O((\log n)^2)$ multiplication can be improved to $O(\log n \log\log n)$ with FFT-based methods (Sch\"onhage--Strassen), which real big-integer libraries switch to above a threshold --- see the algorithms book's chapter on fast multiplication.
+\end{connectionbox}
+
+\subsection{Toy implementation}
+
+Here is square-and-multiply in a few lines of Python, written to mirror the example above. It is short on purpose; the point is to see the algorithm, not to ship it.
+
+\begin{implementbox}
+\textbf{Learning code only --- do not use in production.} Real libraries use constant-time exponentiation (Montgomery ladders, fixed-window methods, blinding) to avoid leaking the exponent through timing or power. The version below branches on the secret bit, which is exactly the kind of leak the side-channels chapter shows how to exploit. Use \texttt{pow(a, k, n)} from the standard library, which is hardened, for anything real.
+
+\begin{lstlisting}[language=Python]
+def mod_pow(a, k, n):
+    """Compute a**k mod n by square-and-multiply (teaching version)."""
+    a = a % n                 # reduce the base first
+    r = 1
+    for bit in bin(k)[2:]:    # exponent bits, most significant first
+        r = (r * r) % n       # SQUARE every step
+        if bit == '1':        # MULTIPLY on a 1-bit
+            r = (r * a) % n
+    return r
+
+# Trace the chapter's example:
+assert mod_pow(7, 13, 11) == 2
+assert mod_pow(3, 6, 7) == 1          # Fermat: 3^(7-1) = 1 mod 7
+# Python's own (hardened) version agrees:
+assert mod_pow(7, 13, 11) == pow(7, 13, 11)
+\end{lstlisting}
+\end{implementbox}
+
+\begin{attackbox}
+\textbf{The naive version leaks the exponent.} The \texttt{if bit == '1'} branch does an extra multiplication only when the secret bit is 1. An attacker who can measure how long each iteration takes (timing), or watch the power trace of a smart card, sees a longer-or-shorter pattern that spells out the bits of $k$ directly. For RSA, $k$ is the private exponent $d$ --- recovering it is total key compromise. The defence, the \emph{Montgomery ladder}, does the \emph{same} sequence of one square and one multiply on every bit regardless of its value, so the trace carries no secret-dependent structure. We return to this in the side-channels chapter; for now, internalise that ``correct math'' and ``safe implementation'' are two different bars, and exponentiation must clear both.
+\end{attackbox}
+
+\section{Solving Linear Congruences}
+
+With inverses in hand we can solve equations. The modular analogue of $ax = b$ is the linear congruence
+\[
+  ax \equiv b \pmod n,
+\]
+and the recipe is exactly what you would hope: if $a$ is invertible, multiply both sides by $a^{-1}$.
+
+\begin{example}[A unique solution]
+\label{ch03:lincon-unique}
+Solve $5x \equiv 3 \pmod 7$. Here $\gcd(5,7)=1$, so $5$ is invertible. Its inverse: $5\cdot 3 = 15 \equiv 1$, so $5^{-1} \equiv 3 \pmod 7$. Multiply both sides by 3: $x \equiv 3\cdot 3 = 9 \equiv 2 \pmod 7$. Check: $5\cdot 2 = 10 \equiv 3$. Unique solution $x \equiv 2$.
+\end{example}
+
+When $a$ is \emph{not} coprime to $n$, the story branches, and this is worth seeing because it is where careless modular reasoning collapses.
+
+\begin{theorem}[Linear congruence solvability]
+\label{ch03:lincon-general}
+Let $d = \gcd(a,n)$. The congruence $ax \equiv b \pmod n$ has a solution if and only if $d \mid b$. When it does, there are exactly $d$ solutions modulo $n$.
+\end{theorem}
+
+\begin{example}[No solution, and many solutions]
+\label{ch03:lincon-degenerate}
+Take $a = 4$, $n = 6$, so $d = \gcd(4,6) = 2$.
+
+$4x \equiv 3 \pmod 6$ has \emph{no} solution: $4x$ is always even, $3$ is odd, and $d = 2 \nmid 3$. Indeed the row for 4 in the mod-6 table is $0,4,2,0,4,2$ --- a 3 never appears.
+
+$4x \equiv 2 \pmod 6$ has $d = 2$ solutions: scanning the same row, $4\cdot 2 = 8 \equiv 2$ and $4\cdot 5 = 20 \equiv 2$, so $x \equiv 2$ and $x \equiv 5$ both work. Two solutions, as promised.
+\end{example}
+
+\begin{trapbox}
+Beginners ``cancel'' a coefficient that is not coprime to the modulus and get nonsense. From $4x \equiv 2 \pmod 6$ you cannot just write $2x \equiv 1 \pmod 6$ (that one has no solution at all, since $2x$ is even). The legal cancellation divides \emph{the modulus too}: $4x\equiv 2\pmod 6 \Rightarrow 2x \equiv 1 \pmod 3$, which gives $x\equiv 2\pmod 3$, i.e. $x\in\{2,5\}\pmod 6$. Cancel a factor, divide the modulus by its gcd with that factor.
+\end{trapbox}
+
+\section{A Worked Mini-Cipher: Affine Encryption}
+
+Let us spend everything we have built on a real (if weak) historical cipher, so the abstractions land somewhere concrete. The \emph{affine cipher} encrypts each letter as a linear function mod 26. It is breakable in seconds --- we will break it --- but it is a clean exercise in modular inverses and linear congruences.
+
+\begin{intuitionbox}
+\textbf{The setup.} Alice and Bob map letters to numbers $A=0, B=1, \dots, Z=25$, so they work in $\Zn{26}$. The key is a pair $(a, b)$ with $\gcd(a,26)=1$. To encrypt a letter $x$, Alice computes
+\[
+  \Enc_{a,b}(x) = (a x + b) \bmod 26 .
+\]
+Bob decrypts by inverting the affine map: $\Dec_{a,b}(y) = a^{-1}(y - b) \bmod 26$. Eve sees only ciphertext. Figure~\ref{ch03:affine-flow} shows the whole exchange on the worked example below.
+\end{intuitionbox}
+
+Why must $\gcd(a,26)=1$? Because decryption multiplies by $a^{-1}$, which exists \emph{only} when $a$ is coprime to 26 (Theorem~\ref{ch03:inverse-exists}). Pick $a = 13$ and the map $13x + b$ collapses many letters onto the same ciphertext --- the row for 13 mod 26 takes only two distinct values --- and decryption is impossible. The legal multipliers are the units $\Zns{26}$, of which there are $\varphi(26) = 12$.
+
+\begin{example}[Encrypt and decrypt by hand]
+\label{ch03:affine-trace}
+Take key $(a,b) = (5, 8)$. Note $\gcd(5,26)=1$, good. Encrypt the letter \texttt{H}. Its number is $x = 7$:
+\[
+  \Enc(7) = (5\cdot 7 + 8) \bmod 26 = (35 + 8) \bmod 26 = 43 \bmod 26 = 17 = \texttt{R}.
+\]
+Now Bob decrypts \texttt{R} $=17$. He needs $5^{-1} \bmod 26$. Since $5 \cdot 21 = 105 = 4\cdot 26 + 1 \equiv 1$, we have $5^{-1} = 21$. Then
+\[
+  \Dec(17) = 21\,(17 - 8) \bmod 26 = 21\cdot 9 \bmod 26 = 189 \bmod 26 = 7 = \texttt{H}.
+\]
+Back to \texttt{H}, as it must be. The decryption inverse $21$ is doing the ``divide by 5'' that modular inverses made legal.
+\end{example}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  party/.style={draw,rounded corners,minimum width=20mm,minimum height=9mm,font=\small\bfseries},
+  lab/.style={font=\scriptsize}]
+  \node[party,draw=aliceblue,fill=aliceblue!8,text=aliceblue] (alice) {Alice};
+  \node[party,draw=bobgreen,fill=bobgreen!8,text=bobgreen,right=42mm of alice] (bob) {Bob};
+  \node[party,draw=evered,fill=evered!8,text=evered,below=14mm of $(alice)!0.5!(bob)$] (eve) {Eve};
+  \draw[->,thick] (alice) -- node[lab,above]{ciphertext \texttt{R}$=17$} (bob);
+  \draw[->,thick,evered,dashed] ($(alice)!0.5!(bob)$) -- node[lab,right]{sees only $17$} (eve);
+  \node[lab,below=1mm of alice,align=center] {$\Enc(7)=5\cdot7+8$\\$=17 \bmod 26$};
+  \node[lab,below=1mm of bob,align=center] {$\Dec(17)=21(17-8)$\\$=7 \bmod 26$};
+\end{tikzpicture}
+\caption{Affine cipher message flow with key $(a,b)=(5,8)$. Alice maps \texttt{H}$=7$ to \texttt{R}$=17$; Bob multiplies by $5^{-1}=21$ to recover $7$; Eve sees only the ciphertext.}
+\label{ch03:affine-flow}
+\end{figure}
+
+\begin{attackbox}
+\textbf{Breaking the affine cipher.} The key space is tiny: 12 valid choices of $a$ times 26 of $b$ gives only $312$ keys. Eve can try all of them in a blink (brute force). Even without that, two known plaintext--ciphertext pairs pin the key exactly. Suppose Eve guesses that \texttt{E}$=4$ encrypts to \texttt{R}$=17$ and \texttt{T}$=19$ encrypts to \texttt{H}$=7$ (perhaps from frequency analysis). She gets two linear congruences:
+\[
+  4a + b \equiv 17, \qquad 19a + b \equiv 7 \pmod{26}.
+\]
+Subtract the first from the second: $15a \equiv -10 \equiv 16 \pmod{26}$. Now $\gcd(15,26)=1$ and $15^{-1} \equiv 7 \pmod{26}$ (since $15\cdot 7 = 105 \equiv 1$), so $a \equiv 7\cdot 16 = 112 \equiv 8 \pmod{26}$. But $\gcd(8,26)=2 \ne 1$ --- an illegal multiplier --- so this guessed pairing is inconsistent, and Eve discards it and tries another. (That consistency check, that a recovered $a$ must be a unit, is itself a useful filter.) The lesson that scales all the way up: a key space you can enumerate is no key space at all, and even linear structure leaks the key to anyone with a couple of matched samples. Modern ciphers exist to destroy exactly this linearity.
+\end{attackbox}
+
+\begin{historybox}
+Affine and shift ciphers (the affine cipher with $a=1$ is the Caesar cipher) are millennia old, and they were genuinely useful when the attacker was a person with a quill. What killed them was not better math but \emph{frequency analysis}, formalised by the 9th-century polymath al-Kindi in Baghdad: because each plaintext letter always maps to the same ciphertext letter, the statistics of the language shine straight through. \texttt{E} is the commonest English letter; the commonest ciphertext letter is almost certainly its image. The entire modern project of making ciphertext look like uniform random noise --- which the rest of this book pursues --- is a 1100-year-old reaction to al-Kindi.
+\end{historybox}
+
+\section{Negative Numbers, and a Useful Symmetric View}
+
+So far we have written residues as $\{0,1,\dots,n-1\}$. Sometimes it is cleaner to use the \emph{balanced} representatives centred on zero, $\{-\floor{n/2}, \dots, -1, 0, 1, \dots\}$. Both name the same residue classes; you just pick whichever representative is smaller in absolute value.
+
+Mod 7, the residue $6$ equals $-1$, and $5$ equals $-2$. This makes some computations trivial: $6^2 \bmod 7$ is easier as $(-1)^2 = 1$, and $5^3 \bmod 7$ is easier as $(-2)^3 = -8 \equiv -1 \equiv 6$.
+
+\begin{walkbox}
+What is $10^{200} \bmod 11$? Brute force is hopeless, but $10 \equiv -1 \pmod{11}$, so $10^{200} \equiv (-1)^{200} = 1 \pmod{11}$. The balanced view turned a 201-digit number into a parity check. (This is also the ``casting out elevens'' divisibility rule in disguise.)
+\end{walkbox}
+
+\section{Why This Underlies Cryptography}
+
+Step back and notice the shape of what we built. Modular arithmetic gives a \emph{finite} set with rich algebraic structure: you can add, subtract, multiply, and --- when you stick to units or a prime modulus --- divide and exponentiate, all without numbers ever growing without bound. Finiteness is what lets a computer handle the operations exactly, with no rounding, while the structure is what lets cryptographers build problems that are easy one way and apparently hopeless to reverse.
+
+\begin{aestheticbox}
+The recurring pattern of public-key cryptography is a \emph{one-way street built from modular exponentiation}. Computing $y = g^x \bmod p$ from $x$ is cheap: square-and-multiply, $O(\log x)$ multiplications. Recovering $x$ from $y$ --- the \emph{discrete logarithm} --- has no known fast algorithm for well-chosen $p$. The asymmetry between the easy forward map and the hard inverse map is the raw material of Diffie--Hellman, ElGamal, DSA, and (in multiplicative-inverse form) RSA. Everything in those schemes is the arithmetic of this chapter, scaled up to numbers hundreds of digits long. You now have the entire toolbox; the later chapters are about \emph{which} modular computations are hard to undo.
+\end{aestheticbox}
+
+\begin{applicationbox}
+When your browser opens an \texttt{https://} connection, the TLS handshake almost always performs a Diffie--Hellman key exchange --- today over an elliptic curve, but the classic ``finite field'' variant is still modular exponentiation $g^x \bmod p$ with $p$ a 2048- or 3072-bit prime, computed by exactly the square-and-multiply you traced above. Your WiFi's WPA3 handshake (SAE) does modular exponentiation. SSH key exchange does it. Signal's X3DH does the elliptic-curve cousin. Every one of those, billions of times a day, is the clock arithmetic from the first page of this chapter, running on enormous numbers. Master this chapter and the cryptographic internet stops being a black box.
+\end{applicationbox}
+
+\section{Exercises}
+
+\begin{exercise}[Reduce by hand]
+Compute each, showing your reductions, and keep every intermediate number below the modulus squared:
+(a) $(123 + 77)\cdot 19 \bmod 5$;\;
+(b) $2^{10} \bmod 11$;\;
+(c) $(-17) \bmod 9$ as a value in $\{0,\dots,8\}$;\;
+(d) $99 \cdot 98 \bmod 100$ using balanced representatives.
+\end{exercise}
+
+\begin{exercise}[Tables]
+Write out the full multiplication table of $\Zn 8$. Circle every unit (every row that is a permutation). Confirm that the units are exactly the residues coprime to 8, and that there are $\varphi(8) = 4$ of them. Which nonzero elements are zero divisors, and what do they multiply to give 0?
+\end{exercise}
+
+\begin{exercise}[Inverses]
+Using the extended Euclidean algorithm (back-substitution), find:
+(a) $7^{-1} \bmod 26$;\;
+(b) $11^{-1} \bmod 30$;\;
+(c) $a^{-1} \bmod 17$ for every $a \in \{2,\dots,16\}$ (you may use the fact that $\Zn{17}$ is a field, so all exist). Verify one of your answers by direct multiplication.
+\end{exercise}
+
+\begin{exercise}[When inverses fail]
+Show that $6$ has no inverse modulo $9$, two ways: (a) by computing $\gcd(6,9)$ and citing Theorem~\ref{ch03:inverse-exists}; (b) by exhibiting a zero divisor, i.e. a nonzero $x$ with $6x \equiv 0 \pmod 9$, and explaining why that rules out an inverse.
+\end{exercise}
+
+\begin{exercise}[Square-and-multiply]
+Compute $5^{117} \bmod 19$ by square-and-multiply. Write $117$ in binary, draw the bit-by-bit table as in Example~\ref{ch03:sqm-example}, and count how many modular multiplications you used. Then check your answer using $5^{18}\equiv 1 \pmod{19}$ (Fermat) to reduce the exponent first.
+\end{exercise}
+
+\begin{exercise}[Orders and generators]
+Work in $\Zns{11}$, which has $10$ elements. (a) Compute the order of $2$ by listing its powers mod 11 until you reach 1, and decide whether 2 is a generator. (b) Do the same for $3$. (c) Using Example~\ref{ch03:orders-mod7}'s rule that every order divides $p-1$, list the only possible orders an element of $\Zns{11}$ can have. (d) Why would an element of order 2 be a catastrophic choice of base for Diffie--Hellman mod 11?
+\end{exercise}
+
+\begin{exercise}[Linear congruences]
+For each, decide whether a solution exists, and if so list \emph{all} solutions modulo $n$:
+(a) $9x \equiv 6 \pmod{12}$;\;
+(b) $14x \equiv 5 \pmod{21}$;\;
+(c) $7x \equiv 4 \pmod{15}$.
+For each, state $d = \gcd(a,n)$ and reconcile your count of solutions with Theorem~\ref{ch03:lincon-general}.
+\end{exercise}
+
+\begin{exercise}[Break an affine cipher]
+You intercept ciphertext and learn two pairings: plaintext \texttt{A}$=0$ encrypts to \texttt{N}$=13$, and \texttt{B}$=1$ encrypts to \texttt{Q}$=16$, under an affine cipher mod 26 with key $(a,b)$. Recover $a$ and $b$ by solving the resulting linear congruences. Verify that your $a$ is a unit mod 26, then decrypt the ciphertext letter \texttt{D}$=3$.
+\end{exercise}
+
+\begin{exercise}[Negative tricks]
+Use balanced representatives to evaluate, with almost no arithmetic:
+(a) $12^{1000} \bmod 13$;\;
+(b) for which $n$ is $16^{n} \equiv 1 \pmod{17}$, and for which is it $\equiv 16$?\;
+(c) $31^2 \bmod 37$ using $31 \equiv -6 \pmod{37}$, without multiplying 31 by 31.
+\end{exercise}
+
+\begin{exercise}[Cost, concretely]
+Suppose the exponent $k$ has exactly $b$ bits, of which $w$ are 1. Express the exact number of squarings and multiplications square-and-multiply performs (process the leading 1-bit as a setup, not a multiply, to get the tightest count). For a 2048-bit exponent with about half its bits set, estimate the total modular multiplications, and compare to the naive $k-1$ multiplications. State the gap as a power of two.
+\end{exercise}
+
+\begin{exercise}[Prove cancellation]
+Prove: if $\gcd(c,n) = 1$ and $ca \equiv cb \pmod n$, then $a \equiv b \pmod n$. (Multiply by $c^{-1}$, and justify each step from the definitions in this chapter.) Then give an explicit counterexample showing the conclusion can fail when $\gcd(c,n) > 1$.
+\end{exercise}
+
+\begin{exercise}[A timing leak, on paper]
+Re-read the toy \texttt{mod\_pow}. Suppose each modular multiplication takes 1 microsecond and an iteration that skips the multiply step takes correspondingly less. If an attacker can time the total run for a fixed base and modulus across many exponents, explain precisely what they learn about a secret exponent, and why the Montgomery-ladder fix (one square \emph{and} one multiply every iteration, regardless of the bit) removes the leak. Estimate the timing difference between an all-zeros and an all-ones 256-bit exponent.
+\end{exercise}

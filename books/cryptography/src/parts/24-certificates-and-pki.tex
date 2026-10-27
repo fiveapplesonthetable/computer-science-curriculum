@@ -1,0 +1,507 @@
+\chapter{Certificates and Public-Key Infrastructure}
+
+Everything in the public-key half of this book rests on one quiet assumption that we have so far waved away: that when Alice grabs Bob's public key, it is really Bob's. Diffie--Hellman lets two strangers agree on a shared secret over a wire that Eve is reading. RSA and elliptic-curve signatures let anyone verify that a message came from the holder of a particular private key. But none of that tells you \emph{whose} key you are holding. A public key is just a big number. Numbers do not come stamped with a face.
+
+This is the binding problem, and it is the whole subject of this chapter. If Eve can convince you that her key is Bob's, then every guarantee collapses cleanly into her hands: she decrypts what you meant for Bob, she signs in his name, she sits in the middle of your ``secure'' channel and relays a doctored copy of everything. The cryptography was never broken. The \emph{trust} was.
+
+We will build up the standard answer the Internet actually uses --- X.509 certificates, certificate authorities, chains of trust --- starting from the smallest possible version with tiny numbers, then layer on the machinery that keeps it from falling over in practice: revocation, the real attacks that have happened, Certificate Transparency, and the automation (Let's Encrypt and ACME) that made HTTPS nearly universal. We close with the road not taken, PGP's web of trust, and why it lost.
+
+\chapterline
+
+\section{The binding problem}
+\label{ch24:binding}
+
+Let us make the danger concrete with a story you have half-seen already.
+
+Alice wants to send a credit-card number to her bank's website, \texttt{bank.example}. The bank has an RSA key pair $(pk_B, sk_B)$. The plan: Alice fetches $pk_B$, encrypts under it (or, more realistically, uses it to authenticate a Diffie--Hellman exchange), and only the bank, holding $sk_B$, can read the result. Beautiful --- if Alice gets the real $pk_B$.
+
+Eve runs the coffee-shop WiFi. When Alice's laptop asks the network for \texttt{bank.example}, Eve answers. She hands Alice her own key $pk_E$ and claims it is the bank's. Alice, seeing only a number, has no way to tell. She encrypts to $pk_E$, Eve decrypts with $sk_E$, reads the card number, re-encrypts to the real $pk_B$, and forwards it on. Both Alice and the bank see a working session. Eve sees everything.
+
+\begin{intuitionbox}
+Public-key crypto solves \emph{secrecy} and \emph{authenticity of messages} given that you already know the right key. It does not, by itself, solve \emph{identity}. ``This message was signed by the holder of key $K$'' is a mathematical fact. ``Key $K$ belongs to Bob's Bank'' is a fact about the world, and the world is not provable by exponentiation. Some out-of-band authority has to vouch for the mapping
+\[
+\text{name} \;\longmapsto\; \text{public key}.
+\]
+A certificate is just that vouching, written down and signed.
+\end{intuitionbox}
+
+\subsection{Three ways to bind a name to a key}
+
+There are essentially three architectures for solving the binding problem, and every real system is one of them or a blend.
+
+\begin{enumerate}
+\item \textbf{Trust on first use (TOFU).} The first time you talk to a party, you accept whatever key they present and remember it. On every later connection you check that the key has not changed. This is how SSH treats host keys: the famous prompt asking you to confirm a fingerprint, then silence forever after (or a loud warning if the key ever changes). Cheap, no central authority --- but the first connection is wide open, and key rotation is painful.
+\item \textbf{A trusted introducer (the CA model).} A small set of authorities you have decided to trust will sign statements of the form ``key $K$ belongs to \texttt{bank.example}.'' You ship with their public keys baked in. Anyone can then prove their key by showing you such a signed statement. This is the web's model, and most of this chapter.
+\item \textbf{A web of trust.} There are no special authorities. Instead, \emph{everyone} can vouch for everyone else, and you decide whom to believe by tracing chains of personal endorsements. This is PGP. We get to it at the end.
+\end{enumerate}
+
+\begin{historybox}
+The phrase ``public-key infrastructure'' and the X.509 certificate format both grew out of the 1988 X.500 directory project, an ambitious telecom effort (CCITT, now ITU-T) to build a single global directory of everything and everyone. X.500 itself never took over the world, but its certificate format, X.509, escaped and became the backbone of TLS, S/MIME, code signing, and smart cards. So the data structure your browser checks a hundred times a day was designed for a 1980s phone-company directory that does not exist. The version we use, X.509v3 (1999), bolted on the \emph{extensions} mechanism that made it flexible enough to survive.
+\end{historybox}
+
+\section{A certificate is a signed statement}
+\label{ch24:cert-as-signature}
+
+Strip away the formatting and a certificate is one sentence with a signature under it:
+
+\begin{center}
+\itshape ``The public key $pk$ belongs to the entity named $N$, and this is true until time $T$. --- signed, the CA.''
+\end{center}
+
+Formally, let the certificate authority (CA) have its own signature key pair $(pk_{CA}, sk_{CA})$. A certificate for subject $N$ with key $pk_N$ is
+\[
+\mathrm{cert} \;=\; \big(\, \underbrace{N \concat pk_N \concat T \concat \dots}_{\text{the ``to be signed'' body, call it } m} \,,\; \sigma \,\big),
+\qquad
+\sigma = \Sign(sk_{CA}, m).
+\]
+To check it, you compute $\Vrfy(pk_{CA}, m, \sigma)$. If it passes, and you trust the CA, you now believe $pk_N$ is $N$'s key. Notice what just happened to the trust: you no longer have to know Bob's key in advance. You have to know \emph{one} key, $pk_{CA}$, and from it you can authenticate the keys of millions of websites you have never visited. The CA's key is the anchor; everything else hangs from it.
+
+\begin{whybox}
+Why is forging a certificate hard? Because forging $\sigma$ means forging a signature under $sk_{CA}$, which by the unforgeability of the signature scheme (Chapter on digital signatures) is infeasible without $sk_{CA}$. Eve can write any body $m$ she likes --- ``$pk_E$ belongs to \texttt{bank.example}'' --- but she cannot produce a $\sigma$ that verifies under $pk_{CA}$. The security of the entire web's identity layer reduces to: (1) the signature scheme is unforgeable, and (2) the CAs guard their private keys and only sign true statements. Point (1) is math we can prove. Point (2) is an operational, human, and political problem, and it is where every real-world disaster has come from.
+\end{whybox}
+
+\subsection{A toy certificate with tiny numbers}
+
+Let us actually sign one. We will use textbook RSA signatures (Chapter on RSA) with absurdly small numbers so you can follow every step by hand. Real keys are thousands of bits; ours will be tens.
+
+Let the CA pick primes $p = 61$, $q = 53$, so $n = pq = 3233$ and $\phi(n) = 60 \cdot 52 = 3120$. Choose public exponent $e = 17$ (it is coprime to $3120$). The private exponent $d$ satisfies $ed \equiv 1 \pmod{3120}$; running the extended Euclidean algorithm gives $d = 2753$ (check: $17 \cdot 2753 = 46801 = 15 \cdot 3120 + 1$). So
+\[
+pk_{CA} = (n, e) = (3233, 17), \qquad sk_{CA} = d = 2753.
+\]
+
+Now suppose the body of Bob's certificate hashes down to the value $m = 100$. (A real cert hashes a long DER blob with SHA-256; we just assert the hash is $100$.) The CA signs by raising to $d$:
+\[
+\sigma = m^{d} \bmod n = 100^{2753} \bmod 3233.
+\]
+Computing this by square-and-multiply gives $\sigma = 1391$. The certificate Bob now carries is the pair $(m=100,\ \sigma=1391)$ --- plus, in reality, the human-readable body that hashes to $100$.
+
+A browser that already trusts $pk_{CA} = (3233,17)$ verifies by raising $\sigma$ to $e$:
+\[
+\sigma^{e} \bmod n = 1391^{17} \bmod 3233 = 100 = m. \checkmark
+\]
+It recomputes the hash of the body, gets $100$, sees it matches $\sigma^e \bmod n$, and accepts. Eve, who knows $(n,e)$ but not $d$, cannot find a $\sigma'$ with $(\sigma')^{17} \equiv 100$ without inverting RSA.
+
+\begin{trapbox}
+Textbook RSA signatures like the toy above are dangerously malleable --- given signatures on $m_1$ and $m_2$ you get one on $m_1 m_2 \bmod n$ for free, and you can forge on chosen values by working backwards. Never sign a raw message this way. Real certificates use a padded, randomized scheme such as RSASSA-PSS, or sign with ECDSA / Ed25519. The point of the toy is only to show the \emph{shape}: CA signs the body, verifier checks with the CA's public key.
+\end{trapbox}
+
+\section{Inside an X.509 certificate}
+\label{ch24:x509}
+
+The sentence ``$pk$ belongs to $N$ until $T$'' has to be written in a format every implementation agrees on, byte for byte, or signatures will not verify. That format is X.509, encoded in DER (Distinguished Encoding Rules, a canonical form of ASN.1). You rarely read the raw bytes; tools show you the fields. Here is the anatomy.
+
+\begin{center}
+\begin{tikzpicture}[font=\small,
+  field/.style={draw=gray!60, fill=blue!3, rounded corners=2pt, text width=10.5cm, inner sep=5pt, align=left},
+  sig/.style={draw=trapred, fill=red!4, rounded corners=2pt, text width=10.5cm, inner sep=5pt, align=left}]
+\node[field] (a) {\textbf{Version} \;(v3)\hfill\textbf{Serial number} \;(unique per CA)};
+\node[field, below=2pt of a] (b) {\textbf{Signature algorithm} \;(e.g.\ \texttt{ecdsa-with-SHA256})};
+\node[field, below=2pt of b] (c) {\textbf{Issuer} \;(the CA's Distinguished Name)};
+\node[field, below=2pt of c] (d) {\textbf{Validity} \;: \texttt{notBefore} \dots\ \texttt{notAfter}};
+\node[field, below=2pt of d] (e) {\textbf{Subject} \;(whose key this is --- the DN)};
+\node[field, below=2pt of e] (f) {\textbf{Subject Public Key Info} \;(algorithm + the key bytes)};
+\node[field, below=2pt of f] (g) {\textbf{Extensions} \;: SAN, Key Usage, Basic Constraints, AIA, CRL/OCSP \dots};
+\node[sig, below=6pt of g] (h) {\textbf{Signature} \;: $\Sign(sk_{CA},\ \text{everything above})$};
+\draw[decorate, decoration={brace, amplitude=6pt}, thick]
+   ($(a.north west)+(-0.15,0)$) -- ($(g.south west)+(-0.15,0)$)
+   node[midway, left=8pt, align=center, rotate=90, anchor=south] {``to be signed'' (TBSCertificate)};
+\end{tikzpicture}
+\end{center}
+
+A few fields deserve a closer look because attacks have turned on them.
+
+\textbf{Subject and the Common Name trap.} Historically the entity's name lived in the Subject's \emph{Common Name} (CN), a free-text field meant for human-readable names like ``Bob's Bank, Inc.'' Early browsers also matched the website's hostname against the CN. That was a mistake, and we will see the null-byte attack it enabled. Modern certificates put hostnames in the \textbf{Subject Alternative Name} (SAN) extension, a structured list of DNS names like \texttt{bank.example} and \texttt{www.bank.example}. Browsers since roughly 2017 ignore the CN entirely and match \emph{only} the SAN.
+
+\textbf{Basic Constraints: \texttt{cA = TRUE/FALSE}.} This single bit says whether the certificate is allowed to sign \emph{other} certificates. A leaf certificate for a website has \texttt{cA = FALSE}; it can authenticate a TLS server but cannot mint child certs. A CA certificate has \texttt{cA = TRUE}. Forgetting to check this bit was the root of one of the most elegant attacks in the field's history (Section~\ref{ch24:misissuance}).
+
+\textbf{Key Usage / Extended Key Usage.} Restricts what the key may do: sign certificates, do TLS server auth, sign code, encrypt email. A key issued ``for TLS server authentication'' should be rejected if presented for code signing.
+
+\textbf{AIA, CRL Distribution Points, OCSP.} Pointers telling the verifier where to fetch the issuer's certificate and where to check whether this certificate has been revoked (Section~\ref{ch24:revocation}).
+
+\begin{implementbox}
+You do not need a library to peek inside a real certificate --- OpenSSL ships everywhere. The following is \emph{for learning only}; do not parse security-critical certificates with hand-rolled code, use a vetted library.
+
+\begin{lstlisting}[language=bash]
+# Fetch and pretty-print the certificate a live server presents:
+openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/dev/null \
+  | openssl x509 -noout -text
+
+# Look for, in the output:
+#   Issuer:  (which CA signed it)
+#   Subject: (whose key it is)
+#   Validity Not Before / Not After
+#   X509v3 Subject Alternative Name:  DNS:example.com, DNS:www.example.com
+#   X509v3 Basic Constraints: CA:FALSE
+#   X509v3 Extended Key Usage: TLS Web Server Authentication
+\end{lstlisting}
+The \texttt{-text} view is the human rendering of the DER bytes that were actually signed.
+\end{implementbox}
+
+\section{Chains of trust}
+\label{ch24:chains}
+
+If a single CA had to sign every certificate on Earth with its most precious key, that key would be online, busy, and one breach away from catastrophe. So the system uses \emph{delegation}, and the delegation is itself just more certificates.
+
+At the top sits a \textbf{root CA}. Its certificate is self-signed: the issuer and subject are the same, and it signs itself with its own key. A self-signed certificate proves nothing cryptographically --- anyone can self-sign --- so roots are not trusted because of their signature. They are trusted because their public keys are \emph{shipped in your browser and operating system}, vetted by a root program (Mozilla's, Apple's, Microsoft's, Google's) under heavy audit. The root store is the actual seat of trust. Everything else is derived.
+
+The root rarely signs leaf certificates directly. Instead it signs one or more \textbf{intermediate CA} certificates (with \texttt{cA = TRUE}), and the intermediates, kept online, sign the millions of \textbf{leaf} certificates for actual websites. The root key can then live offline in a vault, used only a few times a year.
+
+\begin{center}
+\begin{tikzpicture}[font=\small, node distance=10mm,
+  ca/.style={draw=structurepurple, fill=structurepurple!8, rounded corners, text width=3.4cm, align=center, inner sep=5pt},
+  leaf/.style={draw=bobgreen, fill=bobgreen!8, rounded corners, text width=3.4cm, align=center, inner sep=5pt},
+  sgn/.style={-{Stealth[length=2.5mm]}, thick}]
+\node[ca] (root) {\textbf{Root CA}\\ self-signed\\ \texttt{cA=TRUE}\\ \emph{in your trust store}};
+\node[ca, below=of root] (int) {\textbf{Intermediate CA}\\ signed by root\\ \texttt{cA=TRUE}};
+\node[leaf, below=of int] (leaf) {\textbf{Leaf}\\ \texttt{bank.example}\\ signed by intermediate\\ \texttt{cA=FALSE}};
+\draw[sgn] (root) -- node[right]{signs} (int);
+\draw[sgn] (int) -- node[right]{signs} (leaf);
+\node[right=6mm of root, text width=4.2cm, align=left, gray] {anchor of trust\\(not trusted by its signature, but by being preinstalled)};
+\node[right=6mm of leaf, text width=4.2cm, align=left, gray] {the certificate the server actually sends};
+\end{tikzpicture}
+\end{center}
+
+When you connect, the server sends its leaf certificate \emph{and} the intermediate(s) --- the chain. Your client validates the chain bottom to top:
+
+\begin{enumerate}
+\item Verify the leaf's signature using the intermediate's public key.
+\item Verify the intermediate's signature using the root's public key.
+\item Check that the root is in your trust store.
+\item For \emph{every} link, check: validity dates cover ``now''; the issuer field of each cert equals the subject of the one above it; the signing certs have \texttt{cA = TRUE}; key-usage and name constraints are respected; the certificate is not revoked.
+\item Finally, check that the hostname you asked for matches a SAN entry in the leaf.
+\end{enumerate}
+
+\begin{formalbox}
+A chain $C_0, C_1, \dots, C_k$ (leaf to root) is \emph{valid for name $N$ at time $t$} iff:
+\begin{itemize}
+\item $\Vrfy\big(pk_{i+1},\ \mathrm{TBS}(C_i),\ \sigma(C_i)\big) = 1$ for all $i = 0,\dots,k-1$, where $pk_{i+1}$ is the public key in $C_{i+1}$;
+\item $C_k$ (or its key) is a trust anchor;
+\item $t \in [\texttt{notBefore}_i, \texttt{notAfter}_i]$ for every $i$;
+\item every $C_i$ with $i \ge 1$ has \texttt{BasicConstraints.cA} $=$ TRUE and a \texttt{keyCertSign} usage;
+\item path-length and name constraints in the CA certs are satisfied;
+\item $N$ matches a SAN of the leaf $C_0$; and
+\item no $C_i$ is revoked at time $t$.
+\end{itemize}
+Drop \emph{any one} of these checks and you have a real, exploited vulnerability in the historical record. The \texttt{cA} check is the famous one.
+\end{formalbox}
+
+\subsection{Tracing a tiny chain by hand}
+
+Reuse the toy RSA CA above as the \emph{root}: $pk_{root} = (3233, 17)$, $sk_{root} = 2753$. The root signs an intermediate. Suppose the intermediate has its own key pair and the hash of its certificate body is $m_{int} = 920$. The root signs:
+\[
+\sigma_{int} = 920^{2753} \bmod 3233 = 995.
+\]
+(You can verify $995^{17} \bmod 3233 = 920$.) Now the intermediate uses \emph{its} key to sign Bob's leaf. To keep the arithmetic in one modulus, pretend the intermediate reuses the same $(n,e,d)$ --- a contrivance, never do this --- and signs Bob's leaf body $m_{leaf} = 100$, producing $\sigma_{leaf} = 1391$ as before.
+
+A client holding only $pk_{root}$ now reasons:
+\begin{itemize}
+\item $\sigma_{leaf}^{\,17} \bmod 3233 = 1391^{17} \bmod 3233 = 100 = m_{leaf}$, and the intermediate's cert says its key is the one to use --- leaf checks out \emph{under the intermediate's key}.
+\item $\sigma_{int}^{\,17} \bmod 3233 = 995^{17} \bmod 3233 = 920 = m_{int}$ --- intermediate checks out under the root's key.
+\item The root's key $(3233,17)$ is in the trust store. Chain complete.
+\end{itemize}
+The client never had Bob's key, nor the intermediate's, in advance. One preinstalled anchor authenticated both, in sequence. That is the leverage a chain buys you.
+
+\begin{walkbox}
+Why not let the leaf certificate be signed directly by the offline root, skipping intermediates? You could, and a few systems do. But then the root's private key must come out of the vault for every issuance --- millions of times --- multiplying the chance it leaks. Worse, if it ever did leak, you would have to replace the root, and replacing a root means pushing a software update to every browser and OS on Earth and waiting years for the old one to age out. Intermediates are the firebreak: if an intermediate's key is compromised, the root revokes that one intermediate and issues a new one, no client update required. The root stays cold.
+\end{walkbox}
+
+\section{Revocation: taking it back}
+\label{ch24:revocation}
+
+A certificate says ``valid until $T$,'' but life intervenes before $T$. A server's private key is stolen. An employee with signing access is fired. A CA discovers it issued a certificate by mistake. The certificate is still a perfectly valid signed statement --- the math still checks out --- yet we need every client in the world to stop believing it, \emph{now}, before its natural expiry.
+
+This is revocation, and it is the genuinely hard, never-fully-solved part of PKI. The difficulty is structural: validation is offline and local (you can check a signature with no network), but revocation is a fact about the present moment that lives at the CA. To learn it you must, somehow, ask.
+
+\subsection{Certificate Revocation Lists (CRLs)}
+
+The first design: each CA publishes a signed list of the serial numbers of all certificates it has revoked and not yet expired. A client downloads the CRL, checks the CA's signature on it, and refuses any certificate whose serial appears.
+
+\begin{intuitionbox}
+A CRL is a blacklist with a timestamp and a signature, like a stack of bounced-check notices the bank mails out. It is simple and verifiable offline once you have it. The trouble is freshness versus size. To be current you must re-download often; but a busy CA's CRL can grow to many megabytes, because it lists \emph{every} unexpired revoked cert. Fetching a multi-megabyte list before every TLS handshake is a non-starter, so clients cache CRLs for hours or days --- which means there is a window where a revoked, stolen certificate still works. Revocation that you check once a day is revocation an attacker can race.
+\end{intuitionbox}
+
+\subsection{OCSP: ask about one certificate}
+
+The Online Certificate Status Protocol fixes the size problem by inverting the query. Instead of downloading every revocation, the client asks a CA-run \emph{responder} about the single certificate in front of it: ``serial 4F:A3:\dots --- good, revoked, or unknown?'' The responder returns a small, signed, timestamped answer.
+
+Smaller, fresher --- but now three new problems appear:
+
+\begin{enumerate}
+\item \textbf{Latency.} An extra network round-trip to the CA, on the critical path of your page load.
+\item \textbf{Privacy.} The OCSP responder learns every site you visit, because you phone home to it for each one. The CA becomes a surveillance choke point.
+\item \textbf{Soft-fail.} If the responder is down or slow, what should the browser do? If it \emph{hard-fails} (refuses to connect), then anyone who can DoS the responder can take websites offline --- and an attacker holding a stolen cert simply blocks the OCSP query to keep their cert ``unrevoked.'' So browsers historically \emph{soft-fail}: if the check times out, proceed anyway. But soft-fail makes OCSP nearly useless against an active network attacker, who just drops the OCSP packets. The very adversary you most want to stop is the one who can defeat the check.
+\end{enumerate}
+
+\subsection{OCSP stapling: bring your own proof}
+
+The clever fix to latency and privacy: have the \emph{server} fetch a fresh, signed OCSP response from the CA periodically, and ``staple'' it into the TLS handshake. Now the client gets the freshness proof from the server it is already talking to --- no extra round-trip, no phoning the CA, no leaking your browsing to the CA.
+
+\begin{center}
+\begin{tikzpicture}[font=\small, node distance=14mm,
+  party/.style={draw=gray!60, rounded corners, fill=blue!3, text width=2.4cm, align=center, inner sep=4pt},
+  msg/.style={-{Stealth[length=2.5mm]}, thick}]
+\node[party] (client) {Client};
+\node[party, right=55mm of client] (server) {Server};
+\node[party, below=20mm of server] (ca) {CA OCSP\\responder};
+\draw[msg] (server) -- node[right]{periodic: ``status of my cert?''} (ca);
+\draw[msg] (ca) -- node[left]{signed ``good'', valid 7 days} (server);
+\draw[msg] (client.east) -- node[above]{ClientHello} ($(server.west)+(0,3mm)$);
+\draw[msg] ($(server.west)-(0,3mm)$) -- node[below, text width=4.2cm, align=center]{certificate \emph{+ stapled OCSP response}} (client.east);
+\end{tikzpicture}
+\end{center}
+
+Stapling solves latency and privacy. It does not by itself solve soft-fail: a network attacker can strip the staple, and the client falls back to ``proceed anyway.'' The intended cure is the \textbf{Must-Staple} flag, an extension baked into the certificate that says ``a valid stapled response is \emph{required}; reject me if it is missing.'' Then stripping the staple kills the connection instead of bypassing the check. Adoption of Must-Staple has been thin, which tells you how genuinely awkward revocation remains.
+
+\begin{applicationbox}
+Real browsers have largely given up on classic per-connection revocation checking and moved to \emph{pushed} revocation. Chrome ships \textbf{CRLSets}: Google crawls CAs' CRLs, compresses the high-value revocations into a compact set, and pushes it to Chrome through the normal update channel, so the check is local and instant with no network call at handshake time. Firefox does the analogous thing with \textbf{CRLite}, which uses a cascade of Bloom filters to compress the status of \emph{every} known WebPKI certificate into a few megabytes that fit on the client and answer with no false negatives. The lesson the industry absorbed: online revocation checks on the handshake critical path are too slow, too leaky, and too easy to suppress, so push a fresh compressed snapshot to the client instead and check locally. Short-lived certificates (Section~\ref{ch24:acme}) attack the same problem from the other end: if a cert lives only 90 days --- soon perhaps days --- the revocation window shrinks to where it barely matters.
+\end{applicationbox}
+
+\begin{connectionbox}
+CRLite's Bloom-filter cascade is a lovely application of the probabilistic data structures from the companion algorithms book. A single Bloom filter has one-sided error: it never says ``absent'' for something present, but it sometimes false-positives. A \emph{cascade} chains filters so that each layer catches the previous layer's false positives over a \emph{known, finite} universe (all issued certificates, learned from Certificate Transparency logs), driving the error to zero while keeping the structure tiny. The birthday-bound and false-positive-rate analyses you met there are exactly the tools used to size each layer.
+\end{connectionbox}
+
+\section{When the trust breaks: CA mis-issuance}
+\label{ch24:misissuance}
+
+The CA model has a brutal property: \textbf{any} CA in your trust store can vouch for \textbf{any} name. There are hundreds of trusted CAs and intermediates, spanning many jurisdictions. Your browser trusts a certificate for \texttt{bank.example} signed by a CA in any country, whether or not the bank has ever heard of that CA. The system is only as trustworthy as its \emph{weakest} CA. This is the original sin of the WebPKI, and it has been exploited repeatedly.
+
+\begin{attackbox}
+\textbf{The null-prefix / CN confusion attack.} Early TLS clients matched the hostname against the certificate's Common Name, which was a length-prefixed string. Many clients, though, were written in C and treated it as a NUL-terminated string. Moxie Marlinspike's 2009 attack exploited the gap. He requested a certificate for a name he legitimately controlled but crafted as:
+\[
+\texttt{www.bank.example} \;\backslash 0\; \texttt{.attacker.example}
+\]
+A CA, validating control of \texttt{attacker.example}, might approve the registration. But a C-based client reading the CN stopped at the embedded NUL and saw exactly \texttt{www.bank.example}. One signed certificate, accepted by the victim's browser for the bank. The fixes: stop matching on CN, match only on structured SAN entries, and forbid embedded NULs. This is why the CN field is now ignored.
+\end{attackbox}
+
+\begin{attackbox}
+\textbf{The missing \texttt{Basic Constraints} check.} Recall that only certificates with \texttt{cA = TRUE} may sign other certificates. In the mid-2000s, several widely deployed TLS stacks (including a famous Internet Explorer / CryptoAPI bug) \emph{forgot to check that bit}. The consequence is total. An attacker buys an ordinary \emph{leaf} certificate for \texttt{attacker.example} --- \texttt{cA = FALSE}, perfectly legitimate. Because the buggy client never checks \texttt{cA}, the attacker can then use that leaf's key to sign a brand-new certificate for \texttt{bank.example}, and the buggy client will happily build a chain: bank-leaf $\leftarrow$ attacker-leaf $\leftarrow$ real-CA $\leftarrow$ root. Every signature verifies. The single skipped boolean turns any \$10 certificate into a universal forging key. This is the canonical illustration of why \emph{every} field in \emph{every} link of the chain must be checked.
+\end{attackbox}
+
+\begin{attackbox}
+\textbf{DigiNotar, 2011 --- a CA fully compromised.} The Dutch CA DigiNotar was breached by an attacker who used its signing infrastructure to issue \emph{hundreds} of fraudulent certificates, including a wildcard \texttt{*.google.com}. That certificate was then used in a man-in-the-middle attack against an estimated 300{,}000 Iranian Gmail users, who saw a green padlock the whole time. The certificates were mathematically flawless; the CA itself had been subverted. The fallout: browser vendors yanked DigiNotar from every trust store within days, and the company --- a functioning business with a long history --- was bankrupt within weeks. The episode proved that a single compromised CA endangers the entire web, and it is the direct ancestor of Certificate Transparency.
+\end{attackbox}
+
+\begin{whybox}
+Why does one bad CA endanger everyone, when there are hundreds of good ones? Because trust in the CA model is a logical \emph{OR}, not an \emph{AND}. A certificate is accepted if \emph{any} trusted CA signed it. You do not get the security of the strongest CA, or the average; you get the security of the weakest. Adding more CAs makes things \emph{worse}, never better, from a pure-trust standpoint, because it adds more keys that can each forge for your bank. Every structural fix since --- name constraints, CAA records, Certificate Transparency, pinning --- is an attempt to claw back some of that lost ground without throwing out the whole model.
+\end{whybox}
+
+\subsection{Partial fixes before transparency}
+
+\textbf{Public-key pinning (HPKP)} let a site tell browsers ``in future, only accept these specific keys for me,'' converting the trust-any-CA OR back into a narrow whitelist. It worked in theory and was a footgun in practice: a site that pinned the wrong key, or lost it, could lock itself out of its own users for the pin's lifetime (``HPKP suicide''). Browsers deprecated it.
+
+\textbf{CAA records (Certification Authority Authorization)} let a domain publish, in DNS, which CAs are permitted to issue for it: \texttt{bank.example.\ CAA 0 issue "goodca.example"}. CAs are required to check CAA before issuing and refuse if they are not listed. It does not stop a malicious CA --- a compromised CA can ignore CAA --- but it stops \emph{accidental} mis-issuance by well-run CAs, which is most of it. CAA is widely deployed and cheap.
+
+\textbf{Name constraints} let a root limit an intermediate to a set of domains (``this intermediate may only issue under \texttt{*.gov.uk}''). When honored, they bound the blast radius of a delegated CA. The catch is the same as everywhere: they only help if every client enforces them.
+
+\section{Certificate Transparency}
+\label{ch24:ct}
+
+The deepest problem with DigiNotar was not that a certificate was forged --- it was that the forgery stayed \emph{invisible}. Google was MITM'd against its own users and had no way to know a \texttt{*.google.com} certificate existed. Certificate Transparency (CT) attacks exactly this: it does not try to prevent mis-issuance, it makes mis-issuance \emph{undeniable and detectable}.
+
+The idea: every certificate a CA issues must be recorded in a public, append-only, cryptographically verifiable \textbf{log}. If your certificate is not in a log, browsers reject it. Now anyone --- Google, your bank's security team, an independent monitor --- can watch the logs and notice ``a certificate for \texttt{google.com} was issued by a CA in another country that Google never asked for.'' The forgery cannot hide.
+
+\begin{intuitionbox}
+CT does not make CAs trustworthy. It makes them \emph{accountable}. A camera in the vault does not stop a thief, but it guarantees the theft is on record. The whole design rests on one cryptographic primitive that turns ``append-only public ledger'' from a promise into a proof: the Merkle tree.
+\end{intuitionbox}
+
+\subsection{Merkle trees: proving membership and append-only-ness}
+
+A CT log is a growing list of certificates. We need two things from it: (1) a client should be able to verify ``my certificate is in this log'' cheaply, without downloading the whole log; and (2) the log must not be able to \emph{rewrite history} --- remove or alter a certificate it already logged. Merkle trees give both.
+
+Hash every certificate to a leaf. Hash pairs of leaves together, then pairs of those, up to a single \textbf{root hash} (the ``tree head''). The log periodically signs the current root hash and timestamp; that signed head is its public commitment to ``these exact certificates, in this order, are what I have logged.''
+
+\begin{center}
+\begin{tikzpicture}[font=\small, level distance=12mm, sibling distance=22mm,
+  every node/.style={draw=gray!60, rounded corners, fill=blue!4, inner sep=3pt, font=\footnotesize}]
+\node {root $= H(H_{12}\concat H_{34})$}
+  child {node {$H_{12}=H(h_1\concat h_2)$}
+    child {node[fill=bobgreen!12] {$h_1=H(c_1)$}}
+    child {node[fill=quotientorange!18] {$h_2=H(c_2)$}}
+  }
+  child {node[fill=quotientorange!18] {$H_{34}=H(h_3\concat h_4)$}
+    child {node {$h_3=H(c_3)$}}
+    child {node {$h_4=H(c_4)$}}
+  };
+\end{tikzpicture}
+\end{center}
+
+To prove certificate $c_2$ is in the log, the log gives you the \textbf{audit path}: the sibling hashes you need to recompute the root, here $h_1$ and $H_{34}$ (shaded). You compute
+\[
+H\big(H(h_1 \concat H(c_2)) \concat H_{34}\big)
+\]
+and check it equals the signed root. For a log of $N$ certificates the path has only $\lceil \log_2 N \rceil$ hashes --- about 30 even for a billion certificates. You verified membership while downloading almost nothing.
+
+\begin{whybox}
+Why can't the log lie? Because the root hash is a commitment under a collision-resistant hash. To show you a fake audit path proving $c_2$ is present when it is not, the log would need a second preimage or collision against $H$ --- infeasible. And to \emph{remove} a certificate it already committed to, it would have to produce a new, consistent root that drops $c_2$ but matches the old signed head, which again requires breaking $H$. CT adds a second proof, the \textbf{consistency proof}: given two signed tree heads at sizes $m < n$, the log can prove the size-$n$ tree is the size-$m$ tree with $n-m$ entries \emph{appended}, never edited. Auditors demand consistency proofs over time; a log caught failing one is distrusted. So ``append-only'' stops being a policy you hope the operator follows and becomes a property you can check.
+\end{whybox}
+
+\begin{connectionbox}
+This is the same Merkle-tree construction that underlies Git commit history, BitTorrent and IPFS content addressing, and blockchain blocks. The companion algorithms book develops Merkle trees as an authenticated data structure; here you see the cryptographic payoff. The key reuse is the security reduction: ``the log cannot cheat'' reduces to ``the hash is collision-resistant,'' exactly the property analyzed via birthday bounds in the probability volume.
+\end{connectionbox}
+
+\subsection{How CT plugs into TLS}
+
+When a CA logs a certificate, the log returns a \textbf{Signed Certificate Timestamp} (SCT): a signed promise ``I will include this certificate in my tree within a bounded time'' (the Maximum Merge Delay). Browsers require a leaf certificate to come with SCTs from several independent logs --- delivered in the certificate itself, in the TLS handshake, or via OCSP stapling --- or they reject it. Since Chrome and Apple made CT mandatory (2018 onward), essentially every publicly trusted certificate is logged. That is why, today, you can search a service like \texttt{crt.sh} and see every certificate ever issued for a domain. Defenders use exactly that to catch mis-issuance early.
+
+\begin{applicationbox}
+CT has caught real mis-issuance in the wild. Monitors have flagged CAs issuing certificates with invalid fields, certificates for domains the requester did not control, and internal-hostname leaks where companies accidentally logged the names of private servers. Symantec's CA business was effectively ended after CT-driven scrutiny surfaced a pattern of improper issuance, leading Google to distrust its certificates --- a multi-billion-dollar business unwound because the logs made the misbehavior auditable. CT turned ``trust us'' into ``verify us,'' and the WebPKI is meaningfully safer for it.
+\end{applicationbox}
+
+\section{Let's Encrypt and ACME: automating trust}
+\label{ch24:acme}
+
+For two decades, getting a certificate meant paying a CA, emailing documents, and pasting blobs into web forms --- a manual, error-prone, expensive ritual. The result was predictable: most of the web ran on unencrypted HTTP, because HTTPS was a hassle. Let's Encrypt (launched 2015, a nonprofit CA) set out to make certificates free and fully automatic, and in doing so flipped the web from mostly-HTTP to mostly-HTTPS in a few years.
+
+The engine is \textbf{ACME} (Automatic Certificate Management Environment), the protocol a client speaks to the CA to prove domain control and obtain a certificate with no human in the loop.
+
+\subsection{Domain validation: proving you control the name}
+
+A CA must not hand \texttt{bank.example}'s certificate to just anyone who asks. For \emph{domain-validated} certificates, the only thing the CA verifies is: \emph{do you control this domain right now?} ACME proves it with a challenge--response. The CA sends a random token; the client must publish a value derived from it where only the domain's controller could put it.
+
+\begin{enumerate}
+\item \textbf{HTTP-01}: serve the file \texttt{http://bank.example/.well-known/acme-challenge/<token>} containing $\text{token} \concat \text{thumbprint}(pk_{\text{account}})$. The CA fetches it. Only someone running the web server for that name could place it.
+\item \textbf{DNS-01}: publish a TXT record \texttt{\_acme-challenge.bank.example} with the hash of that same value. Only someone controlling the domain's DNS could. (DNS-01 can prove control of an entire wildcard \texttt{*.bank.example}.)
+\item \textbf{TLS-ALPN-01}: answer a special TLS handshake on port 443 with a certificate carrying the challenge --- proving control of the TLS endpoint itself.
+\end{enumerate}
+
+Crucially, the response is bound to the client's \emph{account key} via the thumbprint, so a network eavesdropper who sees the token cannot complete the challenge with their own key. The CA, satisfied, signs the certificate. The whole exchange takes seconds.
+
+\begin{center}
+\begin{tikzpicture}[font=\small, node distance=12mm,
+  party/.style={draw=gray!60, rounded corners, fill=blue!3, text width=2.6cm, align=center, inner sep=4pt},
+  msg/.style={-{Stealth[length=2.5mm]}, thick}]
+\node[party] (c) {ACME client\\(your server)};
+\node[party, right=60mm of c] (ca) {ACME CA\\(Let's Encrypt)};
+\draw[msg] ($(c.east)+(0,12mm)$) -- node[above]{1. request cert for \texttt{bank.example}} ($(ca.west)+(0,12mm)$);
+\draw[msg] ($(ca.west)+(0,6mm)$) -- node[below]{2. here is challenge token} ($(c.east)+(0,6mm)$);
+\node[below=16mm of c, text width=3.4cm, align=center, draw=bobgreen!50, fill=bobgreen!6, rounded corners, inner sep=4pt] (pub) {3. publish token\\under \texttt{/.well-known/} or DNS};
+\draw[msg] ($(ca.west)-(0,4mm)$) -- node[above]{4. fetch \& verify token} ($(c.east)-(0,4mm)$);
+\draw[msg] ($(c.east)-(0,11mm)$) -- node[below]{5. send CSR (public key)} ($(ca.west)-(0,11mm)$);
+\draw[msg] ($(ca.west)-(0,17mm)$) -- node[above]{6. signed certificate} ($(c.east)-(0,17mm)$);
+\end{tikzpicture}
+\end{center}
+
+\begin{trapbox}
+Domain validation proves \emph{control of the name}, nothing more. A DV certificate for \texttt{bank-of-america-login.example} certifies only that whoever holds it controls that exact domain --- not that they are a bank, not that they are trustworthy. The padlock means ``the connection is encrypted to the entity that controls this name,'' never ``this site is safe.'' Phishers get free DV certificates for lookalike domains constantly. Higher-assurance \emph{Organization-Validated} and \emph{Extended-Validation} certificates add vetting of the legal entity, but browsers have quietly dropped the special EV address-bar treatment because users never reliably noticed it. Identity-of-the-business is a problem certificates only partly solve.
+\end{trapbox}
+
+\begin{implementbox}
+Issuing a real certificate is genuinely a one-liner now, which is the entire point of ACME. \emph{This is real, not toy} --- but read your CA's rate limits before scripting it, and never paste private keys into untrusted machines.
+
+\begin{lstlisting}[language=bash]
+# Using certbot (the reference ACME client) with the HTTP-01 challenge.
+# It generates a keypair, proves control of the domain, fetches the cert,
+# and sets up a cron job to renew automatically before the 90-day expiry.
+sudo certbot certonly --standalone -d bank.example -d www.bank.example
+
+# Behind the scenes, simplified, the account-key-bound challenge response is:
+#   key_authorization = token || "." || base64url(SHA256(account_public_key_JWK))
+# served at  http://bank.example/.well-known/acme-challenge/<token>
+\end{lstlisting}
+The reason Let's Encrypt issues \emph{short-lived} (90-day, trending toward days) certificates is that automation makes frequent renewal painless --- and short lifetimes shrink the revocation window, the very problem Section~\ref{ch24:revocation} could not fully solve. Automation did not just make certificates cheaper; it made a different, safer security posture practical.
+\end{implementbox}
+
+\section{The alternative: web of trust}
+\label{ch24:wot}
+
+The CA model centralizes trust in a few hundred authorities. PGP (Pretty Good Privacy, Phil Zimmermann, 1991) took the opposite bet: \emph{no} central authorities, and let people vouch for each other directly. This is the \textbf{web of trust}.
+
+In PGP, anyone can \emph{sign} anyone else's public key, asserting ``I have checked that this key belongs to this person.'' If you meet Bob in person and verify his key's fingerprint, you sign it. You upload the signature. Now anyone who trusts \emph{you} can use your signature as evidence about Bob. Trust propagates through chains of personal endorsement.
+
+\begin{center}
+\begin{tikzpicture}[font=\small, node distance=18mm,
+  p/.style={draw=aliceblue, fill=aliceblue!8, circle, inner sep=3pt, minimum size=9mm},
+  sgn/.style={-{Stealth[length=2mm]}, thick, aliceblue}]
+\node[p] (you) {You};
+\node[p, right=of you] (a) {Ann};
+\node[p, right=of a] (b) {Bob};
+\node[p, above right=10mm and 8mm of you] (c) {Cy};
+\draw[sgn] (you) -- node[above]{trust} (a);
+\draw[sgn] (a) -- node[above]{signs} (b);
+\draw[sgn] (you) -- (c);
+\draw[sgn] (c) -- (b);
+\node[below=10mm of a, text width=8cm, align=center, gray] {You reach Bob's key through Ann (or Cy). No authority involved --- just transitive personal endorsement.};
+\end{tikzpicture}
+\end{center}
+
+The user assigns \emph{trust levels} to keys: a key is considered valid if it is signed by one fully trusted introducer, or several marginally trusted ones. The math is the same signature-verification we have used throughout; what changes is the trust \emph{topology} --- a sprawling social graph instead of a shallow tree rooted at preinstalled CAs.
+
+\begin{historybox}
+Zimmermann released PGP as free software in 1991, partly in response to a proposed US law mandating crypto backdoors. Because strong crypto was then classified as a munition under export law, the US government opened a criminal investigation into Zimmermann for ``exporting'' PGP when it spread overseas. His response became legend: he published the entire PGP source code as a \emph{book}, which was protected speech under the First Amendment and could be exported freely, then re-scanned abroad. The case was dropped in 1996. The web of trust was, from the start, as much a political statement --- trust should not require permission from authorities --- as a technical design.
+\end{historybox}
+
+\begin{whybox}
+The web of trust's strength is also its weakness. \textbf{Strength}: no single point of failure, no DigiNotar that can forge for everyone, no authority to compel or breach. Your trust decisions are yours. \textbf{Weakness}: it does not scale to strangers. To talk securely to a website you have never met, run by people you will never meet, there is no chain of personal endorsements to follow --- and building one would require a key-signing social graph denser than the planet has ever produced. The CA model scales precisely because it does \emph{not} require you to know anyone; one preinstalled anchor authenticates the entire web. That is why the web runs on CAs and the web of trust stayed a niche for activists, developers, and the privacy-conscious.
+\end{whybox}
+
+\begin{applicationbox}
+The web of trust did not die, but the world moved past its hardest parts. Modern secure messengers --- Signal, WhatsApp, iMessage --- bind keys to identities not through CAs \emph{or} a global signing graph, but through \emph{safety numbers} you can optionally verify out-of-band (scan a QR code when you meet) plus key-change notifications (TOFU with alerts). It is the SSH host-key model applied to people: accept on first contact, shout if the key ever changes. For software, \emph{key transparency} systems (used by WhatsApp, Apple's iMessage Contact Key Verification, and Keybase before it) put the name-to-key mapping into a Merkle-tree append-only log --- the same CT machinery from Section~\ref{ch24:ct}, now applied to people instead of websites. The binding problem is eternal; the answers keep converging on ``make the mapping public and auditable.''
+\end{applicationbox}
+
+\section{Putting it together: what your browser does}
+\label{ch24:together}
+
+When you type \texttt{https://bank.example} and press Enter, the identity machinery of this entire chapter fires in milliseconds:
+
+\begin{enumerate}
+\item The server sends its leaf certificate and intermediate(s) in the TLS handshake.
+\item Your browser builds a chain from the leaf up to a root in its trust store, verifying each signature with the key above it.
+\item It checks every link: validity dates, issuer/subject matching, \texttt{cA=TRUE} on the signers, key-usage flags, name constraints.
+\item It checks that \texttt{bank.example} matches a SAN in the leaf.
+\item It checks revocation --- typically against a pushed set (CRLSet/CRLite) rather than a live OCSP call.
+\item It checks that the leaf carries valid \textbf{SCTs} proving it was logged in Certificate Transparency.
+\item Only if \emph{all} of that passes does the padlock appear and the encrypted session proceed --- and the certificate's key is what authenticates the Diffie--Hellman exchange that follows.
+\end{enumerate}
+
+The cryptography you learned in earlier chapters --- signatures, hashes, key exchange --- is the easy, provable part. The hard part, the part that has actually failed in the wild, is binding those keys to the right names and revoking the bindings when they go bad. PKI is the messy, indispensable scaffolding that lets provably-secure math operate in a world of fallible authorities, stolen keys, and adversaries on the wire.
+
+\begin{recoverybox}
+The one sentence to carry out of this chapter: \emph{a certificate is a signed claim that a key belongs to a name, a chain reduces trusting millions of keys to trusting a few preinstalled anchors, and every catastrophe in the history of the WebPKI came not from broken math but from a CA vouching for something it should not have --- which is why the modern fixes (CT, CAA, short-lived certs, key transparency) are all about making those claims public, auditable, and short-lived.}
+\end{recoverybox}
+
+\section*{Exercises}
+\addcontentsline{toc}{section}{Exercises}
+
+\begin{exercise}[Sign and verify a toy certificate]
+Using the toy CA with $n = 3233$, $e = 17$, $d = 2753$, suppose Bob's certificate body hashes to $m = 65$. Compute the CA's signature $\sigma = m^d \bmod n$ by square-and-multiply, then verify by computing $\sigma^e \bmod n$ and checking it equals $65$. Show your intermediate squarings.
+\end{exercise}
+
+\begin{exercise}[Why the chain order matters]
+A client receives a chain (leaf, intermediate, root) but validates it \emph{top-down}, checking the root is trusted first and then descending, and --- crucially --- forgets to verify that each certificate's issuer field equals the subject of the one above it. Describe a concrete forgery: how can an attacker who owns one legitimately-signed leaf splice in a certificate of their choosing? Which check in Section~\ref{ch24:chains} stops it?
+\end{exercise}
+
+\begin{exercise}[The \texttt{cA} bit, exploited]
+Spell out, step by step, the attack from Section~\ref{ch24:misissuance} in which a client fails to check \texttt{BasicConstraints}. Start from the attacker buying a normal leaf certificate for \texttt{attacker.example} and end with the client accepting a forged certificate for \texttt{bank.example}. At which exact step would a correct \texttt{cA} check abort the chain?
+\end{exercise}
+
+\begin{exercise}[Merkle audit path]
+A CT log has eight certificates $c_1,\dots,c_8$ at the leaves of a balanced Merkle tree (leaf $i$ is $h_i = H(c_i)$, parents are hashes of concatenated children). Write the exact audit path (the list of sibling hashes, in order from leaf to root) needed to prove that $c_5$ is in the log, and write the sequence of hash computations a verifier performs to recover the root.
+\end{exercise}
+
+\begin{exercise}[Revocation tradeoffs]
+Compare CRLs, plain OCSP, and OCSP stapling along four axes: freshness, client privacy, latency added to the handshake, and behaviour under an active network attacker who can drop packets. For each mechanism, identify the single property that makes it inadequate \emph{on its own}, and explain why ``Must-Staple'' is needed to close the gap.
+\end{exercise}
+
+\begin{exercise}[Soft-fail is self-defeating]
+Explain precisely why an active man-in-the-middle holding a \emph{stolen but revoked} certificate is undisturbed by a browser that does OCSP checking with soft-fail. Then argue why hard-fail OCSP is not a usable fix on its own, and how short-lived certificates and pushed revocation sets (CRLSet/CRLite) sidestep the dilemma.
+\end{exercise}
+
+\begin{exercise}[ACME challenge binding]
+In the HTTP-01 challenge, the published value is
+\[
+\text{token} \concat \text{``.''} \concat \text{base64url}\big(\Hash(\text{account public key})\big),
+\]
+not just the token. Construct the attack that would succeed if the response were \emph{only} the bare token (think about a passive eavesdropper on the network, or a shared-hosting neighbour), and explain how binding to the account key defeats it.
+\end{exercise}
+
+\begin{exercise}[DV is not identity]
+A user sees a valid padlock on \texttt{https://secure-bank-login.example} and concludes the site is their bank. Exactly what does the certificate prove, and what does it not prove? Explain why a DV certificate for this domain is trivial for a phisher to obtain, and what additional mechanism (if any) could have warned the user.
+\end{exercise}
+
+\begin{exercise}[Trust is an OR]
+Argue formally why, in the CA model, adding a new trusted CA can only \emph{decrease} or hold constant the security of the name-to-key binding for an existing domain, never increase it. Then explain how CAA records and name constraints reintroduce an \emph{AND}-like restriction, and why CT helps even though it prevents nothing.
+\end{exercise}
+
+\begin{exercise}[Web of trust at scale]
+Estimate, with a back-of-envelope model, how many pairwise key-signings would be needed for a PGP-style web of trust to give every pair of $N$ Internet users a short verification path (say, length $\le 3$). Compare with the CA model's requirement (each user trusts a constant number of roots). Use this to explain, quantitatively, why the web of trust never scaled to the public web. (Hint: think about the diameter and density of random graphs from the probability companion.)
+\end{exercise}

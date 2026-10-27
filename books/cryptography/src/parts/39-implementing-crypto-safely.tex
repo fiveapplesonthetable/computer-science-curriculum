@@ -1,0 +1,901 @@
+\chapter{Implementing Cryptography Safely}
+
+Every chapter so far taught you how a cryptographic machine works on the inside.
+You can now trace AES through its rounds, run RSA with small primes by hand, see
+why GCM dies on a repeated nonce, and follow a TLS 1.3 handshake message by
+message. That knowledge is real and it matters. But there is a gap between
+understanding a primitive and shipping a system that uses it, and that gap is
+where almost all real-world cryptographic failures live. The math is rarely what
+breaks. What breaks is the wiring: a nonce that repeats because a counter reset, a
+key that lived in a log file, a comparison that returned early and leaked a tag
+byte at a time, a downgrade that nobody tested, a ``temporary'' ECB mode that
+shipped to production.
+
+This is the chapter the rest of the book has been building toward in a quiet way.
+The famous advice is ``don't roll your own crypto,'' and it is good advice, but as
+usually stated it is a wall, not a door. It tells you to stop without telling you
+what to do instead. We are going to make it constructive. The real rule is sharper
+and more useful: \emph{do not implement primitives, do compose audited high-level
+constructions, and treat every place where you must make a choice as a place where
+you can make a mistake.} The craft of safe implementation is the discipline of
+removing your own choices --- nonces, modes, padding, key sizes, comparison
+routines --- and handing them to code that has already been attacked by people
+smarter and meaner than your future self at 3 a.m.
+
+We will work through the library hierarchy (why libsodium and Tink exist and what
+``misuse-resistant'' actually buys you), key management and rotation with a worked
+key hierarchy, secure defaults, testing against published test vectors, a real
+threat-modeling pass on a small system, the genuinely rare cases where you do
+touch a primitive, and a one-page checklist you can paste into a code review.
+There is less new mathematics here than anywhere else in the book and more
+hard-won engineering judgment. Both keep secrets. Only one of them is usually the
+reason your secret leaked.
+
+\chapterline
+
+\section{The One Rule, Made Precise}
+\label{ch39:one-rule}
+
+Let us start with the slogan and dismantle it carefully, because half of using it
+well is knowing exactly what it forbids.
+
+\begin{focusbox}
+\textbf{``Don't roll your own crypto'' decomposed.} The slogan bundles three very
+different activities that deserve different verdicts.
+\begin{enumerate}
+  \item \textbf{Designing a new primitive} --- a new cipher, hash, or signature
+  scheme. For almost everyone, almost always: \emph{never}. New primitives need
+  years of public cryptanalysis before anyone should trust them. This is a
+  research activity, not an engineering one.
+  \item \textbf{Implementing a standard primitive} --- your own AES, your own
+  Curve25519. \emph{Almost never.} The algorithm is public and correct on paper,
+  but a correct-looking implementation can still leak the key through timing,
+  cache behavior, or a faulty bignum routine. We will see when --- rarely --- this
+  is justified.
+  \item \textbf{Composing primitives into a protocol} --- gluing key exchange,
+  encryption, and authentication into a secure channel. This is the dangerous one
+  precisely because it looks like ordinary programming. Most ``roll your own''
+  disasters live here: people who would never write their own AES happily invent
+  their own handshake, their own MAC-then-encrypt order, their own session
+  resumption. \emph{Use a vetted construction instead.}
+\end{enumerate}
+The corrected rule: \textbf{compose audited high-level constructions; do not
+design or implement primitives; and minimize the choices you are allowed to make
+at every layer.}
+\end{focusbox}
+
+Why is this so much harder than normal software? In ordinary engineering, a bug
+announces itself. The button does not click, the total comes out wrong, the test
+goes red. Cryptographic bugs are silent. A system that uses a fixed nonce, or that
+never actually verifies a signature, or that compares MACs with a short-circuiting
+string equality, \emph{works perfectly} in every functional test. Encrypt,
+decrypt, round-trip succeeds, ship it. The defect is invisible until an adversary
+who is looking for exactly that defect finds it, and by then the failure is a
+breach, not a failed unit test. The feedback loop that keeps normal code roughly
+correct is missing here. That single fact --- correctness is not testable by the
+people writing the code --- is the deepest reason to lean on artifacts that
+hostile experts have already tested.
+
+\begin{intuitionbox}
+Think of a primitive like a structural steel beam and a protocol like a bridge.
+You would not smelt your own steel: the metallurgy is a solved, certified science,
+and a beam that looks fine can fail under a load you did not anticipate. You buy
+certified beams. But you also do not freelance the bridge's load paths from first
+principles --- you follow engineering codes that encode a century of collapsed
+bridges. Safe cryptography is that posture twice over: certified primitives, and
+codified ways to assemble them. The amateur's instinct is to admire the beam and
+improvise the bridge. The professional's instinct is to distrust their own
+improvisation most exactly where it feels easiest.
+\end{intuitionbox}
+
+\begin{historybox}
+The line ``anyone can invent a cipher they cannot break themselves'' is folk
+wisdom usually traced to Bruce Schneier's \emph{Memo to the Amateur Cipher
+Designer} (1998), and the underlying point is older --- it is Kerckhoffs's
+principle from 1883 turned into career advice. The history of broken homebrew
+crypto is long and consistent: WEP's RC4-plus-CRC32 (a fine cipher married to a
+non-cryptographic checksum), Adobe's 2013 password ``encryption'' with ECB and
+unsalted password hints sitting right beside it, the MS-CHAPv2 handshake, and
+countless custom ``obfuscation'' layers in mobile apps that fall in an afternoon.
+The pattern is almost never ``they used a weak cipher.'' It is almost always
+``they used a fine cipher and wired it up wrong.''
+\end{historybox}
+
+\section{The Library Hierarchy: Where to Stand}
+\label{ch39:hierarchy}
+
+Cryptographic APIs come in layers, and the single most consequential decision you
+make is \emph{which layer you build on}. Higher is safer, because higher means
+fewer decisions left to you. Picture a ladder; you want to stand as near the top
+as your problem allows.
+
+\begin{center}
+\begin{tikzpicture}[font=\small,
+  layer/.style={draw, rounded corners, minimum width=11.5cm, minimum height=0.95cm, align=center},
+]
+\node[layer, fill=green!12]   (l4) {\textbf{Layer 4 --- Protocols you don't assemble.} TLS via your stack, \\ age / WireGuard / the Signal protocol, a managed KMS. ``Send this secret to that server.''};
+\node[layer, fill=green!6, below=3mm of l4] (l3) {\textbf{Layer 3 --- Misuse-resistant ``box'' APIs.} libsodium \texttt{crypto\_secretbox}, \\ Tink \texttt{Aead}. ``Encrypt these bytes under this key.'' Nonces handled for you.};
+\node[layer, fill=yellow!10, below=3mm of l3] (l2) {\textbf{Layer 2 --- Named AEAD constructions.} AES-GCM, ChaCha20-Poly1305 \\ from a vetted library. You must supply a correct, unique nonce.};
+\node[layer, fill=orange!14, below=3mm of l2] (l1) {\textbf{Layer 1 --- Raw primitives and modes.} ``Give me an AES block,'' \\ ``give me CBC.'' You own nonces, padding, MAC order, comparisons.};
+\node[layer, fill=red!16, below=3mm of l1] (l0) {\textbf{Layer 0 --- Implement the primitive yourself.} Write the S-box, \\ the bignum, the field arithmetic. Here be dragons.};
+\draw[-{Stealth[length=3mm]}, very thick, structurepurple] ($(l0.east)+(0.7,0)$) -- node[right, rotate=90, anchor=south]{\textbf{safer}} ($(l4.east)+(0.7,0)$);
+\end{tikzpicture}
+\end{center}
+
+The mistakes scale with the layer. At Layer 4 there is almost nothing left to get
+wrong; you call code whose job is to be secure end to end. At Layer 3 you choose a
+key and pass plaintext; the API picks the nonce, the mode, the tag, and refuses to
+let you reuse a nonce. At Layer 2 you have re-acquired one sharp edge --- the nonce
+--- and GCM punishes a repeat catastrophically (recall the authenticated-encryption
+chapter). At Layer 1 every sharp edge is back: you choose the mode, generate the
+IV, add the padding, decide MAC-then-encrypt versus encrypt-then-MAC, and write the
+tag comparison. Layer 0 adds the algorithm itself. \textbf{Each step down the
+ladder multiplies the number of independent ways to be silently wrong.}
+
+\begin{intuitionbox}
+Read the ladder this way: every API parameter you are \emph{required} to fill in is
+a place the library has delegated a security decision to you. Count the parameters.
+\texttt{secretbox(message, key)} delegates almost nothing.
+\texttt{aes\_gcm\_encrypt(message, key, nonce, aad)} delegates the nonce ---
+exactly the parameter with the famous catastrophic failure mode. ``How many ways
+can I hold this wrong?'' is, to a first approximation, ``how many arguments does it
+take?''
+\end{intuitionbox}
+
+\subsection{NaCl and libsodium: the box that hides the nonce}
+
+NaCl (``salt,'' the Networking and Cryptography Library) was Daniel J. Bernstein,
+Tanja Lange, and Peter Schwabe's deliberate answer to the misuse problem.
+libsodium is its portable, packaged, widely audited descendant. Its philosophy is
+this whole chapter compressed into an API: \emph{pick good primitives once, expose
+them through operations that are hard to misuse, and delete the knobs.} There is no
+cipher selection, no mode menu, no negotiation. Secret-key authenticated encryption
+is a single function.
+
+\begin{implementbox}
+\textbf{Learning only --- this is illustrative, but here the lesson \emph{is} to
+use the real library.} The point of the snippet is how little you are asked to
+decide, not to teach you to reimplement anything.
+\begin{lstlisting}[language=Python, caption={libsodium-style authenticated
+encryption via PyNaCl. Notice how few decisions you are handed.}]
+import nacl.secret, nacl.utils
+
+# A 32-byte key from a CSPRNG. Never type a key in; never derive it from
+# a password without a real KDF (see the key-management section).
+key = nacl.utils.random(nacl.secret.SecretBox.KEY_SIZE)
+box = nacl.secret.SecretBox(key)
+
+# Encrypt. We do NOT pass a nonce: SecretBox draws a fresh random one and
+# prepends it to the ciphertext. One catastrophic decision removed from us.
+ct = box.encrypt(b"transfer 100 to account 7")
+
+# Decrypt. The nonce rides along with the ciphertext; the tag is checked.
+# If a single bit was flipped, this RAISES -- it never returns garbage.
+pt = box.decrypt(ct)
+assert pt == b"transfer 100 to account 7"
+\end{lstlisting}
+\end{implementbox}
+
+Look at what is \emph{absent}. You did not pick a cipher (it is
+XSalsa20-Poly1305). You did not pick a mode. You did not choose between encrypt-then-MAC
+and the alternatives --- the construction is fixed and correct. You did not
+generate a nonce, so you cannot reuse one. The decryption either returns the exact
+plaintext or throws; there is no code path that hands you unauthenticated bytes to
+``check later.'' Every one of those absences corresponds to a class of CVEs that
+simply cannot occur in code written against this API. That is what
+\emph{misuse-resistant} means: not ``hard to break if used correctly,'' but ``hard
+to use incorrectly in the first place.''
+
+\begin{focusbox}
+\textbf{Why XSalsa20 and not raw AES-GCM here?} The leading \texttt{X} means
+\emph{extended nonce} --- 192 bits instead of 96. With a 192-bit random nonce you
+can pick nonces at random forever and the chance of a collision stays negligible
+(a birthday bound over $2^{192}$; see the connection box). That is precisely what
+lets \texttt{SecretBox} generate nonces randomly without bookkeeping. AES-GCM's
+96-bit nonce is too short for that, which is why AEAD-at-Layer-2 forces you to
+manage a counter. The library chose a primitive whose parameters make the safe
+usage the only usage. Design choices propagate.
+\end{focusbox}
+
+\begin{connectionbox}
+The random-nonce argument is a birthday-bound calculation from the companion
+probability book. With an $n$-bit nonce drawn uniformly, the expected number of
+draws before a collision is about $\sqrt{2^{n}} = 2^{n/2}$. For $n = 96$ that is
+$2^{48}$ messages --- reachable by a busy service, which is why GCM nonces are
+managed, not random. For $n = 192$ it is $2^{96}$ --- astronomically out of reach,
+which is why XSalsa20's extended nonce can be random. The whole API ergonomics
+question reduces to one square-root.
+\end{connectionbox}
+
+\subsection{Tink: types that refuse to be confused}
+
+Google's Tink (in Java, C++, Go, Python) attacks the same problem from the
+type-system side. Its central ideas are worth naming because they generalize
+beyond any one library.
+
+\textbf{Keys are objects, not byte strings.} In Tink a key is a \texttt{Keyset}
+that carries its own algorithm, parameters, and key-id metadata. You cannot
+accidentally feed an HMAC key into AES-GCM, because the type that comes out of the
+keyset \emph{is} an \texttt{Aead} or a \texttt{Mac}, never raw bytes. A whole genus
+of bugs --- ``key confusion,'' where the same key material gets used for two
+purposes --- is unrepresentable.
+
+\textbf{Operations are interfaces, not algorithms.} You ask for an \texttt{Aead}
+and call \texttt{encrypt(plaintext, associatedData)}. You did not name AES-GCM; the
+keyset did. Swapping AES-GCM for ChaCha20-Poly1305, or rotating to a new key, is a
+keyset change with no call-site edits. Crypto-agility without per-call decisions.
+
+\textbf{Keysets carry rotation built in.} A keyset can hold several keys at once,
+one marked \emph{primary}. New data is encrypted under the primary; incoming data
+is decrypted under whichever key-id its header names. Rotation becomes ``add a key,
+promote it to primary, later retire the old one'' --- and old ciphertext keeps
+decrypting the entire time. We will see why that staging matters when we work
+through rotation by hand.
+
+\begin{intuitionbox}
+libsodium removes decisions by deleting knobs; Tink removes decisions by making the
+wrong combination a type error your compiler rejects before the code runs. Same
+goal, two routes: \emph{the safe path is the path of least resistance.} If your
+crypto API makes you stop and think hard about nonces and modes on every call, it
+is, by this standard, a badly designed API --- and you are one tired afternoon away
+from a vulnerability.
+\end{intuitionbox}
+
+\section{Misuse-Resistance Made Concrete}
+\label{ch39:misuse}
+
+It is worth seeing, with small numbers, exactly which mistake each design choice
+forecloses. We will take the single most expensive misuse in modern symmetric
+crypto --- nonce reuse in a counter-based AEAD --- and watch a misuse-resistant API
+prevent it.
+
+Recall from the authenticated-encryption chapter that GCM (and any CTR-based
+scheme) generates a keystream as a function of the key and nonce alone. Encrypt two
+messages $m_1, m_2$ under the same key and \emph{same nonce} and you get keystream
+$S$ used twice:
+\[
+c_1 = m_1 \xor S, \qquad c_2 = m_2 \xor S
+\quad\Longrightarrow\quad
+c_1 \xor c_2 = m_1 \xor m_2 .
+\]
+The key vanished; an eavesdropper learns the XOR of two plaintexts, and for GCM
+specifically the authentication key is also exposed, letting the attacker forge.
+Let us make the confidentiality half tangible with one byte.
+
+\begin{example}[Nonce reuse leaks plaintext, by hand]
+\label{ch39:nonce-reuse-ex}
+Work in single bytes. Suppose the keystream byte for a given (key, nonce) is
+$S = \texttt{0xA3}$. Message one is the ASCII letter \texttt{'Y'} $= \texttt{0x59}$;
+message two is \texttt{'N'} $= \texttt{0x4E}$ (a yes/no vote, say). Reusing the
+nonce:
+\[
+c_1 = \texttt{0x59} \xor \texttt{0xA3} = \texttt{0xFA}, \qquad
+c_2 = \texttt{0x4E} \xor \texttt{0xA3} = \texttt{0xED}.
+\]
+Eve never learns $S$. She computes
+\[
+c_1 \xor c_2 = \texttt{0xFA} \xor \texttt{0xED} = \texttt{0x17}
+            = \texttt{0x59} \xor \texttt{0x4E} = \text{`Y'} \xor \text{`N'} .
+\]
+\texttt{0x17} is the XOR of the two votes. Given that the plaintexts are one of two
+known ASCII letters, that single value tells Eve the two votes differed --- and a
+sliver of known plaintext (a fixed header, a guessed word) peels the rest apart.
+One repeated nonce, and the ``encrypted'' channel is a crib. Now imagine the
+messages are kilobytes of structured English: classical two-time-pad cryptanalysis
+recovers both in full.
+\end{example}
+
+Here is the point of the whole section. At Layer 2 (raw AES-GCM) this disaster is
+one off-by-one counter away --- a process restart that resets a nonce counter to
+zero, a forked worker that inherits the same counter, a virtual-machine snapshot
+restored twice. At Layer 3, the API never lets you supply the nonce, so the bug is
+\emph{unreachable from your code}. You did not get more careful; the design got
+the carefulness for you.
+
+\begin{trapbox}
+The nastiest version of this bug is the VM-snapshot or fork: your nonce counter is
+perfectly correct, monotone, never reused --- within one process. Then the deploy
+system clones the running machine, or your worker pool forks after seeding the
+counter, and two ``different'' processes march the same counter from the same
+start. Every functional test passes. The collision happens only in production,
+only under scale, only once it matters. This is exactly the class of failure that
+a 192-bit random nonce (XSalsa20) or a managed-keyset design sidesteps by
+construction.
+\end{trapbox}
+
+\section{Key Management: The Part Nobody Tests}
+\label{ch39:keymgmt}
+
+A cipher with a key is a machine with a secret. If the secret is mishandled, the
+machine's mathematical strength is irrelevant. Key management is where most
+real-world crypto actually lives and dies, and it is the part with the fewest unit
+tests, because ``the key never leaked'' is not something a test suite can assert.
+
+\subsection{The key lifecycle}
+
+Every key passes through stages, and each stage has its own failure mode.
+
+\begin{center}
+\begin{tikzpicture}[font=\small, node distance=6mm and 9mm,
+  st/.style={draw, rounded corners, fill=blue!6, minimum height=0.85cm, align=center, inner sep=4pt},
+  ar/.style={-{Stealth[length=2.4mm]}, thick}]
+\node[st] (gen) {Generate \\ \scriptsize CSPRNG, full entropy};
+\node[st, right=of gen] (store) {Store \\ \scriptsize KMS / HSM / sealed};
+\node[st, right=of store] (use) {Use \\ \scriptsize in memory, minimal};
+\node[st, right=of use] (rot) {Rotate \\ \scriptsize new primary};
+\node[st, right=of rot] (rev) {Retire / Revoke \\ \scriptsize wipe, never reuse};
+\draw[ar] (gen)--(store); \draw[ar] (store)--(use); \draw[ar] (use)--(rot);
+\draw[ar] (rot)--(rev);
+\draw[ar] (rot.south) to[out=-120,in=-60] (use.south);
+\end{tikzpicture}
+\end{center}
+
+\textbf{Generate} from a cryptographically secure RNG with full entropy ---
+\texttt{/dev/urandom}, \texttt{getrandom()}, the OS CSPRNG. Never from
+\texttt{rand()}, never from a timestamp, never a hand-typed string. \textbf{Store}
+so the key is not sitting in a config file, an environment variable dumped to logs,
+or a git repository. \textbf{Use} for the shortest time and smallest scope
+possible, ideally never copying the raw key out of a hardware security module.
+\textbf{Rotate} on a schedule and after any suspected exposure. \textbf{Retire} by
+wiping the material and never, ever reusing it for a new purpose.
+
+\begin{trapbox}
+The most common key-management failure is the most boring one: the key in source
+control. A long-lived API key or signing key committed to git, then the repo goes
+public or a laptop is stolen, and the key is in history forever --- removing the
+file does not remove it from the commit graph. The fix is procedural, not
+mathematical: secrets never touch the repo, they come from a secrets manager or
+environment injected at deploy time, and a pre-commit scanner (gitleaks,
+trufflehog) blocks the commit. No cipher protects you from publishing the key.
+\end{trapbox}
+
+\subsection{Key hierarchies and key wrapping}
+
+You almost never encrypt data directly under a long-lived master key. Instead you
+build a \emph{hierarchy}: one well-protected root, many cheap leaves. This is
+\emph{envelope encryption}, and it solves several problems at once.
+
+The pattern: a \textbf{master key} (also called a key-encryption key, KEK) lives in
+an HSM or a managed KMS and never leaves it. For each chunk of data --- a file, a
+record, a session --- you generate a fresh \textbf{data-encryption key} (DEK),
+encrypt the data with the DEK, then ask the KMS to encrypt (``wrap'') the DEK under
+the KEK. You store the ciphertext and the wrapped DEK together; the bare DEK is
+wiped from memory. To read, you send the wrapped DEK to the KMS, it unwraps with
+the KEK, and you decrypt.
+
+\begin{center}
+\begin{tikzpicture}[font=\small, node distance=7mm,
+  box/.style={draw, rounded corners, align=center, inner sep=4pt},
+  kek/.style={box, fill=red!8}, dek/.style={box, fill=yellow!12},
+  data/.style={box, fill=green!8}, ar/.style={-{Stealth[length=2.4mm]}, thick}]
+\node[kek] (kek) {Master key (KEK) \\ \scriptsize lives in HSM/KMS, never exported};
+\node[dek, below left=12mm and 6mm of kek] (dek1) {DEK$_1$};
+\node[dek, below=12mm of kek] (dek2) {DEK$_2$};
+\node[dek, below right=12mm and 6mm of kek] (dek3) {DEK$_3$};
+\node[data, below=6mm of dek1] (d1) {file 1 \\ \scriptsize +wrapped DEK$_1$};
+\node[data, below=6mm of dek2] (d2) {file 2 \\ \scriptsize +wrapped DEK$_2$};
+\node[data, below=6mm of dek3] (d3) {file 3 \\ \scriptsize +wrapped DEK$_3$};
+\draw[ar] (kek) -- node[above left, font=\scriptsize]{wraps} (dek1);
+\draw[ar] (kek) -- (dek2);
+\draw[ar] (kek) -- node[above right, font=\scriptsize]{wraps} (dek3);
+\draw[ar] (dek1)--(d1); \draw[ar] (dek2)--(d2); \draw[ar] (dek3)--(d3);
+\end{tikzpicture}
+\end{center}
+
+Why bother? Three concrete wins. \emph{Blast radius:} the bare key that ever
+touches your application memory is a single-file DEK; compromise it and you lose one
+file, not the archive. \emph{Cheap rotation:} to rotate the master key you re-wrap
+the small DEKs under the new KEK without re-encrypting terabytes of data ---
+you touch kilobytes of wrapped keys, not the data itself. \emph{Separation of duty:}
+the KMS enforces who may unwrap, with an audit log, while your app never sees the
+master key at all.
+
+\begin{example}[Envelope encryption with tiny numbers]
+\label{ch39:envelope-ex}
+We will use a toy XOR ``cipher'' so the arithmetic is visible; a real system uses
+AES-GCM throughout. Let the master key be $K = \texttt{0x5C}$ (one byte). To store
+the message byte $m = \texttt{0x41}$ (\texttt{'A'}):
+\begin{enumerate}
+  \item Draw a fresh DEK from the CSPRNG: $D = \texttt{0x1B}$.
+  \item Encrypt data with the DEK: $c = m \xor D = \texttt{0x41} \xor \texttt{0x1B}
+        = \texttt{0x5A}$.
+  \item Wrap the DEK under the master key: $w = D \xor K = \texttt{0x1B} \xor
+        \texttt{0x5C} = \texttt{0x47}$.
+  \item Wipe $D$. Store the pair $(c, w) = (\texttt{0x5A}, \texttt{0x47})$.
+\end{enumerate}
+To read back: unwrap $D = w \xor K = \texttt{0x47} \xor \texttt{0x5C} =
+\texttt{0x1B}$, then decrypt $m = c \xor D = \texttt{0x5A} \xor \texttt{0x1B} =
+\texttt{0x41} = \text{`A'}$. Now rotate the master key to $K' = \texttt{0x33}$. We
+do \emph{not} touch $c$. We only re-wrap: unwrap with the old $K$ to recover
+$D = \texttt{0x1B}$, then re-wrap $w' = D \xor K' = \texttt{0x1B} \xor \texttt{0x33}
+= \texttt{0x28}$. Store $(\texttt{0x5A}, \texttt{0x28})$. The 1-byte ciphertext was
+never rewritten; only the 1-byte wrapped key changed. Scale $c$ to a terabyte and
+the saving is the whole point.
+\end{example}
+
+\begin{focusbox}
+\textbf{Toy warning, sharpened.} The XOR above is for arithmetic visibility only ---
+XOR-wrapping is a one-time pad and reusing $K$ across many DEKs would leak their
+XORs exactly as in Example~\ref{ch39:nonce-reuse-ex}. Real envelope encryption
+wraps with an AEAD (AES-GCM or AES-KW, the NIST key-wrap mode), which authenticates
+the wrap and is safe under reuse of the KEK across many DEKs. Never wrap keys by
+XOR. The structure of the hierarchy is the lesson; the primitive must be a real
+AEAD.
+\end{focusbox}
+
+\subsection{Rotation, staged so nothing breaks}
+
+Rotation is where good intentions cause outages. Swap the key in one atomic step
+and every piece of data encrypted under the old key suddenly will not decrypt.
+The fix is to let old and new keys coexist, identified by a key-id carried in the
+ciphertext header --- exactly Tink's multi-key keyset.
+
+\begin{center}
+\begin{tikzpicture}[font=\small, node distance=10mm,
+  ph/.style={draw, rounded corners, align=center, inner sep=4pt, minimum height=1.5cm, text width=3.1cm},
+  ar/.style={-{Stealth[length=2.6mm]}, thick}]
+\node[ph, fill=green!8] (p1) {\textbf{1. Add} \\ \scriptsize key v2 generated, \\ in keyset, \emph{not} primary. \\ Can decrypt; not yet \\ used to encrypt.};
+\node[ph, fill=yellow!10, right=of p1] (p2) {\textbf{2. Promote} \\ \scriptsize v2 becomes primary. \\ New writes use v2. \\ v1 still present, still \\ decrypts old data.};
+\node[ph, fill=orange!12, right=of p2] (p3) {\textbf{3. Re-encrypt} \\ \scriptsize (optional) background \\ job rewrites v1 data \\ under v2.};
+\node[ph, fill=red!10, right=of p3] (p4) {\textbf{4. Retire} \\ \scriptsize once no ciphertext \\ references v1, remove \\ it and wipe.};
+\draw[ar] (p1)--(p2); \draw[ar] (p2)--(p3); \draw[ar] (p3)--(p4);
+\end{tikzpicture}
+\end{center}
+
+The invariant that keeps the system online: \textbf{you may start encrypting under
+a new key only after every consumer can decrypt it, and you may remove an old key
+only after no ciphertext still references it.} Each ciphertext names its key-id, so
+the decryptor always knows which key to reach for. Skip the staging --- promote and
+retire in one move --- and you have manufactured an outage or, worse, a silent data
+loss when the old key is gone and old records will not open.
+
+\begin{applicationbox}
+\textbf{How the cloud KMSs do it.} AWS KMS, Google Cloud KMS, and HashiCorp Vault
+all implement exactly this. You get a key with versions; ``rotate'' adds a new
+version and makes it primary; ciphertext blobs embed the version id so old data
+keeps decrypting indefinitely; the master key never leaves the service boundary
+(often a FIPS-validated HSM). Envelope encryption is the default API:
+\texttt{GenerateDataKey} hands you a fresh DEK \emph{and} its wrapped form in one
+call, and you are expected to throw away the plaintext DEK the moment you finish
+the operation. The entire design is the key hierarchy of
+Example~\ref{ch39:envelope-ex}, productized.
+\end{applicationbox}
+
+\section{Secure Defaults and Crypto-Agility}
+\label{ch39:defaults}
+
+A library's defaults are a security decision made on behalf of every user who never
+changes them --- which is most of them. The discipline is: \textbf{the default
+configuration should be the secure configuration}, and the insecure options should
+be hard to reach or absent.
+
+This is why modern designs delete the algorithm menu. Old TLS let the client and
+server \emph{negotiate} a cipher suite from a long list including export-grade
+40-bit keys and broken modes; the negotiation itself became the attack surface
+(FREAK, Logjam, and the downgrade dances of the authenticated-encryption and TLS
+chapters). TLS 1.3 cut the list to a handful of AEAD suites and removed negotiable
+weak options entirely. There is no insecure choice to be tricked into, because the
+insecure choices are gone.
+
+\begin{trapbox}
+\textbf{Agility is a liability if it includes the past.} ``Crypto-agility'' --- the
+ability to swap algorithms --- is genuinely necessary; you will need to migrate to
+post-quantum primitives this decade. But agility that keeps the old algorithm
+\emph{selectable} is a downgrade waiting to happen. The right shape is a versioned
+\emph{suite}: version 1 is ``X25519 + AES-GCM,'' version 2 is ``ML-KEM + AES-GCM,''
+and a peer either speaks version 2 or it does not --- there is no mix-and-match menu
+to negotiate downward. The keyset/suite carries the choice; the wire protocol does
+not haggle over primitives.
+\end{trapbox}
+
+\begin{intuitionbox}
+A secure default is a gift to the 90\% of users who copy your example code verbatim
+and ship it. They will not read the security section. They will not tune the
+parameters. Whatever your constructor does with no arguments is what runs in
+production. Treat the zero-argument path as your most important security feature,
+because it is the one almost everyone actually uses.
+\end{intuitionbox}
+
+\section{Testing Crypto: Vectors, Properties, and Failure Paths}
+\label{ch39:testing}
+
+We said correctness is not testable by the implementer. That is true for
+\emph{security}, but ordinary correctness --- ``does this code compute AES the way
+the standard says'' --- is very testable, and you must, because a one-bit
+implementation error can void all the security. The tools are test vectors,
+round-trip and property tests, and --- the one people forget --- tests of the
+\emph{rejection} path.
+
+\subsection{Known-answer test vectors}
+
+Standards bodies publish \emph{test vectors}: fixed inputs with their exact
+expected outputs, computed by the reference implementation. NIST's CAVP/ACVP
+vectors, Project Wycheproof from Google, RFC appendices --- they exist so your
+implementation, or your wiring of a library, can be checked against ground truth.
+A passing vector test proves you compute the same function the rest of the world
+computes.
+
+\begin{implementbox}
+\textbf{Learning only.} This shows the \emph{shape} of vector testing, not a way to
+trust homemade crypto. Check a real implementation against published vectors; never
+ship the toy.
+\begin{lstlisting}[language=Python, caption={Running a known-answer vector. Real
+suites have thousands of these, including deliberately malformed inputs.}]
+# One ChaCha20-Poly1305 test vector (from RFC 8439). The hex strings below
+# are TRUNCATED for the page -- the real vector has the full 32-byte key and
+# the full expected ct+tag. A vector is:
+#   key, nonce, aad, plaintext -> expected ciphertext+tag.
+vectors = [
+    {
+      "key":   bytes.fromhex("808182838485868788898a8b..."),  # full = 32 bytes
+      "nonce": bytes.fromhex("070000004041424344454647"),     # 12 bytes
+      "aad":   bytes.fromhex("50515253c0c1c2c3c4c5c6c7"),
+      "pt":    b"Ladies and Gentlemen of the class of '99...",
+      "ct_tag": bytes.fromhex("d31a8d34648e60db7b86afbc..."),  # full expected
+    },
+    # ... thousands more, including malformed inputs that MUST be rejected ...
+]
+
+def run_vectors(aead_encrypt, aead_decrypt, vectors):
+    for v in vectors:
+        out = aead_encrypt(v["key"], v["nonce"], v["aad"], v["pt"])
+        assert out == v["ct_tag"], "encryption disagrees with the standard"
+        back = aead_decrypt(v["key"], v["nonce"], v["aad"], v["ct_tag"])
+        assert back == v["pt"],    "decryption disagrees with the standard"
+\end{lstlisting}
+\end{implementbox}
+
+\subsection{Property tests and the rejection path}
+
+Beyond fixed vectors, two kinds of generated tests catch whole classes of bug.
+
+\emph{Round-trip property:} for random keys, nonces, and messages,
+$\Dec_k(\Enc_k(m)) = m$. Easy, and it catches encoding bugs and length-handling
+errors. But notice what it does \emph{not} catch: a decrypt routine that skips tag
+verification round-trips perfectly. Round-trip success is necessary, never
+sufficient.
+
+\emph{Rejection property:} this is the one that matters and the one people skip.
+Take a valid ciphertext, flip one bit anywhere --- in the body, in the nonce, in
+the tag, in the associated data --- and assert that decryption \emph{fails}. A
+shocking number of crypto bugs are decryptors that do not actually check the thing
+they claim to check. The only way to catch ``the signature is never really
+verified'' is a test that feeds a \emph{bad} signature and demands rejection.
+
+\begin{attackbox}
+\textbf{The verify that never verified.} A recurring real-world bug: a signature- or
+MAC-checking routine that returns ``valid'' on every input because of an inverted
+boolean, an exception swallowed by a bare \texttt{except: pass}, or a function that
+computes the expected tag and then forgets to compare it. Apple's 2014
+``goto fail'' was a sibling of this --- a duplicated \texttt{goto} skipped the final
+certificate check, so TLS accepted forged certificates. Every round-trip test
+passed; legitimate traffic worked perfectly. Only a \emph{negative} test --- feed a
+forged certificate, assert it is rejected --- would have caught it. Always test that
+bad inputs fail, not only that good inputs succeed.
+\end{attackbox}
+
+\begin{trapbox}
+\textbf{Constant-time comparison, or you test your way to a timing oracle.} When you
+do compare a tag or MAC, you must compare in \emph{constant time} --- a routine that
+inspects every byte regardless of where the first mismatch is. The natural
+\texttt{a == b} on byte strings short-circuits at the first differing byte, so its
+running time leaks how many leading bytes matched. An attacker who can time
+verification recovers a valid tag byte by byte, turning a forgery from $2^{128}$
+guesses into a few thousand timed queries (the side-channel chapter shows the full
+attack). Use the library's \texttt{constant\_time\_compare} /
+\texttt{sodium\_memcmp} / \texttt{hmac.compare\_digest}; never \texttt{==}.
+\end{trapbox}
+
+\begin{connectionbox}
+The timing-oracle attack is, at heart, a search-cost collapse from the algorithms
+companion. A blind forgery is a $2^{128}$ brute force --- hopeless. A
+byte-at-a-time timing oracle turns it into $16$ independent searches of at most
+$256$ values each --- about $128$ tries per byte on average, so roughly
+$16 \times 128 \approx 2^{11}$ timed queries. The math of the
+tag did not change; the comparison routine handed the attacker a way to decompose
+one impossible search into sixteen trivial ones. Constant-time code denies that
+decomposition.
+\end{connectionbox}
+
+\section{Threat Modeling: Decide What You Are Defending Against}
+\label{ch39:threat}
+
+You cannot build a secure system without first writing down what ``secure'' means
+for it --- against whom, protecting what, assuming what. Skip this and you will
+either under-protect (no defense against an attacker who is clearly in scope) or
+over-engineer (HSMs and key ceremonies to guard a public RSS feed). A threat model
+is four questions answered in plain language before any code.
+
+\begin{enumerate}
+  \item \textbf{What are you protecting?} The assets: user messages, password
+  database, signing key, session tokens. Be specific; ``the data'' is not an asset.
+  \item \textbf{Who is the adversary, and what can they do?} The capabilities: a
+  passive eavesdropper on the wire? An active attacker who can inject and reorder
+  (Dolev--Yao)? A malicious insider with database read access? An attacker who can
+  time your server? Capabilities, not personas.
+  \item \textbf{What must hold for you to be secure?} The security goals tied to
+  assets: confidentiality of messages, integrity of transfers, authenticity of the
+  server, forward secrecy if a key later leaks.
+  \item \textbf{What is explicitly \emph{out} of scope?} The assumptions you are
+  making. ``We do not defend against a compromised client device.'' ``We assume the
+  CSPRNG is sound.'' Writing these down is not cheating --- it is the difference
+  between a known assumption and a blind spot.
+\end{enumerate}
+
+\begin{example}[A threat model for a small message store]
+\label{ch39:threatmodel-ex}
+Suppose you are building a service where users store notes and read them back later.
+A one-page model:
+
+\textbf{Assets:} the note contents (confidentiality), and the fact that a returned
+note is the one the user actually stored (integrity).
+
+\textbf{Adversaries and capabilities:} (a) a network attacker who can read and
+modify traffic between client and server --- handled by TLS, in scope; (b) an
+attacker who steals a database backup --- in scope, so notes must be encrypted at
+rest under a key \emph{not} in that backup; (c) an attacker who fully compromises
+the running server, including memory and the live KEK --- declared \emph{out} of
+scope for this tier of product.
+
+\textbf{Goals:} TLS 1.3 for the channel; per-note envelope encryption with DEKs
+wrapped by a KMS-held KEK for at-rest confidentiality and integrity; the KEK lives
+in the KMS so a stolen backup is useless without KMS access.
+
+\textbf{Out of scope, stated:} a live-server compromise that can call the KMS to
+unwrap; client-device malware; traffic-analysis (sizes and timing). These are
+acknowledged, not defended, at this tier.
+
+Notice the model immediately \emph{decides the architecture}: adversary (b) is the
+reason DEKs are wrapped by a KMS key rather than a key stored next to the data.
+Without writing down (b) you might have ``encrypted at rest'' with the key in the
+same backup --- security theater that the model exposes in one line.
+\end{example}
+
+\begin{intuitionbox}
+A threat model is a contract with reality about which fights you are choosing.
+Every real system loses \emph{some} fight --- to enough resources, every defense
+falls. Maturity is not pretending otherwise; it is naming the line, defending
+hard above it, and not wasting effort below it. The single most common security
+mistake is not a weak algorithm. It is never having decided, in writing, who the
+enemy is.
+\end{intuitionbox}
+
+\section{When (Almost Never) to Implement a Primitive}
+\label{ch39:when-roll}
+
+Having said ``almost never'' many times, intellectual integrity demands we name the
+cases where touching a primitive is defensible --- and surround each with the
+conditions that make it not reckless.
+
+\begin{itemize}
+  \item \textbf{You are a cryptographer doing research}, designing or analyzing a
+  scheme for public scrutiny. The deliverable is a paper and a reference
+  implementation meant to be attacked, not a product feature.
+  \item \textbf{No vetted library exists for your platform.} A genuinely novel
+  environment --- a tiny microcontroller, an exotic enclave, a new language with no
+  binding to libsodium/BoringSSL --- may force your hand. The right move is usually
+  to port a vetted implementation, not to write fresh code, and to get it reviewed
+  and tested against full vector suites and constant-time checks before trusting it.
+  \item \textbf{You are deliberately learning} --- working the examples in a book
+  like this one. This is valuable and you should do it. The discipline is to
+  \emph{label} the result as a learning artifact and never let it cross into a real
+  system. That is exactly why every code box here carries a learning-only warning.
+\end{itemize}
+
+If you do find yourself at Layer 0 for a real deployment, the bar is high: a
+public, peer-reviewed algorithm (never a secret design); constant-time code with
+no secret-dependent branches or memory indices (the side-channel chapter); the full
+published vector suite passing, including malformed-input rejection; a defended
+RNG; secure memory handling that wipes keys and resists being swapped to disk; and,
+non-negotiably, an independent expert audit. If you cannot fund the audit, you
+cannot afford to roll the primitive. That is not gatekeeping; it is the cost
+structure of the silent-failure problem stated as a budget.
+
+\begin{historybox}
+The libraries you should be reaching for are themselves the product of this
+discipline done right. BoringSSL is Google's audited fork of OpenSSL, born after
+Heartbleed showed what a single unchecked length in a widely-trusted C codebase can
+do. libsodium is a hardened, portable packaging of NaCl. ring and RustCrypto bring
+memory-safe implementations with constant-time intent baked in. Each represents
+many person-years of expert attention, fuzzing, formal-ish verification, and audit
+--- precisely the work you are \emph{not} going to replicate over a weekend, and the
+reason standing on their shoulders is not laziness but engineering.
+\end{historybox}
+
+\section{A Practical Checklist}
+\label{ch39:checklist}
+
+Print this. Tape it next to the review queue. It compresses the chapter into
+questions you can answer yes/no during a code review, grouped by the failure
+classes we have walked through.
+
+\begin{focusbox}
+\textbf{Shipping-cryptography checklist.}
+
+\emph{Library and layer}
+\begin{itemize}
+  \item Am I using a vetted, audited, maintained library --- not my own primitive?
+  \item Am I standing on the highest layer that solves my problem (a box/AEAD API,
+  not raw modes)?
+  \item Is every algorithm choice a current standard (AES-GCM or ChaCha20-Poly1305
+  for AEAD, HKDF for derivation, X25519/ML-KEM for exchange, Ed25519 for
+  signatures, Argon2/scrypt for passwords)? No DES, RC4, MD5, SHA-1, ECB, or
+  textbook RSA.
+\end{itemize}
+
+\emph{Keys}
+\begin{itemize}
+  \item Are keys generated from a CSPRNG with full entropy --- never a password
+  directly, never a constant, never \texttt{rand()}?
+  \item Are passwords run through a real KDF (Argon2id, scrypt, or PBKDF2) with a
+  per-user salt --- never hashed bare?
+  \item Are long-lived keys in a KMS/HSM, out of source control, out of logs, out of
+  environment dumps? Is a secret-scanner in the commit hook?
+  \item Is each key used for exactly one purpose? No key reuse across schemes.
+  \item Is there a staged rotation plan (add, promote, re-encrypt, retire) with
+  key-ids in the ciphertext?
+\end{itemize}
+
+\emph{Nonces, modes, and composition}
+\begin{itemize}
+  \item Are nonces/IVs unique per (key, message) --- counter-managed for 96-bit
+  GCM, random only with extended nonces? Survives restarts, forks, and VM
+  snapshots?
+  \item Is encryption authenticated (AEAD)? Never confidentiality without
+  integrity.
+  \item If composing by hand (you should not be), is it encrypt-then-MAC, never
+  MAC-then-encrypt or encrypt-and-MAC?
+\end{itemize}
+
+\emph{Comparison, randomness, and side channels}
+\begin{itemize}
+  \item Are all secret comparisons constant-time
+  (\texttt{compare\_digest}/\texttt{sodium\_memcmp})? Never \texttt{==} on a tag.
+  \item Is there no secret-dependent branch or memory index in code you wrote?
+  \item Is the RNG the OS CSPRNG, seeded, never reused after fork?
+\end{itemize}
+
+\emph{Defaults, testing, and modeling}
+\begin{itemize}
+  \item Is the zero-argument / default path the secure path?
+  \item Do tests run published vectors \emph{and} negative tests (tampered input
+  MUST be rejected; a forged signature MUST fail)?
+  \item Is there a written threat model naming assets, adversary capabilities,
+  goals, and explicit out-of-scope assumptions?
+  \item Is there a plan for crypto-agility (versioned suites, no downgrade menu)
+  toward post-quantum?
+\end{itemize}
+\end{focusbox}
+
+\begin{applicationbox}
+\textbf{What the systems you trust actually do.} Signal stands on libsignal (a
+vetted protocol implementation) rather than reinventing the ratchet per platform.
+WireGuard ships a single fixed cipher suite --- Curve25519, ChaCha20-Poly1305,
+BLAKE2s --- with no negotiation, so there is no downgrade to attack; ``no algorithm
+agility on the wire'' is a stated design goal. Apple and Google's mobile keystores
+keep device keys in dedicated secure hardware (Secure Enclave, Titan/StrongBox), so
+even a fully compromised OS cannot export them --- the key-hierarchy and
+out-of-scope-compromise ideas from our threat model, in silicon. age and Tink give
+application developers misuse-resistant file and data encryption with managed keys.
+Across all of them the through-line is identical to this chapter: \emph{choose
+strong primitives once, expose a narrow safe interface, and refuse to let the caller
+make the dangerous decision.}
+\end{applicationbox}
+
+\section{What to Carry Forward}
+\label{ch39:carry-forward}
+
+The mathematics in this book is the reason cryptography \emph{can} work. This
+chapter is the reason it sometimes does not. Sit with the asymmetry one more time:
+the cipher almost never fails; the wiring around it fails constantly, and silently,
+and only in front of the one adversary looking for that exact flaw. Your defense is
+not more cleverness. It is less of it --- fewer decisions in your hands, more in the
+hands of code that has already survived the attacks.
+
+Stand as high on the API ladder as your problem allows. Reach for libsodium or
+Tink, or higher still for a whole protocol you do not assemble. Let the library
+own the nonce, the mode, the comparison, the composition. Manage keys with a
+hierarchy and a KMS, rotate in stages, and keep secrets out of the repo. Make the
+default the secure default. Test the rejection path, not only the round trip. Write
+the threat model before the code. And treat ``implement a primitive yourself'' as a
+decision that needs an audit budget, not a free afternoon. Do that, and the
+beautiful mathematics of the previous thirty-eight chapters gets to do its job ---
+which is, in the end, the only job: to keep the secret.
+
+\section*{Exercises}
+\addcontentsline{toc}{section}{Exercises}
+
+\begin{exercise}[Nonce reuse by hand]
+A CTR-based AEAD produces keystream byte $S = \texttt{0x6D}$ for a given
+(key, nonce). Two messages are sent under the same key and the \emph{same} nonce:
+$m_1 = \text{`}\texttt{T}\text{'} = \texttt{0x54}$ and
+$m_2 = \text{`}\texttt{F}\text{'} = \texttt{0x46}$ (a true/false bit). Compute
+$c_1$, $c_2$, and $c_1 \xor c_2$. Verify $c_1 \xor c_2 = m_1 \xor m_2$ and explain,
+in one sentence, what Eve learns without ever recovering $S$.
+\end{exercise}
+
+\begin{exercise}[Envelope re-wrap]
+Using the toy XOR scheme of Example~\ref{ch39:envelope-ex}: master key
+$K = \texttt{0x2A}$, data byte $m = \texttt{0x6B}$, fresh DEK $D = \texttt{0x39}$.
+(a) Compute the stored pair $(c, w)$. (b) The master key rotates to
+$K' = \texttt{0x91}$. Compute the new wrapped key $w'$ \emph{without} changing $c$.
+(c) State the one quantity that gets rewritten on a master-key rotation and the one
+that does not, and explain why this is the central payoff of envelope encryption.
+\end{exercise}
+
+\begin{exercise}[Count the rope]
+For each API signature, list the security-relevant decision(s) the caller is forced
+to make, and rank the three from most to least misuse-resistant:
+(a) \texttt{secretbox(message, key)};
+(b) \texttt{aes\_gcm\_encrypt(message, key, nonce, aad)};
+(c) \texttt{aes\_cbc\_encrypt(message, key, iv)} followed by a separate
+\texttt{hmac(...)} you must order and compare yourself. Justify the ranking by the
+``count the arguments'' heuristic and name the specific catastrophic failure each
+delegated decision enables.
+\end{exercise}
+
+\begin{exercise}[The verify that never verified]
+Here is a sketch of a MAC check:
+\begin{quote}\ttfamily
+def verify(key, msg, tag):\\
+\hspace*{2em}expected = hmac(key, msg)\\
+\hspace*{2em}return True
+\end{quote}
+(a) Which test --- round-trip or rejection --- catches this bug, and which one
+passes despite it? (b) Write, in words, the single negative test case that exposes
+it. (c) Relate this to Apple's ``goto fail'': what was structurally the same?
+\end{exercise}
+
+\begin{exercise}[Timing oracle arithmetic]
+A 16-byte authentication tag is verified with a comparison that short-circuits at
+the first differing byte, and an attacker can measure the verification time. (a)
+Estimate the number of timed queries to recover the full tag byte by byte, and
+compare it to the $2^{128}$ cost of a blind forgery. (b) Name the one-line code
+change that defeats the attack and explain why it removes the leak. (c) Connect
+this to the search-cost-collapse idea from the connection box.
+\end{exercise}
+
+\begin{exercise}[Write a threat model]
+You are building a password manager: users store credentials, encrypted, synced
+across their devices through your server. Write a one-page threat model in the
+four-question form of Example~\ref{ch39:threatmodel-ex}. Be explicit about whether
+a \emph{server compromise} is in scope, and let that decision drive where the
+master key lives and what the server can and cannot decrypt. Identify at least one
+adversary you place \emph{out} of scope and say why.
+\end{exercise}
+
+\begin{exercise}[Staged rotation invariant]
+A team rotates an encryption key by deleting the old key and installing the new one
+in a single deploy. (a) Describe precisely what happens to data encrypted under the
+old key, and what the user experiences. (b) State the two-part safety invariant
+from Section~\ref{ch39:keymgmt} that the team violated. (c) Give the corrected
+four-phase sequence and explain what the key-id in each ciphertext header is for.
+\end{exercise}
+
+\begin{exercise}[Defaults as a security feature]
+Library A's AEAD constructor with no arguments selects AES-GCM and generates a
+random 96-bit nonce per message from a global counter. Library B's selects
+XSalsa20-Poly1305 with a 192-bit random nonce. (a) Using the birthday bound from
+the connection box, estimate how many messages each can safely encrypt before nonce
+collision becomes a realistic worry. (b) Argue which default is more
+misuse-resistant for a developer who never reads the docs, and tie your answer to
+the ``zero-argument path'' principle.
+\end{exercise}
+
+\begin{exercise}[Justify the exception]
+Give a concrete scenario in which implementing a standard primitive yourself
+(Layer~0) is defensible, then list every condition from Section~\ref{ch39:when-roll}
+that must hold before the result may touch a real system. For one of those
+conditions --- constant-time code --- give an example of a seemingly innocent line
+that violates it (a secret-dependent branch or a table lookup indexed by secret
+data) and explain the leak.
+\end{exercise}
+
+\begin{exercise}[Audit a snippet, end to end]
+You are reviewing a service that: (i) reads a 16-byte AES key from an environment
+variable set in the deploy YAML committed to git; (ii) encrypts records with
+AES-CBC and a fixed all-zero IV; (iii) stores the ciphertext with no MAC; (iv)
+verifies an API token with \texttt{if token == stored\_token}. Identify every
+distinct vulnerability against the checklist in Section~\ref{ch39:checklist}, and
+for each give the one-line remediation. (There are at least five.)
+\end{exercise}

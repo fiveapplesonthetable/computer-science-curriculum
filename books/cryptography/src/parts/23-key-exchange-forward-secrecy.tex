@@ -1,0 +1,748 @@
+\chapter{Key Exchange and Forward Secrecy}
+
+Diffie and Hellman gave us a small miracle: two strangers shouting across a
+crowded room can agree on a shared secret that the room never learns. But the
+plain handshake from the public-key chapter has a hole in it that you could
+drive a truck through, and the truck has a name. It is called Eve, she sits in
+the middle, and she is happy to be \emph{both} ends of your conversation at
+once.
+
+This chapter is about turning a raw key-agreement primitive into something you
+can actually deploy. We need three things the bare handshake lacks. First,
+\emph{authentication}: each party must know who is on the other end, so that the
+secret is shared with Bob and not with Eve-pretending-to-be-Bob. Second,
+\emph{forward secrecy}: if Bob's long-term key is stolen next year, the messages
+he sent this morning must stay unreadable. Third, a disciplined way to turn the
+one shared group element the handshake produces into the several independent
+keys a real protocol needs --- that is the job of a \emph{key derivation
+function}. Along the way we will worry about replay and downgrade, two failure
+modes that have sunk real protocols. By the end you will have hand-assembled the
+core of what TLS 1.3 and the Signal protocol actually do.
+
+\section{The threat we are defending against}
+
+Let us fix the cast and the rules before we build anything. Alice and Bob want
+to establish a shared secret key over a network. Eve sits on the wire. We grant
+Eve quite a lot of power, because real adversaries have it:
+
+\begin{itemize}
+  \item She sees every byte that crosses the network (eavesdropping).
+  \item She can drop, reorder, replay, and modify messages, and inject her own
+        (an \emph{active}, or \emph{man-in-the-middle}, adversary).
+  \item She knows the protocol completely. The only things she does not know are
+        the secret keys and the random coins the parties flip.
+\end{itemize}
+
+Against this adversary we want a protocol with two output guarantees.
+
+\begin{definition}[Informal goals of authenticated key exchange]
+\label{ch23:ake-goals}
+A \emph{key-exchange protocol} run between two parties produces a session key
+$k$. We say the protocol is a secure \emph{authenticated key exchange} (AKE) if:
+\begin{enumerate}
+  \item \textbf{Secrecy.} An adversary who watches (and tampers with) the
+        protocol cannot distinguish the real session key $k$ from a uniformly
+        random string of the same length. Concretely, $k$ should look like
+        fresh randomness to anyone but the two participants.
+  \item \textbf{Authentication.} When Alice finishes a run believing she shares
+        $k$ with Bob, then either she really does share $k$ with the genuine Bob,
+        or Bob has no matching session at all (he never accepted). She is never
+        fooled into sharing a key with Eve while thinking it is Bob.
+\end{enumerate}
+\end{definition}
+
+The secrecy notion above is the ``real-or-random'' game you have met for
+encryption, lifted to keys. We will make it sharper when we tie security to the
+Decisional Diffie-Hellman assumption.
+
+\begin{intuitionbox}
+Think of a key exchange as a blind handshake in a dark room. Secrecy says the
+secret grip you settle on is meaningless to anyone groping around the edges.
+Authentication says you are gripping the hand you think you are, not an
+imposter's. The plain Diffie-Hellman handshake delivers the first and completely
+abandons the second --- which is exactly the gap Eve lives in.
+\end{intuitionbox}
+
+\section{Recalling the bare handshake, and watching it fail}
+
+Fix a cyclic group $\G$ of prime order $q$ with generator $g$. (Concretely think
+of $\Zns{p}$ for a large prime $p$, or an elliptic-curve group; the algebra is
+identical.) The textbook Diffie-Hellman exchange is one round:
+
+\begin{center}
+\begin{tikzpicture}[font=\small,>=Stealth]
+  \node[draw,rounded corners,fill=aliceblue!12,minimum width=2.4cm] (A) at (0,0) {Alice};
+  \node[draw,rounded corners,fill=bobgreen!12,minimum width=2.4cm] (B) at (8,0) {Bob};
+  \node[below=0.1cm of A,align=center] {picks $a\getsr\Z_q$\\sends $A=g^a$};
+  \node[below=0.1cm of B,align=center] {picks $b\getsr\Z_q$\\sends $B=g^b$};
+  \draw[->] (1.3,0.25) -- node[above]{$A=g^a$} (6.7,0.25);
+  \draw[<-] (1.3,-0.25) -- node[below]{$B=g^b$} (6.7,-0.25);
+  \node[below=1.5cm of A,align=center] {computes\\$B^a=g^{ab}$};
+  \node[below=1.5cm of B,align=center] {computes\\$A^b=g^{ab}$};
+\end{tikzpicture}
+\end{center}
+
+Both sides arrive at $g^{ab}$. Eve sees $g^a$ and $g^b$ and would have to compute
+$g^{ab}$ from them --- the \emph{Computational Diffie-Hellman} problem, believed
+hard. So against a \emph{passive} Eve the shared point is secret. Good.
+
+Now make Eve active. She does not need to solve any hard problem; she just plays
+two handshakes at once.
+
+\begin{attackbox}[Man-in-the-middle on unauthenticated DH]
+\label{ch23:mitm}
+Eve intercepts Alice's $A=g^a$ and never lets it reach Bob. She picks her own
+$e\getsr\Z_q$ and:
+\begin{itemize}
+  \item sends $E=g^e$ to Bob, pretending to be Alice;
+  \item sends $E=g^e$ to Alice, pretending to be Bob (she can reuse $e$ or pick a
+        fresh one --- say $e'$ toward Alice).
+\end{itemize}
+Now Alice computes $k_A=E^a=g^{ae}$ and thinks she shares it with Bob. Bob
+computes $k_B=E^b=g^{be}$ and thinks he shares it with Alice. Eve knows $e$, so
+she computes \emph{both}: $k_A=A^e$ and $k_B=B^e$. She decrypts everything Alice
+sends under $k_A$, re-encrypts it under $k_B$, and forwards it to Bob. Neither
+party sees anything wrong. Eve is a transparent relay who reads and rewrites the
+whole conversation.
+\end{attackbox}
+
+The lesson is blunt: \textbf{a key is only as trustworthy as your knowledge of
+who holds the other copy.} Diffie-Hellman gives you a shared secret with
+\emph{somebody}. Turning ``somebody'' into ``Bob'' is the entire problem of
+authentication, and it cannot come from the group algebra alone. It must come
+from something Alice already knows about Bob: a long-term key, bound to his
+identity, that Eve cannot forge.
+
+\section{Authenticating the handshake}
+
+We have two long-term-key tools that can pin an identity: digital signatures and
+long-term Diffie-Hellman keys. They lead to two families of AKE, and modern
+protocols use both. Let us build the signature-based one first because it is the
+most transparent, then the implicitly-authenticated one because it is what
+elliptic-curve protocols and Signal actually run.
+
+\subsection{Signed ephemeral Diffie-Hellman}
+
+Give Bob a long-term signature key pair $(sk_B, pk_B)$, and suppose Alice already
+holds an authentic copy of $pk_B$ --- through a certificate, a pinned key, or a
+trust-on-first-use record. (Where $pk_B$ comes from is the job of the PKI
+chapter; here we just assume Alice has the right one.) The idea is to keep the
+Diffie-Hellman values \emph{ephemeral} --- fresh per session --- but have each
+party \emph{sign} the ephemeral value they send.
+
+\begin{center}
+\begin{tikzpicture}[font=\small,>=Stealth]
+  \node[draw,rounded corners,fill=aliceblue!12,minimum width=2.6cm] (A) at (0,0) {Alice};
+  \node[draw,rounded corners,fill=bobgreen!12,minimum width=2.6cm] (B) at (9,0) {Bob};
+  \draw[->] (1.4,0.55) -- node[above,align=center]{$A=g^a$ \quad (``ClientHello'')} (7.6,0.55);
+  \draw[<-] (1.4,-0.1) -- node[below,align=center]{$B=g^b,\ \sigma_B=\Sign_{sk_B}(A\concat B)$} (7.6,-0.1);
+  \draw[->] (1.4,-1.0) -- node[below,align=center]{(optional) $\sigma_A=\Sign_{sk_A}(A\concat B)$} (7.6,-1.0);
+\end{tikzpicture}
+\end{center}
+
+\begin{enumerate}
+  \item Alice picks $a\getsr\Z_q$ and sends $A=g^a$.
+  \item Bob picks $b\getsr\Z_q$, and signs the \emph{transcript} so far:
+        $\sigma_B=\Sign_{sk_B}(A\concat B)$. He sends $(B,\sigma_B)$.
+  \item Alice checks $\Vrfy_{pk_B}(A\concat B,\sigma_B)$. If it verifies, she
+        knows the genuine Bob saw \emph{her} $A$ and produced \emph{this} $B$.
+        She computes $k=B^a=g^{ab}$.
+  \item Bob computes $k=A^b=g^{ab}$. (If Alice also has a long-term key and Bob
+        needs to authenticate her --- ``mutual authentication'' --- she signs
+        the transcript too in step 3.)
+\end{enumerate}
+
+Why does signing the transcript, rather than just signing $B$, matter so much?
+Because the signature must \emph{bind Bob's ephemeral to Alice's ephemeral}. If
+Bob signed only $B$, Eve could record an old $(B,\sigma_B)$ pair from a previous
+session and replay it into a new one --- the signature would still verify. By
+covering $A\concat B$, the signature is welded to this specific run. Alice put a
+fresh, random $A$ on the wire; a valid signature over $A\concat B$ proves Bob
+acted \emph{after} seeing that fresh $A$, so the message cannot be a recording.
+
+\begin{whybox}[Why MITM dies here]
+Return to Eve from box~\ref{ch23:mitm}. To impersonate Bob to Alice, Eve must
+send some $B'$ and a signature $\sigma'$ with $\Vrfy_{pk_B}(A\concat B',\sigma')$
+accepting. But producing a valid signature under $pk_B$ on a message of her
+choosing is exactly an existential forgery --- the thing a secure signature
+scheme makes infeasible. Eve does not have $sk_B$. She is stuck. She can still
+relay the genuine messages unchanged, but then she has merely forwarded a real
+Alice--Bob exchange and learned nothing: the resulting $g^{ab}$ is secret from
+her by Computational Diffie-Hellman. The signature converts ``a key with
+somebody'' into ``a key with whoever owns $sk_B$,'' and the certificate says that
+owner is Bob.
+\end{whybox}
+
+\begin{trapbox}[Sign the transcript, not just your own share]
+A recurring real-world bug is signing too little. If a party signs only its own
+public value, or signs a message that omits the peer's nonce, an attacker can
+splice signed pieces from different sessions together. The discipline ``everyone
+signs a hash of the full transcript they have seen so far'' is what TLS 1.3's
+\texttt{CertificateVerify} does, and it is the safe default. We will see the
+matching idea --- a final MAC over the whole transcript --- in the downgrade
+discussion.
+\end{trapbox}
+
+\subsection{The crucial word: ephemeral}
+
+Notice that $a$ and $b$ are freshly chosen for this session and \emph{thrown away
+afterward}. The long-term keys ($sk_B$, and $sk_A$ if used) sign, but they never
+touch the shared secret $g^{ab}$. That separation --- long-term keys for
+\emph{authentication}, ephemeral keys for \emph{secrecy} --- is the structural
+move that buys forward secrecy. Hold that thought; it is the heart of the next
+section.
+
+\begin{historybox}
+The ``station-to-station'' (STS) protocol of Diffie, van Oorschot, and Wiener
+(1992) is essentially the signed-ephemeral-DH scheme above, with a refinement:
+each party signs the DH values and then MACs that signature under the new
+session key, which proves they actually computed the same key (``key
+confirmation''). STS is the direct ancestor of the authenticated handshakes in
+IKE (the IPsec key-exchange protocol), SSH, and TLS. The lineage from a 1976
+idea to the handshake protecting your bank login runs straight through here.
+\end{historybox}
+
+\subsection{Implicit authentication: long-term DH keys}
+
+Signatures are not the only way. Suppose instead Bob's long-term key \emph{is} a
+Diffie-Hellman key: a secret $b_{\mathrm{lt}}$ with public value
+$B_{\mathrm{lt}}=g^{b_{\mathrm{lt}}}$ that Alice trusts. Alice similarly has
+$a_{\mathrm{lt}}$, $A_{\mathrm{lt}}=g^{a_{\mathrm{lt}}}$. Then Alice and Bob can
+agree on a key with no signatures at all, because only the true owners of the
+long-term secrets can compute the right shared value.
+
+The cleanest illustration is the \emph{triple Diffie-Hellman} pattern used by
+Signal. Each party has a long-term ``identity'' key and a fresh ephemeral key:
+
+\[
+\text{Alice: } (a_{\mathrm{lt}},\, a_{\mathrm{eph}}),\qquad
+\text{Bob: } (b_{\mathrm{lt}},\, b_{\mathrm{eph}}),
+\]
+with the corresponding public values exchanged. They form the shared secret by
+hashing together several DH outputs:
+\[
+k = \Hash\!\big(\;
+g^{a_{\mathrm{lt}}\, b_{\mathrm{eph}}}\concat
+g^{a_{\mathrm{eph}}\, b_{\mathrm{lt}}}\concat
+g^{a_{\mathrm{eph}}\, b_{\mathrm{eph}}}
+\;\big).
+\]
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Stealth,node distance=6mm]
+  \node[align=center,fill=aliceblue!12,rounded corners,draw,minimum width=2.0cm] (alt) at (0,1.4) {$a_{\mathrm{lt}}$\\(Alice long-term)};
+  \node[align=center,fill=aliceblue!12,rounded corners,draw,minimum width=2.0cm] (aeph) at (0,-1.4) {$a_{\mathrm{eph}}$\\(Alice ephemeral)};
+  \node[align=center,fill=bobgreen!12,rounded corners,draw,minimum width=2.0cm] (blt) at (6,1.4) {$b_{\mathrm{lt}}$\\(Bob long-term)};
+  \node[align=center,fill=bobgreen!12,rounded corners,draw,minimum width=2.0cm] (beph) at (6,-1.4) {$b_{\mathrm{eph}}$\\(Bob ephemeral)};
+  \draw[->,thick] (alt) -- node[above,sloped,font=\scriptsize]{authenticates Alice} (beph);
+  \draw[->,thick] (aeph) -- node[below,sloped,font=\scriptsize]{authenticates Bob} (blt);
+  \draw[->,thick,structurepurple] (aeph) -- node[below,font=\scriptsize]{fresh randomness} (beph);
+\end{tikzpicture}
+\caption{The three Diffie-Hellman cross-products of triple DH. Each long-term-against-ephemeral
+arrow pins one party's identity; the ephemeral-against-ephemeral arrow injects per-session
+freshness for forward secrecy.}
+\label{ch23:tripledh}
+\end{figure}
+
+Read each factor as a claim. The first mixes Alice's \emph{long-term} key with
+Bob's \emph{ephemeral} --- only the real Alice (who knows $a_{\mathrm{lt}}$) and
+the sender of $b_{\mathrm{eph}}$ can form it, so it authenticates Alice. The
+second mixes Bob's long-term with Alice's ephemeral --- it authenticates Bob.
+The third mixes the two ephemerals --- it injects fresh, throwaway randomness so
+that the session secret depends on per-session coins (Figure~\ref{ch23:tripledh}). ``Implicit'' means there
+is no separate signature to verify: a party who can compute the same $k$ has, by
+that fact alone, proven it holds the right long-term secret.
+
+\begin{intuitionbox}
+A signature is a notarized letter: ``I, Bob, hereby endorse this handshake,''
+verifiable by anyone with Bob's public key. Implicit authentication is more like
+a secret handshake whose grip only works if both palms carry the right tattoo.
+Nobody signs anything; the key simply will not come out right unless you are who
+you claim to be. Signal prefers the implicit style partly because it leaves no
+signature on the wire --- a small but real privacy gain, since a signature is a
+non-repudiable record that you said a particular thing.
+\end{intuitionbox}
+
+\section{Forward secrecy}
+
+Here is the scenario that forward secrecy is built to survive. Eve cannot break
+your handshake today, so she does the patient thing: she records every encrypted
+session you have, byte for byte, and stores them. Months later she compromises
+your server --- a stolen laptop, a subpoena, a Heartbleed-style memory leak ---
+and walks away with your \emph{long-term private key}. The question that decides
+whether this is a catastrophe or a shrug:
+
+\begin{center}
+\emph{Does possessing the long-term key today let Eve decrypt the traffic she
+recorded yesterday?}
+\end{center}
+
+\begin{definition}[Perfect forward secrecy]
+\label{ch23:pfs}
+A key-exchange protocol has \emph{(perfect) forward secrecy} if the compromise of
+long-term secret keys does not compromise the session keys of \emph{past}
+sessions. Equivalently: an adversary who records a session and \emph{later}
+learns all the long-term private keys still cannot recover that session's key.
+\end{definition}
+
+The word ``perfect'' here is historical and a bit grandiose; people increasingly
+just say ``forward secrecy.'' The property is entirely about a \emph{time
+ordering}: secrets created and destroyed before the compromise stay safe.
+
+\subsection{Why ephemeral DH gives it, and static encryption does not}
+
+Picture two ways Alice could send Bob a session key.
+
+\textbf{Way 1 --- static key transport (no forward secrecy).} Alice picks a
+random session key $k$, encrypts it under Bob's long-term public key, and sends
+$\Enc_{pk_B}(k)$. This is essentially old TLS with RSA key transport. Eve records
+the ciphertext. Years later she steals $sk_B$. She computes
+$\Dec_{sk_B}(\Enc_{pk_B}(k)) = k$ and decrypts the whole recorded session. The
+long-term key is a \emph{master key to the past}. One compromise unlocks every
+session ever recorded under it. This is a disaster, and it is why this mode was
+removed from TLS 1.3.
+
+\textbf{Way 2 --- ephemeral DH (forward secrecy).} Alice and Bob run the signed
+ephemeral handshake. The session key is $g^{ab}$, derived from the ephemeral
+secrets $a$ and $b$, which both parties \emph{erase} as soon as the handshake
+finishes. The long-term key only \emph{signed}; it never touched $g^{ab}$. Now
+Eve steals $sk_B$ later. What can she do with it? She can forge signatures from
+\emph{now on} --- she can impersonate Bob in \emph{future} handshakes. But for
+the recorded past session she has only $g^a$, $g^b$, and a signature. To recover
+$g^{ab}$ from $g^a$ and $g^b$ is, again, Computational Diffie-Hellman --- and the
+stolen signing key is no help at all, because it has nothing to do with the DH
+secret. The ephemerals $a,b$ are gone, deleted. The past stays dark.
+
+\begin{whybox}[The one-sentence reason]
+Forward secrecy works because the session secret is computed from
+\emph{ephemeral} values that are destroyed after use, while the long-term key
+only \emph{authenticates} and never enters the secret. Compromising the
+authenticator cannot retroactively reconstruct secrets it never saw.
+\end{whybox}
+
+\begin{center}
+\begin{tikzpicture}[font=\small,>=Stealth,node distance=4mm]
+  \node[draw,fill=trapred!10,rounded corners,align=center,minimum width=4.6cm] (st)
+    {\textbf{Static key transport}\\ $\Enc_{pk_B}(k)$ recorded\\[2pt]
+     steal $sk_B$ later $\Rightarrow$ recover $k$\\
+     \textcolor{trapred}{\textbf{past is decrypted}}};
+  \node[draw,fill=bobgreen!10,rounded corners,align=center,minimum width=4.6cm,right=2.2cm of st] (eph)
+    {\textbf{Ephemeral DH}\\ $g^a,g^b$ recorded; $a,b$ erased\\[2pt]
+     steal $sk_B$ later $\Rightarrow$ only forge \emph{future}\\
+     \textcolor{bobgreen}{\textbf{past stays secret}}};
+\end{tikzpicture}
+\end{center}
+
+\begin{trapbox}[``Ephemeral'' is only as good as your delete]
+Forward secrecy is a property of the \emph{whole system}, not just the math. If
+your server keeps the ephemeral secret $b$ in memory, or worse logs it, or reuses
+one ``ephemeral'' value across thousands of connections to save CPU, then
+stealing it resurrects all those sessions. There is a real-world cautionary tale
+here: some servers cached a single DH ephemeral for the lifetime of the process
+(sometimes called a static-ephemeral or ``semi-static'' key) to avoid recomputing
+$g^b$. That quietly destroys forward secrecy for every session sharing the cached
+value. Ephemeral means \emph{generated fresh and wiped promptly}. If you cannot
+guarantee the wipe, you do not have the property.
+\end{trapbox}
+
+\begin{applicationbox}
+This is why every modern TLS deployment insists on ``(EC)DHE'' cipher suites ---
+the trailing \texttt{E} is for \emph{ephemeral}. TLS 1.3 went further and made
+ephemeral (elliptic-curve) Diffie-Hellman the \emph{only} key-establishment
+mechanism: static RSA key transport was deleted from the protocol outright,
+precisely because it lacked forward secrecy and made mass retroactive decryption
+a one-key-theft-away proposition. If you operate a server, ``do we have forward
+secrecy'' reduces to ``are we negotiating an ephemeral DH suite and actually
+discarding the ephemerals.''
+\end{applicationbox}
+
+\subsection{A worked tiny example}
+
+Numbers make the time-ordering concrete. Work in $\Zns{p}$ with the small prime
+$p=23$. The element $g=5$ generates the group ($5$ has order $22$ modulo $23$, so
+it is a generator). All arithmetic is mod $23$.
+
+\textbf{The session.} Alice picks ephemeral $a=6$, sends $A = 5^6 \bmod 23$.
+Compute: $5^2=25\equiv 2$, $5^3\equiv 10$, $5^6=(5^3)^2\equiv 10^2=100\equiv 8$.
+So $A=8$.
+
+Bob picks ephemeral $b=15$, sends $B = 5^{15}\bmod 23$. Compute by squaring:
+$5^1=5$, $5^2=2$, $5^4=2^2=4$, $5^8=4^2=16$. Then
+$5^{15}=5^{8}\cdot5^{4}\cdot5^{2}\cdot5^{1}=16\cdot4\cdot2\cdot5$. Step it out:
+$16\cdot4=64\equiv 18$; $18\cdot2=36\equiv 13$; $13\cdot5=65\equiv 19$. So $B=19$.
+
+\textbf{Shared secret.} Alice computes $B^a=19^{6}\bmod 23$ and Bob computes
+$A^b=8^{15}\bmod 23$; both equal $g^{ab}=5^{90}\bmod 23$. Since the group has
+order $22$, reduce the exponent: $90 = 4\cdot 22 + 2$, so
+$5^{90}\equiv 5^{2}\equiv 2 \pmod{23}$. The session secret is $2$. (You can check
+$19^6$ directly: $19\equiv -4$, $(-4)^6=4096$, and $4096 = 178\cdot 23 + 2$, so
+$19^6\equiv 2$. Agreement.)
+
+\textbf{Now the theft.} Suppose tomorrow Eve steals Bob's long-term \emph{signing}
+key. From the recorded wire she has $A=8$ and $B=19$. The signing key lets her
+forge signatures but tells her nothing about $a=6$ or $b=15$, which Alice and Bob
+deleted. To get the secret $2$ she must solve $5^x\equiv 8$ (find $a$) or
+$5^y\equiv 19$ (find $b$) --- a discrete log. With $p=23$ she could, of course,
+by brute force; that is the price of toy numbers. With a real $2048$-bit or
+$256$-bit-curve group, that search is the wall the whole field is built on. The
+structural point survives the small numbers: the stolen long-term key is no
+shortcut to the recorded session's secret.
+
+\section{From one group element to many keys: KDFs}
+
+The handshake hands you a single shared secret --- a group element like our $2$,
+or in practice a $256$-bit string. But a real session needs \emph{several}
+independent keys: one to encrypt client-to-server, one for server-to-client,
+maybe separate MAC keys, IVs, a key to confirm the handshake. You must not just
+slice the raw DH output into chunks and use them directly. Two reasons.
+
+First, the raw shared secret is not a uniform random string. A Diffie-Hellman
+value $g^{ab}$ in $\Zns{p}$ is an element of a structured set --- it is biased,
+it has algebraic relations, its bits are not independent. Cryptographic keys are
+supposed to be (indistinguishable from) uniform. We need to ``iron out'' the
+structure.
+
+Second, you want \emph{domain separation}: keys for different purposes must be
+provably unrelated, so that a flaw in one use cannot leak another. Reusing one
+key for two jobs is a classic footgun.
+
+The tool for both is a \emph{key derivation function} (KDF). The standard,
+HKDF, splits the job into two stages with the slogan \emph{extract-then-expand}.
+
+\begin{definition}[HKDF, extract-then-expand]
+\label{ch23:hkdf}
+Built from an HMAC keyed by a hash $\Hash$:
+\begin{itemize}
+  \item \textbf{Extract.} From the raw, non-uniform input keying material
+        $\mathrm{IKM}$ (here $\mathrm{IKM}=g^{ab}$) and an optional non-secret
+        \emph{salt}, produce a fixed-length, uniform-looking pseudorandom key:
+        \[ \mathrm{PRK} \;=\; \mathrm{HMAC}(\text{salt},\ \mathrm{IKM}). \]
+        This is the ``ironing'' step. HMAC, used as a randomness extractor,
+        concentrates whatever entropy is in $\mathrm{IKM}$ into a full-strength
+        uniform key $\mathrm{PRK}$.
+  \item \textbf{Expand.} From $\mathrm{PRK}$ and a per-key \emph{info} label,
+        stretch out as many key bytes as you need, one HMAC block at a time:
+        \[ T_i = \mathrm{HMAC}\big(\mathrm{PRK},\ T_{i-1}\concat \mathrm{info}\concat i\big),
+           \quad T_0 = \text{empty}, \]
+        and concatenate $T_1\concat T_2\concat\cdots$ to the requested length.
+        The \emph{info} string is where domain separation lives: feed
+        \texttt{"c hs traffic"} for one key and \texttt{"s hs traffic"} for
+        another, and the two outputs are unrelated.
+\end{itemize}
+\end{definition}
+
+\begin{intuitionbox}
+\emph{Extract} is a juicer: the raw DH element is lumpy fruit with entropy
+unevenly distributed; HMAC squeezes out a clean, uniform concentrate
+($\mathrm{PRK}$). \emph{Expand} is a vending machine: insert $\mathrm{PRK}$,
+punch a label (\texttt{"enc"}, \texttt{"mac"}, \texttt{"iv"}), and out comes a
+fresh independent key. Different labels, different keys, with a security
+guarantee that knowing one tells you nothing about the others. One handshake
+secret, a whole keyring out the other side.
+\end{intuitionbox}
+
+\begin{connectionbox}
+Why two stages instead of just ``hash the DH output''? It is the same
+distinction the probability companion draws between an \emph{extractor} (turn a
+weak, biased source into near-uniform bits --- a min-entropy and leftover-hash
+argument) and a \emph{pseudorandom generator} (stretch a short uniform seed into
+a long pseudorandom stream). Extract handles the non-uniform \emph{source};
+expand handles the \emph{length}. Conflating them is how subtle biases sneak from
+the group into your keys. The HMAC indistinguishability that makes expand safe is
+the same PRF property developed in the MAC chapter.
+\end{connectionbox}
+
+\begin{implementbox}[Toy HKDF over a real hash --- learning only]
+This shows the extract-then-expand shape. It is a teaching toy: no constant-time
+care, no memory wiping, and it leans on the standard library for HMAC. \textbf{Do
+not use this in production --- use your platform's vetted HKDF.}
+\begin{lstlisting}[language=Python]
+import hmac, hashlib
+
+def _hmac(key, msg):
+    return hmac.new(key, msg, hashlib.sha256).digest()
+
+def hkdf_extract(salt, ikm):
+    # salt acts as the HMAC key; if absent, use a zero block
+    if not salt:
+        salt = b"\x00" * hashlib.sha256().digest_size
+    return _hmac(salt, ikm)            # PRK: one uniform pseudorandom key
+
+def hkdf_expand(prk, info, length):
+    out, t, counter = b"", b"", 1
+    while len(out) < length:
+        # T_i = HMAC(PRK, T_{i-1} || info || i)
+        t = _hmac(prk, t + info + bytes([counter]))
+        out += t
+        counter += 1
+    return out[:length]
+
+def hkdf(salt, ikm, info, length):
+    return hkdf_expand(hkdf_extract(salt, ikm), info, length)
+
+# One shared DH secret -> several independent keys via different labels
+shared = b"raw-diffie-hellman-output-not-uniform"
+prk_salt = b"handshake transcript hash goes here"
+enc_key = hkdf(prk_salt, shared, b"c2s enc", 32)   # client->server
+dec_key = hkdf(prk_salt, shared, b"s2c enc", 32)   # server->client
+mac_key = hkdf(prk_salt, shared, b"c2s mac", 32)
+print(enc_key.hex())
+print(dec_key.hex())     # unrelated to enc_key, by domain separation
+\end{lstlisting}
+The three keys come from one shared secret yet are computationally independent:
+flipping the \texttt{info} label is all it takes. In TLS 1.3 the ``salt'' is
+literally a running hash of the handshake transcript, which is how the derived
+keys also become bound to everything said so far --- a point we exploit next.
+\end{implementbox}
+
+\section{Replay and downgrade}
+
+Two active attacks deserve their own treatment because they bypass secrecy
+entirely and attack the \emph{protocol logic}.
+
+\subsection{Replay}
+
+A \emph{replay} attack records a valid protocol message and re-sends it later.
+The classic damage: Eve records Alice's encrypted ``transfer \$100 to Eve''
+message and replays it ten times. Each copy is a perfectly valid ciphertext;
+encryption alone does not notice it is a duplicate.
+
+The defense in key exchange is \emph{freshness}: weave an unpredictable,
+single-use value into each session so that a recording from one run is invalid in
+another. Ephemeral DH already does this for you --- the secret is $g^{ab}$ with
+fresh $a,b$, so a captured handshake cannot be replayed to produce a usable key
+in a new session, because the peer chose a new ephemeral. More generally,
+protocols add explicit \emph{nonces} (numbers used once) or per-session
+\emph{counters}, and require every authenticated message to cover them.
+
+\begin{trapbox}[The 0-RTT replay hole in TLS 1.3]
+TLS 1.3 offers a ``0-RTT'' (zero round-trip) mode where a returning client can
+send application data in its very first flight, encrypted under a key derived
+from a secret remembered from a previous connection. The speed is wonderful and
+the security caveat is sharp: because that first-flight data is \emph{not} bound
+to a fresh server ephemeral (the server has not spoken yet), it is
+\emph{replayable}. Eve can capture the 0-RTT data and re-send it to the server
+multiple times. The protocol therefore restricts 0-RTT to \emph{idempotent}
+requests (a \texttt{GET} you can safely repeat), never a ``transfer money''
+\texttt{POST}, and servers maintain anti-replay caches. Freshness lost is replay
+gained --- the trade is explicit and it is the application's job to respect it.
+\end{trapbox}
+
+\subsection{Downgrade}
+
+A \emph{downgrade} attack does not break strong crypto; it tricks the parties
+into \emph{negotiating weak crypto}. Real protocols support many cipher suites
+and versions for backward compatibility. Negotiation usually starts with the
+client advertising what it supports in cleartext --- before any key exists to
+protect that list. So Eve, sitting in the middle, edits the list.
+
+\begin{attackbox}[Strip the strong options]
+Alice's ClientHello offers, say, modern ephemeral-ECDH suites \emph{and}, for an
+ancient peer, an export-grade $512$-bit DH suite. Eve intercepts it and deletes
+every strong option, leaving only the weak one. Bob, seeing only the weak choice,
+agrees to it. Now the session uses $512$-bit DH, which Eve can break with modest
+precomputation --- and she reads everything. Neither party intended weak crypto;
+the negotiation itself was unauthenticated. This is the shape of the real
+\textsc{Logjam} and \textsc{FREAK} attacks (2015), which forced browsers and
+servers to drop export-grade suites entirely.
+\end{attackbox}
+
+The defense is \emph{transcript authentication}: at the end of the handshake,
+once a key exists, each party computes a MAC (or signature) over a hash of
+\emph{every handshake message it sent and received}, and the peer checks it.
+
+\begin{whybox}[Why a final transcript MAC stops downgrade]
+If Eve edited the negotiation, Alice's recorded transcript and Bob's recorded
+transcript \emph{disagree} --- Alice ``sent'' a strong-suites list, Bob
+``received'' a stripped one. When each side MACs its own transcript hash under
+the freshly derived key and sends it for the other to verify, the two MACs cover
+different inputs and \emph{will not match}. The handshake aborts. Eve cannot fix
+this by forging a matching MAC, because the MAC key is the session secret she
+does not have. So any mid-handshake tampering, including a downgrade edit, is
+detected the moment the parties cross-check transcripts. This ``Finished''
+message is exactly how TLS seals its handshake, and it is the same key-confirmation
+idea that the station-to-station protocol introduced.
+\end{whybox}
+
+\begin{intuitionbox}
+Downgrade is a forged restaurant menu: Eve hands Bob a menu with only the
+spoiled dish listed, hoping he orders it. The transcript MAC is Alice and Bob, at
+the end of the meal, reading their menus aloud to each other. If the menus
+differ, somebody tampered, and they walk out. The negotiation can happen in the
+clear; it just has to be \emph{ratified} under the key once the key exists.
+\end{intuitionbox}
+
+\section{Putting it together: the shape of TLS 1.3 and Signal}
+
+We now have every piece. Let us see the two protocols that assemble them, because
+they make different choices for different reasons.
+
+\subsection{TLS 1.3 in one breath}
+
+\begin{center}
+\begin{tikzpicture}[font=\footnotesize,>=Stealth]
+  \node[draw,rounded corners,fill=aliceblue!12] (C) at (0,0) {Client};
+  \node[draw,rounded corners,fill=bobgreen!12] (S) at (10,0) {Server};
+  \draw[->] (1.0,0.9) -- node[above,align=center]{ClientHello: nonce, supported suites,\\ ephemeral $g^a$} (9.0,0.9);
+  \draw[<-] (1.0,0.25) -- node[below,align=center]{ServerHello: nonce, chosen suite, ephemeral $g^b$} (9.0,0.25);
+  \draw[<-] (1.0,-0.55) -- node[below,align=center]{\{Certificate, CertificateVerify=$\Sign_{sk_S}(\text{transcript})$,\\ Finished=MAC(transcript)\}} (9.0,-0.55);
+  \draw[->] (1.0,-1.65) -- node[below,align=center]{\{Finished=MAC(transcript)\}, application data} (9.0,-1.65);
+  \node[font=\scriptsize,gray] at (5,-2.3) {\{$\cdots$\} = encrypted under handshake keys derived by HKDF from $g^{ab}$};
+\end{tikzpicture}
+\end{center}
+
+Trace the parts you built:
+\begin{itemize}
+  \item The exchanged $g^a,g^b$ are \emph{ephemeral} ECDH --- forward secrecy by
+        construction (Definition~\ref{ch23:pfs}).
+  \item \texttt{CertificateVerify} is the server \emph{signing the transcript}
+        with its long-term key --- signed ephemeral DH, authenticating the server
+        (and the certificate ties $pk_S$ to the hostname, the PKI chapter's job).
+  \item The handshake and application keys come from $g^{ab}$ through HKDF, with
+        the transcript hash as salt --- one secret, a keyring, all bound to what
+        was said.
+  \item The two \texttt{Finished} MACs are the \emph{transcript authentication}
+        that kills downgrade and confirms both sides derived the same key.
+  \item Nonces in the Hellos provide \emph{freshness} against replay.
+\end{itemize}
+Every defense in this chapter appears exactly once. That is not a coincidence;
+TLS 1.3 was designed by stripping the protocol down to precisely these
+guarantees and removing everything (static RSA, renegotiation, weak suites) that
+violated them.
+
+\subsection{Signal in one breath}
+
+Signal solves a harder problem: the recipient is usually \emph{offline} when the
+first message arrives, so there is no live round trip. Its X3DH (``extended
+triple Diffie-Hellman'') handshake lets Alice start a session against a bundle of
+Bob's public keys that he published to a server in advance.
+
+Bob pre-publishes an \emph{identity key} (long-term), a \emph{signed prekey}
+(medium-term, signed by his identity key so Alice can trust it), and a batch of
+one-time \emph{prekeys}. Alice fetches a bundle, generates her own ephemeral, and
+computes the multi-DH secret from the earlier section --- mixing her ephemeral
+and identity keys against Bob's signed prekey, identity key, and a one-time
+prekey:
+\[
+k=\Hash\big(\,
+\mathrm{DH}(a_{\mathrm{id}},\,B_{\mathrm{spk}})\concat
+\mathrm{DH}(a_{\mathrm{eph}},\,B_{\mathrm{id}})\concat
+\mathrm{DH}(a_{\mathrm{eph}},\,B_{\mathrm{spk}})\concat
+\mathrm{DH}(a_{\mathrm{eph}},\,B_{\mathrm{otp}})\,\big).
+\]
+Read the pieces with the eyes we trained: identity-against-something terms supply
+\emph{implicit authentication} of each party; the ephemeral terms supply
+\emph{forward secrecy}; the one-time prekey $B_{\mathrm{otp}}$, consumed and
+deleted after a single use, adds replay resistance and an extra layer of forward
+secrecy for that very first message. The signed prekey carries the
+\emph{signature-based} authentication (Bob's identity key signs it). Then HKDF
+turns $k$ into the initial chain keys, and the ``double ratchet'' takes over from
+there to refresh keys per message --- pushing forward secrecy down to the
+granularity of individual texts.
+
+\begin{applicationbox}
+The contrast is instructive. TLS authenticates with a \emph{signature} over the
+transcript because a web server is online and wants any client to verify it
+against a public certificate chain. Signal authenticates \emph{implicitly} with
+long-term DH keys because it wants asynchronous, no-round-trip session setup and
+prefers to leave no signed, non-repudiable record of who said what. Both reach
+the same destination --- an authenticated, forward-secret session key fed through
+HKDF --- by the routes that fit their setting. WireGuard's handshake (the modern
+VPN) is a third point in the same design space: it uses the implicit, DH-only
+``Noise'' framework, no certificates at all, with both parties' static keys
+pre-known.
+\end{applicationbox}
+
+\begin{focusbox}[The whole chapter on one page]
+A deployable key exchange is ephemeral Diffie-Hellman (for \emph{forward
+secrecy}) plus an \emph{authenticator} bound to the transcript (a signature, as
+in TLS, or implicit long-term-DH terms, as in Signal) --- which kills the
+\emph{man-in-the-middle} --- plus \emph{nonces} (against replay) and a final
+\emph{transcript MAC} (against downgrade) --- with the one shared secret fanned
+out into many independent keys by \emph{HKDF}. Lose the ephemerals' freshness and
+you lose forward secrecy; lose the transcript binding and you lose authentication
+or downgrade protection. Every real handshake is some arrangement of exactly
+these moving parts.
+\end{focusbox}
+
+\section{Exercises}
+
+\begin{exercise}
+In the man-in-the-middle attack of box~\ref{ch23:mitm}, Eve must actively relay
+messages for the whole session. Suppose she goes offline halfway through, after
+Alice and Bob have each computed their keys $k_A=g^{ae}$ and $k_B=g^{be}$.
+Describe exactly what breaks for Alice and Bob, and explain why this means a MITM
+on unauthenticated DH must stay present for the entire conversation.
+\end{exercise}
+
+\begin{exercise}
+Work the toy handshake in $\Zns{23}$ with $g=5$ for new ephemerals $a=9$ and
+$b=4$. Compute $A=g^a$, $B=g^b$, and the shared secret $g^{ab}$, reducing the
+exponent modulo the group order $22$. Verify Alice's and Bob's computations
+agree.
+\end{exercise}
+
+\begin{exercise}
+Explain precisely why a server that caches one ``ephemeral'' DH value $g^b$ and
+reuses it for an hour of connections \emph{still authenticates correctly} but
+\emph{loses forward secrecy}. What does an attacker who steals that cached $b$
+recover, and over what set of sessions?
+\end{exercise}
+
+\begin{exercise}
+Consider the signed handshake but with Bob signing only $B$, not $A\concat B$.
+Give a concrete replay attack in which Eve causes Alice to accept a session using
+a $B$ that Bob produced in an \emph{earlier, unrelated} session. Then show that
+signing $A\concat B$ defeats your attack.
+\end{exercise}
+
+\begin{exercise}
+Prove a small lemma about HKDF's domain separation under the assumption that
+HMAC keyed by $\mathrm{PRK}$ is a pseudorandom function. Argue that for distinct
+labels $\mathrm{info}_1\neq\mathrm{info}_2$, an adversary given the expanded
+output for $\mathrm{info}_1$ cannot distinguish the output for $\mathrm{info}_2$
+from random. (Hint: reduce to the PRF security of HMAC; the labels become
+distinct inputs.)
+\end{exercise}
+
+\begin{exercise}
+A protocol designer proposes to skip the Extract stage of HKDF and feed the raw
+Diffie-Hellman element $g^{ab}\in\Zns{p}$ directly into Expand as the
+$\mathrm{PRK}$. Give two distinct reasons this is dangerous, one about the
+\emph{non-uniformity} of $g^{ab}$ and one about \emph{small-subgroup} structure
+(what if $g^{ab}$ lands in a small subgroup?). Relate each to a property HKDF's
+Extract is supposed to provide.
+\end{exercise}
+
+\begin{exercise}
+Reconstruct the \textsc{Logjam}-style downgrade at the protocol level. Alice
+offers suites $\{\text{ECDHE-strong},\ \text{DHE-export-512}\}$; Eve wants the
+export suite chosen. Write the message Eve forwards to Bob, the message Bob
+returns, and then show exactly where the final transcript-MAC check (if present)
+would have caught her --- and why it does not if the handshake omits transcript
+authentication.
+\end{exercise}
+
+\begin{exercise}
+In TLS 1.3 0-RTT, explain why data in the client's first flight is replayable
+while data sent \emph{after} the server's ServerHello is not. Identify the
+specific ingredient (from this chapter) that the later data has and the 0-RTT
+data lacks. Then classify which of these HTTP requests are safe to send as 0-RTT:
+\texttt{GET /balance}, \texttt{POST /transfer}, \texttt{GET /logo.png},
+\texttt{POST /search}.
+\end{exercise}
+
+\begin{exercise}
+In Signal's X3DH secret, identify which of the four DH terms would still be
+computable by an attacker who has stolen \emph{Bob's long-term identity private
+key but none of his ephemeral/prekey secrets}, and which remain out of reach.
+Use this to argue that X3DH gives forward secrecy for the initial message with
+respect to identity-key compromise.
+\end{exercise}
+
+\begin{exercise}
+Mutual authentication: modify the signed-ephemeral-DH protocol so that Bob also
+verifies Alice. State exactly what Alice signs and what Bob checks, and explain
+why both signatures must cover the \emph{same} transcript value rather than each
+party signing only its own ephemeral.
+\end{exercise}
