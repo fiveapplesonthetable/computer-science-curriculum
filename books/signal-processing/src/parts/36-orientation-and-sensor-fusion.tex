@@ -1,0 +1,804 @@
+\chapter{Orientation Estimation and Sensor Fusion}
+
+In the last two chapters we met the three little sensors that live inside an inertial
+measurement unit (IMU) -- the accelerometer that feels gravity and motion, the
+gyroscope that feels rotation, the magnetometer that feels the Earth's field -- and we
+learned to calibrate the raw numbers into trustworthy physical units. But raw numbers are
+not what we ultimately want. When you tilt your wrist to bend a note, or roll your
+forearm to sweep a filter, the thing that matters is not ``what is the acceleration
+along the chip's $x$-axis right now'' -- it is \emph{which way is the wrist pointing}.
+That single question -- the device's \emph{orientation} in space, also called its
+\emph{attitude} or \emph{pose} -- is the subject of this chapter.
+
+Orientation is a deceptively rich quantity. It is not three numbers you can simply add
+up; it lives on a curved space (the set of rotations), and the naive ways of writing
+it down hide nasty traps. Worse, none of our three sensors measures orientation
+directly. The gyro measures the \emph{rate of change} of orientation, so to get
+orientation you must integrate -- and integration quietly accumulates error until your
+estimate slowly walks away from the truth. The accelerometer and magnetometer, by
+contrast, give you \emph{absolute} references (down, and roughly north) but they are
+noisy and, for the accelerometer, corrupted by every real motion. Neither sensor alone
+is trustworthy. The art of combining them so that each covers the other's weakness is
+called \emph{sensor fusion}, and it is one of the most satisfying applications of the
+ideas in the companion linear-algebra and probability books: orientation as geometry,
+fusion as optimal estimation under noise.
+
+We will build the picture from the ground up. First, how do you even \emph{represent}
+a rotation -- Euler angles and their gimbal-lock trap, rotation matrices, and the
+quaternion that practitioners actually use? Then, why does the gyro drift and why are
+the accelerometer and magnetometer ``absolute but noisy''? Then the central trick: the
+\emph{complementary filter}, which is just a high-pass on the gyro plus a low-pass on
+the accelerometer, fused in the frequency domain you already understand. We will derive
+the \emph{Kalman filter} intuitively as the optimal version of that same idea, and meet
+the \emph{Madgwick} and \emph{Mahony} filters that run on real microcontrollers. We
+close, as always, with the wrist tracker: how to get a stable wrist orientation, and a
+clear accounting of what orientation can and cannot tell you about the hand.
+
+\section{What orientation is, geometrically}
+\label{ch36:what-orientation-is}
+
+Fix two coordinate frames. One is glued to the world: call it the \emph{navigation
+frame} or \emph{Earth frame}, with axes pointing, say, North, East, and Down (the NED
+convention). The other is glued to the sensor chip and tumbles with it: the \emph{body
+frame}, with axes along the chip's own $x$, $y$, $z$. \emph{Orientation} is the answer
+to a single question: how is the body frame rotated relative to the world frame? Every
+way of writing down orientation is just a different bookkeeping for that one rotation.
+
+\begin{intuitionbox}
+Hold your phone flat on the table, screen up. Body frame and world frame agree --
+zero rotation. Now tip the phone up to read it: you have rotated the body frame about
+a horizontal axis. Spin in your chair while holding it: another rotation, about
+vertical. Orientation is the \emph{total} rotation that carries the world axes onto the
+body axes. The point of this chapter is that ``a rotation'' is a single geometric
+object, and Euler angles, matrices, and quaternions are three languages for naming the
+same object.
+\end{intuitionbox}
+
+A crucial fact, easy to forget, is that rotations do \emph{not commute}. Tip then
+spin lands you somewhere different from spin then tip. Try it with the phone: the final
+orientations genuinely differ. This non-commutativity is the deep reason rotations are
+subtle, and it is exactly what gimbal lock and quaternion algebra are wrestling with.
+
+\subsection{Euler angles: three turns in a row}
+\label{ch36:euler}
+
+The most human way to describe an orientation is as a sequence of three simple turns
+about axes: \emph{roll} $\phi$ about the forward $x$-axis, \emph{pitch} $\theta$ about
+the side $y$-axis, and \emph{yaw} $\psi$ about the down $z$-axis. Aircraft people have
+used these names for a century: roll dips a wingtip, pitch raises the nose, yaw swings
+the nose left or right. Any orientation can be reached by some $(\phi,\theta,\psi)$.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=1.0,>=Stealth]
+  % body axes
+  \draw[->,thick,sourceblue] (0,0,0) -- (2.4,0,0) node[right]{$x$ (roll, $\phi$)};
+  \draw[->,thick,targetgreen] (0,0,0) -- (0,2.0,0) node[above]{$z$ (yaw, $\psi$)};
+  \draw[->,thick,quotientorange] (0,0,0) -- (0,0,2.4) node[below left]{$y$ (pitch, $\theta$)};
+  % rotation arcs
+  \draw[->,sourceblue,thick] (1.6,0,0) ++(0,0.5,0) arc (90:-30:0.5);
+  \draw[->,quotientorange,thick] (0,0,1.6) ++(0.5,0,0) arc (0:120:0.5);
+  \node[structurepurple] at (1.9,1.4,0) {\small body frame};
+\end{tikzpicture}
+\caption{Euler angles describe orientation as three successive turns: roll about the
+forward axis, pitch about the side axis, yaw about the vertical axis. Intuitive, but
+the order matters and the scheme has a singularity (Section~\ref{ch36:gimbal}).}
+\label{ch36:fig-euler}
+\end{figure}
+
+Euler angles are wonderful for talking to humans -- ``pitch up thirty degrees'' is
+instantly clear -- and they are how we will report the final answer. But three numbers
+hide three problems. First, the \emph{order} matters (roll-pitch-yaw $\neq$
+yaw-pitch-roll), so you must commit to a convention. Second, the angles \emph{wrap}:
+$359^\circ$ and $-1^\circ$ are the same heading, so naive averaging or differencing
+goes wrong near the wrap. Third, and most dangerous, is gimbal lock.
+
+\subsection{The gimbal-lock trap}
+\label{ch36:gimbal}
+
+\begin{trapbox}
+When pitch reaches $\pm 90^\circ$, the roll axis and the yaw axis line up and become
+the \emph{same} physical axis. You have lost a degree of freedom: two of your three
+numbers now do the same thing, and the third has become undefined. This is
+\emph{gimbal lock}. Near it, tiny real motions demand huge, fast changes in the Euler
+angles, so any estimator that stores orientation as Euler angles becomes numerically
+violent there.
+\end{trapbox}
+
+\begin{intuitionbox}
+Picture a camera on a mechanical gimbal with three nested rings: outer ring yaws,
+middle ring pitches, inner ring rolls. Pitch the middle ring up to $90^\circ$ so the
+camera stares at the sky. Now the inner (roll) ring and the outer (yaw) ring spin about
+the \emph{same} vertical line. Spinning either one just rotates the picture; you can no
+longer tip the camera sideways without moving the locked middle ring. A whole direction
+of motion has vanished from your control. The Apollo guidance computer had a real
+gimbal-locked inertial platform; astronauts were warned to avoid certain attitudes, and
+mission control joked grimly about ``going to gimbal lock.''
+\end{intuitionbox}
+
+Gimbal lock is not a bug you can patch out of Euler angles; it is a topological fact.
+There is no way to cover the full space of 3-D rotations with three smooth angle
+coordinates without a singularity somewhere -- the same reason every flat map of the
+globe distorts the poles. The fix is to stop forcing orientation into three numbers.
+We move to representations that are \emph{global} and \emph{smooth}: rotation matrices
+(nine numbers, six constraints) and quaternions (four numbers, one constraint).
+
+\subsection{Rotation matrices}
+\label{ch36:rotmat}
+
+A rotation in three dimensions is a linear map that preserves lengths and angles and
+keeps the handedness of space. In the language of the linear-algebra companion, it is an
+orthogonal matrix with determinant $+1$ -- an element of the group $SO(3)$. Write
+$\mat{R}$ for the matrix that takes a vector's coordinates in the body frame and gives
+its coordinates in the world frame:
+\[
+  \vec{v}_{\text{world}} = \mat{R}\,\vec{v}_{\text{body}}, \qquad
+  \mat{R}^\top \mat{R} = \mat{I}, \qquad \det \mat{R} = +1 .
+\]
+The columns of $\mat{R}$ are the body axes expressed in world coordinates -- so $\mat R$
+literally \emph{is} a picture of where the chip's axes are pointing. The single
+elementary rotations are the ones you would guess; for example a rotation by $\theta$
+about the $y$-axis is
+\[
+  \mat{R}_y(\theta) =
+  \begin{bmatrix} \cos\theta & 0 & \sin\theta \\ 0 & 1 & 0 \\ -\sin\theta & 0 & \cos\theta \end{bmatrix},
+\]
+and the full Euler orientation is a product like
+$\mat{R} = \mat{R}_z(\psi)\,\mat{R}_y(\theta)\,\mat{R}_x(\phi)$. The non-commutativity
+of rotations is now obvious: matrix multiplication does not commute.
+
+\begin{whybox}
+Rotation matrices never gimbal-lock and compose by plain multiplication, which makes
+them excellent for \emph{computing}. Their drawback is redundancy: nine numbers for
+three degrees of freedom, tied by six constraints ($\mat R^\top\mat R=\mat I$). When you
+integrate a matrix forward in time with finite-precision arithmetic, those constraints
+slowly rot -- the columns drift out of orthonormality -- so you must periodically
+\emph{re-orthonormalize}. Quaternions carry only one constraint and are cheaper to keep
+clean, which is why they win in practice.
+\end{whybox}
+
+\subsection{Quaternions: the practitioner's choice}
+\label{ch36:quat}
+
+The quaternion is the representation almost every real attitude filter uses internally.
+It is a four-number object $q = (q_w,\,q_x,\,q_y,\,q_z)$, often written
+$q = q_w + q_x\jj_1 + q_y\jj_2 + q_z\jj_3$ with three imaginary units. The geometry
+behind the algebra is clean and is the only part you must \emph{feel}:
+
+\begin{intuitionbox}
+\textbf{Euler's rotation theorem.} Any orientation, however complicated, equals a single
+rotation by some angle $\alpha$ about some fixed axis $\hat{\vec n}$ (a unit vector).
+A unit quaternion packs exactly that axis and angle into four numbers:
+\[
+  q = \Big(\cos\tfrac{\alpha}{2},\ \ \hat n_x \sin\tfrac{\alpha}{2},\ \
+            \hat n_y \sin\tfrac{\alpha}{2},\ \ \hat n_z \sin\tfrac{\alpha}{2}\Big).
+\]
+The scalar part remembers \emph{how much} you turned; the vector part remembers
+\emph{about what axis}. The half-angle is the famous quirk -- a full $360^\circ$ turn
+gives $-q$ and a $720^\circ$ turn returns to the start. For our purposes you only need:
+unit quaternions name rotations, and there are no singularities.
+\end{intuitionbox}
+
+Three facts let you use quaternions without drowning in algebra. (1) A \emph{unit}
+quaternion, $\norm{q} = 1$, represents a rotation; you renormalize after each update to
+keep it on the unit sphere -- one constraint, cheap. (2) Rotations \emph{compose} by
+the quaternion product $q_2 \otimes q_1$ (do $q_1$ then $q_2$), which is just a fixed
+bilinear formula. (3) To rotate a vector $\vec v$, sandwich it:
+$\vec v' = q \otimes \vec v \otimes q^{-1}$. The quaternion product is non-commutative,
+exactly mirroring the non-commutativity of rotations.
+
+\begin{formalbox}
+The Hamilton product of $a=(a_w,\vec a)$ and $b=(b_w,\vec b)$ (scalar part, vector part) is
+\[
+  a\otimes b = \big(a_w b_w - \vec a\cdot\vec b,\ \ a_w \vec b + b_w \vec a + \vec a\times\vec b\big).
+\]
+For a unit quaternion the inverse is the conjugate $q^{-1}=q^{*}=(q_w,-\vec q)$. The
+rotation matrix equivalent to $q$ is
+\[
+  \mat R(q)=\begin{bmatrix}
+  1-2(q_y^2+q_z^2) & 2(q_xq_y-q_wq_z) & 2(q_xq_z+q_wq_y)\\
+  2(q_xq_y+q_wq_z) & 1-2(q_x^2+q_z^2) & 2(q_yq_z-q_wq_x)\\
+  2(q_xq_z-q_wq_y) & 2(q_yq_z+q_wq_x) & 1-2(q_x^2+q_y^2)
+  \end{bmatrix}.
+\]
+You convert to Euler angles only at the very end, for display, and you keep the
+quaternion as the working state.
+\end{formalbox}
+
+\begin{historybox}
+Quaternions were carved by William Rowan Hamilton into the stone of Broom Bridge in
+Dublin on 16 October 1843, in a flash of insight while walking with his wife: the
+relation $\jj_1^2=\jj_2^2=\jj_3^2=\jj_1\jj_2\jj_3=-1$. For decades they were a
+mathematical curiosity, eclipsed by vector calculus. Their revenge came with the space
+age and computer graphics, where their freedom from gimbal lock and their cheap,
+stable composition made them indispensable. Every spacecraft, drone, and VR headset
+today tracks attitude with quaternions.
+\end{historybox}
+
+\begin{connectionbox}
+This is the linear-algebra companion made physical. Rotation matrices are the orthogonal
+matrices ($\mat R^\top\mat R=\mat I$) from the chapter on orthonormal bases; their
+columns are an orthonormal basis -- the body axes. Quaternions are the unit-norm
+elements of a 4-D algebra; ``rotate by sandwiching'' is a conjugation, the same pattern
+as a change of basis $\mat P \mat A \mat P^{-1}$. Orientation lives on a curved manifold
+($SO(3)$), which is precisely why no flat three-number chart (Euler angles) can cover it
+without a singularity.
+\end{connectionbox}
+
+\section{Why each sensor is not enough alone}
+\label{ch36:why-not-enough}
+
+We now have a language for orientation. Where do the numbers come from? Each sensor
+offers a partial, flawed view. Fusion is worth doing only because the flaws are
+\emph{complementary}.
+
+\subsection{The gyroscope: smooth but drifting}
+\label{ch36:gyro-drift}
+
+A gyroscope measures \emph{angular rate} $\boldsymbol\omega(t)$ -- how fast the body is
+rotating, in rad/s, about each body axis. To get orientation you integrate. In
+quaternion form the kinematics are a clean differential equation,
+\[
+  \dot q = \tfrac{1}{2}\, q \otimes (0,\ \boldsymbol\omega),
+\]
+which in a microcontroller becomes the discrete step $q_{k} = q_{k-1} \otimes
+\Delta q(\boldsymbol\omega_k,\Delta t)$, renormalized. Integration is the gyro's gift
+and its curse. Because it accumulates rate, the gyro is remarkably \emph{smooth} and
+responsive over short times -- it tracks fast wrist flicks accurately. But it has no
+idea where ``down'' is, and every small error in the rate accumulates.
+
+\begin{happeningbox}
+Two things make integrated gyro orientation walk away from the truth. The big one is
+\emph{bias}: a real gyro reads a small nonzero rate even when perfectly still (recall
+the calibration chapter). Integrating a constant bias $b$ gives an angle error that
+grows \emph{linearly}, $b\cdot t$ -- a steady drift. The second is \emph{random-walk}:
+broadband noise on the rate, once integrated, performs a random walk whose spread grows
+like $\sqrt{t}$. Bias dominates after a few seconds. A cheap MEMS gyro might drift a
+degree or more per second -- tolerable for a one-second gesture, ruinous over a minute.
+\end{happeningbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.0cm,
+  xlabel={time $t$ (s)}, ylabel={heading error (deg)},
+  xmin=0,xmax=30,ymin=-5,ymax=35, domain=0:30, samples=120,
+  legend pos=north west, legend cell align=left, grid=both,
+  axis lines=left, every axis plot/.append style={thick}]
+  \addplot[sourceblue,thick] {1.0*x};
+  \addlegendentry{integrated gyro (drift $\approx 1^\circ$/s)}
+  \addplot[specred,only marks,mark=*,mark size=0.6pt,samples=120,domain=0:30]
+      {2.2*sin(deg(2.3*x))+1.6*cos(deg(1.1*x+1))};
+  \addlegendentry{accel/mag estimate (noisy, no drift)}
+  \addplot[targetgreen,thick,dashed] {0.0};
+  \addlegendentry{truth}
+\end{axis}
+\end{tikzpicture}
+\caption{The complementary flaws. The integrated gyro (blue) is smooth but ramps away
+from truth as bias accumulates. The accelerometer/magnetometer estimate (red dots) is
+jittery but stays centered on truth -- no drift. Fusion keeps the gyro's smoothness at
+short times and the accel/mag's long-term anchoring.}
+\label{ch36:fig-drift}
+\end{figure}
+
+\subsection{Accelerometer and magnetometer: noisy but absolute}
+\label{ch36:absolute}
+
+A stationary accelerometer measures the reaction to gravity: it reports an upward $1g$
+specific force, which points along world ``up'' regardless of how long you have been
+running. That gives you two of the three orientation angles directly -- \emph{roll} and
+\emph{pitch} (the tilt of the body relative to gravity) -- as
+\[
+  \phi = \operatorname{atan2}(a_y,\,a_z), \qquad
+  \theta = \operatorname{atan2}\!\big(-a_x,\ \sqrt{a_y^2+a_z^2}\big).
+\]
+These are \emph{absolute}: they do not drift, because gravity does not drift. The
+magnetometer plays the same role for the remaining angle, \emph{yaw} (heading): the
+Earth's field points roughly toward magnetic north, giving an absolute compass bearing
+once you have tilt-compensated it using the accel-derived roll and pitch.
+
+\begin{trapbox}
+The accelerometer measures gravity \emph{plus all other acceleration}. The moment the
+wrist actually moves -- and a gesture is nothing but motion -- the accel vector is
+gravity contaminated by the motion you are trying to track. So the accel's ``down'' is
+only trustworthy when the device is nearly still, or on average over time. Likewise the
+magnetometer is wrecked by nearby steel, motors, speakers, and the very electronics on
+your board (hard- and soft-iron distortion from the calibration chapter). Both
+absolute references are \emph{noisy and intermittently wrong}; only the gyro is reliable
+moment to moment.
+\end{trapbox}
+
+The pattern is now sharp, and it is a frequency-domain pattern, which means we already
+own the tools to exploit it:
+\begin{itemize}
+  \item The \textbf{gyro} is trustworthy at \emph{high} frequencies (fast changes) and
+        untrustworthy at \emph{low} frequencies / DC (slow drift, bias).
+  \item The \textbf{accel/mag} are trustworthy at \emph{low} frequencies (the long-term
+        average really is down/north) and untrustworthy at \emph{high} frequencies
+        (motion and noise).
+\end{itemize}
+Two signals that are each good in opposite halves of the spectrum -- and we know exactly
+how to glue those: a high-pass on one, a low-pass on the other, added together so the
+filters sum to unity. That is the complementary filter.
+
+\section{The complementary filter}
+\label{ch36:complementary}
+
+\begin{whybox}
+Let $\theta_g$ be the orientation you get by integrating the gyro and $\theta_a$ the
+orientation you get from the accelerometer (and magnetometer). Choose a high-pass
+$H(s)$ and a low-pass $L(s)$ that are \emph{complementary}: $H(s)+L(s)=1$ for every
+frequency. Then the fused estimate
+\[
+  \hat\theta = H(s)\,\theta_g + L(s)\,\theta_a
+\]
+keeps the gyro's fast detail (high-pass kills the gyro's low-frequency drift) and the
+accel/mag's slow truth (low-pass kills their high-frequency motion noise), and because
+$H+L=1$ a steady true orientation passes through with unit gain and no distortion. You
+are not throwing away either sensor; you are using each only where it is reliable.
+\end{whybox}
+
+The discrete-time form is one line of code and is what runs on a real board. With a
+single tuning constant $\alpha$ close to $1$,
+\[
+  \boxed{\ \hat\theta_k = \alpha\,\big(\hat\theta_{k-1} + \omega_k\,\Delta t\big)
+           \;+\; (1-\alpha)\,\theta_{a,k}\ }
+\]
+Read it geometrically: \emph{predict} the new angle by stepping the previous estimate
+forward with the gyro ($\hat\theta_{k-1}+\omega_k\Delta t$), then nudge that prediction
+a little ($1-\alpha$ of the way) toward what the accelerometer says. The $\alpha$ term
+is the high-pass on the gyro; the $(1-\alpha)$ term is the low-pass on the accel; they
+sum to $1$, so it is exactly the complementary filter in disguise
+(Figure~\ref{ch36:fig-compfreq}).
+
+\begin{intuitionbox}
+The cutoff between ``trust the gyro'' and ``trust the accel'' is set by $\alpha$ and the
+sample time through the time constant $\tau = \dfrac{\alpha\,\Delta t}{1-\alpha}$.
+Above $1/\tau$ the gyro wins; below it the accel wins. With $\Delta t = 0.01$\,s (a
+$100$\,Hz loop) and $\alpha = 0.98$, $\tau \approx 0.49$\,s: trust the gyro for changes
+faster than about half a second, trust the accel for anything slower. Want to lean
+harder on the gyro (steadier, but drift creeps in)? Push $\alpha$ toward $1$.
+\end{intuitionbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.0cm,
+  xlabel={frequency, normalized to the crossover $f/f_c$},
+  ylabel={magnitude}, xmin=0,xmax=5,ymin=0,ymax=1.15,
+  domain=0:5, samples=160, legend pos=south east, legend cell align=left,
+  grid=both, axis lines=left, every axis plot/.append style={thick}]
+  % low-pass on accel: 1/sqrt(1+f^2)
+  \addplot[targetgreen] {1/sqrt(1+x^2)};
+  \addlegendentry{$|L|$: low-pass on accel}
+  % high-pass on gyro: f/sqrt(1+f^2)
+  \addplot[sourceblue] {x/sqrt(1+x^2)};
+  \addlegendentry{$|H|$: high-pass on gyro}
+  % sum of powers = 1: complementary
+  \addplot[specred,dashed] {1};
+  \addlegendentry{$|H|^2+|L|^2=1$}
+\end{axis}
+\end{tikzpicture}
+\caption{The complementary pair in the frequency domain. Below the crossover $f_c$ the
+low-pass (green) lets the accelerometer's slow, drift-free truth through; above it the
+high-pass (blue) lets the gyro's fast detail through. The branches are designed so their
+powers sum to one at every frequency (red dashed), so a steady true orientation passes
+with unit gain and no notch. Sliding $\alpha$ slides $f_c$ left or right.}
+\label{ch36:fig-compfreq}
+\end{figure}
+
+\begin{lstlisting}[language=Python,caption={Complementary filter for tilt from a 6-axis IMU.}]
+import numpy as np
+
+def complementary_tilt(gyro, accel, dt, alpha=0.98):
+    """gyro: (N,3) rad/s, accel: (N,3) g. Returns roll,pitch (deg)."""
+    roll = pitch = 0.0
+    out = []
+    for w, a in zip(gyro, accel):
+        # accel-only absolute tilt (good when nearly still)
+        roll_a  = np.degrees(np.arctan2(a[1], a[2]))
+        pitch_a = np.degrees(np.arctan2(-a[0], np.hypot(a[1], a[2])))
+        # gyro integration (good for fast motion), then blend
+        roll  = alpha*(roll  + np.degrees(w[0])*dt) + (1-alpha)*roll_a
+        pitch = alpha*(pitch + np.degrees(w[1])*dt) + (1-alpha)*pitch_a
+        out.append((roll, pitch))
+    return np.array(out)
+\end{lstlisting}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.0cm,
+  xlabel={time $t$ (s)}, ylabel={estimated pitch (deg)},
+  xmin=0,xmax=10,ymin=-15,ymax=35, domain=0:10, samples=160,
+  legend pos=north east, legend cell align=left, grid=both, axis lines=left]
+  \addplot[targetgreen,thick,dashed] {20*(x>3)*(x<7)};
+  \addlegendentry{true pitch}
+  \addplot[specred,only marks,mark=*,mark size=0.5pt,samples=160]
+     {20*(x>3)*(x<7) + 7*sin(deg(9*x)) + 5*cos(deg(13*x+1))};
+  \addlegendentry{accel only (noisy)}
+  \addplot[sourceblue,thick] {20*(x>3)*(x<7) + 6*exp(-2*x)};
+  \addlegendentry{fused (complementary)}
+\end{axis}
+\end{tikzpicture}
+\caption{A pitch step. Accel alone (red) is centered but jittery; integrated gyro alone
+would track the step then drift. The complementary fusion (blue) follows the step
+crisply and settles onto the true value with little noise.}
+\label{ch36:fig-comp}
+\end{figure}
+
+\begin{applicationbox}
+The complementary filter is everywhere because it is so cheap: self-balancing robots and
+hoverboards, the early flight controllers of consumer drones (Multiwii, early
+ArduPilot), camera gimbals, and countless hobby projects. On an 8-bit Arduino it is a
+few multiplies per axis per loop. For two-axis tilt it is genuinely hard to beat for the
+effort, and it is the right first thing to put on your wrist board.
+\end{applicationbox}
+
+\begin{connectionbox}
+Look again at $\hat\theta = H(s)\theta_g + L(s)\theta_a$ with $H+L=1$. This is exactly
+the complementary high-pass/low-pass pair from the filter-design chapters, and it is the
+\emph{static} (constant-gain) ancestor of the Kalman filter, which lets the blend weights
+\emph{vary in time} to be optimal given how noisy each sensor currently is.
+\end{connectionbox}
+
+\section{The Kalman filter as optimal fusion}
+\label{ch36:kalman}
+
+The complementary filter blends with a \emph{fixed} weight $\alpha$. But the right
+weight is not fixed: when the device is whipping around, the accel is mostly motion and
+should be trusted less; when it sits still, the accel is pure gravity and should be
+trusted more. The Kalman filter is the principled answer to ``what is the
+\emph{optimal}, time-varying blend, given everything I know about the noise?'' It is the
+complementary filter with the weight recomputed every step from the statistics.
+
+\begin{intuitionbox}
+The Kalman filter keeps two things at all times: a best \emph{estimate} of the state
+(here, orientation, maybe plus gyro bias) and a \emph{covariance} -- a number, or matrix,
+saying how unsure it is. Each step has two beats. \textbf{Predict}: push the estimate
+forward with the gyro, and \emph{grow} the uncertainty (we trusted a noisy gyro, so we
+know less now). \textbf{Update}: when an absolute measurement arrives (accel/mag),
+compare it to the prediction and step partway toward it -- and \emph{shrink} the
+uncertainty. How far you step is the \emph{Kalman gain}, computed from the relative
+sizes of your current uncertainty and the measurement's noise. It is a self-tuning
+$\alpha$.
+\end{intuitionbox}
+
+Here is the whole idea in one dimension, which is enough to feel it. Let the state be a
+scalar $x$ (an angle) with estimate $\hat x$ and variance $P$. The gyro gives a control
+input $u=\omega\Delta t$ with process noise variance $Q$. The accel gives a measurement
+$z$ of the angle with measurement noise variance $R$.
+
+\begin{formalbox}
+\textbf{Predict.}
+\[
+  \hat x^- = \hat x + u, \qquad P^- = P + Q .
+\]
+\textbf{Update} (Kalman gain $K$, then correct):
+\[
+  K = \frac{P^-}{P^- + R}, \qquad
+  \hat x = \hat x^- + K\,(z - \hat x^-), \qquad
+  P = (1-K)\,P^- .
+\]
+\end{formalbox}
+
+Stare at the gain. $K = P^-/(P^-+R)$ lives between $0$ and $1$. If the measurement is
+very noisy ($R$ large), $K\to 0$: ignore the accel, coast on the gyro. If our prediction
+is very uncertain ($P^-$ large), $K\to 1$: snap to the accel. The correction
+$\hat x = \hat x^- + K(z-\hat x^-)$ is \emph{identical in form} to the complementary
+filter's $(1-\alpha)$ nudge toward the measurement -- but now the weight $K$ breathes
+with the changing uncertainty.
+
+\begin{whybox}
+Why is this the \emph{optimal} blend, not just a reasonable one? If both noises are
+Gaussian, ``predict'' and ``measure'' are two independent Gaussian opinions about the
+same angle. The product of two Gaussians is another Gaussian whose mean is the
+\emph{inverse-variance-weighted average} of the two means -- each opinion weighted by its
+certainty. Working that average out gives exactly $K=P^-/(P^-+R)$. The Kalman filter is
+nothing more than Bayes' rule for Gaussians, applied once per sample. That is the deep
+link to the probability companion: the gain is the precision-weighting of two beliefs.
+\end{whybox}
+
+\begin{connectionbox}
+Everything here is straight from the probability and linear-algebra books. The variance
+$P$ is the spread of a belief; ``predict grows $P$, update shrinks $P$'' is uncertainty
+propagation. The product-of-Gaussians giving a precision-weighted mean is Bayesian
+updating with conjugate Gaussians. In full 3-D the scalars become vectors and matrices,
+$z-\hat x^-$ becomes the \emph{innovation}, and $K$ becomes a matrix -- but the story is
+unchanged: optimal fusion is inverse-variance weighting.
+\end{connectionbox}
+
+\begin{historybox}
+Rudolf Kalman published the filter in 1960. Its first triumph was the Apollo program:
+the guidance computer used a Kalman filter to fuse inertial measurements with star and
+radar fixes, and it is no exaggeration that it helped get astronauts to the Moon and
+back. Today it runs in GPS receivers, missiles, weather models, robot localization, and
+the orientation chip in your phone. Stanley Schmidt at NASA Ames recognized its power and
+pushed it into Apollo; the nonlinear variant is sometimes called the Schmidt--Kalman
+filter.
+\end{historybox}
+
+\begin{trapbox}
+Orientation is nonlinear (the quaternion kinematics, the trig in the accel model), so a
+plain linear Kalman filter does not directly apply. Practitioners use the
+\emph{extended} Kalman filter (EKF), which linearizes the model each step about the
+current estimate, or the \emph{unscented} Kalman filter (UKF). These work well but are
+fiddly: you must supply Jacobians (EKF), tune the noise matrices $Q$ and $R$, and guard
+against divergence if the linearization is poor during violent motion. This fiddliness
+is exactly why the lighter Madgwick and Mahony filters became popular.
+\end{trapbox}
+
+\section{The Madgwick and Mahony filters}
+\label{ch36:madgwick-mahony}
+
+A full quaternion EKF carries a $4\times4$ (or larger) covariance matrix and its matrix
+algebra -- heavy for a tiny microcontroller. Around 2010 Sebastian Madgwick, then a PhD
+student at Bristol, published a filter that achieves EKF-grade accuracy with a fraction
+of the computation and \emph{one} intuitive tuning knob. It, and the closely related
+Mahony filter, are what most open-source IMU libraries actually ship.
+
+\begin{intuitionbox}
+Both filters share one elegant idea, and it is a \emph{gradient-descent} idea you
+already know from the calculus companion. Integrate the gyro to predict the quaternion.
+Now ask: given my predicted orientation, where \emph{should} the accelerometer point if
+the only force were gravity? Compare that predicted gravity direction to the measured
+accel. The mismatch is an \emph{error}, and you can compute which way to nudge the
+quaternion to shrink that error fastest -- the gradient. Take a small step downhill.
+That small correction, blended with the gyro integration, is the whole filter: gyro for
+speed, a gradient nudge toward gravity (and north, with a magnetometer) for the absolute
+anchor.
+\end{intuitionbox}
+
+\begin{whybox}
+Madgwick frames fusion as an optimization: find the quaternion $q$ that best aligns the
+\emph{predicted} field directions (gravity, and magnetic north) with the
+\emph{measured} accel and mag vectors. That is a least-squares problem,
+\[
+  \min_q \ \norm{\,f(q,\ \text{measured fields})\,}^2 ,
+\]
+and one step of gradient descent on it is cheap to write in closed form. The single knob
+$\beta$ sets the descent step size -- the analog of the complementary $\alpha$ and the
+Kalman $K$. Small $\beta$: trust the gyro more (smooth, slight drift). Large $\beta$:
+pull harder toward accel/mag (drift-free, more noise). Mahony instead drives the same
+mismatch through a PI controller and, as a bonus, its integral term \emph{estimates and
+removes the gyro bias} -- a real practical win.
+\end{whybox}
+
+\begin{focusbox}
+The unifying picture (Figure~\ref{ch36:fig-loop}): \emph{every} attitude filter in this
+chapter is the same skeleton.
+\begin{enumerate}
+  \item \textbf{Predict} orientation by integrating the gyro (fast, drifts).
+  \item Measure how far the prediction's gravity/north disagree with the accel/mag.
+  \item \textbf{Correct} by nudging the prediction toward the absolute references.
+\end{enumerate}
+They differ only in \emph{how} they choose the correction strength:
+\begin{itemize}
+  \item Complementary: fixed weight $\alpha$.
+  \item Kalman/EKF: optimal time-varying weight $K$ from the noise statistics.
+  \item Madgwick: gradient-descent step of size $\beta$.
+  \item Mahony: PI feedback with gain pair, plus online bias estimation.
+\end{itemize}
+\end{focusbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Stealth,node distance=7mm,
+  blk/.style={draw,rounded corners,align=center,minimum height=9mm,font=\small},
+  every node/.style={font=\small}]
+  \node[blk,fill=blue!5] (gyro) {gyro\\$\boldsymbol\omega$};
+  \node[blk,fill=blue!5,right=18mm of gyro] (pred) {Predict\\integrate $\boldsymbol\omega$};
+  \node[blk,fill=green!6,right=22mm of pred] (corr) {Correct\\nudge toward refs};
+  \node[blk,right=18mm of corr] (out) {orientation\\$\hat q$};
+  \node[blk,fill=red!5,below=12mm of corr] (acc) {accel/mag\\absolute refs};
+  \draw[->] (gyro) -- (pred);
+  \draw[->] (pred) -- node[above]{$\hat q^{-}$} (corr);
+  \draw[->] (corr) -- (out);
+  \draw[->] (acc) -- node[right]{error} (corr);
+  % feedback loop
+  \draw[->] (out.south) |- ($(out.south)+(0,-9mm)$) -| node[below,pos=0.25]{previous $\hat q$} (pred.south);
+\end{tikzpicture}
+\caption{Every attitude filter in this chapter is this loop. The gyro drives a
+\emph{predict} step (fast, drifts); the accel/mag supply an absolute reference that the
+\emph{correct} step nudges toward. The filters differ only in the correction strength:
+fixed $\alpha$ (complementary), time-varying $K$ (Kalman), gradient step $\beta$
+(Madgwick), or PI gains (Mahony).}
+\label{ch36:fig-loop}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Choosing an attitude filter.}
+\label{ch36:tab-filters}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+Filter & State & Cost & Tuning & Best for \\
+\midrule
+Complementary & Euler/2 angles & tiny    & $\alpha$        & tilt only, 8-bit MCUs \\
+Madgwick      & quaternion     & low     & $\beta$         & full 9-DoF on MCU \\
+Mahony        & quaternion     & low     & $K_p,K_i$       & like Madgwick, removes bias \\
+EKF           & quat ($+$ bias)& high    & $Q,R$ matrices  & best accuracy, more compute \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{example}[One Kalman step by hand]
+\label{ch36:ex-kalman}
+A 1-D angle filter has $\hat x = 10.0^\circ$, $P = 4.0$ (deg$^2$). The gyro says the
+angle rose by $u = 2.0^\circ$ this step with process noise $Q = 1.0$. The accel
+measures $z = 13.5^\circ$ with noise $R = 9.0$.
+\emph{Predict:} $\hat x^- = 12.0$, $P^- = 5.0$.
+\emph{Gain:} $K = 5.0/(5.0+9.0) = 0.357$.
+\emph{Update:} $\hat x = 12.0 + 0.357\,(13.5-12.0) = 12.54^\circ$, and
+$P = (1-0.357)\cdot 5.0 = 3.21$. The estimate moved only a third of the way toward the
+noisy accel (because $R>P^-$), and our uncertainty dropped from $5.0$ to $3.21$. Run it
+again with the device held still and $P$ keeps shrinking; whip it around and $Q$ keeps
+$P$ large so the filter leans on the accel. That breathing weight is the whole point.
+\end{example}
+
+\section{Getting a stable wrist orientation}
+\label{ch36:wrist}
+
+\begin{goalbox}
+For the wrist controller, here is the recipe, in increasing order of effort.
+\begin{enumerate}
+  \item \textbf{Tilt mapping (start here).} Run a complementary filter on the 6-axis IMU
+        for roll and pitch only. Map wrist tilt to two continuous MIDI controls -- e.g.
+        pitch up/down to a pitch-bend, roll to a mod wheel. This is rock-solid, needs no
+        magnetometer, and never drifts because gravity anchors it.
+  \item \textbf{Full orientation.} Add the magnetometer and run Madgwick or Mahony to get
+        a drift-resistant quaternion, hence heading too. Now ``which way the wrist
+        points'' becomes a usable control, e.g. left/right pointing selects an
+        instrument.
+  \item \textbf{Bias and stillness.} Use Mahony's bias estimate (or a startup
+        gyro-bias calibration while the arm rests) so the heading does not creep when the
+        wrist is held still between notes.
+\end{enumerate}
+\end{goalbox}
+
+\begin{buildbox}
+A workable loop on an ESP32 or Teensy with an MPU-9250 / ICM-20948:
+\begin{itemize}
+  \item \textbf{Rate.} Run the filter at $100$--$200$\,Hz. Gyro integration error grows
+        with $\Delta t$, so a steady, fast loop matters more than raw sensor quality.
+  \item \textbf{Calibrate first.} Apply the gyro-bias, accel, and (especially)
+        magnetometer hard/soft-iron calibration from the previous chapter \emph{before}
+        fusion. The strongest magnetic distortion is your own board -- mount the IMU away
+        from the battery, motors, and high-current traces.
+  \item \textbf{Startup.} Hold the arm still for one second at boot; average the gyro to
+        seed the bias and the accel to seed the initial quaternion. Tune $\beta$ (or
+        $\alpha$) to taste: too low feels sluggish and drifts, too high feels twitchy.
+  \item \textbf{Report.} Keep the quaternion as the working state; convert to Euler only
+        at the moment you emit a MIDI value, and watch the $\pm 90^\circ$ pitch
+        singularity when you do.
+\end{itemize}
+\end{buildbox}
+
+\begin{lstlisting}[language=C,caption={Mahony-style correction core (per loop, quaternion q[4]).}]
+// gx,gy,gz in rad/s; ax,ay,az normalized accel. Kp,Ki tuning gains.
+// estimated direction of gravity from current quaternion:
+float vx = 2*(q[1]*q[3] - q[0]*q[2]);
+float vy = 2*(q[0]*q[1] + q[2]*q[3]);
+float vz = q[0]*q[0] - q[1]*q[1] - q[2]*q[2] + q[3]*q[3];
+// error = measured accel x estimated gravity (cross product):
+float ex = (ay*vz - az*vy);
+float ey = (az*vx - ax*vz);
+float ez = (ax*vy - ay*vx);
+ix += Ki*ex*dt; iy += Ki*ey*dt; iz += Ki*ez*dt;   // integral -> bias removal
+gx += Kp*ex + ix;  gy += Kp*ey + iy;  gz += Kp*ez + iz;  // corrected rates
+// integrate quaternion with corrected rates, then normalize q (omitted)
+\end{lstlisting}
+
+\begin{trapbox}
+\textbf{What wrist orientation does, and where the fingers come from.} A wrist- or
+forearm-worn IMU recovers the \emph{orientation of the forearm/wrist segment} -- tilt and
+heading -- and discrete whole-hand gestures (a flick, a twist, a tap shock seen as an
+accel spike). That alone gives the instrument several expressive axes. What the IMU
+\emph{cannot} give you is which \emph{finger} moved: the IMU is bolted to the wrist, and
+finger motion barely jostles it. But the fingers are far from out of reach. Each finger
+is driven by tendons that run under the wrist and by forearm muscles whose electrical
+activity reaches the skin, so finger movement is genuinely detectable from a band on the
+wrist or forearm -- through \emph{force myography} (FMG, the tendon bulge under a band of
+force sensors) or \emph{surface EMG} (the muscle's electrical pulses). With a short
+per-finger calibration for each user, those signatures separate cleanly enough to drive
+notes. That is the subject of the next chapter and the capstone. The one thing that
+stays out of reach from the wrist is the \emph{continuous joint angle} of each finger --
+how far each knuckle is bent at every instant. That information is not present in wrist
+bulk motion and needs sensors \emph{on the fingers} (instrumented rings); see the
+upgrade path in the capstone. Everything our instrument actually needs -- which finger,
+how hard, when -- is on the doable side.
+\end{trapbox}
+
+\section*{Summary}
+\label{ch36:summary}
+
+Orientation is a single geometric object -- a rotation carrying the world frame onto the
+body frame -- and choosing how to write it down matters. Euler angles are intuitive but
+suffer gimbal lock; rotation matrices and quaternions are global and smooth, and the
+unit quaternion (axis-and-half-angle in four numbers) is what real filters carry. No
+single sensor gives orientation: the gyro is smooth but drifts (bias integrates to a
+linear error), while the accelerometer and magnetometer are absolute but noisy and
+motion-corrupted. Their flaws are complementary in frequency, so we fuse them. The
+complementary filter is a high-pass on the gyro plus a low-pass on the accel with a fixed
+weight; the Kalman filter makes that weight optimal and time-varying via inverse-variance
+(Bayesian) weighting; Madgwick and Mahony reach the same goal with a cheap gradient or PI
+correction toward gravity and north, Mahony also estimating gyro bias. For the wrist
+controller, start with complementary tilt, graduate to Madgwick/Mahony for full
+orientation -- and remember that the wrist IMU sees forearm pose and whole-hand gestures.
+Which finger moved is recovered separately, from tendon (FMG) or muscle (EMG) sensing
+with per-user calibration; only the continuous per-joint finger angle stays out of reach
+of a wrist band.
+
+\section{Exercises}
+\label{ch36:exercises}
+
+\begin{exercise}
+Explain in your own words why three Euler angles cannot smoothly cover all orientations
+without a singularity, and identify the orientation(s) at which the roll-pitch-yaw
+convention gimbal-locks. What physical degree of freedom is lost there?
+\end{exercise}
+
+\begin{exercise}
+A gyro has a constant bias of $0.5^\circ$/s and otherwise perfect output. Starting from a
+known orientation, compute the heading error after $1$, $10$, and $60$ seconds of pure
+integration. Now suppose the bias is zero but there is white rate noise; explain why the
+error grows like $\sqrt{t}$ instead of $t$.
+\end{exercise}
+
+\begin{exercise}
+Show that the discrete complementary filter
+$\hat\theta_k = \alpha(\hat\theta_{k-1}+\omega_k\Delta t) + (1-\alpha)\theta_{a,k}$ is a
+first-order high-pass on the gyro plus a first-order low-pass on the accel. Find the
+crossover time constant $\tau$ and evaluate it for $\alpha=0.95$, $\Delta t=0.005$\,s.
+\end{exercise}
+
+\begin{exercise}
+Why is the accelerometer trustworthy for orientation only when the device is nearly
+still or averaged over time? Write the measured accel as gravity plus motion and explain
+which part the low-pass branch of the complementary filter is trying to keep.
+\end{exercise}
+
+\begin{exercise}
+Repeat Example~\ref{ch36:ex-kalman} but with the device held still, so you receive three
+accel measurements $z = 13.5, 13.4, 13.6$ with no gyro motion ($u=0$). Run three
+predict/update cycles and report how $\hat x$, $P$, and $K$ evolve. What happens to $K$
+as $P$ shrinks, and what does that mean physically?
+\end{exercise}
+
+\begin{exercise}
+Derive the Kalman gain $K=P^-/(P^-+R)$ from the product-of-two-Gaussians fact: if the
+prediction is $\mathcal N(\hat x^-, P^-)$ and the measurement is $\mathcal N(z,R)$, show
+the posterior mean is the inverse-variance-weighted average and rewrite it in the form
+$\hat x^- + K(z-\hat x^-)$.
+\end{exercise}
+
+\begin{exercise}
+Convert the unit quaternion $q=(\cos 30^\circ, 0, 0, \sin 30^\circ)$ to a rotation
+matrix using the formula in Section~\ref{ch36:quat}. What axis and angle of rotation does
+it represent? Verify the matrix is orthogonal with determinant $+1$.
+\end{exercise}
+
+\begin{exercise}
+Both Madgwick and Mahony correct the gyro prediction toward gravity. In the C sketch, the
+error is computed as the \emph{cross product} of measured accel and estimated gravity.
+Explain geometrically why a cross product is the right error signal -- what its direction
+and magnitude tell you about the misalignment, and why it vanishes when the two vectors
+agree.
+\end{exercise}
+
+\begin{exercise}
+Tune by experiment: implement the complementary filter and try $\alpha \in
+\{0.90, 0.98, 0.999\}$ on the same recorded wrist motion. Describe qualitatively the
+trade-off you see between responsiveness, noise, and drift, and state which you would
+pick for (a) a fast percussive trigger and (b) a slow expressive filter sweep.
+\end{exercise}
+
+\begin{exercise}
+Limits question. A friend proposes selling a single wristband that reconstructs every
+finger \emph{joint angle} in real time from one 9-axis IMU. Explain precisely why a wrist
+IMU cannot recover continuous joint angles, and what the IMU \emph{can} measure (forearm
+pose, whole-hand gestures). Then explain which sensing modality you would add to the same
+wrist band -- and why placing it there works -- to detect \emph{which finger moved}
+without putting any hardware on the fingers themselves. Finally, state what you would have
+to add on the fingers if you genuinely needed per-joint angles.
+\end{exercise}

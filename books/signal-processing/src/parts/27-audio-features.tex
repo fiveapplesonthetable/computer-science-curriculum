@@ -1,0 +1,1196 @@
+\chapter{Audio Features}
+
+A spectrogram is a gorgeous picture, but a picture is not a number. If you want a
+machine to \emph{decide} something -- ``is this speech or silence?'', ``is this a
+plucked string or a struck drum?'', ``did a note just start?'', ``which note is
+it?'' -- you need to boil the rich, high-dimensional waveform down to a handful of
+numbers that capture what matters and throw away what does not. Those numbers are
+\textbf{features}.
+
+A feature is a measurement. The waveform of one second of CD audio is
+$44100$ numbers; that is far too much to feed a classifier directly, and almost
+all of it is redundant or irrelevant for the question you actually care about. A
+feature is a function that takes that wall of samples and returns something small
+and meaningful -- the energy, the brightness, the pitch, the rate of change. Good
+features are to a signal what a good summary is to a book: lossy on purpose,
+keeping the gist.
+
+This chapter builds the classic audio features from the ground up, geometrically.
+We will see short-time energy and zero-crossing rate (the two cheapest features in
+all of audio), the spectral shape descriptors (centroid, spread, rolloff, flux),
+the mel scale and the MFCCs derived step by careful step, chroma for harmony,
+pitch detection by autocorrelation and the YIN refinement, and onset detection for
+rhythm. Throughout, keep one fact in mind: \textbf{every one of these features is
+a function of either the waveform or its spectrum, and almost every one of them
+applies, unchanged, to the motion signals from a wrist sensor.} Energy,
+zero-crossing rate, spectral centroid, and flux are exactly the features a gesture
+recognizer computes on accelerometer data. Learn them once here, on audio where
+your ears can check the answer, and you get them for free on the IMU.
+
+\chapterline
+
+\section{What a feature is, geometrically}
+\label{ch27:what-is-a-feature}
+
+A frame of audio is a vector. Take $N$ consecutive samples
+$\vec{x} = (x_0, x_1, \dots, x_{N-1})$ -- a typical frame is $20$--$40$\,ms, so
+$N$ is a few hundred to a couple thousand samples. This frame lives in $\R^N$.
+A feature is a map $\R^N \to \R$ (or to a small vector) that collapses those $N$
+dimensions down to one or a few.
+
+\begin{intuitionbox}
+Think of the frame as a single point in a very high-dimensional space. A feature
+is a \emph{measuring instrument} you point at that point. Energy measures how far
+the point is from the origin. Zero-crossing rate measures how jagged the path
+through the samples is. The spectral centroid measures, after rotating into the
+Fourier basis, where the ``center of mass'' of the energy sits along the frequency
+axis. Each feature is a different ruler, and the art is choosing rulers that line
+up with the distinction you care about.
+\end{intuitionbox}
+
+Because audio changes over time, we almost never compute a feature on the whole
+signal. We compute it \emph{per frame}, sliding a window along the signal exactly
+as we did for the STFT in Chapter~10. The result is a \textbf{feature contour}: a
+new, much shorter, much slower signal -- one number (or a few) per frame, perhaps
+every $10$\,ms. We have traded $44100$ samples per second for, say, $100$ feature
+vectors per second. That is the whole game: turn an audio stream into a
+low-rate stream of descriptors that a downstream stage -- a threshold, a state
+machine, a classifier -- can act on.
+
+\begin{focusbox}
+The pipeline for the entire chapter is always the same three steps:
+\begin{enumerate}
+  \item \textbf{Frame.} Slice the signal into overlapping windows (e.g. $25$\,ms
+        frames, hopping $10$\,ms).
+  \item \textbf{Window.} Multiply each frame by a taper (Hann, Hamming) to avoid
+        edge artifacts -- see Chapter~10.
+  \item \textbf{Measure.} Apply a feature function to each frame, producing one
+        number (or vector) per frame.
+\end{enumerate}
+Different features differ only in step 3. Get the framing right once and you can
+swap features freely.
+\end{focusbox}
+
+\begin{connectionbox}
+A feature map $\R^N \to \R$ is exactly the kind of object the linear-algebra book
+calls a \emph{functional}. The linear ones (like ``the DC value'' or any single
+DFT bin) are inner products with a fixed vector; the nonlinear ones (energy is a
+quadratic form, ZCR involves sign changes) are not, but the geometric picture --
+projecting a high-dimensional point down to something measurable -- is the same.
+And when a feature is an average over a frame, it is an \emph{expectation} in
+disguise, which is why the probability book's tools for means and variances apply
+directly to feature contours.
+\end{connectionbox}
+
+\section{Short-time energy: how loud, right now}
+\label{ch27:energy}
+
+The simplest question you can ask of a frame is: how much is going on? The answer
+is its \textbf{energy}, the squared length of the frame vector:
+\begin{equation}
+\label{ch27:energy-defn}
+E[m] = \sum_{n=0}^{N-1} \bigl(x[mH + n]\, w[n]\bigr)^2 = \norm{\vec{x}_m}^2,
+\end{equation}
+where $m$ indexes the frame, $H$ is the hop size, and $w[n]$ is the window. This
+is nothing but $\norm{\cdot}^2$ from Chapter~3, applied per frame. Silence sits
+near the origin ($E \approx 0$); a loud passage sits far out.
+
+Two cosmetic variants are common. The \textbf{root-mean-square (RMS)} amplitude
+divides by $N$ and takes a square root, $\text{RMS}[m] = \sqrt{E[m]/N}$, which
+puts it back in the same units as the samples (it is the standard deviation of the
+frame when the mean is zero). And because loudness is perceived roughly
+logarithmically, we usually report energy in \textbf{decibels},
+$10\log_{10}(E[m] + \eps)$, with a tiny $\eps$ to avoid $\log 0$.
+
+\begin{whybox}
+Why square, rather than sum the absolute values? Squaring makes energy a smooth,
+differentiable quadratic form $\vec{x}^\top\vec{x}$, it matches the physical
+notion of energy (power is amplitude squared), and -- crucially -- it connects to
+the spectrum through Parseval's theorem: the energy you compute in time
+\eqref{ch27:energy-defn} equals (up to a constant) the sum of squared magnitudes
+of the DFT. The same number, measured in two bases. That is why energy is the
+bridge feature between the time-domain features of this section and the
+spectral features of the next.
+\end{whybox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=3.6cm,
+  xlabel={time (s)}, ylabel={$x(t)$},
+  xmin=0, xmax=3, ymin=-1.2, ymax=1.2,
+  axis lines=box, samples=200,
+  title={A clip: quiet, then loud, then quiet},
+  every axis title/.style={below right,at={(0,1)}},
+]
+\addplot[sigblue, thick, domain=0:1, samples=120] {0.15*sin(deg(2*pi*6*x))};
+\addplot[sigblue, thick, domain=1:2, samples=160] {sin(deg(2*pi*6*x))};
+\addplot[sigblue, thick, domain=2:3, samples=120] {0.15*sin(deg(2*pi*6*x))};
+\end{axis}
+\end{tikzpicture}
+
+\vspace{0.3em}
+
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=3.2cm,
+  xlabel={frame time (s)}, ylabel={RMS},
+  xmin=0, xmax=3, ymin=0, ymax=0.85,
+  axis lines=box,
+  title={Short-time RMS contour tracks the loudness envelope},
+  every axis title/.style={below right,at={(0,1)}},
+]
+\addplot[specred, thick] coordinates {
+  (0,0.106)(0.5,0.106)(0.95,0.106)(1.05,0.707)(1.5,0.707)(1.95,0.707)
+  (2.05,0.106)(2.5,0.106)(3,0.106)};
+\end{axis}
+\end{tikzpicture}
+\caption{Top: a waveform that is quiet, then loud, then quiet. Bottom: the
+short-time RMS contour, one value per frame, recovers the loudness envelope -- a
+slow, low-rate signal you can threshold to find ``where the sound is.''}
+\label{ch27:fig-energy}
+\end{figure}
+
+\begin{example}[Energy of a pure tone]
+\label{ch27:ex-tone-energy}
+Take a frame of a sinusoid $x[n] = A\sin(2\pi f n / f_s)$ with no window. Over an
+integer number of cycles, $\sum \sin^2 = N/2$, so $E = A^2 N/2$ and
+$\text{RMS} = A/\sqrt{2}$. That $\sqrt{2}$ is exactly the peak-to-RMS ratio of a
+sine you may know from AC circuits: a sine of amplitude $1$ has RMS $0.707$. The
+RMS contour of Figure~\ref{ch27:fig-energy} jumps from $0.15/\sqrt2 \approx 0.106$
+to $1/\sqrt2 \approx 0.707$, which is precisely what the plot shows.
+\end{example}
+
+\begin{trapbox}
+Energy is not loudness. Human loudness perception is frequency-dependent (a
+$60$\,Hz tone and a $3$\,kHz tone of equal energy do \emph{not} sound equally
+loud) and compressive. Raw RMS is a fine \emph{relative} measure for finding where
+the action is, but do not call it loudness without an equal-loudness weighting
+(A-weighting) and a logarithmic scale. The same caution applies to motion: the
+acceleration ``energy'' of a flick and a slow wave can be similar while they feel
+completely different.
+\end{trapbox}
+
+\section{Zero-crossing rate: how often it flips sign}
+\label{ch27:zcr}
+
+The second-cheapest feature counts how often the waveform crosses zero within a
+frame:
+\begin{equation}
+\label{ch27:zcr-defn}
+\text{ZCR}[m] = \frac{1}{2N}\sum_{n=1}^{N-1}
+  \bigl|\,\operatorname{sgn}(x[mH+n]) - \operatorname{sgn}(x[mH+n-1])\,\bigr|.
+\end{equation}
+Each term is $1$ when consecutive samples have opposite signs and $0$ otherwise;
+dividing by $2N$ gives a rate per sample (multiply by $f_s$ for crossings per
+second). It costs only comparisons and additions -- no multiplies, no FFT -- which
+is why early speech chips and the cheapest microcontrollers leaned on it heavily.
+
+\begin{intuitionbox}
+Zero-crossing rate is a crude pitch-and-noisiness meter rolled into one. A pure
+low tone crosses zero twice per cycle, so its ZCR is small and proportional to
+frequency. White noise wiggles constantly, so its ZCR is high. A periodic,
+low-pitched sound (a vowel, a bowed cello) has low ZCR; a noisy, high-frequency
+sound (the hiss of /s/, a cymbal, a snare) has high ZCR. So ZCR is the classic
+\textbf{voiced/unvoiced} discriminator in speech, and more generally a
+tonal-versus-noisy detector.
+\end{intuitionbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=6cm, height=3.4cm,
+  xlabel={$n$}, ylabel={},
+  xmin=0, xmax=2, ymin=-1.3, ymax=1.3,
+  axis lines=middle, samples=120, domain=0:2,
+  title={Low tone: low ZCR},
+  every axis title/.style={below right,at={(0,1)}},
+]
+\addplot[sigblue, thick] {sin(deg(2*pi*1.5*x))};
+\end{axis}
+\end{tikzpicture}
+\hspace{0.4cm}
+\begin{tikzpicture}
+\begin{axis}[
+  width=6cm, height=3.4cm,
+  xlabel={$n$}, ylabel={},
+  xmin=0, xmax=2, ymin=-1.3, ymax=1.3,
+  axis lines=middle, samples=160, domain=0:2,
+  title={Hissy/noisy: high ZCR},
+  every axis title/.style={below right,at={(0,1)}},
+]
+\addplot[specred, thick] {0.7*sin(deg(2*pi*9*x))+0.3*sin(deg(2*pi*23*x))};
+\end{axis}
+\end{tikzpicture}
+\caption{Zero-crossing rate distinguishes tonal from noisy. The slow tone (left)
+flips sign rarely; the high-frequency, hissy signal (right) flips constantly.}
+\label{ch27:fig-zcr}
+\end{figure}
+
+\begin{trapbox}
+ZCR is fooled by DC offset and by noise near zero. A small constant bias can stop
+a quiet signal from ever crossing zero (artificially low ZCR), while broadband
+noise sitting on top of a clean tone adds spurious crossings each time the sum
+dithers across zero (artificially high ZCR). Always remove the mean
+(high-pass / DC-block) before computing ZCR, and consider a small hysteresis
+band around zero so that tiny wiggles do not register as crossings.
+\end{trapbox}
+
+\begin{goalbox}
+Short-time energy and ZCR are the first two features your wrist controller will
+ever compute, and it will compute them on accelerometer magnitude, not audio.
+Energy of the acceleration signal tells you \emph{how vigorous} a motion is --
+the difference between resting and gesturing -- and is the natural trigger to wake
+the recognizer from a low-power idle. ZCR of a gyroscope axis tells you how
+\emph{oscillatory} the motion is -- a tremor or a fast shake has high ZCR; a
+smooth sweep has low ZCR. Both cost a few additions per sample, which is exactly
+what a battery-powered microcontroller on your forearm can afford to run
+continuously. The caveat worth stating: these coarse features detect \emph{that} a
+gesture happened and roughly how energetic it was; they do not, on their own,
+recover which fingers moved. That finer question waits for Chapter~37.
+\end{goalbox}
+
+\section{Spectral shape: centroid, spread, rolloff}
+\label{ch27:spectral-shape}
+
+Now cross into the frequency domain. Take the magnitude spectrum of a frame,
+$|X[k]|$ for bins $k = 0, \dots, N/2$ at frequencies $f_k = k f_s / N$. Treat the
+\emph{energy per bin}, $|X[k]|^2$ (or sometimes $|X[k]|$), as a distribution of
+``mass'' along the frequency axis. Once you see the spectrum as a mass
+distribution, the language of statistics describes its shape exactly.
+
+\subsection*{Spectral centroid: the center of mass (brightness)}
+
+The \textbf{spectral centroid} is the energy-weighted mean frequency:
+\begin{equation}
+\label{ch27:centroid-defn}
+\text{centroid}[m] = \frac{\sum_k f_k\, |X_m[k]|}{\sum_k |X_m[k]|}.
+\end{equation}
+This is precisely the formula for the center of mass of point masses $|X[k]|$ at
+positions $f_k$ -- or, in probability language, the \emph{expected frequency}
+$\E[f]$ under the distribution $p_k = |X[k]| / \sum_j |X[j]|$. A spectrum with most
+of its energy down low (a bass note, a vowel) has a low centroid; one with energy
+up high (a cymbal, the hiss of /s/) has a high centroid. The centroid correlates
+remarkably well with the perceptual notion of \textbf{brightness}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=4.2cm,
+  xlabel={frequency (kHz)}, ylabel={$|X[k]|$},
+  xmin=0, xmax=8, ymin=0, ymax=1.4,
+  axis lines=box, ytick=\empty,
+  title={Two spectra and their centroids},
+  every axis title/.style={below right,at={(0,1)}},
+]
+\addplot[sigblue, thick, smooth] coordinates {
+  (0,0.1)(0.5,0.6)(1,1.0)(1.5,0.8)(2,0.45)(3,0.2)(4,0.08)(6,0.03)(8,0.01)};
+\addplot[specred, thick, smooth] coordinates {
+  (0,0.02)(1,0.05)(2,0.15)(3,0.4)(4,0.8)(5,1.0)(6,0.7)(7,0.4)(8,0.2)};
+\draw[sigblue, dashed, thick] (axis cs:1.25,0) -- (axis cs:1.25,1.1);
+\draw[specred, dashed, thick] (axis cs:4.7,0) -- (axis cs:4.7,1.1);
+\node[sigblue] at (axis cs:1.5,1.28) {\small low centroid (dark)};
+\node[specred] at (axis cs:5.6,1.28) {\small high centroid (bright)};
+\end{axis}
+\end{tikzpicture}
+\caption{The spectral centroid is the balance point of the magnitude spectrum.
+The blue spectrum (energy low) balances around $1.25$\,kHz; the red spectrum
+(energy high) balances around $4.7$\,kHz and sounds brighter.}
+\label{ch27:fig-centroid}
+\end{figure}
+
+\subsection*{Spectral spread, skewness, flatness}
+
+If the centroid is the mean, the \textbf{spectral spread} (or bandwidth) is the
+standard deviation -- how wide the energy is smeared around the centroid:
+\begin{equation}
+\label{ch27:spread-defn}
+\text{spread}[m] = \sqrt{\frac{\sum_k (f_k - \text{centroid}[m])^2\,|X_m[k]|}
+                              {\sum_k |X_m[k]|}}.
+\end{equation}
+A pure tone has near-zero spread; broadband noise has huge spread. Carrying the
+moment-by-moment analogy further gives spectral \emph{skewness} (lopsidedness) and
+\emph{kurtosis} (peakiness), all borrowed verbatim from the moments of a
+probability distribution.
+
+A close cousin is \textbf{spectral flatness}, the ratio of the geometric mean to
+the arithmetic mean of the spectrum:
+\begin{equation}
+\label{ch27:flatness-defn}
+\text{flatness}[m] =
+  \frac{\bigl(\prod_k |X_m[k]|^2\bigr)^{1/K}}
+       {\frac{1}{K}\sum_k |X_m[k]|^2}.
+\end{equation}
+Flatness is near $1$ for white noise (a flat spectrum: geometric mean equals
+arithmetic mean) and near $0$ for a pure tone (energy in one bin makes the
+geometric mean collapse). It is the standard \textbf{tonal-versus-noisy} measure,
+the spectral-domain partner of ZCR, and it is what audio codecs use to decide how
+aggressively they can quantize a band.
+
+\subsection*{Spectral rolloff: the frequency below which most energy lives}
+
+The \textbf{spectral rolloff} $R[m]$ is the frequency below which a fixed fraction
+$\kappa$ (commonly $0.85$ or $0.95$) of the total spectral energy is contained:
+\begin{equation}
+\label{ch27:rolloff-defn}
+R[m] = \min\Bigl\{ f_K : \sum_{k \le K} |X_m[k]|^2
+                          \ge \kappa \sum_{k} |X_m[k]|^2 \Bigr\}.
+\end{equation}
+In probability terms this is just the $\kappa$-\emph{quantile} of the spectral
+energy distribution. Rolloff, like centroid, tracks brightness and the
+voiced/unvoiced distinction, but it is more robust to a few stray
+high-frequency bins because it asks about cumulative energy rather than a mean.
+
+\begin{example}[Centroid of a two-tone frame]
+\label{ch27:ex-centroid}
+Suppose a frame's spectrum has just two significant lines: amplitude $3$ at
+$200$\,Hz and amplitude $1$ at $1000$\,Hz. The centroid is
+\[
+\frac{3\cdot 200 + 1\cdot 1000}{3 + 1} = \frac{1600}{4} = 400\text{ Hz}.
+\]
+The strong low line pulls the balance point down toward it -- exactly as a heavier
+mass pulls a center of gravity. If you added high-frequency noise the centroid
+would climb, which is the basis for using it as a brightness/noise detector.
+\end{example}
+
+\section{Spectral flux: how fast the spectrum is changing}
+\label{ch27:flux}
+
+Everything so far described a \emph{single} frame. \textbf{Spectral flux} measures
+the \emph{change} between consecutive frames -- how different this frame's spectrum
+is from the last one:
+\begin{equation}
+\label{ch27:flux-defn}
+\text{flux}[m] = \sum_k \bigl(\, |X_m[k]| - |X_{m-1}[k]| \,\bigr)_{+}^2,
+\end{equation}
+where $(\cdot)_+ = \max(\cdot, 0)$ keeps only the bins that \emph{grew}
+(half-wave rectification). Geometrically, flux is (a rectified version of) the
+squared Euclidean distance between two successive spectrum vectors: it is large
+when the sound's frequency content suddenly shifts and near zero when the sound is
+steady.
+
+\begin{whybox}
+Why keep only the increases? Because we usually use flux to find \emph{onsets} --
+moments when new energy appears (a note begins, a consonant bursts, a drum is
+struck). When a note \emph{ends}, energy in its bins \emph{decreases}; that is a
+release, not an onset, and we do not want it to trigger. Half-wave rectification
+keeps only rising energy, so flux peaks at the births of sounds, not their deaths.
+This makes spectral flux the workhorse of onset detection in
+Section~\ref{ch27:onset}.
+\end{whybox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=3.4cm,
+  xlabel={frame time (s)}, ylabel={flux},
+  xmin=0, xmax=4, ymin=0, ymax=1.1,
+  axis lines=box, ytick=\empty,
+  title={Spectral flux spikes when new notes begin},
+  every axis title/.style={below right,at={(0,1)}},
+]
+\addplot[structurepurple, thick] coordinates {
+  (0,0.02)(0.48,0.03)(0.5,0.95)(0.55,0.2)(0.6,0.04)(0.9,0.03)
+  (1.0,0.85)(1.05,0.18)(1.1,0.03)(1.7,0.02)(1.8,0.9)(1.85,0.22)(1.9,0.03)
+  (2.5,0.02)(2.6,0.8)(2.65,0.15)(2.7,0.03)(3.3,0.02)(3.4,0.92)(3.45,0.2)(3.5,0.03)(4,0.02)};
+\end{axis}
+\end{tikzpicture}
+\caption{Spectral flux over a clip of five separated notes. Each note onset
+produces a sharp spike; the steady-state and silence between notes produce almost
+no flux. Picking the peaks of this curve detects onsets.}
+\label{ch27:fig-flux}
+\end{figure}
+
+\begin{connectionbox}
+Flux is a discrete time-derivative of the spectrum, the same operation the
+calculus book studies as a difference quotient, applied here to a vector-valued
+signal (the whole spectrum at each frame). Many features in this chapter are
+``derivative-like'': flux is the derivative of the spectrum, onset strength is the
+derivative of energy, and the famous \emph{delta} and \emph{delta-delta} MFCCs are
+literally first and second derivatives of the cepstral features over time. A
+recurring theme: \emph{what} something is comes from one frame; \emph{events}
+come from how it changes between frames.
+\end{connectionbox}
+
+\section{The mel scale: hearing as the ear does}
+\label{ch27:mel}
+
+So far our spectral features used a \emph{linear} frequency axis: bin $k$ sits at
+$f_k = k f_s/N$, equally spaced. But human hearing is not linear. We are
+exquisitely sensitive to changes among low frequencies and progressively coarser
+up high. The musical interval from $100$ to $200$\,Hz (one octave) sounds like the
+same ``distance'' as $1000$ to $2000$\,Hz, even though the second spans ten times
+as many hertz. Pitch perception is roughly \emph{logarithmic}.
+
+The \textbf{mel scale} is an empirical warping of the frequency axis built to make
+equal perceptual distances correspond to equal numeric distances. A common formula
+is
+\begin{equation}
+\label{ch27:mel-formula}
+m(f) = 2595 \, \log_{10}\!\Bigl(1 + \frac{f}{700}\Bigr),
+\end{equation}
+which is nearly linear below about $1$\,kHz and logarithmic above it -- matching
+the ear's behavior. ``Mel'' comes from ``melody''; the scale was anchored so that
+$1000$\,mel equals a $1000$\,Hz tone at a reference loudness.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=10cm, height=5.2cm,
+  xlabel={frequency $f$ (Hz)}, ylabel={mel $m(f)$},
+  xmin=0, xmax=8000, ymin=0, ymax=3000,
+  axis lines=box, samples=120, domain=0:8000,
+  title={The mel scale warps frequency: fine resolution low, coarse high},
+  every axis title/.style={below right,at={(0,1)}},
+]
+\addplot[sigblue, thick] {2595*log10(1+x/700)};
+\addplot[gray, dashed] {x*2521/8000};
+\end{axis}
+\end{tikzpicture}
+\caption{The mel mapping (blue) versus a straight line (gray). Equal steps on the
+vertical mel axis correspond to ever-wider hertz steps as frequency rises, which
+is why a mel-spaced filterbank places many narrow filters down low and a few wide
+ones up high.}
+\label{ch27:fig-mel}
+\end{figure}
+
+\subsection*{The mel filterbank}
+
+We do not resample the spectrum onto the mel axis directly; instead we pool the
+linear spectrum into a small number of overlapping \textbf{triangular filters}
+spaced evenly on the mel axis. Each filter is a triangle in frequency: it rises
+from zero at the previous center, peaks at its own center, and falls to zero at
+the next center. Because the centers are equally spaced \emph{in mel}, the
+triangles are narrow at low frequency and wide at high frequency. We compute, for
+each of (typically) $26$--$40$ filters, the weighted sum of spectral energy
+falling under its triangle. The output is the \textbf{mel spectrum}: a short
+vector that summarizes the spectral envelope the way the ear's frequency analysis
+roughly does.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=4cm,
+  xlabel={frequency (Hz)}, ylabel={filter weight},
+  xmin=0, xmax=8000, ymin=0, ymax=1.15,
+  axis lines=box, ytick=\empty,
+  title={A mel filterbank: triangles, narrow low and wide high},
+  every axis title/.style={below right,at={(0,1)}},
+]
+\addplot[sigblue,thick] coordinates {(0,0)(150,1)(330,0)};
+\addplot[sigblue,thick] coordinates {(150,0)(330,1)(560,0)};
+\addplot[sigblue,thick] coordinates {(330,0)(560,1)(850,0)};
+\addplot[sigblue,thick] coordinates {(560,0)(850,1)(1230,0)};
+\addplot[specred,thick] coordinates {(850,0)(1230,1)(1750,0)};
+\addplot[specred,thick] coordinates {(1230,0)(1750,1)(2450,0)};
+\addplot[specred,thick] coordinates {(1750,0)(2450,1)(3400,0)};
+\addplot[structurepurple,thick] coordinates {(2450,0)(3400,1)(4700,0)};
+\addplot[structurepurple,thick] coordinates {(3400,0)(4700,1)(6400,0)};
+\addplot[structurepurple,thick] coordinates {(4700,0)(6400,1)(8000,0)};
+\end{axis}
+\end{tikzpicture}
+\caption{A mel filterbank. Filter centers are equally spaced on the mel axis, so
+in hertz the triangles bunch up at low frequency (fine resolution where the ear
+cares) and stretch out at high frequency (coarse resolution where it does not).}
+\label{ch27:fig-melbank}
+\end{figure}
+
+\begin{historybox}
+The mel scale grows out of 1930s--1940s psychoacoustics, notably the work of
+Stevens, Volkmann, and Newman (1937), who asked listeners to adjust tones until
+one pitch felt ``twice as high'' as another and built a perceptual scale from the
+answers. Decades later, when engineers needed a front-end for automatic speech
+recognition that mimicked the ear, this old perceptual scale was exactly the
+warping they reached for -- a lovely case of mid-century perception experiments
+quietly becoming the bedrock of modern speech technology.
+\end{historybox}
+
+\section{MFCCs, derived step by step}
+\label{ch27:mfcc}
+
+\textbf{Mel-frequency cepstral coefficients} (MFCCs) are the single most famous
+audio feature -- the backbone of speech recognition for decades and still a strong
+baseline for any audio classification task. They look intimidating as a formula
+but each step has a clear geometric purpose. Let us build them from the mel
+spectrum we just computed.
+
+\begin{focusbox}
+The MFCC recipe, in seven steps:
+\begin{enumerate}
+  \item \textbf{Frame and window} the signal (Hann/Hamming, $\sim$25\,ms).
+  \item \textbf{FFT}; take the magnitude (or power) spectrum $|X[k]|^2$.
+  \item \textbf{Mel filterbank}: pool into $\sim$26--40 mel-band energies.
+  \item \textbf{Logarithm}: take $\log$ of each band energy.
+  \item \textbf{DCT}: apply a discrete cosine transform across the bands.
+  \item \textbf{Keep the low coefficients} (typically the first 12--13).
+  \item \textbf{(Optional) deltas}: append first/second time-derivatives.
+\end{enumerate}
+\end{focusbox}
+
+Steps 1--3 we have already met. The magic is in steps 4 and 5; here is why each
+one is there.
+
+\subsection*{Step 4: the logarithm separates source from filter}
+
+Speech (and most pitched instruments) is well modeled as a \emph{source} -- the
+buzzing vocal folds or vibrating string, rich in harmonics -- passed through a
+\emph{filter} -- the resonances of the vocal tract or instrument body that shape
+which harmonics are loud. In the frequency domain these \emph{multiply}: the
+observed spectrum is (source spectrum) $\times$ (filter response). Multiplication
+is hard to separate; but $\log(ab) = \log a + \log b$ turns the product into a
+\emph{sum}. After the log, the slowly varying filter envelope and the rapidly
+varying harmonic source sit side by side as additive components, ready to be
+pried apart.
+
+\begin{happeningbox}
+This is the central trick of the \emph{cepstrum} (an anagram of ``spectrum'').
+Think of the log-spectrum as itself a kind of signal, but one whose ``time'' axis
+is frequency. The vocal-tract filter is a \emph{slowly} varying shape across
+frequency -- a few broad bumps (the formants). The harmonic source is a
+\emph{fast} ripple across frequency -- a comb of evenly spaced harmonics. ``Slow''
+and ``fast'' variation across the frequency axis means \emph{low} and \emph{high}
+``frequency'' of this new signal. So a Fourier-like transform of the log-spectrum
+sorts filter (slow, low) from source (fast, high). Keeping the low coefficients
+keeps the filter shape -- the timbre -- and discards the pitch. That is exactly
+what you want for recognizing \emph{what} was said regardless of \emph{what pitch}
+it was said at.
+\end{happeningbox}
+
+\subsection*{Step 5: the DCT decorrelates and compresses}
+
+To Fourier-analyze the log-mel spectrum we use the \textbf{discrete cosine
+transform} (DCT) rather than the full DFT. The DCT expresses the $M$-vector of
+log-mel energies as a sum of slow-to-fast cosine shapes:
+\begin{equation}
+\label{ch27:dct}
+c[i] = \sum_{j=0}^{M-1} \log\!\bigl(S[j]\bigr)\,
+       \cos\!\Bigl[\frac{\pi i}{M}\Bigl(j + \tfrac12\Bigr)\Bigr],
+       \qquad i = 0, 1, \dots, M-1,
+\end{equation}
+where $S[j]$ is the $j$-th mel band energy. The coefficients $c[i]$ are the
+MFCCs. We keep the low-order ones ($i = 1, \dots, 12$ or so), which describe the
+broad, smooth shape of the spectral envelope, and drop the high-order ones, which
+capture the fine harmonic ripple (pitch) we want to ignore.
+
+\begin{whybox}
+Why the DCT and not the DFT? Three reasons, all geometric. First, the log-mel
+spectrum is real, and the DCT is the natural real-input cousin of the DFT (it
+assumes an even extension, so it needs only cosines -- no imaginary part, no phase
+to worry about). Second, the DCT is famously good at \emph{energy compaction}: for
+the smooth, correlated log-mel envelopes that speech produces, it packs almost all
+the information into the first few coefficients, so $12$ numbers suffice. Third --
+and this is the deep reason -- for signals with the kind of correlation structure
+speech has, the DCT basis is very nearly the Karhunen--Lo\`eve (eigenvector)
+basis, the optimal one that \emph{decorrelates} the components. Decorrelated
+features are exactly what simple classifiers (which assume diagonal covariance)
+want. The DCT is doing a free, fixed, fast approximation to PCA.
+\end{whybox}
+
+\subsection*{What the coefficients mean}
+
+$c[0]$ is the average of the log-mel energies -- essentially overall log-energy
+(loudness), and often dropped or replaced by the frame energy. $c[1]$ measures the
+overall \emph{tilt} of the spectrum (energy concentrated low versus high -- a
+brightness/balance axis, close cousin of the centroid). $c[2]$ measures whether
+energy is concentrated in the middle versus the edges, and so on: each higher
+coefficient corresponds to a faster cosine ripple across the mel bands, describing
+ever-finer detail of the spectral envelope shape.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=1]
+\node (a) at (0,0) [draw, rounded corners, fill=blue!5, minimum height=0.9cm, text width=1.5cm, align=center] {\small frame + window};
+\node (b) at (2.4,0) [draw, rounded corners, fill=blue!5, minimum height=0.9cm, text width=1.3cm, align=center] {\small $|\text{FFT}|^2$};
+\node (c) at (4.6,0) [draw, rounded corners, fill=green!8, minimum height=0.9cm, text width=1.5cm, align=center] {\small mel filterbank};
+\node (d) at (6.9,0) [draw, rounded corners, fill=green!8, minimum height=0.9cm, text width=1.1cm, align=center] {\small $\log$};
+\node (e) at (8.9,0) [draw, rounded corners, fill=orange!10, minimum height=0.9cm, text width=1.1cm, align=center] {\small DCT};
+\node (f) at (11,0) [draw, rounded corners, fill=orange!10, minimum height=0.9cm, text width=1.4cm, align=center] {\small keep $c_1..c_{12}$};
+\draw[-{Latex}] (a)--(b); \draw[-{Latex}] (b)--(c); \draw[-{Latex}] (c)--(d);
+\draw[-{Latex}] (d)--(e); \draw[-{Latex}] (e)--(f);
+\end{tikzpicture}
+\caption{The MFCC pipeline. Source--filter separation happens at the log step; the
+DCT then decorrelates and compresses the smooth envelope into a dozen numbers.}
+\label{ch27:fig-mfcc-pipeline}
+\end{figure}
+
+\begin{example}[Why the log matters: a worked sketch]
+\label{ch27:ex-log}
+Imagine two recordings of the same vowel /a/, one sung at $110$\,Hz and one at
+$220$\,Hz. The vocal-tract filter (the formant shape that makes it an /a/) is
+identical; only the harmonic comb differs. Before the log, doubling the source
+amplitude or changing its harmonic spacing scrambles the spectrum
+multiplicatively. After $\log$, the formant envelope is the same additive
+``baseline'' in both, and the harmonic combs differ only in their fast ripple --
+which the DCT shoves into high coefficients you discard. The surviving low MFCCs
+are nearly identical for both pitches: the feature has become
+\emph{pitch-invariant}, recognizing the /a/-ness. That invariance is the entire
+reason MFCCs dominated speech recognition.
+\end{example}
+
+\begin{trapbox}
+MFCCs deliberately throw away pitch. That is a feature for speech recognition and
+a \emph{bug} for tasks where pitch is the point -- melody transcription, key
+detection, singer identification. For those, use chroma (next section) or a pitch
+tracker. Choosing MFCCs for a melody task is one of the most common beginner
+mistakes in music information retrieval.
+\end{trapbox}
+
+\subsection*{Deltas: motion in the cepstrum}
+
+A single MFCC vector describes one $25$\,ms snapshot, but speech and gesture are
+about \emph{trajectories}. The \textbf{delta} coefficients approximate the time
+derivative of each MFCC,
+\begin{equation}
+\label{ch27:delta}
+\Delta c[i,m] \approx \frac{\sum_{\theta=1}^{\Theta}\theta\,(c[i,m+\theta]-c[i,m-\theta])}
+                            {2\sum_{\theta=1}^{\Theta}\theta^2},
+\end{equation}
+a regression slope over a few neighboring frames, and the \textbf{delta-delta}
+coefficients do it again for the second derivative. Appending deltas typically
+triples the feature dimension ($13 \to 39$) and captures \emph{how the spectrum is
+moving} -- which, as we keep seeing, is where the events live.
+
+\section{Chroma: folding the spectrum onto the twelve pitch classes}
+\label{ch27:chroma}
+
+For music we often want the opposite of MFCCs: we want to keep harmony and pitch
+class while ignoring timbre and octave. The \textbf{chroma} (or pitch-class
+profile) feature does this by folding the spectrum onto the twelve notes of the
+chromatic scale -- C, C\#, D, \dots, B -- summing the energy of all octaves of
+each pitch class into a single bin.
+
+The construction uses the same logarithmic ear-fact as the mel scale, but applied
+musically: an octave is a doubling of frequency, and Western music splits each
+octave into twelve equal ratios of $2^{1/12}$ (the equal-tempered semitone). To
+build chroma, map each spectral bin to its nearest musical pitch, then to that
+pitch's class modulo $12$ (collapsing octaves), and accumulate energy into a
+$12$-dimensional vector:
+\begin{equation}
+\label{ch27:chroma-defn}
+\text{chroma}[p] = \sum_{k\,:\;\text{class}(f_k)=p} |X[k]|^2,
+\qquad p = 0,\dots,11.
+\end{equation}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=4cm,
+  xlabel={pitch class}, ylabel={energy},
+  xmin=-0.6, xmax=11.6, ymin=0, ymax=1.1,
+  axis lines=box, ytick=\empty,
+  xtick={0,1,2,3,4,5,6,7,8,9,10,11},
+  xticklabels={C,C\#,D,D\#,E,F,F\#,G,G\#,A,A\#,B},
+  title={Chroma vector of a C-major chord (C--E--G)},
+  every axis title/.style={below right,at={(0,1)}},
+]
+\addplot[ybar, bar width=10pt, fill=targetgreen, draw=targetgreen!60!black] coordinates {
+  (0,1.0)(1,0.08)(2,0.1)(3,0.06)(4,0.9)(5,0.07)(6,0.05)(7,0.85)
+  (8,0.06)(9,0.09)(10,0.05)(11,0.07)};
+\end{axis}
+\end{tikzpicture}
+\caption{Chroma of a C-major chord: energy piles up on C, E, and G regardless of
+which octaves the notes are played in or what instrument plays them. The small
+nonzero values on other classes are leakage from harmonics and windowing.}
+\label{ch27:fig-chroma}
+\end{figure}
+
+\begin{intuitionbox}
+Chroma is the musical inverse of MFCCs. MFCCs keep the spectral \emph{envelope}
+(timbre) and discard pitch; chroma keeps the \emph{pitch class} and discards both
+timbre and octave. A C-major chord on a piano and on a guitar have very different
+MFCCs (different timbres) but nearly identical chroma (same notes). That octave-
+and timbre-invariance is exactly what you want for chord recognition, key
+estimation, and matching cover versions of a song.
+\end{intuitionbox}
+
+\begin{applicationbox}
+Chroma underlies practical music systems: chord-recognition apps that print
+guitar tabs from audio, key-detection in DJ software that matches songs in
+compatible keys, and audio-to-score alignment that follows a live performer
+through a known piece. Comparing the sequence of chroma vectors between two
+recordings (via dynamic time warping) is also how ``cover song'' and
+audio-fingerprint-adjacent systems decide that two performances are the same
+underlying song.
+\end{applicationbox}
+
+\section{Pitch detection: finding the fundamental period}
+\label{ch27:pitch}
+
+Pitch is not the same as a single feature value -- it is an estimate of the
+\textbf{fundamental frequency} $f_0$, the rate at which a (quasi-)periodic signal
+repeats. A vowel, a bowed string, a sung note: all repeat a basic waveform shape
+many times per frame. Pitch detection asks: what is the period of that repetition?
+
+\begin{trapbox}
+``Just take the FFT and find the biggest peak.'' This fails constantly. For many
+instruments and voices the fundamental is \emph{weaker} than its harmonics, or
+even physically absent (the ``missing fundamental'' -- a telephone removes
+everything below $300$\,Hz, yet you still hear a $150$\,Hz male voice at its true
+pitch because your brain infers $f_0$ from the harmonic \emph{spacing}). The
+strongest spectral peak is often the second or third harmonic. Robust pitch
+detection looks at \emph{periodicity}, not at peak height.
+\end{trapbox}
+
+\subsection*{Autocorrelation: how well a signal matches a shifted copy of itself}
+
+The cleanest way to find a period is to slide the signal against a copy of itself
+and see at which shift it lines up best. That is the \textbf{autocorrelation}:
+\begin{equation}
+\label{ch27:autocorr}
+r[\tau] = \sum_{n} x[n]\,x[n+\tau].
+\end{equation}
+At lag $\tau = 0$ the signal perfectly overlaps itself, giving the maximum (that
+is just the energy). As $\tau$ grows, $r[\tau]$ dips and then, when $\tau$ equals
+one period $T_0$, the signal lines up with itself again and $r[\tau]$ peaks once
+more. The first strong peak after lag zero sits at $\tau = T_0$, and
+$f_0 = f_s / T_0$.
+
+\begin{whybox}
+Autocorrelation is an inner product (Chapter~3) between the signal and a
+time-shifted version of itself: $r[\tau] = \inner{x[n]}{x[n+\tau]}$. An inner
+product measures alignment -- how much two vectors point the same way. When the
+shift equals the period, the shifted copy is nearly identical to the original, so
+their alignment (inner product) is large. Pitch detection by autocorrelation is
+therefore literally ``at what shift does the signal most resemble itself?'' -- a
+purely geometric question.
+\end{whybox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=3.2cm,
+  xlabel={$n$}, ylabel={$x[n]$},
+  xmin=0, xmax=4, ymin=-1.6, ymax=1.6,
+  axis lines=middle, samples=160, domain=0:4,
+  title={A quasi-periodic frame},
+  every axis title/.style={below right,at={(0,1)}},
+]
+\addplot[sigblue, thick] {sin(deg(2*pi*x)) + 0.4*sin(deg(2*pi*2*x)) + 0.2*sin(deg(2*pi*3*x))};
+\end{axis}
+\end{tikzpicture}
+
+\vspace{0.2em}
+
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=3.2cm,
+  xlabel={lag $\tau$}, ylabel={$r[\tau]$},
+  xmin=0, xmax=4, ymin=-1.1, ymax=1.15,
+  axis lines=middle, samples=160, domain=0:4,
+  title={Its autocorrelation: peak at lag zero, next peak at the period $T_0$},
+  every axis title/.style={below right,at={(0,1)}},
+]
+\addplot[specred, thick] {(cos(deg(2*pi*x)) + 0.16*cos(deg(2*pi*2*x)) + 0.04*cos(deg(2*pi*3*x)))/1.2};
+\draw[gray, dashed] (axis cs:1,-1.1) -- (axis cs:1,1.15);
+\node at (axis cs:1.0,1.32) {\small $\tau = T_0$};
+\end{axis}
+\end{tikzpicture}
+\caption{Top: a periodic frame. Bottom: its autocorrelation peaks at lag $0$ and
+again at the period $T_0$. Locating that first non-trivial peak gives the period,
+hence $f_0 = f_s/T_0$.}
+\label{ch27:fig-autocorr}
+\end{figure}
+
+\begin{connectionbox}
+By the convolution theorem (Chapter~11), autocorrelation can be computed
+\emph{fast} as $r = \text{IFFT}\bigl(|X[k]|^2\bigr)$: the inverse transform of the
+power spectrum. So pitch detection in time (autocorrelation) and pitch analysis in
+frequency (the power spectrum) are two views of the same object -- the
+Wiener--Khinchin theorem made practical. This also reveals why ``peak in spectrum''
+and ``peak in autocorrelation'' are related but not identical: the autocorrelation
+folds all the harmonics back onto the single period, which is exactly why it sees
+the true $f_0$ even when the fundamental bin is weak.
+\end{connectionbox}
+
+\subsection*{YIN: fixing autocorrelation's mistakes}
+
+Plain autocorrelation has two well-known failure modes: it can pick lag zero or a
+too-short lag (\emph{octave-too-high} errors, since a half-period also correlates
+somewhat), and amplitude changes within the frame bias the peaks. The
+\textbf{YIN} algorithm (de Cheveign\'e and Kawahara, 2002) is a celebrated set of
+refinements that makes period detection far more reliable. Its key ideas:
+
+\begin{enumerate}
+  \item \textbf{Difference function instead of correlation.} Use the squared
+        difference $d[\tau] = \sum_n (x[n] - x[n+\tau])^2$, which is \emph{zero}
+        when the shifted copy matches (a valley to find) rather than a peak. This
+        is more stable than correlation under amplitude variation.
+  \item \textbf{Cumulative mean normalization.} Divide $d[\tau]$ by its running
+        average up to $\tau$. This deliberately makes lag zero \emph{not} a winner
+        and suppresses the spurious sub-period dips that cause octave errors.
+  \item \textbf{Absolute threshold.} Take the first valley that drops below a fixed
+        threshold (e.g. $0.1$), rather than the global minimum -- this prefers the
+        true (longest, lowest-pitch) period over its harmonics.
+  \item \textbf{Parabolic interpolation.} Fit a parabola around the chosen valley
+        to estimate the period to sub-sample precision, beating the resolution of
+        the integer lags.
+\end{enumerate}
+
+YIN and its descendants (pYIN, CREPE in the neural era) are what real pitch
+trackers use. The lesson is general: the naive idea (autocorrelation) is correct
+in spirit, and the engineering is in defeating its predictable biases -- octave
+errors, amplitude sensitivity, and discrete resolution.
+
+\begin{example}[From lag to frequency]
+\label{ch27:ex-lag}
+At $f_s = 16{,}000$\,Hz, suppose the difference function's first deep valley sits
+at lag $\tau = 145$ samples, and parabolic interpolation refines it to
+$\tau = 145.3$. Then
+\[
+f_0 = \frac{f_s}{\tau} = \frac{16000}{145.3} \approx 110.1\text{ Hz},
+\]
+an A2 -- the open A string of a bass guitar. Note how the interpolation matters:
+the integer lag $145$ would give $110.34$\,Hz and lag $146$ would give
+$109.6$\,Hz, a difference you can hear. Sub-sample interpolation is not a luxury
+for pitch.
+\end{example}
+
+\section{Onset detection: when did something happen}
+\label{ch27:onset}
+
+Rhythm is about \emph{events in time}: the instants when notes begin, drums hit,
+syllables start. An \textbf{onset} is the start of a new sonic event. Detecting
+onsets turns continuous audio into a sequence of time stamps -- the raw material
+for beat tracking, tempo estimation, automatic transcription, and rhythm games.
+
+The standard recipe builds an \textbf{onset strength signal} (also called a
+detection function), one value per frame that is large at onsets and small
+otherwise, then picks its peaks. The building blocks are features we already have:
+
+\begin{itemize}
+  \item \textbf{Energy difference.} The simplest detector: the positive
+        first difference of the (log) energy contour. Works for percussive,
+        sharply-attacked sounds (drums, plucks) where energy jumps suddenly.
+  \item \textbf{Spectral flux.} Section~\ref{ch27:flux}, the half-wave-rectified
+        change in the magnitude spectrum. Catches onsets that change \emph{timbre}
+        or pitch without a big energy jump (a legato note change, a bowed
+        attack) -- the most widely used general-purpose onset feature.
+  \item \textbf{Phase deviation.} For soft, blurry onsets, the \emph{phase} of
+        each bin advances predictably during steady tones; an onset disrupts that
+        predictability. Phase-based and complex-domain detectors combine magnitude
+        flux with phase irregularity for the hardest cases.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=3.6cm,
+  xlabel={time (s)}, ylabel={onset strength},
+  xmin=0, xmax=4, ymin=0, ymax=1.2,
+  axis lines=box, ytick=\empty,
+  title={Onset strength with peak-picking threshold},
+  every axis title/.style={below right,at={(0,1)}},
+]
+\addplot[structurepurple, thick] coordinates {
+  (0,0.05)(0.3,0.07)(0.4,0.95)(0.5,0.3)(0.6,0.08)(1.0,0.06)(1.1,0.8)(1.2,0.25)
+  (1.3,0.07)(1.55,0.5)(1.6,0.9)(1.7,0.3)(1.8,0.08)(2.4,0.05)(2.5,0.85)(2.6,0.28)
+  (2.7,0.07)(3.2,0.06)(3.3,0.92)(3.4,0.3)(3.5,0.08)(4,0.05)};
+\addplot[trapred, dashed, thick] coordinates {(0,0.45)(4,0.45)};
+\node[trapred] at (axis cs:3.4,0.58) {\small threshold};
+\end{axis}
+\end{tikzpicture}
+\caption{An onset-strength contour. Peaks above an adaptive threshold (red) are
+declared onsets. The threshold usually tracks a local moving average so that quiet
+and loud passages are handled fairly.}
+\label{ch27:fig-onset}
+\end{figure}
+
+\subsection*{Peak picking}
+
+Turning the strength curve into discrete onsets needs care, because the curve is
+noisy and onsets come in clusters. Practical peak picking: (1) smooth the strength
+signal lightly; (2) require a peak to exceed a local moving-average threshold by a
+margin, so loud and quiet sections are treated fairly; (3) enforce a minimum
+spacing between onsets (a refractory period of a few tens of milliseconds) so a
+single attack is not counted several times. These three steps -- smooth,
+adaptive-threshold, refractory -- recur in every event detector, audio or not.
+
+\begin{historybox}
+The 2000s saw a friendly arms race over onset detection driven by the MIREX
+evaluation campaigns, where research groups competed on shared annotated audio.
+Spectral flux, complex-domain, and phase-based detectors were systematically
+compared; the broad finding -- that spectral flux is a remarkably strong, simple
+baseline and that the hard cases are soft onsets in expressive music -- still
+shapes how onset detectors are built today, even neural ones, which often just
+learn a better detection function over the same framed spectra.
+\end{historybox}
+
+\section{Putting it together: a feature pipeline on a clip}
+\label{ch27:pipeline}
+
+The features in this chapter are rarely used alone; a real system computes several
+per frame and stacks them into a feature vector, then feeds the stream to a
+classifier or a state machine. Here is a compact, correct sketch of the front end
+in Python/NumPy.
+
+\begin{lstlisting}[language=Python, caption={Framing plus a handful of features per frame.}]
+import numpy as np
+
+def frames(x, N=1024, H=512):
+    # generator of windowed frames
+    w = np.hanning(N)
+    for m in range(0, len(x) - N, H):
+        yield x[m:m+N] * w
+
+def features(frame, fs):
+    # time-domain
+    energy = np.sum(frame**2)
+    rms    = np.sqrt(energy / len(frame))
+    sgn    = np.sign(frame)
+    zcr    = np.mean(np.abs(np.diff(sgn))) / 2.0
+    # spectral
+    X  = np.abs(np.fft.rfft(frame))
+    fk = np.fft.rfftfreq(len(frame), 1.0 / fs)
+    Xs = X.sum() + 1e-12
+    centroid = np.sum(fk * X) / Xs
+    spread   = np.sqrt(np.sum((fk - centroid)**2 * X) / Xs)
+    cumE     = np.cumsum(X**2)
+    rolloff  = fk[np.searchsorted(cumE, 0.85 * cumE[-1])]
+    return dict(rms=rms, zcr=zcr, centroid=centroid,
+                spread=spread, rolloff=rolloff)
+
+def spectral_flux(prev_mag, mag):
+    d = mag - prev_mag
+    return np.sum(np.maximum(d, 0.0)**2)   # half-wave rectified
+\end{lstlisting}
+
+\begin{walkbox}
+Run this front end on a clip and you get five contours (RMS, ZCR, centroid,
+spread, rolloff) plus a flux contour, each at the frame rate. Look at them
+together: during a vowel, RMS is high, ZCR is low, centroid is low; during an /s/,
+RMS is moderate, ZCR is high, centroid is high. During silence everything drops.
+You have, in a few dozen lines, built a representation in which speech-versus-
+silence and voiced-versus-unvoiced are nearly linearly separable -- the kind of
+input a tiny classifier can handle. Ask yourself: which single feature best
+separates your particular clip's classes? That is the feature-selection question
+every applied project must answer.
+\end{walkbox}
+
+\begin{buildbox}
+On a microcontroller you will not run an FFT every frame for free, so budget
+deliberately. The cheap tier -- RMS energy and ZCR -- needs no FFT and runs
+comfortably at full sample rate on an Arduino-class chip; use it as an
+always-on gate. The spectral tier -- centroid, rolloff, flux -- needs one
+real FFT per frame; a $256$- or $512$-point fixed-point FFT (e.g. CMSIS-DSP's
+\texttt{arm\_rfft}) on a Cortex-M4 at $80$--$120$\,MHz fits easily in a $10$\,ms
+hop. The expensive tier -- a full mel filterbank plus DCT for MFCCs -- is feasible
+on an M4/M7 but is where you start watching the clock and the battery. A common
+embedded pattern: gate on energy, and only run the FFT/MFCC stage when the gate is
+open. This same tiered budgeting is exactly how the wrist controller will manage
+its own feature extraction.
+\end{buildbox}
+
+\section{The same features on motion signals}
+\label{ch27:motion}
+
+Here is the payoff promised at the start. A tri-axial accelerometer streams three
+signals $a_x[n], a_y[n], a_z[n]$ at, say, $100$--$200$\,Hz; a gyroscope adds three
+more. These are signals exactly like audio, only slower and lower-dimensional, and
+the features of this chapter transfer with almost no change:
+
+\begin{itemize}
+  \item \textbf{Energy / RMS} of the acceleration magnitude
+        $\sqrt{a_x^2+a_y^2+a_z^2}$ measures motion intensity -- resting versus
+        gesturing -- and is the standard activity gate.
+  \item \textbf{Zero-crossing rate} of a band-passed axis measures how oscillatory
+        a motion is, distinguishing a shake or tremor from a smooth sweep.
+  \item \textbf{Spectral centroid and rolloff} of a short motion FFT capture
+        whether the motion energy is slow (a deliberate wave) or fast (a flick or
+        vibration).
+  \item \textbf{Spectral flux} marks the \emph{onset} of a gesture, the motion
+        analogue of a note attack -- the trigger that says ``a gesture is
+        starting, begin classifying.''
+  \item \textbf{MFCC-style features} (a small mel-like filterbank plus DCT on the
+        motion spectrum) are used in human-activity-recognition research and work
+        surprisingly well for distinguishing walking, typing, and gesturing.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=3.4cm,
+  xlabel={time (s)}, ylabel={accel mag (g)},
+  xmin=0, xmax=4, ymin=0, ymax=2.2,
+  axis lines=box, samples=200, domain=0:4,
+  title={Accelerometer magnitude: rest, gesture, rest},
+  every axis title/.style={below right,at={(0,1)}},
+]
+\addplot[sigblue, thick, domain=0:1.2, samples=60] {1 + 0.03*sin(deg(2*pi*3*x))};
+\addplot[specred, thick, domain=1.2:2.6, samples=120]
+  {1 + 0.8*sin(deg(2*pi*4*x))*exp(-1.2*(x-1.9)^2)};
+\addplot[sigblue, thick, domain=2.6:4, samples=60] {1 + 0.03*sin(deg(2*pi*3*x))};
+\end{axis}
+\end{tikzpicture}
+\caption{A motion trace with a gesture in the middle. Short-time energy rises in
+the gesture region (intensity gate); spectral flux spikes at its start (onset);
+centroid reports how fast the motion is. The very same code from
+Section~\ref{ch27:pipeline} produces these contours.}
+\label{ch27:fig-motion}
+\end{figure}
+
+\begin{goalbox}
+For the wrist controller, the plan is now concrete. An always-on energy gate on
+accelerometer magnitude wakes the system; a spectral-flux onset detector marks the
+gesture's start; and a short feature vector (energy, ZCR, centroid, a few
+mel-DCT coefficients, plus their deltas) computed over the gesture window feeds the
+classifier that decides \emph{which} gesture it was, which is then mapped to a MIDI
+message. Every block in that sentence is a feature from this chapter.
+
+\textbf{The limit, stated plainly:} this pipeline recognizes coarse,
+discrete wrist and forearm gestures -- a flick, a twist, a tap, a hold. A
+wrist-worn IMU \emph{cannot} recover continuous individual finger joint angles;
+the wrist simply does not move enough, distinctly enough, when only a finger
+moves. Detecting which finger pressed, or tracking continuous finger pose, needs
+sensors that see the muscles or the fingers themselves -- surface EMG or force
+myography on the forearm for discrete finger events, or instrumented rings for
+continuous pose. We confront those sensors and their own features in
+Chapter~37. Audio-style features get you robust \emph{gesture} control; they do
+not get you a glove.
+\end{goalbox}
+
+\section{Summary}
+\label{ch27:summary}
+
+A feature collapses a high-dimensional frame to a few meaningful numbers, computed
+frame by frame to produce a low-rate contour. The cheapest features are
+time-domain: \emph{energy/RMS} (squared length, the loudness envelope) and
+\emph{zero-crossing rate} (sign flips, a tonal-versus-noisy and voiced-versus-
+unvoiced meter). Treating the magnitude spectrum as a mass distribution yields the
+shape features: \emph{centroid} (mean frequency, brightness), \emph{spread}
+(standard deviation), \emph{rolloff} (a quantile), and \emph{flatness}
+(tonal-versus-noisy). \emph{Spectral flux} measures change between frames and
+drives onset detection.
+
+The \emph{mel scale} warps frequency to match the ear's logarithmic pitch
+sensitivity; pooling the spectrum through a mel filterbank, taking the log
+(to separate source from filter), and applying a DCT (to decorrelate and compress)
+yields the \emph{MFCCs}, the timbre-describing, pitch-invariant feature that
+dominated speech recognition. Their opposite, \emph{chroma}, folds the spectrum
+onto twelve pitch classes to keep harmony while discarding timbre and octave.
+\emph{Pitch} is found by periodicity -- autocorrelation (an inner product of the
+signal with a shifted copy of itself), refined by \emph{YIN} to beat octave errors
+and reach sub-sample precision. \emph{Onsets} come from peak-picking a detection
+function built from energy difference, spectral flux, or phase deviation.
+
+Every one of these features is a function of the waveform or its spectrum, and
+nearly all of them apply unchanged to motion signals, which is why this chapter is
+the feature toolbox for the wrist controller -- with the standing caveat that IMU
+features yield coarse gestures, not finger pose.
+
+\section{Exercises}
+\label{ch27:exercises}
+
+\begin{exercise}[RMS and dB]
+\label{ch27:ex1}
+A frame of $N=1024$ samples holds a sine of amplitude $0.5$ over an integer number
+of cycles. Compute its energy, RMS, and energy in dB ($10\log_{10}E$). Then a
+second frame holds the same sine plus white noise of RMS $0.05$; estimate the new
+RMS (assume signal and noise are uncorrelated, so energies add) and the change in
+dB. Is the dB change something a listener would notice?
+\end{exercise}
+
+\begin{exercise}[ZCR of a tone]
+\label{ch27:ex2}
+Show that a pure sinusoid of frequency $f$ sampled at $f_s$ has an expected
+zero-crossing rate of $2f/f_s$ crossings per sample. Use this to ``read off'' the
+frequency of a clean tone from its ZCR. Then explain, with a sketch, why this
+estimate breaks down when a second, higher-frequency tone or noise is added.
+\end{exercise}
+
+\begin{exercise}[Centroid arithmetic]
+\label{ch27:ex3}
+A frame's spectrum has lines of magnitude $4$ at $250$\,Hz, $2$ at $500$\,Hz, and
+$1$ at $2000$\,Hz. Compute the spectral centroid and the spectral spread. Now
+double the $2000$\,Hz line to magnitude $2$ and recompute both. By how much, and in
+which direction, did each move? Interpret in terms of brightness.
+\end{exercise}
+
+\begin{exercise}[Rolloff as a quantile]
+\label{ch27:ex4}
+Given the same three-line spectrum as Exercise~\ref{ch27:ex3} (use magnitudes
+$4, 2, 1$ as energies for simplicity), compute the $0.85$ spectral rolloff
+frequency. Explain why rolloff can be more robust than centroid when a single
+loud high-frequency bin appears, and give an example spectrum where centroid moves
+a lot but rolloff barely moves.
+\end{exercise}
+
+\begin{exercise}[Why the log in MFCCs]
+\label{ch27:ex5}
+Two frames have spectra $A[k]$ and $2A[k]$ (the second is the first scaled by a
+constant gain, as if recorded louder). Show that after the $\log$ step their
+mel-band vectors differ only by a constant offset, and therefore -- because the
+DCT of a constant lands entirely in $c[0]$ -- their MFCCs $c[1], c[2], \dots$ are
+\emph{identical}. What practical invariance does this give the feature?
+\end{exercise}
+
+\begin{exercise}[DCT energy compaction]
+\label{ch27:ex6}
+Take a length-8 vector that is a smooth ramp $v_j = j$ for $j=0,\dots,7$. Compute
+its DCT (by hand or with a few lines of code) and report how much of the total
+energy lands in the first two coefficients versus the rest. Repeat for a vector of
+random values. Explain what this demonstrates about why MFCCs keep only the
+low-order coefficients.
+\end{exercise}
+
+\begin{exercise}[Autocorrelation period]
+\label{ch27:ex7}
+A signal is sampled at $f_s = 8000$\,Hz. Its autocorrelation has its first strong
+peak after lag zero at $\tau = 100$ samples. What is the estimated $f_0$? Now
+suppose a spurious peak also appears at $\tau = 50$; which note is that, and why
+might a naive ``first peak'' rule pick it? Which YIN step is designed to prevent
+this error?
+\end{exercise}
+
+\begin{exercise}[The missing fundamental]
+\label{ch27:ex8}
+A periodic tone has $f_0 = 200$\,Hz but the recording high-passes away everything
+below $400$\,Hz, leaving only the harmonics at $400, 600, 800, \dots$\,Hz. Explain
+why an FFT-peak pitch detector would report the wrong answer, while an
+autocorrelation detector still finds $f_0 = 200$\,Hz. What is the lag of the
+relevant autocorrelation peak at $f_s = 16000$\,Hz?
+\end{exercise}
+
+\begin{exercise}[Onset detection function]
+\label{ch27:ex9}
+Explain why spectral flux uses half-wave rectification (keeping only increases)
+rather than the full difference. Construct a short example -- a note that grows then
+fades -- and sketch both the full-difference and the half-wave-rectified flux,
+showing how the rectified version peaks at the attack only.
+\end{exercise}
+
+\begin{exercise}[Peak picking pitfalls]
+\label{ch27:ex10}
+You apply a fixed global threshold to an onset-strength curve and find it misses
+soft onsets in quiet passages while double-counting loud drum hits. Propose two
+fixes (one about the threshold, one about timing), and explain how each addresses a
+specific failure. Relate your answer to the smooth / adaptive-threshold /
+refractory recipe.
+\end{exercise}
+
+\begin{exercise}[Transfer to motion]
+\label{ch27:ex11}
+You record $100$\,Hz accelerometer magnitude during ten repetitions of a wrist
+flick separated by rest. Describe which features from this chapter you would
+compute and how you would combine an energy gate with a spectral-flux onset
+detector to segment the ten flicks. Then state plainly what this pipeline
+\emph{cannot} tell you about the hand, and which sensor you would add to recover
+finger-level information.
+\end{exercise}
+
+\begin{exercise}[Feature separability]
+\label{ch27:ex12}
+For each pair below, name the single feature from this chapter that best separates
+them and justify it in one sentence: (a) silence vs.\ speech; (b) a vowel vs.\ the
+consonant /s/; (c) a flute note vs.\ a cymbal crash; (d) a C-major chord vs.\ an
+A-minor chord; (e) a sustained note vs.\ the instant a new note begins.
+\end{exercise}

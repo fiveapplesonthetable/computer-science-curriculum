@@ -1,0 +1,859 @@
+\chapter{Quantization, ADCs, and DACs}
+
+\chapterline
+
+In the last chapter we cut time into a grid. Sampling answered the question \emph{when} do we
+look at a signal, and Nyquist told us how often we must look so that nothing is lost. But there
+is a second grid hiding inside every digital system, and it is just as important and far less
+discussed: the grid on the \emph{vertical} axis. A computer cannot store the real number
+$0.7182818\ldots$ It stores a finite pattern of bits. So when the analog-to-digital converter
+(the ADC) measures a voltage, it must not only pick a moment in time -- it must also snap the
+measured value to the nearest rung on a ladder of allowed values. That snapping is
+\textbf{quantization}, and it is the subject of this chapter.
+
+Sampling is about the horizontal grid; quantization is about the vertical grid. Together they
+turn a smooth analog wiggle into a finite list of integers -- the only thing a microcontroller,
+a CPU, or a DSP chip can actually hold. Going the other way, a digital-to-analog converter (the
+DAC) reads integers back out and rebuilds a voltage you can send to a speaker or a motor. This
+chapter builds the geometric picture of that vertical grid, derives the famous "about 6~dB per
+bit" rule from scratch, opens up the two ADC architectures you will actually meet
+(successive-approximation and sigma-delta), and shows why oversampling and \emph{adding noise on
+purpose} (dithering) can buy you resolution that the raw bit count seems to forbid. We end at the
+bench, reading a real sensor through the ADC on an Arduino and a Raspberry Pi.
+
+\section{The vertical grid: from a value to a code}
+\label{ch19:vertical-grid}
+
+Picture the ADC's job geometrically. The input is a voltage $x$ somewhere in an allowed range,
+say from $0$ to a reference voltage $V_{\mathrm{ref}}$. The output is one of a finite set of
+integer \emph{codes}: $0, 1, 2, \ldots, 2^N - 1$ for an $N$-bit converter. The converter draws a
+ladder of evenly spaced horizontal lines across the input range and reports which rung your
+voltage is nearest. The spacing between rungs is the single most important number in the whole
+chapter:
+\[
+  \Delta \;=\; \frac{V_{\mathrm{ref}}}{2^N}.
+\]
+We call $\Delta$ the \textbf{quantization step} or the value of one \textbf{LSB} (least
+significant bit) -- the smallest change in voltage that can possibly change the output code.
+
+\begin{intuitionbox}
+Sampling chops a continuous curve into a row of vertical pins (one per sample instant).
+Quantization then files the top of each pin down to the nearest line on a piece of ruled paper.
+After both operations the signal lives entirely on a finite lattice: finitely many time slots
+across, finitely many value-rungs up. A digital signal is a set of points on graph paper, and
+nothing in between exists.
+\end{intuitionbox}
+
+Figure~\ref{ch19:fig-staircase} shows the transfer characteristic -- output code versus input
+voltage -- for a tiny 3-bit converter (eight rungs). It is a staircase. Inside each tread the
+output does not change at all; cross a riser and the code jumps by one. The flat treads are
+exactly where information is being thrown away: every input voltage in a tread is reported by the
+same code.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=11cm, height=6cm,
+  xlabel={input voltage $x$ (in units of $V_{\mathrm{ref}}$)},
+  ylabel={output code},
+  xmin=0, xmax=1, ymin=0, ymax=8,
+  axis lines=left,
+  ytick={0,1,2,3,4,5,6,7},
+  xtick={0,0.25,0.5,0.75,1},
+  enlargelimits=false,
+]
+% ideal line
+\addplot[gray, dashed, domain=0:1, samples=2] {8*x};
+% staircase: codes 0..7, top code saturates at 7
+\addplot[sigblue, thick, const plot, no marks] coordinates {
+ (0,0) (0.125,1) (0.25,2) (0.375,3) (0.5,4) (0.625,5) (0.75,6) (0.875,7) (1,7)
+};
+\end{axis}
+\end{tikzpicture}
+\caption{The quantizer transfer characteristic for a 3-bit converter (8 codes). The dashed line
+is the ideal continuous response; the blue staircase is what you actually get. Each flat tread
+has width $\Delta = V_{\mathrm{ref}}/8$, and any input within a tread maps to the same code.}
+\label{ch19:fig-staircase}
+\end{figure}
+
+\begin{definition}[Uniform quantizer]
+\label{ch19:def-quantizer}
+A \textbf{uniform quantizer} with step $\Delta$ maps a real input $x$ to the nearest multiple of
+$\Delta$:
+\[
+  Q(x) \;=\; \Delta \cdot \mathrm{round}\!\left(\frac{x}{\Delta}\right).
+\]
+The integer $\mathrm{round}(x/\Delta)$, clipped to the available code range, is the digital code
+stored in memory.
+\end{definition}
+
+\paragraph{Bit depth.} The number $N$ is the \textbf{bit depth} or resolution. Each extra bit
+doubles the number of rungs and halves $\Delta$. The vocabulary you will hear:
+\begin{itemize}
+  \item \textbf{8-bit}: 256 levels. Old samplers, simple sensors, control loops where you only
+        need coarse values.
+  \item \textbf{10/12-bit}: the ADCs built into microcontrollers (Arduino Uno is 10-bit,
+        many Cortex-M parts are 12-bit). Plenty for an IMU axis or a slider.
+  \item \textbf{16-bit}: CD-quality audio. 65{,}536 levels.
+  \item \textbf{24-bit}: studio audio and high-end sigma-delta sensor front-ends.
+\end{itemize}
+
+\begin{trapbox}
+Bit depth and sample rate are independent axes and people constantly confuse them. Sample rate
+(Chapter~18) is the horizontal grid spacing and is governed by Nyquist; it decides the highest
+\emph{frequency} you can represent. Bit depth is the vertical grid spacing; it decides the
+smallest \emph{amplitude change} you can represent, which sets the noise floor. A 1~MHz, 4-bit
+converter and a 1~kHz, 24-bit converter are good at completely different things. Always ask both
+"how fast?" and "how fine?"
+\end{trapbox}
+
+\subsection*{Mid-rise versus mid-tread, and clipping}
+There are two ways to position the staircase. A \emph{mid-tread} quantizer has a flat tread
+centered on zero, so small inputs map to code zero -- handy because true silence reads as exactly
+zero. A \emph{mid-rise} quantizer has a riser at zero, so it never outputs an exact zero but
+treats positive and negative symmetrically. Audio converters are usually mid-tread. The
+difference is one half-LSB of offset and rarely matters in practice, but it explains why your DC
+reading might sit on $0$ or might dither between $-1$ and $+1$ codes.
+
+What always matters is \textbf{clipping}. The ladder has a top and a bottom. Push the input above
+$V_{\mathrm{ref}}$ (or below ground) and the code saturates at its maximum (or minimum) and
+\emph{stays there}. Geometrically the staircase goes flat forever. Clipping is not graceful
+rounding -- it is a hard wall that flattens the peaks of your waveform into plateaus, generating a
+spray of harmonics. Sampling errors can be undone by a filter; clipping destroys information
+irreversibly. Set your input gain so peaks land just below full scale, never above.
+
+\begin{connectionbox}
+The round-to-nearest rule is exactly the projection idea from the linear-algebra companion,
+applied to a one-dimensional lattice. $Q(x)$ is the closest point of the set $\Delta\Z$ to $x$,
+i.e.\ the orthogonal projection of $x$ onto a discrete grid. Quantization error is the residual
+$x - Q(x)$, the part of $x$ that the grid cannot represent -- the same "what is left over after
+projection" object you met with Fourier coefficients, now in the crudest possible space.
+\end{connectionbox}
+
+\section{Quantization error as noise}
+\label{ch19:error-as-noise}
+
+The interesting quantity is not $Q(x)$ but the \textbf{error} it makes:
+\[
+  e \;=\; Q(x) - x.
+\]
+Because $Q$ rounds to the nearest rung, and the rungs are spaced $\Delta$ apart, the error can
+never exceed half a step in magnitude:
+\[
+  -\tfrac{\Delta}{2} \;\le\; e \;\le\; \tfrac{\Delta}{2}.
+\]
+That bound is exact and unconditional. The error is the vertical distance from each pin-top down
+(or up) to the nearest ruled line, and that distance is at most half the line spacing.
+
+Here is the move that makes quantization tractable. For a busy signal -- music, an accelerometer
+trace, anything that swings across many codes from sample to sample -- the error $e$ behaves like
+a \emph{random number, uniformly spread} across the interval $[-\Delta/2, \Delta/2]$, and roughly
+independent from one sample to the next. We do not need this to be exactly true; we need it to be
+a good model, and for active signals it is excellent. Under that model, quantization is just a
+weak, broadband \textbf{noise} added to the clean signal.
+
+\begin{whybox}
+Why is treating a \emph{deterministic} rounding rule as random legitimate? Because the signal
+sweeps across the treads in a way that is, from the error's point of view, effectively
+unpredictable. If $x$ moves by a fraction of an LSB that has no simple relation to $\Delta$, the
+fractional part $x/\Delta \bmod 1$ tumbles through $[0,1)$ and visits all positions about
+equally. The error is a deterministic function of an effectively-uniform phase, so it inherits a
+uniform distribution. This is the same reason that a fast-spinning analog phase looks like a
+random angle. The model fails only when the signal is too quiet or too slow to stir the
+phase -- which is precisely the case dithering will fix in Section~\ref{ch19:dither}.
+\end{whybox}
+
+\subsection*{The power of the noise}
+Model $e$ as uniform on $[-\Delta/2, \Delta/2]$. Its mean is zero, and its power is its variance
+-- a textbook integral from the probability companion:
+\[
+  \sigma_e^2 \;=\; \E[e^2] \;=\; \frac{1}{\Delta}\int_{-\Delta/2}^{\Delta/2} e^2 \,\dd e
+  \;=\; \frac{\Delta^2}{12}.
+\]
+That little $\Delta^2/12$ is one of the most useful numbers in all of DSP. It says the
+quantization noise power depends only on the step size, and shrinks as the \emph{square} of the
+step. Halve $\Delta$ (add one bit) and you cut the noise power by a factor of four.
+
+\begin{connectionbox}
+$\sigma_e^2 = \Delta^2/12$ is just the variance of a uniform distribution, derived in the
+probability book. The $1/12$ is not magic: $\Var(U)$ for $U$ uniform on an interval of width $w$
+is $w^2/12$, and here $w=\Delta$. Quantization is your first concrete meeting with a
+\emph{random signal} -- a noise process whose statistics you can compute exactly. Chapter~20
+picks up this thread and treats noise in earnest.
+\end{connectionbox}
+
+\begin{happeningbox}
+Visualize what $\Delta^2/12$ means on the graph. After quantizing, your reconstructed waveform is
+the true waveform plus a thin, grassy fuzz of height about $\pm\Delta/2$. That fuzz is spread
+fairly evenly across \emph{all} frequencies (it is broadband, "white"). It is not a distortion of
+the shape so much as a fine hiss riding on top. Crucially, its total power is fixed by $\Delta$
+alone -- it does not care how loud or quiet your signal is. That single fact drives the entire
+SNR story below: a loud signal stands far above a fixed hiss; a quiet one drowns in it.
+\end{happeningbox}
+
+\section{Signal-to-noise ratio and the 6~dB-per-bit rule}
+\label{ch19:snr}
+
+Now we can answer the question every spec sheet brags about: how good is an $N$-bit converter? We
+compare the power of the largest signal it can carry against the power of the quantization hiss.
+That ratio, in decibels, is the \textbf{signal-to-noise ratio} (SNR).
+
+Take a full-scale sinusoid -- the loudest signal that fits without clipping. Its peak-to-peak
+swing fills the whole range $2^N \Delta$, so its amplitude is $A = 2^N\Delta/2 = 2^{N-1}\Delta$.
+A sinusoid of amplitude $A$ has power
+\[
+  P_{\mathrm{sig}} \;=\; \frac{A^2}{2} \;=\; \frac{(2^{N-1}\Delta)^2}{2}
+  \;=\; \frac{2^{2N}\,\Delta^2}{8}.
+\]
+The noise power is $\sigma_e^2 = \Delta^2/12$. Their ratio is
+\[
+  \mathrm{SNR} \;=\; \frac{P_{\mathrm{sig}}}{\sigma_e^2}
+  \;=\; \frac{2^{2N}\Delta^2/8}{\Delta^2/12} \;=\; \frac{12}{8}\,2^{2N}
+  \;=\; \frac{3}{2}\,2^{2N}.
+\]
+The $\Delta^2$ cancels -- a beautiful and important fact. The SNR of an ideal converter does not
+depend on the reference voltage or the step size; it depends only on the number of bits. Now
+convert to decibels:
+\[
+  \mathrm{SNR}_{\mathrm{dB}} \;=\; 10\log_{10}\!\left(\frac{3}{2}\,2^{2N}\right)
+  \;=\; 10\log_{10}\tfrac{3}{2} \;+\; 2N\cdot 10\log_{10} 2.
+\]
+Plug in $10\log_{10}2 \approx 3.0103$ and $10\log_{10}\tfrac32 \approx 1.76$:
+\[
+  \boxed{\;\mathrm{SNR}_{\mathrm{dB}} \;\approx\; 6.02\,N \;+\; 1.76 \ \text{dB}.\;}
+\]
+
+\begin{focusbox}
+\textbf{The 6~dB-per-bit rule.} Each additional bit of resolution buys you about $6.02$~dB of
+SNR -- roughly a factor of two in amplitude, four in power. The $+1.76$~dB is the bonus from
+using a full-scale sinusoid (a constant that depends on the signal's crest factor; it changes if
+the signal is not a sinusoid, but the $6.02\,N$ slope is universal).
+\end{focusbox}
+
+\begin{example}[Putting numbers on it]
+\label{ch19:ex-snr}
+\begin{itemize}
+  \item \textbf{8-bit:} $6.02(8) + 1.76 \approx 49.8$~dB. Audibly hissy for music, fine for a
+        control signal.
+  \item \textbf{12-bit} (typical MCU ADC): $6.02(12)+1.76 \approx 74$~dB. Excellent for an IMU
+        axis or a slider.
+  \item \textbf{16-bit} (CD): $6.02(16)+1.76 \approx 98$~dB. The hiss sits about 98~dB below a
+        full-scale tone -- below the threshold of hearing in a normal room.
+  \item \textbf{24-bit:} $\approx 146$~dB in theory. In practice the analog electronics
+        (thermal noise in resistors, the reference, the op-amps) hit a wall around 20--21 bits
+        of \emph{effective} resolution; the last bits are buried in real noise. This is why we
+        speak of ENOB.
+\end{itemize}
+\end{example}
+
+\begin{definition}[ENOB]
+\label{ch19:def-enob}
+The \textbf{effective number of bits} of a real converter is obtained by measuring its actual SNR
+(including all real-world noise and distortion) and inverting the formula:
+\[
+  \mathrm{ENOB} \;=\; \frac{\mathrm{SNR}_{\mathrm{dB}} - 1.76}{6.02}.
+\]
+A converter labelled "16-bit" with a measured SNR of 90~dB has $\mathrm{ENOB}\approx 14.7$ bits.
+The marketing number is the size of the register; ENOB is what you actually get.
+\end{definition}
+
+Figure~\ref{ch19:fig-snr} plots the ideal line. It is dead straight, slope $6.02$~dB/bit -- one
+of the cleanest "more is better" curves in engineering.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=11cm, height=5.5cm,
+  xlabel={bit depth $N$},
+  ylabel={ideal SNR (dB)},
+  xmin=0, xmax=24, ymin=0, ymax=150,
+  axis lines=left,
+  xtick={0,4,8,12,16,20,24},
+  ytick={0,25,50,75,100,125,150},
+  enlargelimits=false,
+  grid=both, grid style={gray!20},
+]
+\addplot[specred, thick, domain=0:24, samples=2] {6.02*x + 1.76};
+\addplot[only marks, sigblue, mark=*] coordinates {(8,49.9)(12,74.0)(16,98.1)(24,146.2)};
+\end{axis}
+\end{tikzpicture}
+\caption{Ideal SNR versus bit depth, $\mathrm{SNR}\approx 6.02N+1.76$~dB. Dots mark the common
+depths from Example~\ref{ch19:ex-snr}. Real converters fall below this line by their noise and
+distortion; the vertical gap is what ENOB captures.}
+\label{ch19:fig-snr}
+\end{figure}
+
+\begin{walkbox}
+If quantization noise power is fixed at $\Delta^2/12$ regardless of the signal, what happens to
+the SNR of a \emph{quiet} signal -- say one using only the bottom few codes? Its $P_{\mathrm{sig}}$
+plummets while the noise stays put, so SNR collapses. This is why recording engineers chase a hot
+input level, and why a 16-bit recording made at $-40$~dB has the effective fidelity of a
+roughly 9-bit recording. Use the whole ladder.
+\end{walkbox}
+
+\section{Seeing and hearing quantization}
+\label{ch19:seeing}
+
+Let us make the hiss visible. Figure~\ref{ch19:fig-quantsine} quantizes a sine wave to a brutal
+3 bits so the staircase is obvious. The smooth curve is the original; the stepped curve is what
+you store; the gap between them, sample by sample, is the error $e$ -- and you can see it is a
+little sawtooth-like wiggle bounded by $\pm\Delta/2$.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=5.5cm,
+  xlabel={time $t$}, ylabel={amplitude},
+  xmin=0, xmax=1, ymin=-1.25, ymax=1.25,
+  axis lines=left, domain=0:1, samples=200,
+  enlargelimits=false, legend pos=north east, legend cell align=left,
+]
+\addplot[sigblue, thick] {sin(deg(2*pi*2*x))};
+\addlegendentry{original}
+\addplot[specred, thick, samples=200] {0.25*round(sin(deg(2*pi*2*x))/0.25)};
+\addlegendentry{3-bit quantized}
+\end{axis}
+\end{tikzpicture}
+\caption{A sine wave quantized to 3 bits (step $\Delta=0.25$ on a $[-1,1]$ range). The red
+staircase is the stored signal; the vertical gaps to the blue curve are the quantization error,
+each no larger than $\Delta/2=0.125$.}
+\label{ch19:fig-quantsine}
+\end{figure}
+
+The error itself is worth a plot of its own. Figure~\ref{ch19:fig-quanterror} draws
+$e = Q(x) - x$ for that same 3-bit sine. It is a jagged little signal that lives entirely
+inside the band $[-\Delta/2, \Delta/2]$ and never escapes it -- the bound from
+Section~\ref{ch19:error-as-noise} made visible. For a busy signal this trace looks like grass;
+that is the white-noise model at work.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=4.5cm,
+  xlabel={time $t$}, ylabel={error $e$},
+  xmin=0, xmax=1, ymin=-0.2, ymax=0.2,
+  axis lines=left, domain=0:1, samples=200,
+  enlargelimits=false,
+  ytick={-0.125,0,0.125}, yticklabels={$-\Delta/2$,$0$,$\Delta/2$},
+]
+\addplot[gray, dashed, domain=0:1, samples=2] {0.125};
+\addplot[gray, dashed, domain=0:1, samples=2] {-0.125};
+\addplot[specred, thick, samples=200] {0.25*round(sin(deg(2*pi*2*x))/0.25) - sin(deg(2*pi*2*x))};
+\end{axis}
+\end{tikzpicture}
+\caption{The quantization error $e = Q(x) - x$ for the 3-bit sine of
+Figure~\ref{ch19:fig-quantsine}. It stays strictly between the dashed bounds $\pm\Delta/2$ and,
+for an active signal, scatters like broadband noise.}
+\label{ch19:fig-quanterror}
+\end{figure}
+
+\begin{labbox}
+Quantize a tone yourself and \emph{listen} to the error. In Python:
+\begin{lstlisting}[language=Python]
+import numpy as np
+fs = 44100
+t  = np.arange(fs) / fs           # 1 second
+x  = 0.9 * np.sin(2*np.pi*440*t)  # full-ish-scale A4
+
+def quantize(x, bits):
+    levels = 2**bits
+    step   = 2.0 / levels         # x in [-1, 1]
+    return step * np.round(x / step)
+
+for b in (16, 8, 4, 2):
+    xq  = quantize(x, b)
+    err = xq - x
+    snr = 10*np.log10(np.mean(x**2) / np.mean(err**2))
+    print(f"{b:2d}-bit  measured SNR = {snr:6.2f} dB")
+\end{lstlisting}
+You will see the measured SNR track $6.02b+1.76$ closely for the higher bit depths, and the error
+audibly turns from gentle hiss (high bits) into gritty, signal-correlated distortion (2--4 bits).
+That correlation -- the error "following" the tone -- is the failure of the random model at low
+bit depth, and the reason dither exists.
+\end{labbox}
+
+\section{How a real ADC works}
+\label{ch19:adc-arch}
+
+So far the quantizer has been an abstract staircase. How does silicon actually find the nearest
+rung? There are several architectures; two dominate the world you will build in, and they sit at
+opposite ends of a speed/resolution trade-off.
+
+\subsection{Successive approximation (SAR): binary search in hardware}
+\label{ch19:sar}
+The successive-approximation register (SAR) ADC is the workhorse inside almost every
+microcontroller. Its idea is a binary search, and it is genuinely elegant.
+
+The converter holds an internal DAC and a comparator. To convert an unknown input $x$, it asks a
+sequence of yes/no questions, one per bit, from the most significant bit down:
+\begin{enumerate}
+  \item Guess the MSB is 1: set the trial DAC output to half of full scale,
+        $V_{\mathrm{ref}}/2$. Ask the comparator: is $x$ above this?
+  \item If yes, keep that bit as 1; if no, clear it to 0. Either way, move to the next bit and
+        add (or not) the next halving, $V_{\mathrm{ref}}/4$.
+  \item Repeat down to the LSB. After $N$ comparisons the register holds the code.
+\end{enumerate}
+Each step halves the remaining uncertainty -- exactly binary search on the value axis. An $N$-bit
+SAR takes $N$ comparator decisions, so its conversion time grows only \emph{linearly} with
+resolution. That makes SAR fast, low-power, and cheap, which is why it is everywhere from 10-bit
+to 18-bit and from kHz to several MHz sample rates.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>={Stealth[length=2mm]}]
+\node[draw, rounded corners, minimum height=8mm, fill=blue!4] (sh)  at (0,0)   {S/H};
+\node[draw, isosceles triangle, isosceles triangle apex angle=60, minimum height=10mm, fill=green!5] (cmp) at (2.8,0) {};
+\node at (2.6,0) {$>$};
+\node[draw, rounded corners, minimum height=8mm, fill=orange!6] (sar) at (5.6,0) {SAR logic};
+\node[draw, rounded corners, minimum height=8mm, fill=violet!6] (dac) at (5.6,-1.7) {internal DAC};
+\node[left=4mm of sh] (in) {$x$};
+\node[right=5mm of sar] (out) {code};
+\draw[->] (in) -- (sh);
+\draw[->] (sh) -- (cmp);
+\draw[->] (cmp) -- (sar);
+\draw[->] (sar) -- (out);
+\draw[->] (sar) -- (dac);
+\draw[->] (dac) -| (cmp.south);
+\end{tikzpicture}
+\caption{A SAR ADC. A sample-and-hold (S/H) freezes the input; the SAR logic toggles bits of an
+internal DAC and uses the comparator to do a binary search, settling on the code in $N$ steps.}
+\label{ch19:fig-sar}
+\end{figure}
+
+\begin{whybox}
+Why the sample-and-hold matters: the binary search takes $N$ comparisons during which the input
+must not move, or the early (big) decisions and the late (small) decisions would be about
+\emph{different} voltages and the answer would be garbage. The S/H grabs the value at one instant
+and holds it steady on a capacitor while the search runs. This is the hardware that realizes the
+"sample at an instant" idealization of Chapter~18 -- a real, physical freezing of the signal.
+\end{whybox}
+
+\begin{example}[A SAR binary search by hand]
+\label{ch19:ex-sar}
+A 4-bit SAR with $V_{\mathrm{ref}}=8$~V converts $x=5.3$~V. With a half-LSB offset added so the
+search rounds to nearest, the trial weights are $4,2,1,0.5$~V.
+\begin{itemize}
+  \item Bit 3: trial $4.0$. Is $5.3>4.0$? Yes $\to$ bit $=1$, accumulator $=4.0$.
+  \item Bit 2: trial $4.0+2.0=6.0$. Is $5.3>6.0$? No $\to$ bit $=0$, accumulator stays $4.0$.
+  \item Bit 1: trial $4.0+1.0=5.0$. Is $5.3>5.0$? Yes $\to$ bit $=1$, accumulator $=5.0$.
+  \item Bit 0: trial $5.0+0.5=5.5$. Is $5.3>5.5$? No $\to$ bit $=0$, accumulator stays $5.0$.
+\end{itemize}
+Code $=1010_2 = 10$, representing $5.0$~V. The true value was $5.3$~V; the residual error is
+$-0.3$~V. Note $\Delta = 0.5$~V here, so $\Delta/2 = 0.25$~V; the $0.3$~V residual exceeds it
+because the simple truncating search lands on the rung \emph{below}. A real SAR adds the half-LSB
+offset to its comparator threshold so the worst-case error becomes the promised $\Delta/2$. A
+small but instructive subtlety.
+\end{example}
+
+\subsection{Sigma-delta: trade speed for resolution by oversampling}
+\label{ch19:sigmadelta}
+The other architecture you will meet -- in audio codecs, in 24-bit sensor front-ends, in the ADCs
+on precision IMU and EMG chips -- is the \textbf{sigma-delta} ($\Sigma\Delta$) converter. It is
+almost the philosophical opposite of SAR. Where SAR resolves a value finely in one shot, sigma-
+delta uses a crude quantizer (often just \emph{one bit}) running absurdly fast, then does the real
+work in arithmetic.
+
+The trick has three ingredients, and each is worth seeing on its own.
+
+\paragraph{1. Oversampling spreads the noise out.} Suppose you sample far faster than Nyquist
+requires -- by an \textbf{oversampling ratio} $\mathrm{OSR} = f_s / (2 f_{\max})$. The total
+quantization noise power is still $\Delta^2/12$, but now it is spread (white) across a much wider
+band, from $0$ to $f_s/2$. The fraction that falls in your actual signal band $[0, f_{\max}]$ is
+only $1/\mathrm{OSR}$ of the total. After you digitally low-pass filter and discard everything
+above $f_{\max}$, the in-band noise power drops by $\mathrm{OSR}$:
+\[
+  \sigma_{\mathrm{in\text{-}band}}^2 \;=\; \frac{\Delta^2/12}{\mathrm{OSR}}.
+\]
+In decibels that is a gain of $10\log_{10}\mathrm{OSR}$. Every quadrupling of the sample rate
+($\mathrm{OSR}\times 4$) wins $\approx 6$~dB -- one bit of effective resolution -- \emph{for free},
+purely by sampling faster and filtering.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=5cm,
+  xlabel={frequency}, ylabel={noise power density},
+  xmin=0, xmax=1, ymin=0, ymax=0.5,
+  axis lines=left, enlargelimits=false,
+  xtick={0,0.1,1}, xticklabels={$0$,$f_{\max}$,$f_s/2$},
+  legend pos=north east, legend cell align=left,
+]
+\addplot[draw=none, fill=blue!12, domain=0:1, samples=2] {0.25} \closedcycle;
+\addlegendentry{noise spread to $f_s/2$}
+\addplot[draw=none, fill=specred!35, domain=0:0.1, samples=2] {0.25} \closedcycle;
+\addlegendentry{in-band ($<f_{\max}$)}
+\addplot[specred, thick, domain=0:1, samples=2] {0.25};
+\end{axis}
+\end{tikzpicture}
+\caption{Oversampling. The same total quantization noise (area under the floor) is spread across a
+much wider band, so the slice that lands in the signal band $[0,f_{\max}]$ (red) is small. A
+digital filter keeps the red part and discards the rest.}
+\label{ch19:fig-oversample}
+\end{figure}
+
+\paragraph{2. Noise shaping pushes the noise uphill.} Sigma-delta does much better than plain
+oversampling by \emph{shaping} the noise spectrum so it slopes steeply upward with frequency,
+piling almost all of the quantization noise into the high band that the filter will throw away. A
+feedback loop integrates the difference (the "delta") between input and the quantizer's output and
+feeds it back. The loop forces the average output to track the input -- the low frequencies come
+through cleanly -- while the inevitable error is shoved up to high frequencies. A first-
+order loop wins $9$~dB per octave of OSR instead of $3$; higher-order loops win even more. This is
+why a 1-bit modulator at a few MHz can deliver 20+ effective bits in the audio band.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>={Stealth[length=2mm]}]
+\node (in) {$x$};
+\node[draw, circle, right=8mm of in] (sum) {$+$};
+\node[draw, rounded corners, right=10mm of sum, fill=blue!4] (int) {$\int$};
+\node[draw, rounded corners, right=10mm of int, fill=green!5] (q) {1-bit Q};
+\node[right=10mm of q] (out) {bitstream};
+\node[draw, rounded corners, below=10mm of int, fill=violet!6] (dac) {1-bit DAC};
+\draw[->] (in) -- (sum);
+\draw[->] (sum) -- (int);
+\draw[->] (int) -- (q);
+\draw[->] (q) -- (out);
+\draw[->] (q.south) |- (dac.east);
+\draw[->] (dac.west) -| (sum.south) node[pos=0.2, below, font=\tiny] {$-$};
+\end{tikzpicture}
+\caption{A first-order sigma-delta modulator. The integrator accumulates the error between input
+and the fed-back 1-bit estimate; the feedback drives the running average of the output to equal
+the input, while pushing quantization noise to high frequency where a decimation filter removes
+it.}
+\label{ch19:fig-sigmadelta}
+\end{figure}
+
+\paragraph{3. Decimation turns the fast bitstream into clean samples.} The modulator emits a
+torrent of single bits at the high oversampled rate. A digital low-pass \emph{decimation} filter
+averages and downsamples this stream to the final output rate, producing high-resolution
+multi-bit samples in the signal band. (Decimation gets its own treatment in Chapter~22.) The net
+effect: the analog part is trivial (a comparator and an integrator), and the heavy lifting is
+done by cheap digital arithmetic -- exactly the trade modern chips love.
+
+\begin{focusbox}
+\textbf{SAR vs.\ sigma-delta in one breath.} SAR: one sample, $N$ fast comparisons, moderate
+resolution, easy to multiplex across many channels, low latency -- ideal for control loops, IMUs,
+general MCU sensing. Sigma-delta: oversample hard, shape the noise, decimate -- very high
+resolution, built-in anti-alias filtering, but higher latency and best for one continuous
+channel -- ideal for audio and precision instrumentation.
+\end{focusbox}
+
+\section{Dithering: adding noise to get resolution}
+\label{ch19:dither}
+
+Return to the failure mode we keep flagging: when the signal is small or slowly varying, the
+quantization error stops looking random. It becomes \emph{correlated} with the signal, and
+correlated error is not benign hiss -- it is \textbf{distortion}, harmonics that the ear and the
+spectrum analyzer both find ugly. The cure is counterintuitive and beautiful: \textbf{add a small
+amount of random noise before quantizing.}
+
+\begin{intuitionbox}
+Imagine a quiet sine wave whose entire swing fits between two rungs of the ladder. Without help,
+the quantizer reports a flat line at the nearer rung -- the tone vanishes into a stair-step and
+its information is lost. Now sprinkle in a little noise of about one LSB. On each sample the noisy
+value sometimes pushes up to the next rung and sometimes down. The \emph{individual} outputs are
+wrong, but their \emph{running average} tracks the true sub-LSB value. You have traded a coherent,
+audible error for incoherent hiss -- and incoherent hiss is far easier to ignore and can be
+averaged or filtered away.
+\end{intuitionbox}
+
+\begin{whybox}
+Dither works because averaging recovers information that a single quantized sample cannot hold.
+A value sitting $0.3$~LSB above a rung, dithered, will round up about $30\%$ of the time and down
+$70\%$ of the time; the long-run mean of the codes is exactly $0.3$~LSB above the rung. The dither
+\emph{linearizes} the quantizer on average: it converts a deterministic, signal-dependent rounding
+into an unbiased estimator whose error is independent of the signal. You pay a small, fixed
+increase in noise floor and in return you banish the distortion harmonics entirely. For
+well-chosen dither (triangular PDF, two LSB peak-to-peak) the residual error is not only
+decorrelated but its variance becomes independent of the signal level -- the gold standard.
+\end{whybox}
+
+This is not a hack confined to audio. It is standard in every high-quality ADC and DAC, in image
+processing (the "dithered" gradients that hide banding in 8-bit images), and in any place a coarse
+grid would otherwise create visible or audible structure. The deep idea -- \emph{break correlated
+error into uncorrelated noise, then average} -- recurs throughout signal processing.
+
+\begin{applicationbox}
+\textbf{Audio mastering.} When a 24-bit studio mix is reduced to 16-bit for a CD, engineers add
+TPDF (triangular probability density) dither, often with a spectral shape that pushes the added
+noise into frequencies where the ear is least sensitive ("noise-shaped dither"). The result is
+that quiet reverb tails fade smoothly into silence instead of chopping off in audible steps, even
+though only 16 bits are stored.
+\end{applicationbox}
+
+\section{From bits back to the world: the DAC}
+\label{ch19:dac}
+
+A digital-to-analog converter runs the staircase in reverse: given a code, produce a voltage. The
+simplest mental model is a bank of switches and a resistor network (an "R-2R ladder") that adds up
+weighted contributions of each bit. But the geometry that matters is what comes \emph{out}.
+
+A DAC does not emit the ideal samples (infinitely thin pins). It holds each sample's voltage
+constant until the next one arrives -- a \textbf{zero-order hold} (ZOH). The output is a
+staircase in time, not a smooth curve. That staircase is the samples convolved with a rectangular
+pulse one sample wide, and convolution with a rectangle in time means multiplication by a
+\emph{sinc} in frequency:
+\[
+  H_{\mathrm{ZOH}}(f) \;=\; T_s\,\sinc(f T_s)\, e^{-\jj \pi f T_s},
+  \qquad \abs{H_{\mathrm{ZOH}}(f)} = T_s\,\abs{\sinc(f T_s)}.
+\]
+Two consequences follow, and both have fixes.
+
+\begin{enumerate}
+  \item \textbf{High-frequency droop.} The sinc magnitude sags as $f$ rises, reaching about
+        $-3.9$~dB at the band edge $f = f_s/2$. Your highest wanted frequencies come out slightly
+        quiet. Fix: a gentle digital or analog \emph{de-emphasis} that boosts the top of the band
+        by the inverse sinc.
+  \item \textbf{Spectral images.} The staircase contains copies (images) of your spectrum around
+        every multiple of $f_s$. Fix: an analog \textbf{reconstruction filter} (low-pass) after
+        the DAC that smooths the steps and removes the images -- the mirror image of the
+        anti-alias filter before the ADC.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=5cm,
+  xlabel={time}, ylabel={DAC output},
+  xmin=0, xmax=1, ymin=-1.25, ymax=1.25,
+  axis lines=left, enlargelimits=false,
+  legend pos=south east, legend cell align=left,
+]
+\addplot[sigblue, thick, domain=0:1, samples=200] {sin(deg(2*pi*1.5*x))};
+\addlegendentry{ideal signal}
+\addplot[specred, thick, const plot, no marks] coordinates {
+  (0,0)(0.1,0.81)(0.2,0.95)(0.3,0.31)(0.4,-0.59)(0.5,-1.0)
+  (0.6,-0.59)(0.7,0.31)(0.8,0.95)(0.9,0.81)(1.0,0.0)
+};
+\addlegendentry{zero-order hold}
+\end{axis}
+\end{tikzpicture}
+\caption{A DAC's zero-order-hold output (red) holds each sample until the next. The steps contain
+high-frequency images and a slight sinc droop; an analog reconstruction filter smooths them back
+toward the ideal curve (blue).}
+\label{ch19:fig-zoh}
+\end{figure}
+
+\begin{connectionbox}
+The ZOH droop is the $\sinc$ from Chapter~18 wearing a different hat. There, sampling in time put
+a sinc-shaped interpolation kernel between samples; here, holding in time multiplies the spectrum
+by a sinc. Same rectangle, same transform pair $\rect \leftrightarrow \sinc$ -- just applied on
+the way out instead of the way in. Whenever you see a sinc, look for a rectangle nearby.
+\end{connectionbox}
+
+\section{Reading a real sensor through an ADC}
+\label{ch19:bench}
+
+Enough theory; let us read a voltage. Everything above turns into a handful of practical numbers
+the moment you touch hardware.
+
+\begin{buildbox}
+\textbf{Arduino Uno (ATmega328P): 10-bit SAR ADC.} The Uno has one SAR converter multiplexed
+across six pins. Key facts:
+\begin{itemize}
+  \item Resolution $N=10 \Rightarrow 1024$ codes. With the default $V_{\mathrm{ref}}=5$~V,
+        $\Delta = 5/1024 \approx 4.9$~mV per code. You cannot resolve a change smaller than that.
+  \item \texttt{analogRead()} returns $0\ldots1023$. Convert to volts with
+        \texttt{v = raw * 5.0 / 1024.0}.
+  \item Default conversion time is about $100\,\mu s$ ($\sim$9600 reads/s), set by the ADC clock
+        prescaler. Plenty for an IMU at 100--1000~Hz; far too slow for audio.
+  \item For quiet measurements use the internal 1.1~V reference (\texttt{analogReference(INTERNAL)}):
+        now $\Delta \approx 1.07$~mV, about four times finer, at the cost of a smaller input range.
+\end{itemize}
+\begin{lstlisting}[language=C]
+// Read a flex sensor / EMG envelope on A0, oversample to fake extra bits.
+void setup() { Serial.begin(115200); }
+
+void loop() {
+  long acc = 0;
+  const int OS = 16;             // average 16 reads
+  for (int i = 0; i < OS; i++) acc += analogRead(A0);
+  // OSR=16 -> +2 effective bits IF the signal jitters by >= 1 LSB
+  float code12 = acc / 4.0;      // 10-bit*16 -> ~12-bit scale
+  float volts  = code12 * (5.0 / 4096.0);
+  Serial.println(volts, 4);
+  delay(5);                      // ~200 Hz output
+}
+\end{lstlisting}
+The averaging only buys real resolution if the input (plus its natural noise) wiggles by at least
+an LSB between reads -- that is dithering happening for free. On a dead-quiet, perfectly stable
+voltage, averaging 16 identical reads gives you back the same number and no extra bits.
+\end{buildbox}
+
+\begin{buildbox}
+\textbf{Raspberry Pi: no analog pins at all.} The Pi's GPIO is digital only. To read an analog
+sensor you add an external ADC over SPI or I\textsuperscript{2}C:
+\begin{itemize}
+  \item \textbf{MCP3008}: 8-channel, 10-bit SAR, SPI, up to $\sim$200~kS/s. Cheap and ubiquitous;
+        the standard "give my Pi an ADC" chip.
+  \item \textbf{ADS1115}: 4-channel, 16-bit sigma-delta, I\textsuperscript{2}C, with a
+        programmable-gain amplifier. Slower (up to 860~S/s) but far finer -- a good match for an
+        EMG envelope or any low-frequency, high-dynamic-range signal.
+\end{itemize}
+\begin{lstlisting}[language=Python]
+# Raspberry Pi + ADS1115 (16-bit sigma-delta) over I2C
+import board, busio
+import adafruit_ads1x15.ads1115 as ADS
+from adafruit_ads1x15.analog_in import AnalogIn
+
+i2c = busio.I2C(board.SCL, board.SDA)
+ads = ADS.ADS1115(i2c)
+ads.gain = 1                      # +/-4.096 V full scale
+chan = AnalogIn(ads, ADS.P0)      # single-ended on A0
+
+while True:
+    print(f"{chan.voltage:7.4f} V  (raw {chan.value})")
+\end{lstlisting}
+With $\pm4.096$~V full scale and 16 bits, $\Delta \approx 8.192/65536 \approx 125\,\mu$V -- about
+40 times finer than the Uno's default. The sigma-delta front-end also gives you built-in
+anti-alias filtering, which matters for the low, clean signals (EMG/FMG envelopes) we want.
+\end{buildbox}
+
+Figure~\ref{ch19:fig-emg} sketches why the converter choice bites here. An EMG envelope is a
+small, slow bump riding on a steady baseline; if the ADC's $\Delta$ is comparable to the bump's
+height, the staircase swallows the feature whole. A finer step traces the same bump smoothly.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=5cm,
+  xlabel={time (s)}, ylabel={EMG envelope (V)},
+  xmin=0, xmax=2, ymin=0, ymax=2,
+  axis lines=left, domain=0:2, samples=200,
+  enlargelimits=false, legend pos=north east, legend cell align=left,
+]
+% slow baseline plus a gentle activation bump
+\addplot[sigblue, thick, samples=200] {0.6 + 0.7*exp(-((x-1.0)^2)/0.06)};
+\addlegendentry{true envelope}
+% coarse quantization: step 0.25 V (close to bump height) loses detail
+\addplot[specred, thick, const plot, no marks, samples=40]
+  {0.25*round((0.6 + 0.7*exp(-((x-1.0)^2)/0.06))/0.25)};
+\addlegendentry{coarse $\Delta=0.25$~V}
+\end{axis}
+\end{tikzpicture}
+\caption{A slow EMG-style envelope (blue) and the same signal read by a converter whose step
+$\Delta$ is a large fraction of the feature height (red staircase). Coarse quantization smears the
+activation into a few plateaus; a 16-bit front-end with a small $\Delta$ keeps the shape.}
+\label{ch19:fig-emg}
+\end{figure}
+
+\begin{goalbox}
+For the wrist controller, match the converter to the signal. The \textbf{IMU} (accelerometer +
+gyro, Chapter~34) already contains its own high-quality sigma-delta ADCs and hands you clean
+multi-bit samples over I\textsuperscript{2}C/SPI -- you never touch its quantizer, but its ENOB
+and noise density (specified in $\mu g/\sqrt{\mathrm{Hz}}$) set the floor on how small a wrist
+tilt you can detect. The \textbf{muscle signals} that hint at finger intent (EMG/FMG,
+Chapter~37) are tiny, low-frequency, and ride on a large slow baseline -- a textbook case for a
+16-bit sigma-delta front-end like the ADS1115 with a PGA, where dithering and oversampling
+genuinely buy you resolution. And keep a clear eye on what bits can and cannot do: a finer ADC reads
+the forearm's coarse muscle activity more precisely, but \emph{no} bit depth lets a wristband
+recover continuous individual finger-joint angles -- that information is not present in the signal
+the wristband sees (Chapter~37 makes this limit precise). Quantization sets how cleanly you
+capture what is there; it cannot conjure what is not.
+\end{goalbox}
+
+\begin{historybox}
+The $\Delta^2/12$ noise model and the additive-noise view of quantization were put on firm footing
+by Bernard Widrow in the 1950s and 60s; his quantization theorem gives precise conditions
+(roughly, a band-limited error spectrum) under which the uniform-noise model is \emph{exactly}
+right. Dither has an even more colorful origin: WWII-era mechanical analog computers worked more
+accurately while vibrating in flying bombers than sitting still on the ground -- the vibration was
+unintentional dither, shaking the gears past their stiction. Engineers later added motors to
+vibrate the computers on purpose. Sigma-delta modulation was introduced by Inose, Yasuda, and
+Murata in 1962 and became the dominant audio-ADC architecture once cheap, fast digital filtering
+made the decimation stage practical.
+\end{historybox}
+
+\section{Summary}
+\label{ch19:summary}
+
+Quantization is the vertical twin of sampling. An $N$-bit ADC snaps each sample to the nearest of
+$2^N$ rungs spaced $\Delta = V_{\mathrm{ref}}/2^N$ apart; the error is bounded by $\pm\Delta/2$
+and, for busy signals, behaves like uniform noise of power $\Delta^2/12$. Comparing that fixed
+noise to a full-scale sinusoid gives the master rule
+$\mathrm{SNR}\approx 6.02N + 1.76$~dB -- about a bit per 6~dB -- and inverting it on a real
+converter gives its ENOB. SAR converters do a fast hardware binary search for moderate-resolution,
+low-latency, multi-channel sensing; sigma-delta converters oversample a crude quantizer, shape the
+noise out of band, and decimate, reaching very high resolution for one continuous channel.
+Oversampling alone buys $\approx 3$~dB per doubling of $f_s$; noise shaping does much better; and
+\emph{adding} noise (dither) converts ugly signal-correlated distortion into benign hiss you can
+average away. On the way back out, a DAC holds each sample (zero-order hold), which droops the top
+of the band and creates spectral images that a reconstruction filter cleans up. At the bench, the
+Arduino gives you a 10-bit SAR for free; the Pi needs an external ADC, where a 16-bit sigma-delta
+part is the right tool for small, slow biosignals -- always remembering that resolution captures
+what the signal contains and never more.
+
+\section{Exercises}
+\label{ch19:exercises}
+
+\begin{exercise}
+An ADC has $V_{\mathrm{ref}}=3.3$~V and $N=12$ bits. (a) Compute the LSB size $\Delta$ in
+millivolts. (b) What is the maximum quantization error in millivolts? (c) What is the ideal SNR in
+dB for a full-scale sinusoid?
+\end{exercise}
+
+\begin{exercise}
+Derive the quantization noise power $\sigma_e^2 = \Delta^2/12$ from scratch by integrating $e^2$
+against a uniform density on $[-\Delta/2,\Delta/2]$. Then state in one sentence why the answer is
+independent of where the signal sits on the ladder.
+\end{exercise}
+
+\begin{exercise}
+You record audio at 16 bits but, through a gain mistake, your loudest peaks only reach
+$1/8$ of full scale. (a) By how many dB has your signal power dropped relative to full scale?
+(b) Estimate your effective number of bits. (c) State the practical lesson.
+\end{exercise}
+
+\begin{exercise}
+A SAR ADC has $N=8$ bits and $V_{\mathrm{ref}}=4.096$~V (so $\Delta = 16$~mV). Trace the binary
+search by hand for an input of $2.7$~V: list each trial voltage, each comparator decision, and the
+final 8-bit code. What voltage does that code represent, and what is the residual error?
+\end{exercise}
+
+\begin{exercise}
+You oversample a signal by $\mathrm{OSR}=64$ (no noise shaping) and then ideally low-pass filter
+to the signal band. (a) How many dB of in-band SNR improvement do you gain? (b) How many effective
+bits is that? (c) Why does this require the quantization error to be uncorrelated across samples,
+and what tool guarantees that?
+\end{exercise}
+
+\begin{exercise}
+Explain, in your own words and with a small numeric example, how dithering lets the long-run
+\emph{average} of quantized codes represent a value that lies strictly between two rungs. Use a
+true value of $0.4$~LSB above a rung and predict the fraction of samples that round up.
+\end{exercise}
+
+\begin{exercise}
+A DAC runs at $f_s = 48$~kHz with a zero-order hold. (a) Write the magnitude of the ZOH frequency
+response. (b) Compute the droop in dB at $f = 20$~kHz relative to DC. (c) Describe the two analog
+problems the ZOH creates and the filter that fixes each.
+\end{exercise}
+
+\begin{exercise}
+Modify the Arduino sketch in Section~\ref{ch19:bench} to switch to the internal 1.1~V reference.
+(a) What is the new $\Delta$? (b) Under what condition on your sensor's output range is this a good
+idea, and when would it clip? (c) Why does oversampling-and-averaging fail to add bits on a
+perfectly stable, noise-free input, and what is the one-sentence connection to dither?
+\end{exercise}
+
+\begin{exercise}
+A "16-bit" ADC datasheet quotes a measured SNR of 91~dB. (a) Compute its ENOB. (b) The same part
+quoted with a $4\times$ slower (more averaged) output mode reports 97~dB; compute the new ENOB and
+explain physically where the extra bits came from. (c) Why can no amount of averaging push the
+ENOB past the analog noise floor of the front-end?
+\end{exercise}
+
+\begin{exercise}
+For the wrist controller, you must choose an ADC for an EMG envelope signal that spans roughly
+0--2~V, changes slowly (under 50~Hz of useful bandwidth), and must resolve features as small as a
+few hundred microvolts. (a) Would you pick a 10-bit SAR at 200~kS/s or a 16-bit sigma-delta at
+860~S/s? Justify using $\Delta$ and the bandwidth. (b) State one thing this ADC choice still
+\emph{cannot} tell you about the user's individual fingers, and why.
+\end{exercise}

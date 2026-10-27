@@ -1,0 +1,1190 @@
+\chapter{Gesture and Activity Recognition}
+
+Everything we have built so far -- signals as vectors, the Fourier transform as a
+projection onto sinusoids, spectrograms that localize frequency in time, filters
+that sculpt a signal's spectrum, and the inertial and muscle sensors of the last
+few chapters -- has been working toward a single concrete question. A band sits on
+your forearm. A few sensors stream numbers many times a second. \emph{What is the
+hand doing right now?} Is it making a fist, flicking left, tapping, rolling the
+wrist, or just resting? And can we answer fast enough, and reliably enough, to
+drive a musical instrument in real time?
+
+That question is the subject of \textbf{gesture and activity recognition}. It is
+the bridge between raw, wiggly sensor traces and meaningful, discrete labels:
+\emph{fist}, \emph{wave}, \emph{walking}, \emph{typing}. The good news is that
+almost none of it is new physics. It is a \emph{pipeline} built almost entirely
+from tools you already own. We cut the endless stream into manageable
+\textbf{windows}; from each window we compute a handful of \textbf{features}
+(many of them just the time-domain and frequency-domain quantities from earlier
+chapters); and we hand those features to a \textbf{classifier} that maps them to
+a label. The art is in choosing the windows and features so that the geometry of
+the problem -- where different gestures land in feature space -- becomes simple
+enough that even a tiny classifier can draw the boundaries.
+
+This chapter is clear about what this pipeline can and cannot do. A wrist IMU on
+its own tells a flick from a fist from a roll. Add a force-myography (FMG) or
+surface-EMG band on the forearm, and -- with a short per-finger calibration for
+the person wearing it -- you can detect \emph{which finger moved}, because the
+tendons and muscles that drive each finger leave a distinct mechanical and
+electrical signature just below the band. What stays out of reach from the wrist
+is the \emph{continuous joint angle} of each finger; that is genuinely
+underdetermined and needs sensors on the fingers themselves. A recognizer tuned
+to one person can also drop in accuracy on a stranger -- which is exactly why
+\emph{calibration} sits at the center of our design rather than a one-size-fits-all
+model. We will see \emph{why} each of these is true, and how to measure them so
+you are never fooled by your own optimism.
+
+\chapterline
+
+\section{The recognition pipeline, end to end}
+\label{ch38:pipeline}
+
+Let us name the stages before we open any of them up. Sensor samples arrive as a
+stream -- say a tri-axial accelerometer at $f_s = 100$ Hz, so every
+$10$ ms we get a new triple $(a_x, a_y, a_z)$. We never classify a single sample;
+one instant carries almost no information about a \emph{motion}, which by
+definition unfolds over time. Instead:
+
+\begin{enumerate}
+  \item \textbf{Segmentation / windowing.} Group the stream into chunks of $N$
+        samples. Each chunk -- a \emph{window} -- is the atomic unit we will
+        label. (Section~\ref{ch38:windowing}.)
+  \item \textbf{Feature extraction.} Reduce each window of (possibly many) raw
+        samples to a short \emph{feature vector} $\vec{x} \in \R^{d}$ of
+        descriptive numbers: how big the motion is, how fast it wiggles, how the
+        axes move together, where its energy sits in frequency.
+        (Sections~\ref{ch38:time-features}--\ref{ch38:freq-features}.)
+  \item \textbf{Classification.} Map the feature vector to one of $K$ gesture
+        labels, $\vec{x} \mapsto \hat{y} \in \set{1,\dots,K}$.
+        (Section~\ref{ch38:classification}.)
+  \item \textbf{Evaluation.} Measure how often $\hat{y}$ is right, on data the
+        classifier has never seen, and ideally on \emph{people} it has never
+        seen. (Section~\ref{ch38:evaluation}.)
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  box/.style={draw, rounded corners, minimum height=1.0cm, minimum width=2.3cm,
+              align=center, fill=blue!4},
+  >=Stealth]
+\node[box, fill=gray!8] (raw) {raw stream\\$(a_x,a_y,a_z)$};
+\node[box, right=0.7cm of raw] (win) {window\\$N$ samples};
+\node[box, right=0.7cm of win] (feat) {features\\$\vec{x}\in\R^d$};
+\node[box, right=0.7cm of feat] (clf) {classifier};
+\node[box, fill=green!6, right=0.7cm of clf] (lab) {label\\$\hat y$};
+\draw[->] (raw) -- (win);
+\draw[->] (win) -- (feat);
+\draw[->] (feat) -- (clf);
+\draw[->] (clf) -- (lab);
+\end{tikzpicture}
+\caption{The recognition pipeline. A continuous sensor stream is chopped into
+windows; each window is reduced to a low-dimensional feature vector; a classifier
+maps that vector to a discrete gesture label. Every box reuses tools from earlier
+chapters.}
+\label{ch38:fig-pipeline}
+\end{figure}
+
+\begin{intuitionbox}
+The whole pipeline is one long act of \emph{dimensionality reduction with a
+purpose}. A two-second accelerometer window at 100 Hz is a point in
+$\R^{600}$ (200 samples $\times$ 3 axes) -- a space far too big and too noisy to
+draw boundaries in. Feature extraction throws away the parts that do not matter
+(exactly \emph{when} in the window a wiggle happened, the precise noise) and keeps
+the parts that do (how strong, how fast, how coupled), landing us in a friendly
+$\R^{10}$ or so. The classifier then just has to carve that small space into
+gesture-shaped regions. Good features make those regions large and well
+separated; bad features leave the classes tangled no matter how clever the
+classifier.
+\end{intuitionbox}
+
+\begin{connectionbox}
+Feature extraction is a \emph{lossy projection}, and you have met projections
+throughout this book and the companion linear-algebra reader. The Fourier
+transform projects onto sinusoids; PCA (Chapter on machine learning) projects
+onto directions of maximum variance; here we project onto a hand-chosen set of
+physically meaningful axes (energy, dominant frequency, inter-axis correlation).
+The choice of \emph{what to project onto} is the entire game.
+\end{connectionbox}
+
+\begin{goalbox}
+For the wrist controller this pipeline is split across two devices. A thin wrist
+node samples the sensors, applies light filtering, compresses, and BLE-streams the
+result; the paired phone does the heavy lifting -- it runs the guided per-finger
+calibration, builds the user's templates, conditions the signals, and keeps the
+streamed logs for deep offline analysis. For the low-latency live-play path a
+lightweight template match runs on the node itself: every $\sim$0.1 s it emits a
+verdict -- is a new gesture starting? which finger? -- and turns that into a MIDI
+message (note on, pitch bend, control change) fast enough that a musician does not
+feel the lag. That real-time constraint shapes every decision below: windows must
+be short, features cheap, and the on-device match must fit in kilobytes. There is
+no machine-learned model anywhere in the loop. The method is direct: calibrate
+each user once, store their templates, and match the live signal against them.
+\end{goalbox}
+
+\section{Windowing and segmentation}
+\label{ch38:windowing}
+
+A window is just $N$ consecutive samples treated as one unit. Two numbers define
+the windowing scheme: the \textbf{length} $N$ (or duration $T = N/f_s$) and the
+\textbf{hop} $H$, the number of samples we advance before starting the next
+window. The \emph{overlap} is $N - H$ samples, often quoted as a fraction
+$1 - H/N$.
+
+\begin{definition}[Sliding window]
+\label{ch38:def-window}
+Given a stream $x[0], x[1], \dots$, the $m$-th window of length $N$ with hop $H$
+is the block
+\[
+  w_m = \big( x[mH],\, x[mH+1],\, \dots,\, x[mH + N - 1] \big), \qquad m = 0,1,2,\dots
+\]
+With $H = N$ the windows tile the stream without overlap; with $H < N$ they
+overlap and a given sample contributes to several windows.
+\end{definition}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small, >=Stealth]
+% timeline
+\draw[->] (0,0) -- (11.2,0) node[right] {sample index $n$};
+\foreach \n in {0,1,...,10} \draw (\n,-0.06) -- (\n,0.06);
+% windows length 4, hop 2
+\draw[fill=blue!12, draw=blue!60!black] (0,0.25) rectangle (4,0.75)
+  node[midway] {$w_0$};
+\draw[fill=blue!8, draw=blue!60!black] (2,0.95) rectangle (6,1.45)
+  node[midway] {$w_1$};
+\draw[fill=blue!12, draw=blue!60!black] (4,1.65) rectangle (8,2.15)
+  node[midway] {$w_2$};
+\draw[fill=blue!8, draw=blue!60!black] (6,2.35) rectangle (10,2.85)
+  node[midway] {$w_3$};
+\node[align=left, anchor=west] at (0,3.4)
+  {$N=4$ samples, hop $H=2 \Rightarrow$ 50\% overlap};
+\end{tikzpicture}
+\caption{Sliding windows of length $N=4$ with hop $H=2$ (50\% overlap). Each
+window is classified independently; overlap means a gesture is ``looked at'' from
+several alignments, which smooths the verdict and shortens latency.}
+\label{ch38:fig-sliding}
+\end{figure}
+
+\subsection{How long should a window be?}
+
+This is the first real design tension, and it is the same time--frequency
+trade-off you met with the STFT (Chapter~10), wearing different clothes.
+
+\begin{itemize}
+  \item \textbf{Too short} and the window cannot contain a whole gesture. A flick
+        of the wrist lasts maybe 300--500 ms; a 50 ms window catches only a
+        sliver and cannot tell a flick from the start of a punch. Short windows
+        also give the frequency-domain features almost no resolution (recall the
+        DFT bin spacing is $f_s/N$).
+  \item \textbf{Too long} and you blur distinct actions together, add latency
+        (you cannot label a 2 s window until 2 s have elapsed), and risk a single
+        window straddling two different gestures.
+\end{itemize}
+
+A useful rule of thumb: make the window roughly as long as the \emph{shortest
+gesture you must distinguish}, then choose the hop to meet your latency budget.
+For human activity and hand gestures, windows of $1$--$2.5$ s with $50\%$ overlap
+are a common, defensible default; for the snappy, low-latency triggers a musician
+needs, you push down toward $200$--$400$ ms and lean on detecting onsets rather
+than steady states.
+
+\begin{trapbox}
+Beware analyzing a window long enough to contain a whole \emph{repetitive}
+activity (walking, stirring) the same way you analyze a one-shot
+\emph{gesture} (a flick). Repetitive activities have a clean periodicity that
+frequency-domain features capture beautifully. One-shot gestures are
+\emph{transients}: their information is in the \emph{shape} of a single burst, not
+in any steady frequency. Using a long window and a centroid feature on a transient
+throws away exactly what makes it recognizable. Match the analysis to the kind of
+motion.
+\end{trapbox}
+
+\subsection{Event segmentation: finding where a gesture is}
+
+Fixed sliding windows are simple and real-time friendly, but they are
+\emph{dumb}: they chop on a clock, not on the action. Most windows of a wrist
+stream contain nothing -- the hand is at rest -- and we waste effort classifying
+emptiness, and worse, we risk slicing a gesture down the middle.
+
+The fix is a cheap \textbf{onset detector} (or activity detector) that decides
+\emph{when} something is happening, and only then fires the classifier. A robust
+and almost free detector watches a short-time energy or jerk signal and triggers
+when it crosses a threshold. Define the windowed energy of the (gravity-removed)
+acceleration magnitude,
+\begin{equation}
+\label{ch38:energy}
+  E[m] = \frac{1}{N}\sum_{n=0}^{N-1} \big\| \vec{a}[mH+n] - \bar{\vec{a}} \big\|^2 ,
+\end{equation}
+and call a window ``active'' when $E[m]$ exceeds a threshold $\theta$. To avoid
+chattering at the threshold, use \emph{hysteresis}: a high threshold $\theta_{\text{on}}$
+to start an event and a lower $\theta_{\text{off}}$ to end it. This is exactly the
+Schmitt-trigger idea, and it is the difference between a controller that triggers
+once per gesture and one that machine-guns a dozen spurious notes as your hand
+crosses the threshold.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=4.6cm,
+  xlabel={time (s)}, ylabel={short-time energy $E[m]$},
+  xmin=0, xmax=6, ymin=0, ymax=1.25,
+  axis lines=box, samples=200, domain=0:6,
+  title={Energy-based event segmentation with hysteresis},
+  every axis title/.style={below right,at={(0,1)}},
+  legend style={at={(0.99,0.97)},anchor=north east, font=\scriptsize, draw=none, fill=none},
+]
+% energy: two bursts
+\addplot[sigblue, thick, samples=200]
+  {0.06 + 0.9*exp(-((x-1.6)^2)/0.10) + 0.75*exp(-((x-4.2)^2)/0.13)};
+\addlegendentry{$E[m]$}
+\addplot[trapred, dashed, thick, domain=0:6] {0.55};
+\addlegendentry{$\theta_{\text{on}}$}
+\addplot[quotientorange, dotted, thick, domain=0:6] {0.30};
+\addlegendentry{$\theta_{\text{off}}$}
+\end{axis}
+\end{tikzpicture}
+\caption{An onset detector with hysteresis. An event begins when energy rises
+above $\theta_{\text{on}}$ and ends only when it falls below the lower
+$\theta_{\text{off}}$. The gap between thresholds prevents a single gesture from
+being split into many spurious triggers by noise near the boundary.}
+\label{ch38:fig-onset}
+\end{figure}
+
+\begin{buildbox}
+A minimal real-time segmenter on a microcontroller. Keep a running window energy;
+emit a window for classification only on the rising edge through
+\texttt{TH\_ON}, and refuse to re-trigger until energy has dropped below
+\texttt{TH\_OFF}. This is a few lines and saves enormous CPU.
+\begin{lstlisting}[language=C]
+// streaming onset detector with hysteresis (one axis-magnitude sample at a time)
+static int   armed = 1;          // ready to fire?
+static float e = 0.0f;           // leaky energy estimate
+const  float alpha = 0.05f;      // smoothing (approx 20-sample memory)
+const  float TH_ON = 0.55f, TH_OFF = 0.30f;
+
+int onset_step(float a_mag, float gravity) {
+    float ac = a_mag - gravity;          // remove DC / gravity baseline
+    e = (1.0f - alpha) * e + alpha * ac * ac;   // leaky short-time energy
+    if (armed && e > TH_ON)  { armed = 0; return 1; }  // fire: classify now
+    if (!armed && e < TH_OFF){ armed = 1; }            // re-arm
+    return 0;
+}
+\end{lstlisting}
+\end{buildbox}
+
+\begin{historybox}
+The threshold-with-hysteresis trick is the \emph{Schmitt trigger}, invented by
+Otto Schmitt in 1934 while he was a graduate student studying nerve impulse
+propagation in squid axons -- biology, not electronics. He noticed that a neuron
+fires cleanly despite noisy, slowly-varying inputs precisely because it has two
+different thresholds. The same idea now keeps your gesture controller from
+stuttering. Good ideas in signal processing are frequently borrowed from the
+nervous system, which has been doing real-time activity recognition for a very
+long time.
+\end{historybox}
+
+\section{Time-domain features}
+\label{ch38:time-features}
+
+Now we reduce a window to numbers. Time-domain features are computed directly from
+the samples without any transform -- they are cheap, robust, and surprisingly
+powerful. Take a single-axis window $x[0],\dots,x[N-1]$ with mean
+$\bar{x} = \frac1N\sum_n x[n]$.
+
+\paragraph{Mean.} $\bar{x}$ itself. For an accelerometer it captures the gravity
+component along that axis, hence \emph{orientation}: a flat wrist and a vertical
+wrist have different per-axis means even when perfectly still. For a gyroscope or
+high-pass-filtered signal the mean is near zero and carries little.
+
+\paragraph{Variance / standard deviation.}
+\begin{equation}
+\label{ch38:variance}
+  \sigma_x^2 = \frac{1}{N}\sum_{n=0}^{N-1}\big(x[n]-\bar{x}\big)^2 .
+\end{equation}
+The single most useful motion feature. It measures \emph{how much} the signal
+moves regardless of orientation, separating ``still'' from ``active'' and gentle
+from vigorous. Standing and sitting both have low variance; walking and waving
+have high variance.
+
+\paragraph{RMS (root mean square).}
+\begin{equation}
+\label{ch38:rms}
+  \mathrm{RMS}(x) = \sqrt{\frac{1}{N}\sum_{n=0}^{N-1} x[n]^2}.
+\end{equation}
+The signal's effective magnitude including its DC level; note
+$\mathrm{RMS}^2 = \bar{x}^2 + \sigma_x^2$, so RMS blends ``how tilted'' with
+``how much it moves.'' For zero-mean signals RMS equals the standard deviation and
+is a clean energy proxy.
+
+\paragraph{Zero-crossing rate (ZCR).} The number of times the signal crosses its
+mean per window,
+\begin{equation}
+\label{ch38:zcr}
+  \mathrm{ZCR} = \frac{1}{N-1}\sum_{n=1}^{N-1}
+     \tfrac12\,\big| \operatorname{sgn}(x[n]-\bar x) - \operatorname{sgn}(x[n-1]-\bar x)\big|.
+\end{equation}
+A poor-man's frequency estimate computed without a single multiply: a fast wiggle
+crosses its mean often, a slow one rarely. We met ZCR in the audio-features
+chapter; here it cheaply distinguishes a brisk tremor from a slow roll.
+
+\paragraph{Min, max, range, and peak count.} Order statistics of the window. The
+\emph{range} $\max - \min$ captures the amplitude of a one-shot transient that
+variance smears out; the number of peaks above a threshold counts repetitions
+(steps, taps).
+
+\paragraph{Correlation between axes.} Real gestures move several axes \emph{in a
+coordinated way}, and that coordination is a fingerprint. The Pearson correlation
+between axes $x$ and $y$ over the window,
+\begin{equation}
+\label{ch38:corr}
+  \rho_{xy} = \frac{\sum_{n}(x[n]-\bar x)(y[n]-\bar y)}
+                   {\sqrt{\sum_n (x[n]-\bar x)^2}\,\sqrt{\sum_n (y[n]-\bar y)^2}}
+            = \frac{\inner{x-\bar x}{\,y-\bar y}}{\norm{x-\bar x}\,\norm{y-\bar y}},
+\end{equation}
+is exactly the cosine of the angle between the two mean-centered window vectors --
+the inner-product geometry from Chapter 3. $\rho_{xy} \approx +1$ means the axes
+rise and fall together (a diagonal motion), $-1$ means they oppose, $0$ means they
+are unrelated. A wrist \emph{roll} couples two axes strongly; a straight
+\emph{flick} drives mostly one. Correlation is what lets a classifier tell the
+\emph{direction} of a motion, not just its size.
+
+\begin{whybox}
+Why is inter-axis correlation so informative when variance per axis is not?
+Because variance is \emph{rotation-blind in a misleading way}: two completely
+different motions can deposit the same total variance, just distributed
+differently across axes and time. Correlation looks at the \emph{joint} behavior
+-- the \emph{shape} of the cloud of $(x[n],y[n])$ points. A motion confined to a
+tilted line in the $xy$-plane has $|\rho| \approx 1$; an isotropic shake fills a
+disk and has $\rho \approx 0$. That shape is a geometric signature of the gesture
+that survives changes in how hard you perform it.
+\end{whybox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=5.2cm,
+  xlabel={time (s)},
+  xmin=0, xmax=2, ymin=-1.6, ymax=1.6,
+  axis lines=box, samples=150, domain=0:2,
+  title={Two gestures, same per-axis variance, different correlation},
+  every axis title/.style={below right,at={(0,1)}},
+  legend style={at={(0.99,0.03)},anchor=south east, font=\scriptsize, draw=none, fill=none},
+]
+% coupled (roll): x and y in phase -> rho near +1
+\addplot[sigblue, thick] {sin(deg(2*pi*2*x))*exp(-0.3*x)};
+\addlegendentry{axis $x$ (roll)}
+\addplot[sigblue, thick, dashed] {0.9*sin(deg(2*pi*2*x)+10)*exp(-0.3*x)};
+\addlegendentry{axis $y$ (roll): $\rho\approx +0.97$}
+% anti / independent
+\addplot[specred, thick] {0.5+sin(deg(2*pi*2*x)-180)*exp(-0.3*x)};
+\addlegendentry{axis $x$ (flick)}
+\addplot[specred, thick, dashed] {0.5+0.2*sin(deg(2*pi*5*x))*exp(-0.3*x)};
+\addlegendentry{axis $y$ (flick): $\rho\approx 0$}
+\end{axis}
+\end{tikzpicture}
+\caption{Per-axis variance alone cannot separate these two gestures, but their
+inter-axis correlation does: the roll drives $x$ and $y$ together
+($\rho \approx +1$), while the flick drives $x$ alone ($\rho \approx 0$).
+Correlation encodes the \emph{direction} of motion.}
+\label{ch38:fig-corr}
+\end{figure}
+
+\begin{connectionbox}
+The list above -- variance, RMS, correlation -- is the elementary statistics of
+the companion probability book applied to a window. Variance is
+$\E[(X-\E X)^2]$ estimated over the window; correlation is the normalized
+covariance $\operatorname{Cov}(X,Y)/(\sigma_X\sigma_Y)$. Treating a window as a
+small sample from a random process is not a metaphor; it is the literal bridge
+between Chapter 20 (random signals, noise) and feature engineering. A feature is
+an \emph{estimator} of some property of the underlying motion, and like all
+estimators it has bias and variance of its own.
+\end{connectionbox}
+
+\section{Frequency-domain features}
+\label{ch38:freq-features}
+
+For \emph{periodic} or \emph{textured} motions -- walking, running, scrubbing, a
+sustained tremor -- the most discriminating information lives in the spectrum.
+Take the DFT of the window, $X[k] = \sum_{n=0}^{N-1} x[n]\,e^{-\jj 2\pi kn/N}$, and
+form the magnitude spectrum $|X[k]|$ over bins $k = 0,\dots,N/2$, with bin $k$
+corresponding to frequency $f_k = k f_s / N$.
+
+\paragraph{Band energies.} Partition the frequency axis into a few bands and sum
+the power in each:
+\begin{equation}
+\label{ch38:band}
+  E_{\text{band}} = \sum_{k \in \text{band}} |X[k]|^2 .
+\end{equation}
+Human locomotion lives below $\sim$3 Hz (step cadence) with harmonics up to
+$\sim$10 Hz; voluntary hand gestures are slower still; physiological and pathological
+tremor sits in characteristic bands (rest tremor $\approx 4$--6 Hz, essential
+tremor $\approx 6$--12 Hz). A handful of band energies is often enough to separate
+walking from running from idle.
+
+\paragraph{Dominant frequency.} The bin with the most power,
+$f^\star = f_{\,\arg\max_k |X[k]|}$, e.g. the step rate while walking. Cheap and
+very informative for periodic activities; nearly meaningless for one-shot
+transients (whose energy is spread, not peaked).
+
+\paragraph{Spectral centroid.} The power-weighted average frequency -- the
+spectrum's ``center of mass'',
+\begin{equation}
+\label{ch38:centroid}
+  f_{\text{c}} = \frac{\sum_k f_k\,|X[k]|^2}{\sum_k |X[k]|^2}.
+\end{equation}
+We met the centroid as ``brightness'' in the audio-features chapter; for motion it
+says whether the energy is concentrated low (slow, sweeping) or high (jittery,
+fast). A gentle wave has a low centroid; a nervous shake has a high one.
+
+\paragraph{Spectral entropy.} How \emph{spread out} the spectrum is. Normalize
+the power spectrum to a distribution $p_k = |X[k]|^2 / \sum_j |X[j]|^2$ and take
+\begin{equation}
+\label{ch38:entropy}
+  S = -\sum_k p_k \log p_k .
+\end{equation}
+Low entropy means the energy is concentrated at one frequency -- a clean periodic
+motion like steady walking. High entropy means the energy is smeared across many
+frequencies -- broadband, irregular, noise-like motion. Entropy beautifully
+separates ``rhythmic'' from ``erratic'' even when the dominant frequency is the
+same.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=6.0cm, height=4.4cm,
+  xlabel={freq (Hz)}, ylabel={$|X[k]|^2$},
+  xmin=0, xmax=10, ymin=0, ymax=1.1,
+  axis lines=box, ybar, bar width=4pt,
+  title={Walking: low entropy},
+  every axis title/.style={below right,at={(0,1)}, font=\scriptsize},
+  xtick={0,2,...,10}, ytick=\empty,
+]
+\addplot[fill=fillsig, draw=sigblue] coordinates {
+  (0,0.03)(1,0.08)(2,1.0)(3,0.10)(4,0.35)(5,0.06)(6,0.18)(7,0.04)(8,0.05)(9,0.03)(10,0.02)};
+\end{axis}
+\end{tikzpicture}
+\hspace{0.4cm}
+\begin{tikzpicture}
+\begin{axis}[
+  width=6.0cm, height=4.4cm,
+  xlabel={freq (Hz)}, ylabel={$|X[k]|^2$},
+  xmin=0, xmax=10, ymin=0, ymax=1.1,
+  axis lines=box, ybar, bar width=4pt,
+  title={Fidgeting: high entropy},
+  every axis title/.style={below right,at={(0,1)}, font=\scriptsize},
+  xtick={0,2,...,10}, ytick=\empty,
+]
+\addplot[fill=specred!40, draw=specred] coordinates {
+  (0,0.30)(1,0.45)(2,0.40)(3,0.55)(4,0.48)(5,0.50)(6,0.42)(7,0.52)(8,0.38)(9,0.44)(10,0.35)};
+\end{axis}
+\end{tikzpicture}
+\caption{Two power spectra with similar total energy. Walking concentrates power
+at the step frequency and its harmonics (low spectral entropy); irregular
+fidgeting spreads power across the band (high entropy). The dominant-frequency
+feature would call the right plot's peak meaningless, but entropy cleanly flags it
+as broadband.}
+\label{ch38:fig-spectra}
+\end{figure}
+
+\begin{trapbox}
+Do not compute frequency features on a window without first removing the mean (DC)
+and ideally applying a taper (Hann window). The huge DC bin from gravity will
+dominate $\sum |X[k]|^2$ and drag the centroid toward 0 Hz, and spectral leakage
+from the rectangular cutoff (Chapter 10) will smear sharp peaks into neighbors,
+corrupting band energies. Mean-remove, taper, then transform.
+\end{trapbox}
+
+\section{A worked example: four wrist gestures}
+\label{ch38:worked}
+
+Let us make this concrete with small, hand-computable numbers. Suppose we capture
+short windows from four gestures on a wrist IMU and (after preprocessing) read off
+just three features per window: the variance of the $x$-axis acceleration
+$\sigma_x^2$, the dominant frequency $f^\star$, and the $xy$ correlation
+$\rho_{xy}$. Idealized values:
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Gesture & $\sigma_x^2$ (g$^2$) & $f^\star$ (Hz) & $\rho_{xy}$ \\
+\midrule
+Rest        & 0.002 & --   & $\approx 0$ \\
+Flick left  & 0.45  & 2.5  & $+0.1$ \\
+Wrist roll  & 0.30  & 2.0  & $+0.9$ \\
+Tremor      & 0.05  & 8.0  & $+0.2$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Look at how cleanly these separate, \emph{one feature at a time}: variance alone
+peels Rest off the bottom; the dominant frequency isolates Tremor at the top;
+correlation distinguishes the otherwise-similar Flick and Roll. No single feature
+does the whole job, but together they place the four gestures at four corners of a
+small feature cube, and \emph{any} reasonable classifier can separate corners.
+
+\begin{example}[Computing features from raw samples]
+\label{ch38:ex-compute}
+Take a tiny window of $x$-axis acceleration (gravity already removed), $N = 8$:
+\[
+  x = (0.0,\; 0.4,\; 0.6,\; 0.2,\; -0.3,\; -0.5,\; -0.2,\; 0.1)\ \text{g}.
+\]
+Mean: $\bar x = \tfrac{1}{8}(0.3) = 0.0375 \approx 0$. Variance (about the mean),
+\[
+  \sigma_x^2 = \tfrac18\sum (x[n]-\bar x)^2 \approx \tfrac18(0.939) \approx 0.117\ \text{g}^2,
+\]
+so $\mathrm{RMS} \approx \sigma_x \approx 0.34$ g. Zero crossings of $x-\bar x$:
+the sign pattern is $-,+,+,+,-,-,-,+$, which flips three times (between samples
+0--1, 3--4 and 6--7), so $\mathrm{ZCR} = 3/(N-1) = 3/7 \approx 0.43$ crossings per
+sample. At $f_s = 100$ Hz that suggests a fundamental of a few Hz -- a quick
+sanity check against whatever the DFT reports. Every one of these is a few
+additions; this is why time-domain features are the backbone of an embedded
+recognizer.
+\end{example}
+
+\begin{labbox}
+Record yourself (or just simulate) doing each of the four gestures ten times.
+Compute the three features per window and scatter-plot variance against
+correlation, coloring by gesture. You should \emph{see} the four clusters with
+your own eyes -- and where two clusters overlap is exactly where your classifier
+will make its mistakes. This plot, made before you train anything, is the single
+most valuable diagnostic in the whole project: if the clusters are not visually
+separable in your features, no classifier will rescue you, and you should go back
+and find better features.
+\end{labbox}
+
+\section{Classification}
+\label{ch38:classification}
+
+Once each window is a feature vector $\vec{x} \in \R^d$, classification is the act
+of carving $\R^d$ into $K$ labeled regions. You do not need a deep network. For
+the small, well-separated feature spaces of gesture recognition, simple
+classifiers are fast, interpretable, and frequently \emph{better} (less prone to
+overfitting on the modest data you can realistically collect from a few people).
+
+\paragraph{$k$-nearest neighbors (k-NN).} Store all labeled training feature
+vectors. To classify a new $\vec{x}$, find the $k$ stored points nearest to it
+(Euclidean distance, on \emph{normalized} features) and take a majority vote. It
+is a one-line idea -- ``it is whatever its neighbors are'' -- with no training at
+all, and it makes the geometry of Section~\ref{ch38:worked} literal: a gesture is
+recognized by landing near other examples of the same gesture. Its cost is memory
+and per-query distance computations, which can sting on a microcontroller.
+
+\paragraph{Decision trees and random forests.} A tree asks a sequence of
+threshold questions -- ``is $\sigma_x^2 > 0.1$? if so, is $f^\star > 5$?'' --
+each splitting feature space with an axis-aligned cut, until a leaf assigns a
+label. This is \emph{exactly} the one-feature-at-a-time reasoning we did by eye in
+Section~\ref{ch38:worked}, automated and made optimal. A \emph{random forest}
+(many trees voting) is one of the most reliable off-the-shelf classifiers for
+tabular features like ours, and small trees run in microseconds on a
+microcontroller.
+
+\paragraph{Linear and logistic classifiers.} Draw a hyperplane
+$\vec{w}\cdot\vec{x} + b = 0$ between classes; the sign of $\vec{w}\cdot\vec{x}+b$
+is the decision. When classes are linearly separable in feature space (often the
+case after good feature engineering) this is the cheapest possible classifier --
+one dot product -- and its weights $\vec{w}$ are interpretable as ``how much each
+feature matters.''
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=10.5cm, height=6.0cm,
+  xlabel={variance $\sigma_x^2$ (normalized)}, ylabel={correlation $\rho_{xy}$},
+  xmin=-0.1, xmax=1.1, ymin=-0.3, ymax=1.1,
+  axis lines=box,
+  title={Feature space with a calibrated decision boundary},
+  every axis title/.style={below right,at={(0,1)}, font=\scriptsize},
+  legend style={at={(0.99,0.5)},anchor=east, font=\scriptsize, draw=none, fill=none},
+]
+% rest cluster (low var, low corr)
+\addplot[only marks, sourceblue, mark=*] coordinates {
+  (0.02,0.05)(0.04,-0.02)(0.01,0.10)(0.05,0.03)(0.03,0.07)};
+\addlegendentry{rest}
+% flick (high var, low corr)
+\addplot[only marks, specred, mark=triangle*, mark size=2.5] coordinates {
+  (0.85,0.12)(0.92,0.05)(0.80,0.18)(0.95,0.02)(0.88,0.10)};
+\addlegendentry{flick}
+% roll (high var, high corr)
+\addplot[only marks, targetgreen, mark=square*] coordinates {
+  (0.70,0.88)(0.78,0.92)(0.65,0.85)(0.82,0.90)(0.72,0.95)};
+\addlegendentry{roll}
+% a decision boundary illustration
+\draw[structurepurple, thick, dashed] (axis cs:0.35,-0.3) -- (axis cs:0.35,1.1);
+\draw[structurepurple, thick, dashed] (axis cs:0.35,0.5) -- (axis cs:1.1,0.5);
+\end{axis}
+\end{tikzpicture}
+\caption{Three gestures in a two-feature space. Good features make the classes
+fall into separated clusters; a tiny decision tree -- ``high variance? then high
+correlation?'' -- draws the two axis-aligned cuts (dashed) that separate them. The
+classifier is doing exactly the by-eye reasoning of Section~\ref{ch38:worked}.}
+\label{ch38:fig-decision}
+\end{figure}
+
+\begin{focusbox}
+\textbf{Always normalize your features before classifying.} A k-NN or linear model
+measures distances in feature space; if variance ranges over $[0, 0.5]$ and
+dominant frequency over $[0, 50]$, the frequency axis silently dominates every
+distance and the variance feature is ignored. Standardize each feature to zero
+mean and unit standard deviation (using statistics computed \emph{on the training
+set only}), then store those constants and apply the same transform on the device.
+This single step often matters more than the choice of classifier.
+\end{focusbox}
+
+\begin{happeningbox}
+What is really happening when a classifier fits to data? It is drawing the
+\emph{boundaries} between the clusters you already created with your features. The
+classifier adds almost nothing if the clusters are clean -- a child could draw the
+lines in Figure~\ref{ch38:fig-decision}. Conversely, no classifier can separate
+clusters that overlap. This is why experienced practitioners spend their time on
+windowing and features, not on swapping classifiers: \textbf{the features decide
+whether the problem is solvable; the classifier merely solves the solvable
+problem.} For our controller we lean on the simplest end of this spectrum -- store
+the user's calibration examples and label a new window by the nearest stored
+template -- precisely because clean features make the boundaries trivial and a
+direct match needs no training procedure at all.
+\end{happeningbox}
+
+\section{Template matching and dynamic time warping}
+\label{ch38:dtw}
+
+The feature-vector approach summarizes a window into static numbers, discarding
+the order in which things happened. For some gestures the \emph{trajectory} --
+the precise temporal shape -- is the point: a checkmark motion, a circle, a
+signature. For these, \textbf{template matching} keeps the whole trajectory and
+compares an incoming gesture to stored exemplars.
+
+The naive comparison is the Euclidean distance between two sequences sample by
+sample. It fails badly because two performances of the same gesture are never the
+same length or speed: you do the circle a little faster this time, or pause in the
+middle. Aligning sample $n$ of one to sample $n$ of the other compares the top of
+one circle to the side of another and reports a huge, meaningless distance.
+
+\textbf{Dynamic time warping (DTW)} fixes this by finding the best
+\emph{nonlinear} alignment between two sequences before measuring their distance.
+Given sequences $a$ (length $M$) and $b$ (length $N$), it builds a warping path
+through the $M\times N$ grid of local distances $d(i,j) = (a_i - b_j)^2$ that
+stretches and compresses time to match the shapes. The optimal-path cost is found
+by dynamic programming:
+\begin{equation}
+\label{ch38:dtw-rec}
+  D(i,j) = d(i,j) + \min\big\{\, D(i-1,j),\; D(i,j-1),\; D(i-1,j-1)\,\big\},
+\end{equation}
+with $D(0,0)=d(0,0)$ along the boundaries, and the DTW distance is $D(M-1,N-1)$.
+The three predecessors correspond to ``advance in $a$ only'' (compress $b$),
+``advance in $b$ only'' (stretch $b$), and ``advance both'' (match). The cheapest
+path through the grid is the best way to line up the two gestures despite
+differences in tempo.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=0.55, font=\scriptsize, >=Stealth]
+% grid
+\draw[gray!50] (0,0) grid (7,5);
+\node[below] at (3.5,-0.4) {sequence $a$ (time)};
+\node[rotate=90, above] at (-0.5,2.5) {sequence $b$ (time)};
+% a monotone warping path
+\draw[structurepurple, ultra thick, ->]
+  (0.5,0.5) -- (1.5,0.5) -- (1.5,1.5) -- (2.5,1.5) -- (3.5,2.5)
+  -- (4.5,3.5) -- (4.5,4.5) -- (6.5,4.5);
+% endpoints
+\fill[targetgreen] (0.5,0.5) circle (4pt);
+\fill[trapred] (6.5,4.5) circle (4pt);
+\node[right] at (7.2,4.5) {end};
+\node[right] at (0.7,0.15) {start};
+\end{tikzpicture}
+\caption{A dynamic time warping path through the cost grid. The path moves
+monotonically from corner to corner; horizontal/vertical steps stretch or
+compress one sequence in time to match the other, while diagonal steps match
+samples directly. DTW measures shape similarity while tolerating differences in
+speed.}
+\label{ch38:fig-dtw}
+\end{figure}
+
+\begin{intuitionbox}
+Picture two people humming the same tune, one slightly slower with a pause in the
+middle. Lay one performance along the bottom of a grid and the other up the side.
+A diagonal line would assume they are perfectly in sync; DTW instead finds a
+\emph{wiggly monotone staircase} that pairs each note of one with the matching
+note of the other, pausing (going straight along a row) exactly where one singer
+paused. The total mismatch \emph{along that best staircase} is the DTW distance.
+It answers ``are these the same shape, played at possibly different speeds?''
+\end{intuitionbox}
+
+\begin{whybox}
+Why does the simple recurrence~\eqref{ch38:dtw-rec} find the \emph{globally}
+optimal alignment? Because the best path to cell $(i,j)$ must pass through one of
+its three valid predecessors, and the best path to \emph{each} of those was
+already computed and stored. This is the optimal-substructure property that makes
+dynamic programming work: a globally optimal alignment is built from optimal
+sub-alignments. The cost is $O(MN)$ time and memory -- fine for a stored library
+of short templates, but it grows with the number and length of templates, which
+is the practical limit on DTW.
+\end{whybox}
+
+\begin{trapbox}
+DTW is seductive but does not scale. Matching every incoming gesture against a
+large library is $O(MN)$ \emph{per template}, and DTW distances are not a metric
+you can index easily. For a handful of distinctive whole-trajectory gestures (a
+few templates per class) it is excellent and needs no training. For many classes,
+many users, or high throughput, the window-feature-classifier path of
+Sections~\ref{ch38:time-features}--\ref{ch38:classification} is usually the better
+engineering choice. Use a constraint band (Sakoe--Chiba) to cap how far the path
+may stray from the diagonal: it speeds DTW up and, by forbidding absurd
+alignments, often improves accuracy too.
+\end{trapbox}
+
+\begin{applicationbox}
+DTW was born in 1970s speech recognition (Sakoe and Chiba, 1978), where it aligned
+a spoken word against templates despite people talking at different speeds. The
+same algorithm now powers gesture recognition on smartwatches, signature
+verification, gait analysis, and bioinformatics sequence alignment. Whenever you
+need ``same shape, different speed,'' DTW is the classical answer -- a single
+elegant idea that crossed from speech into motion sensing wholesale.
+\end{applicationbox}
+
+\section{Evaluating a recognizer}
+\label{ch38:evaluation}
+
+A recognizer that has not been carefully evaluated is just a hope. This section is
+about not fooling yourself -- the most important and most neglected skill in the
+whole pipeline.
+
+\subsection{Accuracy and its lies}
+
+\textbf{Accuracy} is the fraction of windows labeled correctly. It is the obvious
+metric and it is frequently misleading. If 95\% of your windows are ``rest'' (as
+they will be -- hands are still most of the time), a classifier that
+\emph{always} says ``rest'' scores 95\% accuracy while detecting exactly zero
+gestures. With imbalanced classes, accuracy rewards the trivial.
+
+\subsection{The confusion matrix}
+
+The full summary is the \textbf{confusion matrix} $C$, where $C_{ij}$ counts
+windows whose true label is $i$ but were predicted $j$. The diagonal is correct
+predictions; every off-diagonal entry is a specific, named mistake. The confusion
+matrix tells you not just \emph{how often} you are wrong but \emph{how} -- and
+``flick mistaken for roll'' is an actionable clue (add a correlation feature)
+while a bare accuracy number is not.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small]
+\matrix (m) [matrix of nodes,
+  nodes={minimum size=1.05cm, anchor=center},
+  column sep=-\pgflinewidth, row sep=-\pgflinewidth,
+  nodes in empty cells]
+{
+  |[fill=green!30]| 48 & |[fill=red!10]| 1  & |[fill=red!10]| 1  \\
+  |[fill=red!10]| 2    & |[fill=green!30]| 44 & |[fill=red!25]| 4 \\
+  |[fill=red!10]| 1    & |[fill=red!25]| 6  & |[fill=green!30]| 43 \\
+};
+\draw (m-1-1.north west) rectangle (m-3-3.south east);
+\foreach \r in {1,2} \draw (m-\r-1.south west) -- (m-\r-3.south east);
+\foreach \c in {1,2} \draw (m-1-\c.north east) -- (m-3-\c.south east);
+% labels
+\node[above=2pt] at (m-1-1.north) {pred R};
+\node[above=2pt] at (m-1-2.north) {pred F};
+\node[above=2pt] at (m-1-3.north) {pred Roll};
+\node[left=2pt] at (m-1-1.west) {true R};
+\node[left=2pt] at (m-2-1.west) {true F};
+\node[left=2pt] at (m-3-1.west) {true Roll};
+\end{tikzpicture}
+\caption{A confusion matrix for three gestures (Rest, Flick, Roll). The strong
+diagonal is good; the highlighted off-diagonal cells -- Flick predicted as Roll
+(4) and Roll predicted as Flick (6) -- reveal that these two are the classifier's
+main confusion, exactly as Figure~\ref{ch38:fig-corr} would predict if the
+correlation feature were weak or noisy.}
+\label{ch38:fig-confusion}
+\end{figure}
+
+From the confusion matrix come the per-class metrics that survive class imbalance.
+For a class $c$: \textbf{precision} $= \frac{\text{TP}}{\text{TP}+\text{FP}}$
+(of windows you \emph{called} $c$, how many were?), \textbf{recall}
+$= \frac{\text{TP}}{\text{TP}+\text{FN}}$ (of windows that \emph{were} $c$, how
+many did you catch?), and their harmonic mean the \textbf{F1 score}
+$= 2\,\frac{\text{precision}\cdot\text{recall}}{\text{precision}+\text{recall}}$.
+For a controller, precision and recall trade off in a way you can \emph{feel}: low
+precision means spurious notes you did not intend; low recall means gestures you
+performed that the instrument missed. Which is worse depends on the instrument.
+
+\subsection{The cardinal sin: leaky evaluation}
+
+You must measure performance on data the classifier never saw in training. That
+much is well known. What is less appreciated -- and what silently inflates most
+reported gesture-recognition numbers -- is \emph{how} you split.
+
+\begin{trapbox}
+\textbf{Never split overlapping windows randomly into train and test.} With 50\%
+overlap, adjacent windows share half their samples; a random split puts a window
+in training and its near-twin in test, so the classifier is graded on data it has
+effectively memorized. Accuracy looks spectacular and means nothing. Split by
+\emph{recording session} or by \emph{time block}, never by individual window.
+\end{trapbox}
+
+\subsection{Cross-subject generalization: the number that hurts}
+
+Here is the truth the glossy demos omit. Fit and test on the \emph{same person}
+and you will see very high accuracy -- often 95\%+ -- because the templates match
+\emph{that person's} particular way of moving. Now test on a \emph{different}
+person, using someone else's templates, and accuracy commonly falls hard, into the
+70s or worse. The way to measure this gap is \textbf{leave-one-subject-out
+cross-validation (LOSO)}: fit on everyone except one person, test on that held-out
+person, and repeat for each person. The LOSO number is what a stranger would
+experience if you handed them a band with \emph{someone else's} templates -- and it
+is precisely the gap our per-user calibration step is designed to close. We do not
+ship a stranger's boundaries; we record the new user's own finger movements at
+enrollment, so the templates always belong to the hand wearing the band.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=11cm, height=5.0cm,
+  ybar, bar width=22pt,
+  symbolic x coords={within-subject, mixed (leaky), cross-subject},
+  xtick=data, x tick label style={font=\scriptsize, align=center},
+  ymin=0, ymax=110, ylabel={accuracy (\%)},
+  axis lines=box,
+  title={The same recognizer, three evaluation protocols},
+  every axis title/.style={below right,at={(0,1)}, font=\scriptsize},
+  nodes near coords, nodes near coords style={font=\scriptsize},
+  enlarge x limits=0.25,
+]
+\addplot[fill=fillsig, draw=sigblue] coordinates {
+  (within-subject,96) (mixed (leaky),93) (cross-subject,74)};
+\end{axis}
+\end{tikzpicture}
+\caption{Illustrative (and typical) accuracies for one recognizer under three
+protocols. Within-subject and the leaky mixed split look great; the
+leave-one-subject-out (cross-subject) number is the one a new user feels with
+someone else's templates. Always report LOSO -- the others flatter your model.}
+\label{ch38:fig-loso}
+\end{figure}
+
+\begin{whybox}
+Why does accuracy drop so much across people? Because the feature distributions
+\emph{shift}. People differ in limb length, where the band sits, how they wear it
+(rotation!), baseline tremor, strength, and personal motion style. A boundary
+tuned to your variance and correlation values lands in the wrong place for
+someone whose ``vigorous flick'' is another person's ``gentle one.'' This is
+\emph{distribution shift}, and it is the central difficulty of cross-subject
+wearable recognition. The cleanest remedy is the one we build the whole product
+around: a brief per-user calibration so the templates and thresholds belong to
+\emph{this} wearer, not to an average of strangers. Supporting tactics help too --
+orientation-invariant features (use acceleration \emph{magnitude} and inter-axis
+correlation rather than raw axes), per-user normalization, and re-running the
+calibration whenever the band is re-seated. With calibration, the cross-subject
+gap stops being your problem: every user effectively runs a within-subject
+recognizer.
+\end{whybox}
+
+\begin{connectionbox}
+Cross-subject drop is a concrete instance of the train/test mismatch the machine
+learning chapter formalizes as the difference between empirical risk (error on
+your sample) and true risk (error on the real population). LOSO is your best cheap
+estimator of true risk for the population ``people who are not in your dataset.''
+It usually has high variance with few subjects, so report the mean \emph{and}
+spread across the held-out folds, not a single rosy figure.
+\end{connectionbox}
+
+\section{What the wrist can and cannot sense}
+\label{ch38:limits}
+
+We have built a pipeline that recognizes a vocabulary of distinct
+wrist-and-forearm motions. Now let us draw the line precisely between what is
+within reach and what is not -- because the line is not where casual intuition
+puts it.
+
+\begin{focusbox}
+\textbf{Which finger moved is detectable from the wrist; each finger's continuous
+joint angle is not.} The accelerometer and gyroscope sense the wrist as a rigid
+segment, so on their own they give you whole-hand and wrist gestures (fist vs.\
+open, flick, twist, tap-induced shock, double-tap). But the muscles and tendons
+that drive the fingers run \emph{through the forearm, directly under a band}. Tap
+your index versus your ring finger and the tendon bulge and electrical activity
+just below the band differ in a repeatable way. A force-myography or surface-EMG
+sensor picks that up, and with a short per-finger calibration the band detects
+\emph{which finger moved}. What remains genuinely out of reach from the wrist is
+the \emph{continuous flexion angle} of each joint: that information is simply not
+present in wrist-frame bulk motion, and recovering it needs sensors on the fingers.
+\end{focusbox}
+
+To detect \emph{which finger} acted, add a forearm sensing modality alongside the
+IMU:
+\begin{itemize}
+  \item \textbf{Force myography (FMG)} reads the mechanical bulging of forearm
+        muscles with a ring of pressure sensors (FSRs). It is cheap, robust to
+        electrical noise and sweat, and after a short per-finger enrollment it
+        separates finger and grip patterns well (Figure~\ref{ch38:fig-fmg}). This
+        is the principle behind WristFlex, which distinguished finger pinches from a
+        wrist FMG band.
+  \item \textbf{Surface EMG} on the forearm senses the electrical activity of the
+        finger-driving muscles, the basis of myoelectric control (Myo, MyoWare).
+        It catches \emph{intended} movement slightly before motion appears, but is
+        more sensitive to electrode shift and sweat than FMG, so it benefits most
+        from per-user calibration and re-seating checks.
+  \item \textbf{Continuous finger \emph{pose}} -- actual joint angles for a piano-like
+        ten-voice instrument -- requires sensors \emph{on the fingers} (rings with
+        IMUs, stretch sensors, instrumented gloves). Recent finger-worn work such
+        as ``Learning on the Rings'' tracks continuous flexion this way. There is no
+        way around the physics: to measure a joint you must observe something that
+        the joint actually moves. We treat this as an optional upgrade path, not a
+        requirement for the instrument we are building.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=12cm, height=5.0cm,
+  xlabel={FSR channel around the forearm (1--8)}, ylabel={pressure (normalized)},
+  xmin=0.5, xmax=8.5, ymin=0, ymax=1.15,
+  axis lines=box, xtick={1,2,...,8},
+  title={Per-finger FMG signatures from an 8-channel forearm band},
+  every axis title/.style={below right,at={(0,1)}, font=\scriptsize},
+  legend style={at={(0.99,0.97)},anchor=north east, font=\scriptsize, draw=none, fill=none},
+]
+% index finger: bulge concentrated on channels 2-3
+\addplot[sigblue, thick, mark=*, mark size=1.4] coordinates {
+  (1,0.18)(2,0.85)(3,0.62)(4,0.22)(5,0.10)(6,0.08)(7,0.12)(8,0.15)};
+\addlegendentry{index tap}
+% ring finger: bulge concentrated on channels 5-6
+\addplot[specred, thick, dashed, mark=square*, mark size=1.4] coordinates {
+  (1,0.12)(2,0.16)(3,0.20)(4,0.40)(5,0.80)(6,0.70)(7,0.30)(8,0.14)};
+\addlegendentry{ring tap}
+% rest: flat baseline
+\addplot[targetgreen, thick, dotted] coordinates {
+  (1,0.10)(2,0.11)(3,0.10)(4,0.12)(5,0.10)(6,0.11)(7,0.10)(8,0.11)};
+\addlegendentry{rest}
+\end{axis}
+\end{tikzpicture}
+\caption{Force-myography snapshots across an eight-channel forearm band. Tapping
+the index finger bulges the tendons under channels~2--3; tapping the ring finger
+bulges channels~5--6; at rest the profile is flat. After a short per-finger
+enrollment, matching the live channel vector to these stored signatures tells
+\emph{which finger} moved -- something a wrist IMU alone cannot see. The signatures
+are person-specific, which is exactly why calibration is per user.}
+\label{ch38:fig-fmg}
+\end{figure}
+
+\begin{goalbox}
+This sets the design of our controller. From the wrist IMU we get a reliable
+\emph{discrete gesture vocabulary} (taps, flicks, twists, holds) plus continuous
+wrist \emph{orientation}, a superb expressive pitch-bend or modulation axis. Add a
+forearm FMG/FSR array (and optionally surface EMG) and, after the per-finger
+calibration, the band reports \emph{which finger} acted -- enough to play notes and
+chords by finger. The edge over single-sensor lab demos comes from \emph{fusing}
+modalities: a high-rate IMU for gross motion and orientation, the FMG/FSR array for
+finger identity, and a separate high-rate accelerometer used as a contact /
+bio-acoustic pickup that hears the sharp transient of a fingertip tap (the ViBand
+idea). No one of these is enough alone; together, with per-user calibration, they
+cover finger \emph{events} cleanly. The one thing we do not promise is ten
+continuously variable finger voices like a piano -- that needs finger-worn sensors.
+For everything a player actually does on this instrument -- triggering notes and
+chords with finger movements, bending and modulating with the wrist -- the wrist
+band delivers.
+\end{goalbox}
+
+\begin{historybox}
+Wearable activity recognition matured in the 2000s as MEMS accelerometers became
+cheap and tiny. Bao and Intille's 2004 study, recognizing everyday activities from
+multiple body-worn accelerometers, is a landmark that established the
+window-feature-classifier template still used today. The cross-subject gap
+they and successors documented has not been ``solved'' so much as managed; it
+remains the reason a fitness tracker counts \emph{your} steps well after a few days
+and a stranger's less so. The thread that leads to our wrist instrument runs
+through specific systems: WristFlex (finger pinch detection from a wrist FMG band),
+the Myo and MyoWare surface-EMG modules, ViBand (UIST 2016, a high-rate
+wrist accelerometer used as a bio-acoustic pickup for tap and contact events), a
+PLOS One 2020 study fusing IMU with acoustic sensing, an MDPI Sensors 2023 study
+counting gestures from a wrist IMU, and ``Learning on the Rings'' for finger-worn
+continuous tracking. Our edge over any single one of these is to fuse modalities --
+IMU, FMG/FSR array, and a bio-acoustic accelerometer -- and to calibrate per finger
+per user, rather than chase one sensor with a heavier model.
+\end{historybox}
+
+\section{Putting it together: a reference recognizer}
+\label{ch38:reference}
+
+Here is the whole pipeline in a few lines of NumPy -- windowing, a compact feature
+vector mixing time- and frequency-domain quantities, and a nearest-template match
+against the per-user enrollment. It is deliberately small and correct; it is the
+seed of what we will port to the microcontroller in the embedded chapter.
+
+\begin{lstlisting}[language=Python]
+import numpy as np
+
+def features(win, fs):
+    """win: (N,3) tri-axial window (gravity removed). Returns a feature vector."""
+    feats = []
+    for ax in range(3):                       # per-axis time-domain features
+        x = win[:, ax]
+        feats += [x.mean(), x.var(), np.sqrt((x**2).mean())]   # mean, var, RMS
+        zc = np.mean(np.abs(np.diff(np.sign(x - x.mean())))) / 2
+        feats.append(zc)                                       # zero-crossing rate
+    # inter-axis correlations (the coupling / direction signature)
+    c = np.corrcoef(win.T)                    # 3x3 correlation matrix
+    feats += [c[0,1], c[0,2], c[1,2]]
+    # frequency-domain on the acceleration magnitude
+    mag = np.linalg.norm(win, axis=1)
+    mag = (mag - mag.mean()) * np.hanning(len(mag))   # detrend + taper
+    P = np.abs(np.fft.rfft(mag))**2
+    f = np.fft.rfftfreq(len(mag), 1/fs)
+    P[0] = 0                                   # kill residual DC
+    centroid = np.sum(f * P) / (np.sum(P) + 1e-12)
+    dom = f[np.argmax(P)]
+    p = P / (P.sum() + 1e-12)
+    entropy = -np.sum(p * np.log(p + 1e-12))
+    feats += [centroid, dom, entropy]
+    return np.array(feats)
+
+def windows(stream, N, H):
+    """Yield (start, window) for each sliding window."""
+    for m in range((len(stream) - N) // H + 1):
+        s = m * H
+        yield s, stream[s:s+N]
+
+# usage sketch (direct template matching -- no learned model):
+#   T = {g: features(cal_win, fs=100) for g, cal_win in enrollment}  # per-finger templates
+#   x = (features(w, fs=100) - mu) / sigma     # normalize with enrollment mu, sigma
+#   y_hat = min(T, key=lambda g: np.linalg.norm(x - (T[g]-mu)/sigma))  # nearest template
+\end{lstlisting}
+
+\begin{aestheticbox}
+Step back and notice what we have. Twenty-odd numbers per window -- means,
+variances, RMS, zero-crossings, three correlations, a centroid, a dominant
+frequency, an entropy -- and almost every one is something you derived from first
+principles in an earlier chapter. The inner product became correlation; the DFT
+became band energy and centroid; the STFT's time--frequency trade-off became the
+window-length decision; the probability book's variance and expectation became
+features. Gesture recognition is not a separate subject bolted on at the end. It
+is the \emph{payoff}: the same handful of geometric ideas, pointed at your moving
+hand.
+\end{aestheticbox}
+
+\section{Summary}
+\label{ch38:summary}
+
+\begin{itemize}
+  \item Recognition is a pipeline: \emph{window} the stream, extract a low-dim
+        \emph{feature vector}, \emph{classify} it, \emph{evaluate} without fooling
+        yourself.
+  \item Window length trades latency and gesture-containment against frequency
+        resolution -- the STFT trade-off in a new guise. An onset detector with
+        hysteresis segments events cheaply and avoids spurious triggers.
+  \item Time-domain features (mean, variance, RMS, ZCR, range, inter-axis
+        correlation) are cheap and powerful; correlation, the cosine between
+        mean-centered axis vectors, encodes \emph{direction} of motion.
+  \item Frequency-domain features (band energies, dominant frequency, spectral
+        centroid, spectral entropy) shine for periodic/textured motion; always
+        remove DC and taper first.
+  \item Simple classifiers (k-NN, decision trees/forests, linear) suffice when
+        features separate the classes; features matter more than the classifier.
+        Always normalize features with train-set statistics.
+  \item DTW matches whole trajectories despite speed differences via dynamic
+        programming; great for a few template gestures, poor at scale.
+  \item Evaluate with confusion matrices and per-class precision/recall/F1, never
+        bare accuracy on imbalanced classes; never split overlapping windows
+        randomly; report leave-one-subject-out accuracy as the number that counts.
+  \item A wrist IMU yields whole-hand gestures plus orientation. Adding a forearm
+        FMG/EMG band and a short per-finger calibration detects \emph{which finger}
+        moved. What the wrist cannot give is each finger's continuous joint angle;
+        that needs sensors on the fingers.
+\end{itemize}
+
+\section{Exercises}
+\label{ch38:exercises}
+
+\begin{exercise}
+A sensor streams at $f_s = 100$ Hz. You choose windows of $N = 256$ samples with
+$50\%$ overlap. (a) What is the window duration in seconds? (b) What is the hop in
+samples and in seconds? (c) How many windows per second does the classifier
+process? (d) What is the DFT bin spacing $f_s/N$ in Hz, and what is the lowest
+nonzero frequency you can resolve?
+\end{exercise}
+
+\begin{exercise}
+For the 8-sample window in Example~\ref{ch38:ex-compute}, verify the variance
+$\sigma_x^2 \approx 0.117$ by computing $\sum (x[n]-\bar x)^2$ by hand. Then
+compute the range ($\max-\min$) and explain in one sentence which feature --
+variance or range -- you would trust more to flag a sharp, one-shot tap, and why.
+\end{exercise}
+
+\begin{exercise}
+Two accelerometer axes over a window are $x = (1,2,3,2,1)$ and $y = (2,4,6,4,2)$.
+(a) Compute the Pearson correlation $\rho_{xy}$ from \eqref{ch38:corr}. (b) Without
+recomputing, state $\rho$ for $y' = (-2,-4,-6,-4,-2)$ and explain geometrically
+why scaling and sign flips affect (or do not affect) the correlation.
+\end{exercise}
+
+\begin{exercise}
+You build an onset detector with a single threshold $\theta$ (no hysteresis). The
+energy hovers right around $\theta$ during a slow gesture, dithering above and
+below it due to noise. Describe the failure you will observe at the controller's
+output, and explain quantitatively how splitting $\theta$ into
+$\theta_{\text{on}} > \theta_{\text{off}}$ fixes it. What is the cost of making the
+gap too wide?
+\end{exercise}
+
+\begin{exercise}
+A dataset is 92\% ``rest'' and 8\% ``gesture'' windows. A lazy classifier always
+predicts ``rest.'' (a) What is its accuracy? (b) What are its precision and recall
+\emph{for the gesture class}? (c) What is its F1 for the gesture class? Use this to
+argue in two sentences why F1 (or a confusion matrix) is the right metric here.
+\end{exercise}
+
+\begin{exercise}
+Compute a small DTW distance. Let $a = (0, 2, 0)$ and $b = (0, 0, 2, 2, 0)$ with
+local cost $d(i,j) = |a_i - b_j|$. Fill in the $3\times 5$ cumulative cost grid
+using \eqref{ch38:dtw-rec} and report $D$ at the top-right corner. Sketch (or
+describe) the optimal warping path and say which samples of $b$ get matched to the
+peak of $a$.
+\end{exercise}
+
+\begin{exercise}
+You report 96\% accuracy by randomly splitting 50\%-overlapping windows into 80\%
+train / 20\% test. A colleague says the number is meaningless. (a) Explain the
+specific leak. (b) Describe two concrete changes to the split that would make the
+estimate trustworthy. (c) Predict qualitatively how the reported accuracy will change
+after each fix, and why.
+\end{exercise}
+
+\begin{exercise}
+Design a five-feature vector to distinguish four wrist gestures: \emph{rest},
+\emph{flick}, \emph{wrist roll}, and \emph{double-tap}. For each feature name it,
+say whether it is time- or frequency-domain, and state in one phrase which pair of
+gestures it primarily helps separate. Then identify which two gestures you expect
+to be hardest to tell apart and what extra feature or sensor would help.
+\end{exercise}
+
+\begin{exercise}
+(Cross-subject reasoning.) You train on five people and test LOSO, getting per-fold
+accuracies $\{0.81, 0.62, 0.88, 0.55, 0.79\}$. (a) Report the mean and the spread.
+(b) The fold at 0.55 is one specific held-out person; give two physical reasons
+that one user might be much harder than the others. (c) Propose one change to the
+feature set that targets the most likely cause, and explain why it should help.
+\end{exercise}
+
+\begin{exercise}
+(Real-time budget.) Your microcontroller must, every hop, compute the feature
+vector and run a small decision tree, all within the hop interval. With
+$N = 200$, which features in the reference code of Section~\ref{ch38:reference} are
+$O(N)$ and which are $O(N\log N)$? If you must cut cost, which single feature would
+you drop first and which would you never drop, and why?
+\end{exercise}
+
+\begin{exercise}
+(Sensing-limits check.) A teammate proposes that, using only the wrist IMU, the
+controller will continuously output each of the five fingers' joint angles to
+drive five independent synth voices. State plainly whether this is achievable with
+a wrist IMU alone, explain the physical reason in one or two sentences, and
+describe the minimal sensing change that would make a \emph{discrete} per-finger
+scheme (which finger tapped) feasible. Then say which sensing change is required to
+recover the \emph{continuous} joint angles, and why it cannot live at the wrist.
+\end{exercise}

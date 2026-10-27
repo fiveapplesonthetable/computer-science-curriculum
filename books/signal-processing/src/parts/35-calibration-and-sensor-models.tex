@@ -1,0 +1,990 @@
+\chapter{Calibration and Sensor Models}
+
+In the last chapter we met the three workhorses of motion sensing --- the
+accelerometer, the gyroscope, and the magnetometer --- and saw, in principle,
+what each one measures. ``In principle'' is the load-bearing phrase. A
+datasheet promises that an accelerometer reports specific force in
+$\mathrm{m/s^2}$ and a magnetometer reports the field in microtesla. Wire one up,
+hold it dead still on your desk, and the numbers it gives you will be
+\emph{wrong}. Not catastrophically wrong, usually --- a few percent here, a
+fraction of a degree there, a slow creep over a minute --- but wrong in ways that
+quietly poison everything downstream. Feed those readings into an orientation
+filter (next chapter) and the errors do not average out; they accumulate, and
+your virtual wrist drifts away from your real one.
+
+The fix is \emph{calibration}: building a small mathematical model of how the
+sensor lies, measuring the parameters of that model, and then undoing the lie in
+software before any other processing touches the data. This chapter is about
+that model and that measurement. It is one of the most practical chapters in the
+book, and also one of the most geometric --- because the central trick, the
+ellipsoid fit, is a statement about a sphere that got squashed and shoved, and
+calibration is the act of un-squashing and un-shoving it.
+
+We will build the standard sensor error model one term at a time, each with a
+picture of what it does to your data. We will see why an ideal accelerometer or
+magnetometer, swung through all orientations, should trace a perfect sphere ---
+and why a real one traces a tilted, off-center ellipsoid instead. We will fit
+that ellipsoid and read the calibration off of it. We will estimate gyroscope
+bias and watch it drift. We will meet the Allan variance, the single most useful
+plot for understanding what a noisy sensor will do to you over time. And
+throughout, we will be clear about what calibration can and cannot rescue:
+no amount of clever fitting recovers individual finger joint angles from wrist
+bulk motion.
+
+\section{Why a raw reading is not the truth}
+\label{ch35:why-raw-lies}
+
+Start with the cleanest possible mental model of a sensor. You have some
+physical quantity --- call it the \emph{true} value $\vec{a}$, a 3-vector for an
+accelerometer or magnetometer, a scalar per axis for a rate gyro. The sensor
+performs a measurement and hands you back a number $\vec{y}$. In a perfect world
+$\vec{y} = \vec{a}$ and we would never have written this chapter. In the real
+world there is a \emph{transfer relationship} between them, and the whole art of
+calibration is to discover that relationship and invert it.
+
+\begin{intuitionbox}
+Think of the sensor as a slightly drunk translator. You hand it the truth in one
+language (real acceleration in $\mathrm{m/s^2}$) and it hands you back a
+translation (counts, or volts, or scaled floats). A \emph{good} translator
+gets it right. A drunk one consistently adds a fixed greeting you never asked for
+(bias), stretches every sentence by ten percent (scale factor), occasionally
+swaps two words (axis misalignment), gets sloppier as the room warms up
+(temperature drift), and slurs randomly from word to word (noise). Calibration
+is learning the translator's specific quirks well enough to mentally subtract
+them --- so that even a drunk translator becomes reliable, as long as it is
+\emph{consistently} drunk.
+\end{intuitionbox}
+
+The crucial word there is \emph{consistently}. Calibration only helps with the
+parts of the error that are \emph{systematic} --- repeatable, the same today as
+yesterday, a deterministic function of the true value. The part that is genuinely
+random --- the slurring --- cannot be calibrated away. It can only be
+\emph{characterized} (so you know how much to trust a reading) and \emph{filtered}
+(averaged down, as in Chapter~20). So our sensor model splits cleanly in two:
+\[
+  \underbrace{\text{systematic error}}_{\text{calibrate it out}}
+  \;+\;
+  \underbrace{\text{random error}}_{\text{characterize, then filter}}.
+\]
+The rest of Section~\ref{ch35:error-model} builds the systematic part term by
+term; Sections~\ref{ch35:allan} and onward handle the random part.
+
+\section{The standard sensor error model}
+\label{ch35:error-model}
+
+Here is the model we are heading toward. For a 3-axis sensor, the measured
+vector $\vec{y}$ relates to the true vector $\vec{a}$ by
+\begin{equation}
+  \vec{y} \;=\; \mat{S}\,\mat{M}\,\mat{R}\,\vec{a} \;+\; \vec{b} \;+\; \vec{n},
+  \label{ch35:full-model}
+\end{equation}
+where $\vec{b}$ is a constant \emph{bias} (offset), $\mat{S}$ is a diagonal
+\emph{scale-factor} matrix, $\mat{M}$ captures \emph{misalignment} and
+cross-axis coupling, $\mat{R}$ is the rotation from the sensor's nominal axes to
+its true sensing axes, and $\vec{n}$ is random \emph{noise}. The three matrices
+in front are almost always lumped together into one general $3\times3$ matrix,
+\begin{equation}
+  \vec{y} \;=\; \mat{A}\,\vec{a} \;+\; \vec{b} \;+\; \vec{n},
+  \qquad \mat{A} = \mat{S}\,\mat{M}\,\mat{R},
+  \label{ch35:lumped-model}
+\end{equation}
+and calibration becomes: \emph{find $\mat{A}$ and $\vec{b}$, then recover}
+$\hat{\vec{a}} = \mat{A}^{-1}(\vec{y}-\vec{b})$. That single equation is the
+spine of the whole chapter. Everything else is either a picture of one term, a
+method for measuring the terms, or a caveat worth stating plainly. Let us walk
+the terms.
+
+\subsection{Bias: a finger on the scale}
+\label{ch35:bias}
+
+The simplest error is a constant offset. The sensor adds (or subtracts) a fixed
+amount regardless of the true value:
+\begin{equation}
+  y = a + b.
+  \label{ch35:bias-scalar}
+\end{equation}
+A gyroscope sitting perfectly still should read zero rotation rate; if it reads
+$0.6^\circ/\mathrm{s}$, that $0.6$ is bias. An accelerometer lying flat should
+report exactly $1\,g$ on its vertical axis and $0$ on the others; a few hundred
+$\mathrm{mg}$ on a horizontal axis is bias. Bias is geometrically the most
+innocent error --- it just \emph{shifts} every reading by the same vector $\vec{b}$
+--- but for integrating sensors it is the most dangerous, because a constant
+offset integrates into a ramp. We return to that in
+Section~\ref{ch35:gyro-bias}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=11.5cm, height=4.6cm,
+    xlabel={true value $a$}, ylabel={measured $y$},
+    xmin=-1.1, xmax=1.1, ymin=-1.3, ymax=1.7,
+    axis lines=left, samples=2, domain=-1:1,
+    legend pos=north west, legend cell align=left,
+    title={Three systematic errors as distortions of the input--output line},
+    every axis plot/.append style={line width=1.0pt},
+]
+\addplot[gray, dashed] {x}; \addlegendentry{ideal $y=a$}
+\addplot[sigblue] {x + 0.35}; \addlegendentry{bias: $y=a+0.35$}
+\addplot[specred] {1.4*x}; \addlegendentry{scale: $y=1.4\,a$}
+\addplot[quotientorange] {1.4*x + 0.35}; \addlegendentry{both}
+\end{axis}
+\end{tikzpicture}
+\caption{For a single axis, the ideal sensor is the line $y=a$ (gray dashed).
+Bias slides the line vertically; scale-factor error tilts it about the origin;
+real sensors do both. Calibration is the act of recovering the slope and
+intercept so the line can be straightened back to $y=a$.}
+\label{ch35:fig-bias-scale}
+\end{figure}
+
+\subsection{Scale factor: the wrong gain}
+\label{ch35:scale}
+
+The next error multiplies rather than adds. The sensor's gain is off, so a true
+$1\,g$ reads as $1.03\,g$ or $0.97\,g$:
+\begin{equation}
+  y = s\,a, \qquad s \approx 1.
+  \label{ch35:scale-scalar}
+\end{equation}
+Each axis can have its own scale factor, which is why $\mat{S}$ in
+\eqref{ch35:full-model} is diagonal, $\mat{S}=\diag(s_x,s_y,s_z)$. Scale error
+\emph{tilts} the input--output line of Figure~\ref{ch35:fig-bias-scale} instead
+of sliding it. Combined with bias you get the affine relationship $y = s\,a + b$
+--- a line with the wrong slope \emph{and} the wrong intercept --- and recovering
+that one line per axis is exactly the textbook ``six-position'' accelerometer
+calibration we will do by hand in Example~\ref{ch35:ex-sixpos}.
+
+\begin{trapbox}
+Bias and scale are easy to confuse when you only look at one orientation. If a
+flat accelerometer reads $1.05\,g$, is that $0.05\,g$ of bias or a $5\%$ scale
+error? You \emph{cannot tell from one measurement} --- both predict the same
+reading at $+1\,g$. The two only separate when you look at \emph{different} input
+levels: flip the sensor over so the true input is $-1\,g$. Bias makes both
+readings shift the same way ($+1g\!\to\!1.05$, $-1g\!\to\!-0.95$); pure scale
+makes them shift oppositely ($+1g\!\to\!1.05$, $-1g\!\to\!-1.05$). This is why
+any trustworthy calibration excites the sensor at \emph{multiple} known inputs.
+\end{trapbox}
+
+\subsection{Misalignment and cross-axis coupling}
+\label{ch35:misalign}
+
+Now the geometry gets interesting. A 3-axis sensor is supposed to have three
+\emph{orthogonal} sensing axes lined up perfectly with the chip's package and,
+through it, with your board. Two things go wrong. First, the physical sensing
+axes are not perfectly orthogonal to each other --- the MEMS structure was etched
+with finite precision. Second, the whole triad is rotated slightly relative to
+where you \emph{think} it points, because the die was bonded into the package at a
+tiny angle and you soldered the package onto the board at another tiny angle.
+
+Both effects mean that motion along the true $x$ axis leaks a little signal into
+the reported $y$ and $z$ channels. That leakage is exactly an off-diagonal entry
+in a matrix:
+\begin{equation}
+  \begin{bmatrix} y_x \\ y_y \\ y_z \end{bmatrix}
+  =
+  \begin{bmatrix}
+    1 & m_{xy} & m_{xz} \\
+    m_{yx} & 1 & m_{yz} \\
+    m_{zx} & m_{zy} & 1
+  \end{bmatrix}
+  \begin{bmatrix} a_x \\ a_y \\ a_z \end{bmatrix}.
+  \label{ch35:misalign-matrix}
+\end{equation}
+The diagonal is the wanted response; the small off-diagonal terms $m_{ij}$ (a few
+percent or a few tenths of a degree, in radians) are the cross-talk. A pure
+rotation $\mat{R}$ is one special, structured case of this (orthogonal, $\det=1$);
+genuine non-orthogonality of the axes is another. In practice we do not bother to
+separate $\mat{S}$, $\mat{M}$, and $\mat{R}$ --- they multiply into the single
+matrix $\mat{A}$ of \eqref{ch35:lumped-model}, and the ellipsoid fit recovers
+$\mat{A}$ as a whole. The separation only matters when you care \emph{why} the
+matrix is what it is.
+
+\begin{connectionbox}
+Equation~\eqref{ch35:misalign-matrix} is your linear-algebra book come to
+life. The matrix $\mat{A}$ is a linear map from the true field to the reported
+field; its diagonal is gain, its off-diagonals are coupling, and its inverse
+$\mat{A}^{-1}$ is precisely the change of basis that re-expresses your readings in
+the coordinate frame you actually wanted. When we later diagonalize the
+ellipsoid, we are finding the eigenvectors and eigenvalues of
+$\mat{A}^{\!\top}\mat{A}$ --- the principal axes along which the squashing happened
+and by how much. The sphere-to-ellipsoid story is a singular-value-decomposition
+story wearing a lab coat.
+\end{connectionbox}
+
+\subsection{Temperature drift: the model breathes}
+\label{ch35:temp}
+
+Here is the cruel part: $\mat{A}$ and $\vec{b}$ are not actually constants. They
+drift with temperature. MEMS structures are tiny silicon springs, and a spring's
+stiffness changes as it warms; the electronics' reference voltages drift too. So
+bias and scale are really functions of temperature $T$:
+\begin{equation}
+  \vec{b}(T) \approx \vec{b}_0 + \vec{k}_b\,(T - T_0), \qquad
+  \mat{A}(T) \approx \mat{A}_0 + \mat{K}_A\,(T - T_0),
+  \label{ch35:temp-model}
+\end{equation}
+to first order around a reference temperature $T_0$. Gyro bias is the notorious
+offender: a cheap MEMS gyro can shift its zero-rate output by several
+$^\circ/\mathrm{s}$ across the temperature swing from a cold room to a
+self-heated, hand-warmed device. A wrist tracker turned on in a cold room and
+then warmed by body heat will see its gyro bias \emph{walk} for the first minute
+or two of wear --- a real, repeatable effect you can watch on a plot.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=11.5cm, height=4.6cm,
+    xlabel={time since power-on (s)}, ylabel={gyro zero-rate ($^\circ$/s)},
+    xmin=0, xmax=180, ymin=-0.1, ymax=0.95,
+    axis lines=left, samples=120, domain=0:180,
+    title={Warm-up bias drift: a still gyro's zero slowly settles},
+    every axis plot/.append style={line width=1.0pt},
+]
+\addplot[sigblue] {0.8*(1 - exp(-x/45)) + 0.03*sin(deg(x/6))};
+\addplot[gray, dashed] {0.8};
+\node[anchor=west, gray] at (axis cs:95,0.86) {\small settled bias};
+\end{axis}
+\end{tikzpicture}
+\caption{A stationary MEMS gyroscope after power-on. The zero-rate output is not
+flat --- it ramps as the chip self-heats and the silicon's properties shift, then
+settles. Estimating bias in the first few seconds and trusting it for the next
+hour is a classic mistake; bias must be re-estimated, ideally continuously.}
+\label{ch35:fig-warmup}
+\end{figure}
+
+\begin{trapbox}
+The single most common field failure in cheap IMU projects is calibrating once,
+cold, on the bench, and baking those numbers into firmware forever. The device
+then warms up on the wrist, the bias walks off your stored value, and the
+orientation drifts. Either calibrate at the operating temperature, store a
+temperature curve as in \eqref{ch35:temp-model}, or --- best for gyros ---
+re-estimate bias on the fly whenever the device is detected to be still (see
+Section~\ref{ch35:gyro-bias}).
+\end{trapbox}
+
+\subsection{Random walk and the noise terms}
+\label{ch35:random-walk}
+
+Finally the genuinely random part, $\vec{n}$. It comes in two flavors that
+behave very differently under integration, and telling them apart is the whole
+reason the Allan variance exists.
+
+The first is plain \emph{white noise}: zero-mean, uncorrelated sample-to-sample
+jitter on top of every reading. For a gyro this is called \emph{angle random
+walk} (ARW), because when you integrate white rate noise to get angle, the angle
+performs a random walk --- it wanders away from the truth with a standard
+deviation that grows like $\sqrt{t}$ (Chapter~20's averaging law in reverse:
+summing $N$ independent steps gives spread $\propto\sqrt{N}$).
+
+The second is sneakier: the \emph{bias itself} is not a fixed number but slowly
+random-walks over time. This is \emph{bias instability} or \emph{rate random
+walk}. It is what makes ``calibrate the bias once'' fail even at constant
+temperature --- you nail the bias at $t=0$, and ten minutes later it has quietly
+drifted to a different value through no fault of yours.
+
+\begin{intuitionbox}
+White noise and bias drift pull in opposite directions when you average. Average
+\emph{more} samples and white noise shrinks (good) --- but average over a
+\emph{longer time} and bias drift grows (bad), because the bias has had longer to
+wander. So there is a sweet-spot averaging time: short enough that the bias has
+not moved much, long enough that the white noise has been beaten down. The Allan
+variance is precisely the plot that reveals this sweet spot, and we draw it in
+Section~\ref{ch35:allan}.
+\end{intuitionbox}
+
+\section{The big idea: a still sensor should trace a sphere}
+\label{ch35:sphere-idea}
+
+Now the geometric heart of the chapter. It applies to any sensor that measures a
+vector of \emph{constant magnitude} regardless of orientation. Two of our three
+sensors qualify, and beautifully so:
+
+\begin{itemize}
+\item A \textbf{stationary accelerometer} feels only gravity. Gravity has a fixed
+magnitude ($\approx 9.81\,\mathrm{m/s^2}$, or $1\,g$) and points down. As you
+rotate the device through every orientation while holding it still, the gravity
+vector \emph{in sensor coordinates} sweeps over all directions but always has the
+same length. The tip of that vector traces a \textbf{sphere of radius $1\,g$}.
+\item A \textbf{magnetometer} sitting in one location feels the local Earth field
+(plus any fixed nearby iron). That field has a fixed magnitude and direction in
+the room. Rotate the device through every orientation and, again, the field
+vector in sensor coordinates traces a \textbf{sphere}, this time of radius equal
+to the local field strength.
+\end{itemize}
+
+That is the reference truth: \emph{a perfect sensor, swung through all
+orientations, returns points that lie exactly on a sphere centered at the
+origin}. We do not need to know which orientation produced which point. We do not
+need a turntable or a reference instrument. We only need the geometric fact that
+the magnitude is constant. This is what makes accelerometer and magnetometer
+calibration so wonderfully self-contained: \emph{the calibration target is free.}
+
+\begin{whybox}
+Why does constant magnitude buy us a full calibration? Because the error model
+\eqref{ch35:lumped-model} maps that sphere to a predictable shape. Apply a matrix
+$\mat{A}$ to every point of a sphere and you get an \emph{ellipsoid} (the matrix
+stretches different directions by different amounts and rotates the whole thing).
+Then add the bias $\vec{b}$ and the ellipsoid \emph{shifts off the origin}. So a
+miscalibrated sensor's data does not lie on a centered sphere --- it lies on a
+\textbf{tilted, stretched, off-center ellipsoid}. The entire calibration problem
+collapses to: \emph{find the ellipsoid that best fits my data points, then find
+the transform that turns that ellipsoid back into the unit sphere.} That transform
+\emph{is} $\mat{A}^{-1}$ and $\vec{b}$.
+\end{whybox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=1.0]
+% ideal sphere (circle, 2D slice)
+\begin{scope}[shift={(0,0)}]
+  \draw[gray, dashed] (0,0) circle (1.4);
+  \draw[->] (-2,0)--(2,0) node[right]{$y_x$};
+  \draw[->] (0,-2)--(0,2) node[above]{$y_y$};
+  \fill[sigblue] (0:1.4) circle (1.5pt); \fill[sigblue] (35:1.4) circle (1.5pt);
+  \fill[sigblue] (70:1.4) circle (1.5pt); \fill[sigblue] (110:1.4) circle (1.5pt);
+  \fill[sigblue] (150:1.4) circle (1.5pt); \fill[sigblue] (200:1.4) circle (1.5pt);
+  \fill[sigblue] (250:1.4) circle (1.5pt); \fill[sigblue] (300:1.4) circle (1.5pt);
+  \node at (0,-2.4) {\small ideal: centered circle};
+\end{scope}
+% measured ellipse, rotated and shifted
+\begin{scope}[shift={(6,0)}]
+  \draw[->] (-2,0)--(2.4,0) node[right]{$y_x$};
+  \draw[->] (0,-2)--(0,2) node[above]{$y_y$};
+  \draw[specred, rotate around={25:(0.45,0.3)}, shift={(0.45,0.3)}, dashed]
+        (0,0) ellipse (1.7 and 0.95);
+  \begin{scope}[rotate around={25:(0.45,0.3)}, shift={(0.45,0.3)}]
+    \fill[specred] (0:1.7) circle (1.5pt); \fill[specred] (35:1.42) circle (1.5pt);
+    \fill[specred] (70:1.1) circle (1.5pt); \fill[specred] (110:1.05) circle (1.5pt);
+    \fill[specred] (150:1.42) circle (1.5pt); \fill[specred] (200:1.55) circle (1.5pt);
+    \fill[specred] (250:1.12) circle (1.5pt); \fill[specred] (300:1.3) circle (1.5pt);
+  \end{scope}
+  \fill[black] (0.45,0.3) circle (1.2pt);
+  \node[anchor=west] at (0.55,0.3) {\small $\vec{b}$};
+  \node at (0.2,-2.4) {\small measured: tilted, off-center ellipse};
+\end{scope}
+\end{tikzpicture}
+\caption{A 2D slice of the central idea. Left: a perfect sensor swung through all
+orientations returns points on a circle (sphere) centered at the origin. Right:
+scale and misalignment ($\mat{A}$) stretch and tilt it into an ellipse, and bias
+($\vec{b}$) slides its center off the origin. Calibration finds the map that
+sends the red ellipse back to the gray circle.}
+\label{ch35:fig-ellipsoid}
+\end{figure}
+
+\section{The ellipsoid fit}
+\label{ch35:ellipsoid-fit}
+
+Let us make the picture into arithmetic. Collect a cloud of measured points
+$\vec{y}_k$ by slowly tumbling the (stationary, for the accelerometer)
+sensor through as many orientations as you can --- the more uniformly you cover
+the sphere, the better. We assert that, after we remove bias and undo $\mat{A}$,
+each point should have the known constant magnitude $g$ (or field strength $F$).
+That is the constraint
+\begin{equation}
+  \norm{\mat{A}^{-1}(\vec{y}_k - \vec{b})}^2 = g^2 \quad\text{for all } k.
+  \label{ch35:constraint}
+\end{equation}
+A general ellipsoid is the set of points satisfying a quadratic equation,
+\begin{equation}
+  (\vec{y}-\vec{b})^{\!\top}\,\mat{Q}\,(\vec{y}-\vec{b}) = 1,
+  \qquad \mat{Q} = \frac{1}{g^2}\,\mat{A}^{-\top}\mat{A}^{-1},
+  \label{ch35:ellipsoid-eq}
+\end{equation}
+where $\mat{Q}$ is a symmetric positive-definite matrix encoding the ellipsoid's
+shape and orientation, and $\vec{b}$ its center. Expanding
+\eqref{ch35:ellipsoid-eq} gives a \emph{linear} equation in the unknown entries of
+$\mat{Q}$ and $\vec{b}$ (ten unknowns in 3D: six in symmetric $\mat{Q}$, three in
+$\vec{b}$, one scale). With many points $\vec{y}_k$ we get an overdetermined
+linear system and solve it by least squares --- the same machinery from the
+linear-algebra book. Then we recover the calibration from $\mat{Q}$ and $\vec{b}$.
+
+\begin{whybox}
+Why does fitting an ellipsoid give us a \emph{unique} $\mat{A}$? Strictly, it does
+not --- and that subtlety matters. From $\mat{Q}$ we can recover $\mat{A}^{-1}$
+only up to an arbitrary rotation, because rotating the whole sensor frame leaves
+all magnitudes unchanged and so leaves the ellipsoid identical. In symbols, if
+$\mat{A}^{-1}$ works then so does $\mat{R}\mat{A}^{-1}$ for any rotation $\mat{R}$.
+The standard fix is to demand the corrected matrix be \emph{symmetric}
+positive-definite (the unique symmetric square root of $g^2\mat{Q}$). This pins
+down a definite answer that makes the magnitude correct in every direction; the
+leftover rotation ambiguity is harmless because it just means ``which way is the
+sensor's true $x$ axis'' --- and \emph{that} we fix separately by physically
+defining the body frame, or by cross-referencing the accelerometer (see the next
+chapter on alignment).
+\end{whybox}
+
+\begin{happeningbox}
+What is really happening in an ellipsoid fit is a sphere being un-deformed. The
+matrix square root of $\mat{Q}$ is doing the work of an inverse SVD: it finds the
+three principal axes of your data cloud (the eigenvectors), notes how much each
+was stretched (the eigenvalues), un-stretches them back to equal length, and
+un-rotates them. Subtracting $\vec{b}$ recenters the cloud. After both steps your
+once-lopsided blob of points snaps onto a clean sphere of radius $g$. You can
+literally watch this happen if you plot the points before and after --- it is the
+most satisfying ``before/after'' in all of sensor work.
+\end{happeningbox}
+
+\subsection{The simplest version: the bounding box}
+\label{ch35:bounding-box}
+
+You do not always need the full ten-parameter fit. The crudest useful method,
+beloved of hobbyist firmware, ignores misalignment and assumes $\mat{A}$ is
+\emph{diagonal} (per-axis scale only). Then bias and scale come straight from the
+min and max reading on each axis as you tumble the sensor:
+\begin{equation}
+  b_i = \frac{\max_i + \min_i}{2}, \qquad
+  s_i = \frac{\max_i - \min_i}{2}.
+  \label{ch35:minmax}
+\end{equation}
+The bias is the center of the swing; the scale is its half-range. This is the
+``hard-iron / soft-iron'' min-max calibration you will see in five-line Arduino
+sketches. It captures bias and per-axis scale (the dominant errors) but
+\emph{not} misalignment or non-orthogonality. For a hobby wrist controller it is
+often good enough; when it is not, you graduate to the full ellipsoid fit.
+
+\begin{example}[Six-position accelerometer calibration by hand]
+\label{ch35:ex-sixpos}
+Forget tumbling for a moment; here is the classic deterministic method. Place the
+accelerometer flat in six precise orientations: each of $\pm x$, $\pm y$, $\pm z$
+pointing straight down. In each pose, exactly one axis should read $\pm 1\,g$ and
+the others $0$. Suppose for the $x$-axis you measure $+1.04\,g$ with $+x$ down and
+$-0.98\,g$ with $-x$ down. Solve the two-point line $y = s_x a + b_x$ with
+$a=+1g\Rightarrow y=1.04$ and $a=-1g\Rightarrow y=-0.98$:
+\[
+  s_x = \frac{1.04-(-0.98)}{2} = 1.01, \qquad
+  b_x = \frac{1.04+(-0.98)}{2} = 0.03\,g.
+\]
+So this axis has a $1\%$ scale error and a $30\,\mathrm{mg}$ bias. Corrected
+reading: $\hat a_x = (y_x - 0.03)/1.01$. Repeat for $y$ and $z$. Six poses give
+you the diagonal-$\mat{A}$ calibration without any curve fitting --- the
+geometry of $\pm 1g$ does the work. Cross-axis terms need the ellipsoid fit or
+extra poses.
+\end{example}
+
+\subsection{Magnetometer: hard iron and soft iron}
+\label{ch35:mag-cal}
+
+For magnetometers the ellipsoid distortions have evocative names. \emph{Hard-iron}
+distortion is a constant added field from permanent magnets and magnetized metal
+fixed to your board (a speaker magnet, a steel screw). It \emph{shifts the sphere
+center} --- it is exactly the bias $\vec{b}$. \emph{Soft-iron} distortion comes
+from nearby ferromagnetic material that bends and concentrates the field
+direction-dependently; it \emph{stretches and tilts the sphere} into an ellipsoid
+--- it is exactly the matrix $\mat{A}$. So the abstract ellipsoid story and the
+folk magnetometer vocabulary are the same thing: hard iron $=\vec{b}$, soft iron
+$=\mat{A}$. The cure for both is one ellipsoid fit.
+
+\begin{trapbox}
+Soft-iron sources that move \emph{with} the sensor (screws on your own board) can
+be calibrated out, because they distort the field consistently in sensor
+coordinates. Iron in the \emph{environment} (a steel desk, a passing car, the
+motor in a nearby drone) cannot --- it changes as you move through the room, so it
+is not a fixed function of your orientation. Magnetometer calibration assumes all
+the iron rides along with the sensor. Out in a steel-framed building, even a
+perfectly calibrated magnetometer will lie. This is a deep reason a wrist tracker
+cannot lean too hard on the magnetometer for heading.
+\end{trapbox}
+
+\begin{lstlisting}[language=Python, caption={Hard/soft-iron-aware ellipsoid fit (least squares), then correction.}, label={ch35:lst-ellipsoid}]
+import numpy as np
+
+def fit_ellipsoid(Y):
+    # Y: (N,3) magnetometer/accel samples taken while tumbling the sensor.
+    # Fit  x^T Q x + p^T x = 1  (general quadric), then extract center b
+    # and shape matrix; return corrector W and offset b so that
+    #   a_hat = W @ (y - b)  has constant unit magnitude.
+    x, y, z = Y[:, 0], Y[:, 1], Y[:, 2]
+    # Design matrix for the 9 quadric coefficients (RHS folded to 1).
+    D = np.column_stack([x*x, y*y, z*z, 2*x*y, 2*x*z, 2*y*z, 2*x, 2*y, 2*z])
+    rhs = np.ones_like(x)
+    coef, *_ = np.linalg.lstsq(D, rhs, rcond=None)    # least-squares solve
+    A11, A22, A33, A12, A13, A23, gx, gy, gz = coef
+    Q = np.array([[A11, A12, A13],
+                  [A12, A22, A23],
+                  [A13, A23, A33]])
+    b = -0.5 * np.linalg.solve(Q, np.array([gx, gy, gz]))  # ellipsoid center
+    # Shape: symmetric square root of Q, scaled so corrected radius = 1.
+    evals, evecs = np.linalg.eigh(Q)
+    evals = np.clip(evals, 1e-12, None)               # guard tiny negatives
+    Qsqrt = evecs @ np.diag(np.sqrt(evals)) @ evecs.T
+    scale = np.mean([np.linalg.norm(Qsqrt @ (yi - b)) for yi in Y])
+    W = Qsqrt / scale                                 # so |W (y-b)| ~ 1
+    return W, b
+
+# usage:  a_hat = W @ (y - b)   -> lies on the unit sphere
+\end{lstlisting}
+
+\begin{labbox}
+Log raw magnetometer readings for thirty seconds while you slowly rotate the
+sensor in a figure-eight, covering as many orientations as you can, then make a
+3D scatter (or three 2D scatters: $xy$, $xz$, $yz$). \emph{Before} calibration
+the points form a tilted, off-center ellipsoidal shell. Run
+Listing~\ref{ch35:lst-ellipsoid}, apply $\hat{\vec{a}} = \mat{W}(\vec{y}-\vec{b})$,
+and scatter again: the shell snaps to a unit sphere centered on the origin. Now
+plot $\norm{\hat{\vec{a}}}$ for every sample --- it should hug $1$ flat across all
+orientations. That flat line is the signature of a good calibration.
+\end{labbox}
+
+\section{Gyroscope bias estimation}
+\label{ch35:gyro-bias}
+
+The sphere trick does not work for a gyroscope, and it is worth understanding
+exactly why. A gyro measures \emph{rate of rotation}, not a constant-magnitude
+field. When the device is still, the true rate is zero --- there is no sphere to
+trace, just a point at the origin. So gyros need a different, and in some ways
+simpler, calibration. The dominant systematic error is bias, and the dominant
+problem bias causes is \emph{integration drift}.
+
+\subsection{Why gyro bias is the cardinal sin}
+\label{ch35:gyro-drift}
+
+To get orientation from a gyro you integrate rate over time: angle is the running
+sum of rate $\times$ $\Delta t$. Now suppose the gyro has a tiny constant bias
+$b$. Integrating a constant gives a ramp:
+\begin{equation}
+  \theta_{\text{error}}(t) = \int_0^t b \, \dd\tau = b\,t.
+  \label{ch35:bias-integrates}
+\end{equation}
+A bias of just $0.5^\circ/\mathrm{s}$ --- utterly invisible in the raw rate ---
+becomes a $30^\circ$ heading error after one minute and a full $180^\circ$ after
+six. This is why, of all the error terms, gyro bias is the one you must hunt down
+most aggressively. It is also why a gyro alone can never hold orientation
+indefinitely: even after you subtract the best constant bias you can measure, the
+\emph{leftover} drifting bias (the rate random walk of
+Section~\ref{ch35:random-walk}) keeps integrating into an ever-growing angle
+error. The accelerometer and magnetometer exist in the fusion filter precisely to
+nail this drift back down --- which they can only do if \emph{they} have been
+calibrated first.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=11.5cm, height=4.8cm,
+    xlabel={time (s)}, ylabel={integrated angle error ($^\circ$)},
+    xmin=0, xmax=60, ymin=-2, ymax=35,
+    axis lines=left, samples=80, domain=0:60,
+    legend pos=north west, legend cell align=left,
+    title={A constant gyro bias integrates into linear drift},
+    every axis plot/.append style={line width=1.0pt},
+]
+\addplot[specred] {0.5*x}; \addlegendentry{bias 0.5 deg/s ramp}
+\addplot[sigblue] {0.1*x}; \addlegendentry{bias 0.1 deg/s, after coarse cal}
+\addplot[targetgreen] {0.03*x + 0.9*sin(deg(x/9))};
+  \addlegendentry{residual random-walk}
+\end{axis}
+\end{tikzpicture}
+\caption{Integrating rate to get angle turns a constant bias into a linear ramp
+(red). Subtracting a measured bias flattens the ramp (blue), but the leftover
+slowly drifting bias still wanders (green). No static calibration removes the
+green term; that is the job of sensor fusion.}
+\label{ch35:fig-gyro-drift}
+\end{figure}
+
+\subsection{Estimating the bias: average while still}
+\label{ch35:gyro-bias-estimate}
+
+The good news: because the true rate is zero when the device is motionless, gyro
+bias is trivial to measure --- \emph{hold the device still and average}. With $N$
+samples $\omega_k$ taken at rest,
+\begin{equation}
+  \hat{b} = \frac{1}{N}\sum_{k=1}^{N}\omega_k.
+  \label{ch35:gyro-bias-avg}
+\end{equation}
+This is Chapter~20's averaging law doing exactly what it does best: the true
+signal is a known constant (zero), so the sample mean estimates the bias, and the
+white-noise part shrinks like $1/\sqrt{N}$. Average a few seconds at, say,
+$200\,\mathrm{Hz}$ and you have a clean bias estimate. The catch, as we keep
+insisting, is that $\hat b$ is only good \emph{now}: it drifts with temperature
+and time. So good firmware re-runs \eqref{ch35:gyro-bias-avg} automatically every
+time it detects stillness.
+
+\begin{whybox}
+How does the device know it is still, so it can re-estimate bias? You watch two
+cheap signals. First, the accelerometer magnitude: at rest it reads almost
+exactly $1\,g$ with very little variance, so $\bigl|\,\norm{\vec{a}} - g\,\bigr|$
+small over a short window is strong evidence of stillness. Second, the gyro's own
+short-term variance: if the rate is barely wiggling, you are not turning. When
+both say ``still'' for, say, half a second, you trust that the true rate is zero
+and fold the current average into your running bias estimate. This ``zero-rate
+update'' (ZRU, or ZUPT for the velocity version) is the single most effective
+trick for taming gyro drift in a wearable, and it costs almost nothing.
+\end{whybox}
+
+\section{Allan variance: reading a sensor's whole noise story}
+\label{ch35:allan}
+
+We have claimed twice now that white noise shrinks with longer averaging while
+bias drift grows. The Allan variance is the one plot that shows both effects at
+once and lets you read off the numbers. It was invented by David Allan in 1966 to
+characterize atomic-clock stability, and it migrated to inertial sensors because
+the problem is identical: how stable is a thing's output over different time
+scales?
+
+\begin{historybox}
+David W. Allan, working at the U.S. National Bureau of Standards on the stability
+of atomic frequency standards, faced a problem ordinary variance could not
+answer. The standard variance of a drifting signal does not converge --- it just
+grows as you record longer, because slow drift keeps adding spread. Allan's
+fix (1966) was to measure variance \emph{between adjacent averaging windows} of
+length $\tau$, and to plot it as a function of $\tau$. The resulting curve cleanly
+separates noise processes that live at different time scales. Decades later, IEEE
+standard 952 adopted the Allan variance as the canonical way to specify
+fiber-optic and MEMS gyroscopes, which is why every serious IMU datasheet quotes
+an ``angle random walk'' and a ``bias instability'' number --- both read straight
+off an Allan deviation plot.
+\end{historybox}
+
+\subsection{What it measures}
+\label{ch35:allan-defn}
+
+Take a long recording of a stationary sensor. Pick an averaging time $\tau$.
+Chop the record into consecutive bins of length $\tau$, compute the average value
+$\bar{y}_i(\tau)$ in each bin, and then measure how much \emph{adjacent} bin
+averages differ from one another:
+\begin{equation}
+  \sigma_A^2(\tau) = \frac{1}{2}\,\E\!\left[\bigl(\bar{y}_{i+1}(\tau) - \bar{y}_i(\tau)\bigr)^2\right].
+  \label{ch35:allan-defn-eq}
+\end{equation}
+The factor of $\tfrac12$ makes the answer match ordinary variance for white
+noise. We sweep $\tau$ from tiny to large and plot the \emph{Allan deviation}
+$\sigma_A(\tau)$ (the square root) on log--log axes. Different physical noise
+processes show up as straight-line segments with characteristic slopes:
+
+\begin{itemize}
+\item \textbf{Angle/velocity random walk (white noise)} appears as a slope of
+$-\tfrac12$: doubling the averaging time cuts the deviation by $\sqrt 2$. This is
+the averaging-helps regime.
+\item \textbf{Bias instability} appears as a \emph{flat} region (slope $0$): the
+floor of the curve. Averaging longer than this stops helping --- the bias is
+wandering as fast as you can average it out. The minimum of the curve is the
+sensor's best achievable stability.
+\item \textbf{Rate random walk} appears as a slope of $+\tfrac12$: at long
+averaging times the deviation \emph{grows}, because slow drift dominates.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=12cm, height=6.2cm,
+    xlabel={averaging time $\tau$ (s, log scale)},
+    ylabel={Allan deviation $\sigma_A(\tau)$ (log)},
+    xmode=log, ymode=log,
+    xmin=0.01, xmax=1000, ymin=0.002, ymax=1,
+    axis lines=left, grid=both, grid style={gray!18},
+    title={The classic Allan deviation ``bathtub''},
+    every axis plot/.append style={line width=1.1pt},
+    samples=60,
+]
+% white-noise branch: slope -1/2
+\addplot[sigblue, domain=0.01:3] {0.06*x^(-0.5)};
+% rate-random-walk branch: slope +1/2
+\addplot[specred, domain=20:1000] {0.0045*x^(0.5)};
+% flat bias-instability floor
+\addplot[targetgreen, domain=2:40] {0.022};
+\node[sigblue, anchor=south west] at (axis cs:0.012,0.45) {slope $-1/2$: white noise (ARW)};
+\node[targetgreen, anchor=south] at (axis cs:9,0.024) {flat: bias instability};
+\node[specred, anchor=south east] at (axis cs:900,0.10) {slope $+1/2$: rate random walk};
+\end{axis}
+\end{tikzpicture}
+\caption{The Allan deviation of a real MEMS sensor traces a ``bathtub.'' At short
+averaging times white noise dominates and falls with slope $-1/2$ (averaging
+helps). It bottoms out at the bias-instability floor (flat). At long times slow
+drift takes over and the curve climbs with slope $+1/2$. The bottom of the
+bathtub tells you the best averaging time and the best stability you can hope
+for.}
+\label{ch35:fig-allan}
+\end{figure}
+
+\begin{intuitionbox}
+The Allan deviation plot is a sensor's autobiography. Read left to right it says:
+``For the first fraction of a second I am all hiss --- average me and I get
+better fast. Around a few seconds I am as good as I will ever be; that flat floor
+is my true talent. Average me any longer and I start daydreaming --- my bias
+wanders and I get worse again.'' The single most useful number on the plot is the
+$\tau$ at the bottom of the bathtub: that is the optimal averaging window for your
+zero-rate updates. Average exactly that long when you estimate gyro bias and you
+extract the most truth the sensor has to give.
+\end{intuitionbox}
+
+\begin{connectionbox}
+The Allan variance is a cousin of the power spectral density from Chapter~20.
+Both describe how a random signal's energy is distributed across time scales /
+frequencies; in fact each Allan-slope corresponds to a power-law region of the
+PSD ($1/f^0$ white, $1/f$ flicker, $1/f^2$ random walk). The Allan variance is
+often preferred for sensors because the integrating, drifting low-frequency
+behavior that ruins a gyro is exactly where the ordinary PSD estimate is hardest
+to pin down --- and where the Allan plot is clearest and most stable.
+\end{connectionbox}
+
+\begin{lstlisting}[language=Python, caption={Computing the Allan deviation from a long stationary recording.}, label={ch35:lst-allan}]
+import numpy as np
+
+def allan_deviation(y, fs, taus):
+    # y: 1D array of a stationary sensor axis; fs: sample rate (Hz)
+    # taus: list of averaging times (s) to evaluate
+    out = []
+    for tau in taus:
+        m = int(tau * fs)                 # samples per averaging bin
+        if m < 1 or 2*m > len(y):
+            continue
+        n = len(y) // m
+        bins = y[:n*m].reshape(n, m).mean(axis=1)   # bin averages
+        d = np.diff(bins)                            # adjacent differences
+        sigma2 = 0.5 * np.mean(d**2)                 # Allan variance
+        out.append((tau, np.sqrt(sigma2)))
+    return np.array(out)
+\end{lstlisting}
+
+\section{Why calibration must come before fusion}
+\label{ch35:before-fusion}
+
+We have hinted at this throughout; now we state it as the chapter's thesis. The
+next chapter builds a \emph{sensor fusion} filter that blends gyro, accelerometer,
+and magnetometer into one orientation estimate. The blend works by \emph{trusting
+each sensor where it is strong and correcting it where it is weak}: the gyro for
+fast, short-term rotation; the accelerometer and magnetometer to pin down the
+slow drift. That correction is only as good as the sensors' agreement about
+``which way is down'' and ``which way is north.'' If the accelerometer's down is
+tilted $3^\circ$ by uncorrected misalignment, or the magnetometer's north is bent
+$20^\circ$ by uncorrected hard iron, the fusion filter will dutifully drag your
+orientation \emph{toward the wrong answer} --- and do it confidently, because it
+has no way to know the reference is lying.
+
+\begin{aestheticbox}
+Calibration is upstream of everything. A fusion filter, a gesture classifier, a
+machine-learning model --- each assumes its inputs mean what they claim. Garbage
+in is not merely garbage out here; it is \emph{confident, plausible-looking}
+garbage out, which is worse, because it survives a casual glance. The half-hour
+you spend calibrating buys correctness for every line of code downstream. It is
+the cheapest, highest-leverage step in the entire pipeline, and the one beginners
+skip first. Do it, and do it at operating temperature.
+\end{aestheticbox}
+
+\begin{goalbox}
+For the wrist controller, here is the calibration discipline that makes the
+difference between a toy and an instrument. (1) \textbf{Accelerometer:} full
+ellipsoid fit once per build, so ``down'' is trustworthy to a fraction of a
+degree --- this anchors pitch and roll. (2) \textbf{Magnetometer:} ellipsoid fit
+\emph{with the final enclosure, battery, and any magnets in place}, because the
+hard/soft iron you must cancel is the iron that ships on the wrist; and accept
+that environmental iron will still corrupt heading, so the design must
+not depend on absolute magnetic north for playing notes. (3) \textbf{Gyro:}
+continuous zero-rate bias updates whenever the wrist is detected still between
+gestures --- this is what keeps fast wrist flicks from accumulating drift over a
+song. The same discipline carries over to the band's tendon and contact sensors,
+the channels that actually carry finger movement: the force-myography (FMG) array
+and the high-rate accelerometer used as a contact/bio-acoustic sensor each have
+their own baseline and gain, and each gets calibrated during the guided
+enrollment of the capstone --- the user performs every finger movement a few
+times, the phone records the per-finger signal signature, and it sets the matching
+thresholds. With that per-finger calibration in hand, finger movements \emph{are}
+detectable from a wrist or forearm band: tendon displacement (FMG) and the surface
+EMG pulse both carry which finger moved
+(Figure~\ref{ch35:fig-fmg-trace}).
+
+The one limit worth stating plainly: all of the IMU work above calibrates the
+\emph{wrist's} bulk motion, and continuous per-joint finger angles are simply not
+present in that bulk motion --- the problem is underdetermined, and no fit recovers
+what the signal does not contain. A continuous finger-pose curve needs sensors on
+the fingers themselves (instrumented rings). Treat that as an upgrade path, not a
+prerequisite: detecting which finger moved, and when, is enough to play notes, and
+that is squarely on the doable side.
+\end{goalbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=12cm, height=5.2cm,
+    xlabel={time (s)}, ylabel={FMG channel (calibrated)},
+    xmin=0, xmax=6, ymin=-0.1, ymax=1.15,
+    axis lines=left, samples=160, domain=0:6,
+    legend pos=north east, legend cell align=left,
+    title={Calibrated tendon (FMG) signal: a finger press above its threshold},
+    every axis plot/.append style={line width=1.0pt},
+]
+% baseline subtracted, gain normalized; a press is a bump
+\addplot[sigblue, domain=0:6]
+  {0.03*sin(deg(3*x)) + 0.85*exp(-((x-3)^2)/0.18)};
+\addlegendentry{index-finger channel}
+\addplot[trapred, dashed, domain=0:6] {0.4};
+\addlegendentry{enrollment threshold}
+\node[anchor=south, sigblue] at (axis cs:3,0.9) {\small press detected};
+\end{axis}
+\end{tikzpicture}
+\caption{What per-finger calibration produces on a tendon (FMG) channel. The
+enrollment step subtracts each channel's resting baseline and normalizes its gain,
+so a still hand reads near zero. When the calibrated index finger presses, that
+channel rises into a clear bump; crossing the threshold set during enrollment (red
+dashed) fires a per-finger event. No machine learning is involved --- the detector
+is a calibrated baseline, a gain, and a threshold per finger, matched live against
+the enrolled signature.}
+\label{ch35:fig-fmg-trace}
+\end{figure}
+
+\begin{buildbox}
+A practical calibration routine you can ship in firmware and run on the bench.
+
+\textbf{Gyro bias (every boot, plus continuously).}
+\begin{enumerate}
+\item At boot, ask the user to set the device down. Confirm stillness:
+$\bigl|\,\norm{\vec{a}}-g\,\bigr| < 0.05\,g$ and gyro variance below a threshold
+over a $0.5\,\mathrm{s}$ window.
+\item Average the gyro over $1$--$2\,\mathrm{s}$ (Eq.~\ref{ch35:gyro-bias-avg})
+and store $\hat{\vec b}_{\text{gyro}}$.
+\item During use, re-run the average whenever stillness is detected; blend the new
+estimate into the stored one with a slow low-pass so temperature drift is tracked.
+\end{enumerate}
+
+\textbf{Accelerometer (once per build, at operating temperature).}
+\begin{enumerate}
+\item Either do the six-position method (Example~\ref{ch35:ex-sixpos}) for the
+diagonal model, or tumble slowly through all orientations and run the ellipsoid
+fit (Listing~\ref{ch35:lst-ellipsoid}).
+\item Store $\mat{W}_{\text{acc}}$ and $\vec{b}_{\text{acc}}$; apply
+$\hat{\vec a}=\mat{W}_{\text{acc}}(\vec y-\vec b_{\text{acc}})$ on every sample.
+\item Sanity check: corrected $\norm{\hat{\vec a}}$ should be $1\,g\pm$ a few
+$\mathrm{mg}$ in every pose.
+\end{enumerate}
+
+\textbf{Magnetometer (once, with final hardware assembled).}
+\begin{enumerate}
+\item Power the board exactly as it will ship (battery in, enclosure closed).
+\item Rotate in slow figure-eights for $20$--$30\,\mathrm{s}$, logging raw mag.
+\item Run the ellipsoid fit; store $\mat{W}_{\text{mag}}$ (soft iron) and
+$\vec{b}_{\text{mag}}$ (hard iron).
+\item Verify corrected $\norm{\hat{\vec m}}$ is flat across orientations.
+\end{enumerate}
+
+\textbf{Characterize (once, informative).} Log a stationary gyro for $20$--$60$
+minutes and compute the Allan deviation (Listing~\ref{ch35:lst-allan}). The
+bottom-of-bathtub $\tau$ tells you how long to average for zero-rate updates; the
+floor tells you the best heading stability to expect from the gyro alone.
+\end{buildbox}
+
+\begin{applicationbox}
+This exact ellipsoid machinery shows up far beyond wearables. Smartphone compass
+apps run a continuous background magnetometer ellipsoid fit --- that ``wave your
+phone in a figure eight'' prompt is collecting points to refit the sphere after
+hard-iron conditions change. Drone flight controllers calibrate accelerometer
+and magnetometer with the same six-position and tumble routines before every
+serious flight, because a $2^\circ$ heading error sends an autonomous waypoint
+mission off course. Even MRI and geophysical magnetometers use sphere/ellipsoid
+calibration to remove fixed instrument bias. The geometry of ``constant magnitude
+implies a sphere'' is one of the most reused ideas in all of sensing.
+\end{applicationbox}
+
+\section{Worked example: separating bias from drift}
+\label{ch35:worked}
+
+\begin{example}[Reading an Allan plot for averaging time]
+\label{ch35:ex-allan}
+Suppose your gyro's Allan deviation reaches its minimum (flat floor) at
+$\tau^\star \approx 8\,\mathrm{s}$ with a floor value of $0.02^\circ/\mathrm{s}$,
+and at short times the white-noise branch passes through
+$\sigma_A(1\,\mathrm{s}) = 0.06^\circ/\mathrm{s}$ with slope $-1/2$. Two practical
+readings follow. First, if you average a zero-rate update over $8\,\mathrm{s}$ you
+get the best possible bias estimate, good to about $0.02^\circ/\mathrm{s}$;
+averaging longer is wasted effort because the floor is flat and then climbs.
+Second, the angle random walk (the white-noise branch's value at
+$\tau=1\,\mathrm{s}$, by the standard convention) is
+$N \approx 0.06^\circ/\sqrt{\mathrm{s}}$, so after $t$ seconds of free
+integration the random-walk angle uncertainty is roughly
+$0.06\sqrt{t}\ ^\circ$ --- about $0.4^\circ$ after $40\,\mathrm{s}$. That tells
+you how often the accelerometer must step in to reset drift, which is exactly the
+tuning knob of the next chapter's fusion filter.
+\end{example}
+
+\begin{example}[Bias still integrates faster than random walk]
+\label{ch35:ex-bias-vs-walk}
+Contrast Example~\ref{ch35:ex-allan} with an \emph{uncalibrated} bias of
+$0.5^\circ/\mathrm{s}$. After $40\,\mathrm{s}$ that bias alone contributes
+$0.5\times40 = 20^\circ$ of error --- fifty times the $\sim 0.4^\circ$ from random
+walk. The lesson is stark: a constant bias you failed to remove dwarfs the
+fundamental noise floor. Calibration (removing the deterministic $20^\circ$) is
+not a refinement on top of good noise performance; it is the difference between a
+usable device and an unusable one. Get the systematic part out first; only then
+does the random part even matter.
+\end{example}
+
+\section{Exercises}
+\label{ch35:exercises}
+
+\begin{exercise}
+A flat accelerometer's $z$-axis reads $+1.06\,g$ pointing up and $-0.96\,g$
+pointing down. Find the scale factor $s_z$ and bias $b_z$ for the affine model
+$y=s_z a + b_z$, and write the correction formula for $\hat a_z$. Is the bias
+positive or negative?
+\end{exercise}
+
+\begin{exercise}
+Explain, using the input--output line of Figure~\ref{ch35:fig-bias-scale}, why a
+single measurement at $+1\,g$ cannot distinguish bias from scale error. What is
+the minimum number of distinct true input levels needed to separate them on one
+axis, and why?
+\end{exercise}
+
+\begin{exercise}
+A magnetometer's raw data, plotted in 3D while tumbling, forms a sphere whose
+center is at $(12, -8, 30)\ \mu\mathrm{T}$ rather than the origin. Which error
+term is this --- hard iron or soft iron? What is the corresponding vector in the
+model of \eqref{ch35:lumped-model}, and how do you correct it?
+\end{exercise}
+
+\begin{exercise}
+Using the min--max method of \eqref{ch35:minmax}, suppose the $x$-axis of a
+magnetometer swings between $\min_x = -55$ and $\max_x = +5$. Compute the
+hard-iron offset and per-axis scale for $x$. If the $y$-axis swings between
+$-30$ and $+30$, what does the difference in scale tell you about soft iron?
+\end{exercise}
+
+\begin{exercise}
+A gyro has a constant bias of $0.2^\circ/\mathrm{s}$ that you did not remove. You
+integrate to track heading. How long until the heading error reaches $90^\circ$?
+Now suppose you remove that bias but a residual rate random walk makes the angle
+uncertainty grow as $0.05\sqrt{t}\ ^\circ$. How long until \emph{that} reaches
+$90^\circ$? Comment on the enormous ratio.
+\end{exercise}
+
+\begin{exercise}
+Sketch (by hand or in code) the Allan deviation bathtub. Label the slope of each
+of the three regions and name the noise process responsible. Mark the point that
+gives the optimal averaging time, and explain in one sentence why averaging
+longer than that point makes the estimate \emph{worse}.
+\end{exercise}
+
+\begin{exercise}
+Why does the sphere-fit calibration work for accelerometers and magnetometers but
+\emph{not} for gyroscopes? Identify the geometric property the first two share
+that the gyro lacks, and describe the alternative calibration the gyro requires
+instead.
+\end{exercise}
+
+\begin{exercise}
+You calibrate a magnetometer perfectly on your wooden workbench, then carry the
+device to a steel-framed doorway. The calibration that gave a flat
+$\norm{\hat{\vec m}}=1$ on the bench now gives readings off by $15^\circ$ in
+heading. Explain why, distinguishing iron that moves with the sensor from iron
+fixed in the environment. What does this imply for a wrist controller's use of
+magnetic heading?
+\end{exercise}
+
+\begin{exercise}
+Write pseudocode for a stillness detector suitable for triggering a zero-rate
+gyro bias update. Use both the accelerometer magnitude and the short-window gyro
+variance. State the two thresholds you would tune and what failure mode each one
+guards against.
+\end{exercise}
+
+\begin{exercise}
+(Scope-of-calibration essay.) A teammate hopes to recover \emph{continuous
+per-joint finger angles} from a single well-calibrated wrist IMU. In two or three
+sentences, explain why no amount of IMU calibration can deliver that (what
+information is missing from wrist bulk motion), and what sensor change would be
+required. Separately, note why \emph{detecting which finger moved} is a different,
+achievable problem given a calibrated tendon/contact sensor array.
+\end{exercise}
+
