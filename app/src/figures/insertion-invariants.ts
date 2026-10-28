@@ -1,5 +1,5 @@
 // Chapter 2: Insertion Sort Invariants Visualization
-import { responsiveSvg, s, handle, row, button, formula, slider, clamp, scale, label, type Mount } from './lib';
+import { responsiveSvg, s, handle, row, button, formula, note, slider, clamp, scale, label, type Mount } from './lib';
 
 const initialArray = [5, 2, 4, 6, 1, 3, 8, 7];
 
@@ -78,6 +78,7 @@ const mount: Mount = (root) => {
   });
 
   const f = formula(root);
+  const nBox = note(root);
   const r = row(root);
   const sld = slider(r, {
     label: 'Step',
@@ -110,6 +111,11 @@ const mount: Mount = (root) => {
     barsGroup.replaceChildren();
     textGroup.replaceChildren();
 
+    // Top lane header and invariant divider
+    label(bgGroup, xMin, 18, 'sorted prefix A[1..j−1]  ·  key  ·  unsorted', 'lbl', 'start');
+    const divX = xMin + step.j * ((xMax - xMin) / n);
+    s('line', { class: 'edge', x1: divX, x2: divX, y1: pad.t, y2: H - pad.b }, bgGroup);
+
     // Timeline track
     s('line', { class: 'ax', x1: xMin, x2: xMax, y1: H - 20, y2: H - 20 }, bgGroup);
     const handleX = xMin + (stepIdx / (trace.length - 1)) * (xMax - xMin);
@@ -131,8 +137,15 @@ const mount: Mount = (root) => {
     });
 
     f.set(
-      `j=${step.j},\\ \\text{key}=${step.key},\\ \\text{comps}=${step.comparisons},\\ \\text{shifts}=${step.shifts}`,
+      `j=${step.j + 1},\\ \\text{key}=${step.key},\\ \\text{comps}=${step.comparisons},\\ \\text{shifts}=${step.shifts}`,
     );
+    const phaseDesc =
+      step.phase === 'select'
+        ? `Select key = ${step.key} at index j = ${step.j + 1}; prefix A[1..${step.j}] is already in sorted order.`
+        : step.phase === 'shift'
+          ? `Compare A[${step.i + 1}] = ${step.arr[step.i]} > key (${step.key}): shift ${step.arr[step.i]} one slot right to open space.`
+          : `Insert key = ${step.key} into slot ${step.i + 1}; the sorted prefix now extends across A[1..${step.j + 1}].`;
+    nBox.set(phaseDesc);
   }
 
   view.onResize(draw);

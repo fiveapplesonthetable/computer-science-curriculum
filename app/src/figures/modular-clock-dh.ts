@@ -1,5 +1,5 @@
 // Modular arithmetic clock Z/pZ (p=17, g=3) and Diffie-Hellman key exchange visualizer.
-import { responsiveSvg, s, handle, row, button, formula, slider, clamp, label, type Mount } from './lib';
+import { responsiveSvg, s, handle, row, button, formula, note, slider, clamp, label, type Mount } from './lib';
 
 const p = 17;
 const g = 3;
@@ -35,6 +35,7 @@ const mount: Mount = (root) => {
   // Labels for public/shared values
   const infoGroup = s('g', {}, svgEl);
   const formulaBox = formula(root);
+  const nBox = note(root);
 
   const r = row(root);
   const sA = slider(r, {
@@ -165,6 +166,9 @@ const mount: Mount = (root) => {
 
     formulaBox.set(
       `A=${A},\\ B=${B},\\ K=3^{${a}\\cdot ${b}}\\bmod 17=${K_alice}`
+    );
+    nBox.set(
+      `Alice multiplies by generator g = 3 a total of a = ${a} times around Z/17Z to publish A = ${A}; Bob takes b = ${b} steps to publish B = ${B}. Both compute shared secret K = B^${a} = A^${b} ≡ ${K_alice} (mod 17).`,
     );
   }
 

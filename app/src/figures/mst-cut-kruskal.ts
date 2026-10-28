@@ -1,7 +1,7 @@
 // Chapter 6, graph-algorithms: Minimum Spanning Tree Cut Property & Kruskal Edge Stepper.
 // Default-export mount(root). Uses responsiveSvg, handle, formula, row, slider, button, and SVG theme classes.
 
-import { responsiveSvg, s, handle, row, slider, button, formula, clamp, lerp, type Mount } from './lib';
+import { responsiveSvg, s, handle, row, slider, button, formula, note, label, clamp, lerp, type Mount } from './lib';
 
 interface Vertex {
   id: string;
@@ -108,6 +108,7 @@ const mount: Mount = (root) => {
   });
   const svgEl = view.el;
 
+  const bgG = s('g', {}, svgEl);
   const cutBand = s('ellipse', { class: 'band', rx: 90, ry: 60, cx: 180, cy: 135 }, svgEl);
   const edgesG = s('g', {}, svgEl);
   const nodesG = s('g', {}, svgEl);
@@ -153,6 +154,7 @@ const mount: Mount = (root) => {
   });
 
   const f = formula(root);
+  const nBox = note(root);
   const r = row(root);
 
   button(r, 'Reset', () => {
@@ -222,6 +224,9 @@ const mount: Mount = (root) => {
 
     const startX = sx(60);
     const endX = view.W - sx(60);
+    bgG.replaceChildren();
+    label(bgG, sx(60), 22, 'Kruskal sorted edges & cut property', 'lbl', 'start');
+    s('line', { class: 'ax', x1: startX, x2: endX, y1: 240, y2: 240 }, bgG);
     const curX = lerp(startX, endX, tStep / maxStep);
     hd.move(curX, 240);
 
@@ -237,6 +242,7 @@ const mount: Mount = (root) => {
     f.set(
       `\\text{Step } ${tStep}:\\ ${edgeDesc}\\ (\\text{${st.action}}),\\ W(\\text{MST}) = ${totalW}`,
     );
+    nBox.set(st.desc);
   }
 
   view.onResize(() => {

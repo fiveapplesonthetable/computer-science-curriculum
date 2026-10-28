@@ -1,5 +1,5 @@
 // Chapter 13: Red-Black Tree Rotation Visualizer
-import { responsiveSvg, s, handle, row, button, formula, slider, clamp, label, lerp, type Mount } from './lib';
+import { responsiveSvg, s, handle, row, button, formula, note, slider, clamp, label, lerp, type Mount } from './lib';
 
 const mount: Mount = (root) => {
   let t = 0.0; // 0 = left rotation state (y root), 1 = right rotation state (x root)
@@ -35,6 +35,7 @@ const mount: Mount = (root) => {
   });
 
   const f = formula(root);
+  const nBox = note(root);
   const r1 = row(root);
   const sld = slider(r1, {
     label: 'Interpolation t',
@@ -61,6 +62,7 @@ const mount: Mount = (root) => {
     nodesGroup.replaceChildren();
     textGroup.replaceChildren();
 
+    label(textGroup, pad.l, 18, 'BST rotation & fixed in-order projection', 'lbl', 'start');
     s('line', { class: 'ax', x1: pad.l, x2: W - pad.r, y1: H - 20, y2: H - 20 }, edgesGroup);
     hd.move(pad.l + t * (W - pad.l - pad.r), H - 20);
 
@@ -114,6 +116,13 @@ const mount: Mount = (root) => {
     label(nodesGroup, gx, gy + 4, 'γ', 'lbl-fg');
 
     f.set(`t=${t.toFixed(2)}:\\ \\text{in-order } [\\alpha, x, \\beta, y, \\gamma]`);
+    nBox.set(
+      t < 0.15
+        ? 'Right-heavy root y with left child x: subtree β sits between x and y as the right child of x, while α is at depth 2.'
+        : t > 0.85
+          ? 'After right rotation (x is root, y is right child): subtree β re-attaches as the left child of y, keeping in-order sequence α < x < β < y < γ intact.'
+          : 'During rotation: pointers rewire in O(1) time—x rises, y descends, and middle subtree β hands off from x.right to y.left.',
+    );
   }
 
   view.onResize(draw);

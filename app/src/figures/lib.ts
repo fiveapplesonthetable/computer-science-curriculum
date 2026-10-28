@@ -99,6 +99,18 @@ export function formula(root: HTMLElement) {
   };
 }
 
+/** A stage-by-stage explanation note under the figure. Call .set(text). */
+export function note(root: HTMLElement) {
+  const el = h('div', { class: 'fig-note', 'aria-live': 'polite' }, root);
+  let last = '';
+  return {
+    el,
+    set(txt: string) {
+      if (txt !== last) el.textContent = (last = txt);
+    },
+  };
+}
+
 /** A row for controls (sliders, buttons, notes). */
 export function row(root: HTMLElement) {
   return h('div', { class: 'fig-row' }, root);

@@ -1,5 +1,5 @@
 // Chapter 2: Loop Invariant Proof Stepper & Interactive Array Inspector
-import { responsiveSvg, stepper, s, handle, row, button, formula, slider, clamp, scale, label, texHtml, type Step, type Mount } from './lib';
+import { responsiveSvg, stepper, s, handle, row, button, formula, note, slider, clamp, scale, label, texHtml, type Step, type Mount } from './lib';
 
 const steps: Step[] = [
   {
@@ -68,6 +68,7 @@ const mount: Mount = (root) => {
   });
 
   const f = formula(root);
+  const nBox = note(root);
   const r = row(root);
   sld = slider(r, {
     label: 'Index j',
@@ -99,6 +100,11 @@ const mount: Mount = (root) => {
     barsGroup.replaceChildren();
     textGroup.replaceChildren();
 
+    // Top lane header and boundary divider
+    label(textGroup, xMin, 18, 'invariant prefix A[1..j−1] vs uninspected A[j..n]', 'lbl', 'start');
+    const divX = xMin + Math.min(jVal - 1, n) * ((xMax - xMin) / n);
+    s('line', { class: 'edge', x1: divX, x2: divX, y1: pad.t, y2: H - pad.b }, barsGroup);
+
     // Timeline track
     s('line', { class: 'ax', x1: xMin, x2: xMax, y1: H - 20, y2: H - 20 }, barsGroup);
     const jNorm = Math.min(jVal - 1, n) / n;
@@ -118,6 +124,13 @@ const mount: Mount = (root) => {
     });
 
     f.set(`j=${jVal},\\ \\text{Sorted prefix: } A[1..${Math.min(jVal - 1, n)}]`);
+    const stageTxt =
+      jVal === 2
+        ? 'Initialization (j = 2): the single-element prefix A[1..1] = [2] has no out-of-order pairs, so the invariant holds before the first iteration.'
+        : jVal <= n
+          ? `Maintenance (j = ${jVal}): A[1..${jVal - 1}] is sorted before inserting key A[${jVal}] = ${sampleArr[jVal - 1]} into its proper rank.`
+          : `Termination (j = ${n + 1}): the loop exits when j > n; substituting j = ${n + 1} into the invariant proves the entire array A[1..${n}] is sorted.`;
+    nBox.set(stageTxt);
   }
 
   view.onResize(draw);

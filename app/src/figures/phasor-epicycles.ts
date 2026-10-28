@@ -2,7 +2,7 @@
 // Rotating complex exponential phasor z(t) = A e^{j(omega t + phi)} on the left unit circle
 // projecting horizontally onto the real cosine wave on the right time-domain plot.
 
-import { responsiveSvg, s, attr, handle, row, button, formula, slider, clamp, scale, label, type Mount } from './lib';
+import { responsiveSvg, s, attr, handle, row, button, formula, note, slider, clamp, scale, label, type Mount } from './lib';
 
 const mount: Mount = (root) => {
   let A = 1.0;
@@ -71,6 +71,7 @@ const mount: Mount = (root) => {
   });
 
   const f = formula(root);
+  const nBox = note(root);
   const r = row(root);
   const ampSlider = slider(r, {
     label: 'Amplitude A',
@@ -179,6 +180,9 @@ const mount: Mount = (root) => {
     attr(waveDot, { cx: currentPx, cy: currentPy });
 
     f.set(`z(t)=${A.toFixed(1)}e^{j(${omega.toFixed(1)}t+${phi.toFixed(1)})},\\ \\operatorname{Re} z=${(A * Math.cos(theta)).toFixed(2)}`);
+    nBox.set(
+      `Euler’s formula e^{jθ} = cos θ + j sin θ turns uniform rotation at speed ω = ${omega.toFixed(1)} rad/s on the complex plane (left) into a real sinusoid of amplitude A = ${A.toFixed(2)} and phase φ = ${phi.toFixed(2)} rad in time (right).`,
+    );
   }
 
   view.onResize(draw);

@@ -1474,5 +1474,13 @@ else {
   const merged = BOOKS.map((b) => library.find((x) => x.id === b.id) || lib.find((x) => x.id === b.id)).filter(Boolean);
   writeFileSync(p, JSON.stringify(merged));
 }
-writeFileSync(TIKZ_JOBS, JSON.stringify(tikzJobs));
+if (!onlyBook) writeFileSync(TIKZ_JOBS, JSON.stringify(tikzJobs));
+else {
+  const oldJobs = existsSync(TIKZ_JOBS) ? JSON.parse(readFileSync(TIKZ_JOBS, 'utf8')) : {};
+  for (const k of Object.keys(oldJobs)) {
+    if (oldJobs[k].book === onlyBook) delete oldJobs[k];
+  }
+  Object.assign(oldJobs, tikzJobs);
+  writeFileSync(TIKZ_JOBS, JSON.stringify(oldJobs));
+}
 writeFileSync(join(here, '../.content-warnings.json'), JSON.stringify(allWarnings, null, 1));

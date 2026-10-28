@@ -3,7 +3,7 @@
 // Top row shows input stems x[k] and flipped-and-shifted impulse response h[n - k];
 // bottom row shows the running convolution output up to shift n.
 
-import { responsiveSvg, s, attr, handle, row, button, formula, slider, clamp, scale, label, type Mount } from './lib';
+import { responsiveSvg, s, attr, handle, row, button, formula, note, slider, clamp, scale, label, type Mount } from './lib';
 
 const mount: Mount = (root) => {
   let shiftN = 0; // shift index n in [-2..9]
@@ -51,6 +51,7 @@ const mount: Mount = (root) => {
   });
 
   const f = formula(root);
+  const nBox = note(root);
   const r = row(root);
   const shiftSlider = slider(r, {
     label: 'Shift n',
@@ -92,6 +93,7 @@ const mount: Mount = (root) => {
     stemsGroup.replaceChildren();
     // Draw x[k] stems (solid up) and h[n-k] stems (accent down)
     let overlapSum = 0;
+    const terms: string[] = [];
     for (let k = kMin; k <= kMax; k++) {
       const px = getX(k);
       const xVal = (k >= 0 && k < xSeq.length) ? xSeq[k] : 0;
@@ -109,6 +111,7 @@ const mount: Mount = (root) => {
 
       if (xVal > 0 && hVal > 0) {
         overlapSum += xVal * hVal;
+        terms.push(`x[${k}]h[${hIdx}] (${xVal}·${hVal})`);
       }
     }
 
@@ -132,7 +135,12 @@ const mount: Mount = (root) => {
     // Place handle on the h[n-k] leading stem (k = shiftN) below yTop so it never collides with lblTop or x[k]
     hd.move(getX(shiftN), yTop + 22);
 
-    f.set(`(x * h)[${shiftN}] = \\sum_{k} x[k]h[${shiftN} - k] = ${overlapSum.toFixed(1)}`);
+    f.set(`(x * h)[${shiftN}] = \\sum_{k} x[k]h[${shiftN} - k] = ${overlapSum.toFixed(2)}`);
+    nBox.set(
+      terms.length > 0
+        ? `At shift n = ${shiftN}, the flipped impulse response h[${shiftN} − k] overlaps x[k] at ${terms.join(' + ')} = ${overlapSum.toFixed(2)}.`
+        : `At shift n = ${shiftN}, the flipped impulse response h[${shiftN} − k] and input x[k] have no overlapping non-zero stems, so (x * h)[${shiftN}] = 0.`,
+    );
   }
 
   view.onResize(draw);

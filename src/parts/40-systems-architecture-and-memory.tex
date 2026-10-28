@@ -1,0 +1,802 @@
+\chapter{Modern Systems Architecture: From the CPU Pipeline to DRAM Cycles}
+\label{ch40:sysarch}
+
+Consider two simple programs that perform the exact same task. Both take an
+ordered collection of $n = 10^7$ sixty-four-bit integers and compute their sum.
+Both execute exactly $n$ additions in a single pass from start to finish.
+Under the classical Random Access Machine (RAM) model introduced in early chapters,
+both algorithms execute $\Theta(n)$ operations, and one might expect them to finish
+in virtually identical running times.
+
+\begin{lstlisting}[language=C++]
+// Program A: Contiguous flat array
+int64_t sum_array(const int64_t* arr, size_t n) {
+    int64_t total = 0;
+    for (size_t i = 0; i < n; ++i) total += arr[i];
+    return total;
+}
+// Program B: Pointer-linked list
+struct Node { int64_t val; Node* next; };
+int64_t sum_list(const Node* head) {
+    int64_t total = 0;
+    for (const Node* curr = head; curr != nullptr; curr = curr->next) total += curr->val;
+    return total;
+}
+\end{lstlisting}
+
+When compiled with identical optimization flags and measured on modern hardware,
+Program~A completes in roughly $3\text{ milliseconds}$. Program~B requires
+approximately $180\text{ milliseconds}$---a slowdown of $60\times$. If the nodes of
+the linked list were allocated haphazardly across a fragmented heap, the disparity
+can exceed $100\times$.
+
+Why does an algorithm with the exact same nominal step count run sixty to one hundred
+times slower simply because its numbers are separated by pointers rather than arranged
+in consecutive memory locations? The classical RAM model makes an assumption that was
+broadly reasonable in the early 1970s: that reaching any word in memory requires a
+fixed, uniform unit of time. On modern silicon, that assumption is completely detached
+from physical reality.
+
+\begin{aestheticbox}
+The central bottleneck in contemporary computing is not the rate at which a processor
+can add two numbers together. It is the time and energy required to transport those
+numbers from physical silicon capacitors into the arithmetic registers of the central
+processing unit.
+\end{aestheticbox}
+
+In 1975, a single CPU arithmetic instruction and a read from main memory took roughly
+the same duration---about $500\text{ nanoseconds}$. Over the subsequent four decades,
+transistor scaling, architectural pipelining, and frequency increases sped up CPU
+arithmetic by more than $10{,}000\times$. Clock frequencies reached several gigahertz,
+bringing the time for a single register-level addition down to roughly
+$0.25\text{ nanoseconds}$ (less than one clock cycle on a $4\text{ GHz}$ core).
+
+Main memory, however, faced an entirely different set of physical constraints. A memory
+fetch requires driving electrical signals through silicon packages, pin connectors,
+and copper traces on a motherboard, reaching dynamic memory cells whose charge must be
+sensed, amplified, and restored. While DRAM capacity exploded by a factor of millions,
+the latency of a random DRAM read improved by barely a factor of ten, dropping from
+roughly $500\text{ ns}$ down to $50\text{--}80\text{ ns}$.
+
+This growing disparity is universally known as the \emph{Memory Wall}. When a modern
+processor requests a word from memory that does not already reside in on-chip cache,
+it must stall for roughly $200\text{ to }300\text{ clock cycles}$. During that brief
+interval of silence, a contemporary four-wide out-of-order processor could have executed
+nearly one thousand independent arithmetic instructions. An algorithm whose memory access
+pattern ignores hardware structure will spend more than ninety-eight percent of its
+execution time completely idle, waiting for the memory bus.
+
+\begin{historybox}
+The structural tension between computation and memory dates to the earliest days of electronic computing. In June 1945, John von Neumann authored the foundational \emph{First Draft of a Report on the EDVAC}, formalizing an architecture where both executable instructions and program data inhabit a single unified storage space and pass across a shared communication bus. While revolutionary in its flexibility, this arrangement forced all arithmetic to queue behind memory transfers, a structural ceiling that John Backus later christened the \emph{von Neumann bottleneck} during his 1977 Turing Award lecture.
+
+By 1965, the widening performance gap between processing logic and magnetic core memory prompted British computing pioneer Maurice Wilkes to propose a radical design: placing a small, auxiliary memory built from high-speed transistors directly between the central processor and main storage. Wilkes termed this buffer a ``slave memory''---the direct predecessor of the modern processor cache. Three years later, in 1968, Robert Dennard at the IBM Thomas J.~Watson Research Center invented the one-transistor dynamic random-access memory (DRAM) cell. By replacing complex multi-transistor latch circuits with a single microscopic capacitor and a lone access gate, Dennard unlocked orders of magnitude greater bit density at low cost, establishing DRAM as the universal medium for system memory.
+
+As processor clock rates escalated into the gigahertz realm during the 1990s, microarchitects realized that passive caching alone was insufficient to bridge the Memory Wall. Chip designers adopted silicon implementations of Robert Tomasulo's dynamic scheduling algorithm, giving rise to out-of-order superscalar execution. Processors began inspecting hundreds of upcoming instructions in flight, predicting conditional branches speculatively, and reordering independent arithmetic operations to hide hundreds of cycles of DRAM latency. In 2007, Ulrich Drepper published his landmark 114-page treatise, \emph{What Every Programmer Should Know About Memory}, sounding an alarm across the software industry: hardware had become so deeply tiered that algorithms designed without explicit attention to cache hierarchies, memory buses, and line boundaries were forfeiting most of the silicon's potential.
+
+In modern computing, the physical properties of memory define the frontiers of system reliability and security. Microscopic DRAM storage capacitors packed nanometers apart suffer from electromagnetic interference, giving rise to \emph{Rowhammer} attacks, where repeatedly activating adjacent rows induces electrical disturbance that flips bits in neighboring physical memory without write privileges. Concurrently, speculative execution across out-of-order pipelines exposed subtle timing side channels such as \emph{Spectre} and \emph{Meltdown}, where the transient presence of data in CPU caches leaks cryptographic secrets across security boundaries. To supply modern machine learning accelerators with the necessary memory throughput, engineers have embraced High Bandwidth Memory (HBM), stacking dynamic memory dies vertically with through-silicon vias directly atop silicon interposers alongside the processing cores.
+\end{historybox}
+
+\chapterline
+
+\section{Inside the Silicon: 6-Transistor SRAM versus 1T1C DRAM}
+
+To understand why the memory hierarchy is organized as it is, we must look at how
+physical silicon stores a single binary digit. A bit is not an abstract mathematical
+entity; it is an arrangement of physical charge or voltage maintained against the
+dissipative forces of nature. Modern computers use two radically different circuit
+designs for random-access memory: Static RAM (SRAM) and Dynamic RAM (DRAM).
+
+\subsection{Static RAM (SRAM): The Fast, Expensive Bistable Seesaw}
+
+Static RAM is the technology used for CPU registers and the L1, L2, and L3 on-chip
+caches. An SRAM cell achieves speed and stability by employing a closed feedback loop
+composed of two cross-coupled CMOS inverters.
+
+Each CMOS inverter consists of two complementary transistors: a p-channel transistor
+connected to the supply voltage ($V_{DD}$) to pull the output high, and an n-channel
+transistor connected to ground ($0\text{ V}$) to pull the output low. When two such
+inverters are wired in a loop---the output of the first driving the input of the second,
+and the output of the second driving the input of the first---the circuit possesses two
+stable equilibrium states:
+\begin{enumerate}[itemsep=0pt]
+    \item State `1': Node $Q$ is held at $V_{DD}$, forcing the second inverter to pull $\overline{Q}$ to $0\text{ V}$, which in turn keeps $Q$ clamped to $V_{DD}$.
+    \item State `0': Node $Q$ is held at $0\text{ V}$, forcing $\overline{Q}$ to $V_{DD}$, which actively keeps $Q$ at ground.
+\end{enumerate}
+
+\begin{intuitionbox}
+Picture two people sitting on a seesaw with a mechanical locking pin. As long as the
+circuit has power, the active transistors act like muscles holding the board locked
+firmly at one side or the other. It will not drift into the middle. To read the position,
+you simply look at which side is up; sensing the state does not disturb the locked seesaw
+in the slightest.
+\end{intuitionbox}
+
+To read from or write to this loop, two n-channel access transistors controlled by a
+horizontal \emph{Wordline} ($WL$) connect nodes $Q$ and $\overline{Q}$ to vertical
+differential \emph{Bitlines} ($BL$ and $\overline{BL}$). This brings the transistor
+count to six per bit, known as a \textbf{6T SRAM cell}.
+
+When the Wordline activates, the access transistors turn on. The internal inverters
+immediately drive current onto the vertical bitlines:
+\begin{itemize}[itemsep=0pt]
+    \item \textbf{Extreme Speed}: Active transistors drive output lines directly, presenting values in under a nanosecond ($< 1\text{ ns}$), matching gigahertz clock cycles.
+    \item \textbf{Non-Destructive Reads}: Reading leaves stored charges fully intact. No refresh or restoration is required as long as power is maintained.
+    \item \textbf{Large Silicon Footprint and Static Leakage}: Six transistors per bit consume $0.02\text{--}0.04\,\mu\text{m}^2$ of area. Fabricating 32 gigabytes of SRAM would require trillions of transistors and dozens of watts of static leakage power.
+\end{itemize}
+
+\subsection{Dynamic RAM (DRAM): Density via Dennard's 1T1C Simplification}
+
+In 1968, Robert Dennard observed that if one is willing to accept operational
+complexity, the six-transistor latch can be stripped down to a single switch and a
+microscopic storage reservoir: \textbf{one access transistor and one capacitor} (a \textbf{1T1C cell}).
+
+The capacitor is a vertical cylinder etched into silicon with a capacitance $C_s$ of
+only $20\text{ to }30\text{ femtofarads}$ ($10^{-15}\text{ F}$). At $1.2\text{ V}$, it holds:
+\[
+    Q = C_s \cdot V \approx (25 \times 10^{-15}\text{ F}) \times (1.2\text{ V}) = 3.0 \times 10^{-14}\text{ Coulombs} \approx 180{,}000\text{ electrons}.
+\]
+A 1T1C cell requires only $6\text{ to }8\,F^2$ of silicon area---over ten times smaller than
+SRAM. This density enables gigabytes of memory per die, but introduces two physical penalties.
+
+\begin{formalbox}
+\textbf{Physical Penalty 1: Destructive Reads and Charge Sharing}\\
+The vertical bitline wire spans thousands of cells, creating a parasitic capacitance
+$C_{\text{bitline}} \approx 200\text{--}300\text{ fF}$ ($10\times$ larger than $C_s$).
+Precharging the bitline to $V_{DD}/2$ and opening the access transistor equalizes charge:
+\[
+    \Delta V = \frac{C_s}{C_s + C_{\text{bitline}}} \left( V_{\text{cell}} - \frac{V_{DD}}{2} \right) \approx \pm 25\text{ to }50\text{ millivolts}.
+\]
+This charge sharing empties the capacitor, destroying the bit. A differential
+\emph{Sense Amplifier} at the bitline detects this millivolt deflection, amplifies it to
+full rail voltage ($0\text{ V}$ or $V_{DD}$), and drives that amplified potential back
+into the opened capacitor to restore its charge before the row closes.
+\end{formalbox}
+
+\begin{formalbox}
+\textbf{Physical Penalty 2: Charge Leakage and Periodic Refresh ($t_{\text{REFI}}$)}\\
+Dielectric insulation is atomic in thickness. Electrons leak out via quantum tunneling
+and junction leakage within $64\text{ milliseconds}$. The memory controller must issue
+refresh commands every $t_{\text{REFI}} \approx 7.8\,\mu\text{s}$, opening and restoring
+rows and temporarily locking out normal read/write commands.
+\end{formalbox}
+
+Figure~\ref{ch40:fig-sram-vs-dram} illustrates the physical anatomy of both cells.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=0.92, >=Stealth, every node/.style={font=\small},
+  boxstyle/.style={draw=sourceblue!80!black, fill=sourceblue!8, rounded corners=3pt, thick},
+  drambox/.style={draw=quotientorange!80!black, fill=quotientorange!8, rounded corners=3pt, thick}]
+% Panel (a): 6T SRAM
+\begin{scope}[shift={(0,0)}]
+  \node[font=\bfseries\small] at (3.3, 6.2) {(a) 6-Transistor SRAM Cell};
+  \draw[thick, quotientorange!80!black] (0.2, 5.0) -- (6.0, 5.0);
+  \node[above, font=\scriptsize, quotientorange!80!black] at (3.1, 5.0) {Wordline ($WL$)};
+  \draw[thick, sourceblue!80!black] (0.8, 0.8) -- (0.8, 5.5) node[above, font=\scriptsize] {$BL$};
+  \draw[thick, sourceblue!80!black] (5.4, 0.8) -- (5.4, 5.5) node[above, font=\scriptsize] {$\overline{BL}$};
+  \node[draw, fill=white, minimum width=0.6cm, minimum height=0.4cm, font=\scriptsize] (M5) at (1.6, 5.0) {$M_5$};
+  \node[draw, fill=white, minimum width=0.6cm, minimum height=0.4cm, font=\scriptsize] (M6) at (4.6, 5.0) {$M_6$};
+  \draw[thick] (0.8, 5.0) -- (M5) -- (2.3, 5.0); \draw[thick] (5.4, 5.0) -- (M6) -- (3.9, 5.0);
+  \draw[boxstyle] (2.0, 1.4) rectangle (4.2, 4.4);
+  \node[font=\scriptsize\bfseries, sourceblue!80!black] at (3.1, 4.1) {Cross-Coupled Latch};
+  \node[draw, fill=white, shape=isosceles triangle, shape border rotate=180, minimum width=0.6cm, minimum height=0.5cm] (inv1) at (3.1, 3.2) {};
+  \node[draw, fill=white, shape=isosceles triangle, minimum width=0.6cm, minimum height=0.5cm] (inv2) at (3.1, 2.2) {};
+  \draw[->, thick] (2.4, 3.2) -- (inv1.east);
+  \draw[thick] (inv1.west) -- (3.8, 3.2) -- (3.8, 2.2) -- (inv2.west);
+  \draw[thick] (inv2.east) -- (2.4, 2.2) -- (2.4, 3.2);
+  \fill[black] (2.4, 5.0) circle (1.2pt); \draw[thick] (2.4, 5.0) -- (2.4, 3.2) node[left=2pt, font=\scriptsize\bfseries] {$Q$};
+  \fill[black] (3.8, 5.0) circle (1.2pt); \draw[thick] (3.8, 5.0) -- (3.8, 3.2) node[right=2pt, font=\scriptsize\bfseries] {$\overline{Q}$};
+  \node[align=center, font=\scriptsize] at (3.1, 0.4) {\textbf{Non-destructive read} ($< 1\text{ ns}$)\\$6\text{ transistors/bit} \implies$ high area and leakage};
+\end{scope}
+% Panel (b): 1T1C DRAM
+\begin{scope}[shift={(7.8,0)}]
+  \node[font=\bfseries\small] at (3.4, 6.2) {(b) 1T1C DRAM Cell};
+  \draw[thick, quotientorange!80!black] (0.2, 5.0) -- (6.0, 5.0);
+  \node[above, font=\scriptsize, quotientorange!80!black] at (3.1, 5.0) {Wordline ($WL$)};
+  \draw[thick, sourceblue!80!black] (1.3, 1.8) -- (1.3, 5.5) node[above, font=\scriptsize] {$BL$};
+  \node[draw, fill=white, minimum width=0.6cm, minimum height=0.4cm, font=\scriptsize] (M1) at (2.4, 5.0) {$M_1$};
+  \draw[thick] (1.3, 5.0) -- (M1) -- (4.2, 5.0);
+  \draw[thick] (4.2, 5.0) -- (4.2, 3.7);
+  \draw[thick] (3.7, 3.7) -- (4.7, 3.7); \draw[thick] (3.7, 3.5) -- (4.7, 3.5); \draw[thick] (4.2, 3.5) -- (4.2, 3.0);
+  \node[font=\scriptsize] at (5.4, 3.6) {$C_s \approx 25\text{ fF}$};
+  \draw[thick] (3.9, 3.0) -- (4.5, 3.0); \draw[thick] (4.0, 2.85) -- (4.4, 2.85); \draw[thick] (4.1, 2.7) -- (4.3, 2.7);
+  \draw[drambox] (0.3, 0.6) rectangle (2.3, 1.6);
+  \node[font=\scriptsize\bfseries, align=center, quotientorange!80!black] at (1.3, 1.1) {Sense\\Amp};
+  \draw[dashed, trapred!80!black, ->] (1.3, 4.6) to[out=270, in=120] (1.1, 1.7);
+  \node[font=\tiny, trapred!80!black, align=left] at (3.4, 2.5) {1. Charge share ($\Delta V \approx 30\text{ mV}$)\\Destructive read!};
+  \draw[dashed, targetgreen!80!black, ->] (2.3, 1.2) to[out=30, in=300] (4.2, 3.4);
+  \node[font=\tiny, targetgreen!80!black, align=left] at (5.3, 2.1) {2. Sense amp\\restores charge};
+  \node[align=center, font=\scriptsize] at (3.4, 0.2) {\textbf{Destructive read} $\implies$ restore required\\Leaks in $64\text{ ms}$ ($t_{\text{REFI}}$) $\cdot$ 1 transistor/bit};
+\end{scope}
+\end{tikzpicture}
+\caption{The physical storage of a bit. (a) A 6-transistor SRAM cell maintains a bistable voltage state using cross-coupled inverters, providing sub-nanosecond, non-destructive access at the expense of high silicon footprint and power. (b) A 1T1C DRAM cell stores data as microscopic charge in a 25-femtofarad capacitor, yielding high density but requiring destructive charge sharing, sense-amplifier restoration, and periodic refresh.}
+\label{ch40:fig-sram-vs-dram}
+\end{figure}
+
+\chapterline
+
+\section{Anatomy of a DRAM Cycle: Banks, Row Buffers, and Latency Numbers}
+
+A DRAM chip is not a simple tape of addressable bytes. It is a multi-tiered array of
+electrochemical matrix switches.
+
+\subsection{Matrix Organization: Rows, Columns, and the Row Buffer}
+
+A DRAM chip is organized internally into multiple independent sub-arrays called
+\textbf{Banks} (typically 16 in DDR4, 32 in DDR5) to allow interleaved parallel requests.
+Inside each bank sits a 2D matrix of 1T1C cells:
+\begin{itemize}[itemsep=0pt]
+    \item \textbf{Rows}: Typically $65{,}536$ rows ($2^{16}$).
+    \item \textbf{Columns}: Each row contains $8{,}192$ bitlines ($1\text{ KiB} = 8{,}192\text{ bits}$).
+\end{itemize}
+
+At the bottom of this matrix sits an array of $8{,}192$ differential Sense Amplifiers.
+Activating a row dumps all $8{,}192$ charges onto bitlines; the sense amplifiers latch
+the entire $1\text{ KiB}$ of data, acting as a high-speed internal cache called the
+\textbf{Row Buffer} (or ``open page'').
+Only \emph{one row per bank} can be open in the Row Buffer at any moment.
+
+\subsection{The Three Scenarios: Hit, Empty, and Conflict}
+
+When reading a 64-byte block of memory from a bank, hardware encounters one of three states:
+\begin{enumerate}[itemsep=0pt]
+    \item \textbf{Row Buffer Hit (Open Page)}: The target address falls within the row
+    already open in the Sense Amplifiers. The controller sends a \textbf{Column Address Strobe}
+    ($\overline{\text{CAS}}$) command. The column multiplexer selects the 64-byte slice and
+    streams it across the bus. The delay is purely the \textbf{CAS Latency} ($t_{\text{CL}}$):
+    \[
+        T_{\text{hit}} = t_{\text{CL}} \approx 14\text{ nanoseconds}.
+    \]
+    \item \textbf{Row Buffer Empty (Precharged)}: No row is open; bitlines are equalized to
+    $V_{DD}/2$. The controller sends an \textbf{Activate} ($\text{ACT}$) command with the row
+    address, waits the \textbf{Row-to-Column Delay} ($t_{\text{RCD}}$) while cells latch into
+    sense amplifiers, then sends $\overline{\text{CAS}}$ and waits $t_{\text{CL}}$:
+    \[
+        T_{\text{empty}} = t_{\text{RCD}} + t_{\text{CL}} \approx 14\text{ ns} + 14\text{ ns} = 28\text{ nanoseconds}.
+    \]
+    \item \textbf{Row Buffer Conflict (Row Miss)}: Row $B$ is requested, but Row $A$ is open.
+    The controller must execute three sequential steps:
+    \begin{itemize}[itemsep=0pt]
+        \item \emph{Precharge ($\text{PRE}$)}: Deactivate Row $A$ and equalize bitlines to $V_{DD}/2$, taking the \textbf{Row Precharge Time} ($t_{\text{RP}} \approx 14\text{ ns}$).
+        \item \emph{Activate ($\text{ACT}$)}: Open Row $B$ and latch into sense amplifiers, taking $t_{\text{RCD}} \approx 14\text{ ns}$.
+        \item \emph{Column Read ($\overline{\text{CAS}}$)}: Read the column slice, taking $t_{\text{CL}} \approx 14\text{ ns}$.
+    \end{itemize}
+    Total latency is the sum of all three phases:
+    \[
+        T_{\text{conflict}} = t_{\text{RP}} + t_{\text{RCD}} + t_{\text{CL}} \approx 14\text{ ns} + 14\text{ ns} + 14\text{ ns} = 42\text{ to }55\text{ nanoseconds}.
+    \]
+\end{enumerate}
+
+\subsection{Demystifying Memory Timings on Hardware Labels}
+
+When RAM is sold as $\text{DDR4-3200 CL16-18-18-38}$, the numbers specify physical delays:
+\begin{itemize}[itemsep=0pt]
+    \item \textbf{DDR4-3200}: I/O clock of $1{,}600\text{ MHz}$ ($3{,}200\text{ MT/s}$). Clock period $t_{\text{CK}} = 0.625\text{ ns}$.
+    \item \textbf{CL16}: $t_{\text{CL}} = 16\text{ cycles} \times 0.625\text{ ns} = 10.0\text{ ns}$.
+    \item \textbf{tRCD 18}: $t_{\text{RCD}} = 18\text{ cycles} \times 0.625\text{ ns} = 11.25\text{ ns}$.
+    \item \textbf{tRP 18}: $t_{\text{RP}} = 18\text{ cycles} \times 0.625\text{ ns} = 11.25\text{ ns}$.
+    \item \textbf{tRAS 38}: Row Active Time ($38\text{ cycles} \approx 23.75\text{ ns}$), the minimum duration a row must stay open to fully recharge its capacitors.
+\end{itemize}
+
+\begin{walkbox}
+\textbf{Tracing the Memory Bus on a Real Memory Access Trace}\\
+Let us trace the cycle-by-cycle physical behavior on a DDR4-3200 bus ($0.625\text{ ns}$ per clock cycle) for two algorithms reading 128 consecutive 64-bit integers:
+\begin{enumerate}[itemsep=0pt]
+    \item \textbf{Array Access}: All 128 integers fit inside $1{,}024\text{ bytes} = 1\text{ KiB}$.
+    Assuming the bank was initially precharged:
+    \begin{itemize}[itemsep=0pt]
+        \item At cycle 0: Controller sends $\text{ACT}$. It waits $t_{\text{RCD}} = 18\text{ cycles}$ ($11.25\text{ ns}$).
+        \item At cycle 18: Controller sends $\overline{\text{CAS}}$ for column 0. It waits $t_{\text{CL}} = 16\text{ cycles}$ ($10\text{ ns}$).
+        \item At cycle 34: Data burst begins. A 64-byte line transfers in 4 bus cycles (8 half-cycle beats).
+        \item For the remaining 15 cache lines (120 integers), the row buffer is \emph{already open}. The controller pipelines back-to-back $\overline{\text{CAS}}$ commands, streaming subsequent cache lines every 4 cycles without paying $t_{\text{RP}}$ or $t_{\text{RCD}}$ again!
+    \end{itemize}
+    \item \textbf{Pointer Chasing}: The 128 integers reside in 128 independently allocated nodes scattered across different heap rows. Every single access targets a different row in the same bank:
+    \begin{itemize}[itemsep=0pt]
+        \item Each hop pays $t_{\text{RP}} (18\text{ cyc}) + t_{\text{RCD}} (18\text{ cyc}) + t_{\text{CL}} (16\text{ cyc}) + \text{Burst} (4\text{ cyc}) = 56\text{ cycles}$ ($35\text{ ns}$).
+        \item For 128 elements, total bus time exceeds $7{,}168\text{ cycles}$ ($4.48\,\mu\text{s}$), compared to fewer than $100\text{ cycles}$ for the contiguous array!
+    \end{itemize}
+\end{enumerate}
+\end{walkbox}
+
+\begin{focusbox}
+\textbf{The Algorithmic Consequence of Row Buffers}\\
+A $1\text{ KiB}$ Row Buffer holds sixteen 64-byte cache lines (128 eight-byte integers).
+Scanning a contiguous array incurs one activation followed by fifteen consecutive
+\emph{Row Buffer Hits} costing only $t_{\text{CL}}$.
+Pointer-chasing in a linked list or binary tree jumps to arbitrary rows in arbitrary
+banks, causing \textbf{Row Buffer Conflicts} ($t_{\text{RP}} + t_{\text{RCD}} + t_{\text{CL}}$)
+on nearly every hop.
+\end{focusbox}
+
+Figure~\ref{ch40:fig-dram-timing} compares the internal bank geometry and access timelines.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=0.92, >=Stealth, every node/.style={font=\small},
+  arraybox/.style={draw=sourceblue!80!black, fill=sourceblue!10, rounded corners=2pt, thick},
+  sensebox/.style={draw=targetgreen!80!black, fill=targetgreen!15, rounded corners=2pt, thick},
+  muxbox/.style={draw=quotientorange!80!black, fill=quotientorange!15, rounded corners=2pt, thick}]
+% Panel (a): Bank Structure
+\begin{scope}[shift={(0,0)}]
+  \node[font=\bfseries\small] at (3.3, 6.2) {(a) DRAM Bank Internal Geometry};
+  \draw[arraybox] (0.5, 3.2) rectangle (6.1, 5.7);
+  \node[font=\footnotesize\bfseries] at (3.3, 5.0) {2D Cell Array ($65{,}536$ Rows)};
+  \node[font=\scriptsize, align=center, text=gray!70!black] at (3.3, 4.0) {
+    $8{,}192$ Columns / Bitlines ($1\text{ KiB}$ wide)\\
+    $1\text{ access transistor} + 1\text{ capacitor per bit}$
+  };
+  \draw[->, thick, quotientorange!80!black] (0.0, 5.1) -- (0.5, 5.1);
+  \node[left, font=\scriptsize, quotientorange!80!black] at (0.0, 5.1) {Row $k$};
+  \draw[sensebox] (0.4, 1.8) rectangle (6.2, 2.7);
+  \node[font=\footnotesize\bfseries, targetgreen!80!black] at (3.3, 2.25) {Sense Amplifier Row Buffer ($1\text{ KiB}$)};
+  \draw[->, very thick, targetgreen!80!black] (3.3, 3.2) -- (3.3, 2.7) node[midway, right=2pt, font=\tiny] {$\text{ACT}$ (Activate \& Restore)};
+  \draw[muxbox] (1.6, 0.6) rectangle (5.0, 1.3);
+  \node[font=\footnotesize\bfseries, quotientorange!80!black] at (3.3, 0.95) {Column Multiplexer};
+  \draw[->, thick] (3.3, 1.8) -- (3.3, 1.3);
+  \draw[<-, thick, quotientorange!80!black] (1.6, 0.95) -- (0.6, 0.95) node[left, font=\scriptsize] {$\overline{\text{CAS}}$};
+  \draw[->, very thick, sourceblue!80!black] (3.3, 0.6) -- (3.3, 0.0) node[below, font=\scriptsize\bfseries] {64-Byte Cache Line Burst to Bus};
+\end{scope}
+% Panel (b): Timing Timeline
+\begin{scope}[shift={(7.8,0)}]
+  \node[font=\bfseries\small] at (3.4, 6.2) {(b) Access Timelines: Hit vs. Conflict};
+  \node[anchor=west, font=\footnotesize\bfseries] at (0.0, 5.2) {Row Buffer Hit ($T \approx 14\text{ ns}$):};
+  \draw[fill=quotientorange!20, draw=quotientorange!80!black, thick] (0.0, 4.2) rectangle (3.8, 4.8);
+  \node[font=\scriptsize\bfseries] at (1.9, 4.5) {$t_{\text{CL}}$ ($14\text{ ns}$)};
+  \draw[fill=sourceblue!20, draw=sourceblue!80!black, thick] (3.8, 4.2) rectangle (5.2, 4.8);
+  \node[font=\tiny\bfseries] at (4.5, 4.5) {Burst};
+  \node[anchor=west, font=\tiny, text=gray!80!black] at (5.3, 4.5) {$\sim 18\text{ ns}$ total};
+  \node[anchor=west, font=\footnotesize\bfseries] at (0.0, 3.2) {Row Buffer Conflict ($T \approx 46\text{ ns}$):};
+  \draw[fill=trapred!20, draw=trapred!80!black, thick] (0.0, 2.2) rectangle (1.8, 2.8);
+  \node[font=\tiny\bfseries] at (0.9, 2.5) {$t_{\text{RP}}$ ($14\text{ ns}$)};
+  \draw[fill=targetgreen!20, draw=targetgreen!80!black, thick] (1.8, 2.2) rectangle (3.6, 2.8);
+  \node[font=\tiny\bfseries] at (2.7, 2.5) {$t_{\text{RCD}}$ ($14\text{ ns}$)};
+  \draw[fill=quotientorange!20, draw=quotientorange!80!black, thick] (3.6, 2.2) rectangle (5.4, 2.8);
+  \node[font=\tiny\bfseries] at (4.5, 2.5) {$t_{\text{CL}}$ ($14\text{ ns}$)};
+  \draw[fill=sourceblue!20, draw=sourceblue!80!black, thick] (5.4, 2.2) rectangle (6.6, 2.8);
+  \node[font=\tiny\bfseries] at (6.0, 2.5) {Burst};
+  \node[font=\tiny, trapred!80!black, align=center] at (0.9, 1.7) {1. Precharge\\close row};
+  \node[font=\tiny, targetgreen!80!black, align=center] at (2.7, 1.7) {2. Activate\\open row};
+  \node[font=\tiny, quotientorange!80!black, align=center] at (4.5, 1.7) {3. Column\\read};
+  \node[font=\scriptsize, align=center, text=gray!80!black] at (3.3, 0.4) {
+    A conflict is more than $3\times$ slower than a hit!\\
+    Sequential scans hit the open buffer; random hops conflict.
+  };
+\end{scope}
+\end{tikzpicture}
+\caption{DRAM internal bank geometry and access latencies. (a) An activated row fills the $1\text{ KiB}$ Sense Amplifier Row Buffer, after which individual 64-byte chunks are extracted via column multiplexing. (b) A Row Buffer Hit pays only the CAS latency $t_{\text{CL}}$, while a Row Buffer Conflict must first close the active row ($t_{\text{RP}}$), activate the requested row ($t_{\text{RCD}}$), and then read the column ($t_{\text{CL}}$), more than tripling latency.}
+\label{ch40:fig-dram-timing}
+\end{figure}
+
+\chapterline
+
+\section{The CPU Cache Hierarchy and Working-Set Curves}
+
+Because trips to physical DRAM are so punishing, modern processors place a hierarchy
+of SRAM caches between registers and external memory.
+
+\subsection{The Hierarchy Levels: L1, L2, and L3}
+
+A contemporary x86 or ARM CPU core features three cache levels:
+\begin{itemize}[itemsep=0pt]
+    \item \textbf{L1 Data Cache (L1d)}: Private to each core, $32\text{--}48\text{ KiB}$, latency $\sim \mathbf{4\text{ clock cycles}}$ ($\approx 1\text{ ns}$).
+    \item \textbf{L2 Cache}: Private to each core, $512\text{ KiB}\text{ to }2\text{ MiB}$, latency $\sim \mathbf{12\text{--}14\text{ clock cycles}}$ ($\approx 3\text{--}4\text{ ns}$).
+    \item \textbf{L3 Cache (Last-Level Cache)}: Shared across all cores, $16\text{--}128\text{ MiB}$, latency $\sim \mathbf{40\text{--}50\text{ clock cycles}}$ ($\approx 10\text{--}12\text{ ns}$).
+    \item \textbf{Main DRAM}: External off-chip, tens of gigabytes, latency $\sim \mathbf{200\text{--}300\text{ clock cycles}}$ ($\approx 50\text{--}80\text{ ns}$).
+\end{itemize}
+
+\subsection{The 64-Byte Cache Line: The Quantum of Memory Movement}
+
+Data moves exclusively in aligned \textbf{64-Byte Cache Lines} ($512\text{ bits}$).
+Reading an 8-byte integer at \texttt{0x1000} automatically loads all 64 bytes spanning
+from \texttt{0x1000} to \texttt{0x103F}. The next seven consecutive integers are
+already present in L1 cache, accessible in a single cycle.
+
+\subsection{Set Associativity and the Power-of-Two Stride Disaster}
+
+Hardware implements \textbf{$W$-Way Set-Associative Caches}. An $m$-bit physical address is carved into:
+\[
+    \text{Physical Address: } [\;\; \underbrace{\text{Tag}}_{m - s - 6\text{ bits}} \;\;\big|\;\; \underbrace{\text{Set Index}}_{s\text{ bits}} \;\;\big|\;\; \underbrace{\text{Offset}}_{6\text{ bits}} \;\;]
+\]
+where 6 bits select the byte in the 64-byte line, $s$ bits select one of $S = 2^s$ sets,
+and the Tag is compared across all $W$ ways simultaneously.
+
+\begin{trapbox}
+\textbf{The Power-of-Two Stride Catastrophe}\\
+Iterating down a column of a $1024 \times 1024$ float matrix (\texttt{matrix[i][j]})
+jumps with a stride of $1024 \times 4\text{ bytes} = 4{,}096\text{ bytes} = 2^{12}\text{ bytes}$.
+Every address in this column traversal has the exact same low 12 bits!
+In a $32\text{ KiB}$ 8-way cache ($64\text{ sets} = 2^6$ sets, indexed by bits 6--11),
+every access hashes to the exact same cache set. After 8 iterations, that single set is full,
+provoking a $100\%$ cache miss rate while the remaining 63 sets sit completely empty.
+\end{trapbox}
+
+\subsection{Hardware Prefetchers and Ulrich Drepper's Working-Set Curves}
+
+Modern CPUs feature \textbf{Hardware Stream and Stride Prefetchers} that detect linear
+memory access and fetch lines $k+1, k+2, \dots$ ahead of execution.
+In 2007, Ulrich Drepper proved the reality of the cache hierarchy by measuring pointer
+chasing across a circular list of 64-byte nodes (\texttt{struct Node \{ Node* next; char pad[56]; \}}):
+\begin{itemize}[itemsep=0pt]
+    \item \textbf{Sequential Traversal}: Prefetchers detect the stride; latency stays flat at $\sim 4\text{ cycles}$ across all working-set sizes up to gigabytes!
+    \item \textbf{Random Pointer Chasing}: Prefetchers cannot predict hops, producing a staircase:
+    $4\text{ cycles}$ in L1 ($\le 32\text{ KiB}$), $14\text{ cycles}$ in L2 ($\le 1\text{ MiB}$),
+    $45\text{ cycles}$ in L3 ($\le 32\text{ MiB}$), and soaring to $220+\text{ cycles}$ in DRAM.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=0.92, >=Stealth, every node/.style={font=\small},
+  tagbox/.style={draw=sourceblue!80!black, fill=sourceblue!15, rounded corners=2pt, font=\scriptsize\ttfamily},
+  idxbox/.style={draw=targetgreen!80!black, fill=targetgreen!15, rounded corners=2pt, font=\scriptsize\ttfamily},
+  offbox/.style={draw=quotientorange!80!black, fill=quotientorange!15, rounded corners=2pt, font=\scriptsize\ttfamily}]
+% Panel (a): Address Slicing and Set Associativity
+\begin{scope}[shift={(0,0)}]
+  \node[font=\bfseries\small] at (3.3, 6.3) {(a) Address Slicing into 4-Way Cache};
+  \draw[tagbox] (0.2, 4.8) rectangle (3.0, 5.4);
+  \node[font=\scriptsize] at (1.6, 5.1) {Tag ($m - s - 6$)};
+  \draw[idxbox] (3.0, 4.8) rectangle (4.8, 5.4);
+  \node[font=\scriptsize] at (3.9, 5.1) {Set ($s$)};
+  \draw[offbox] (4.8, 4.8) rectangle (6.4, 5.4);
+  \node[font=\scriptsize] at (5.6, 5.1) {Offset ($6$)};
+  \draw[->, thick, targetgreen!80!black] (3.9, 4.8) -- (3.9, 4.0);
+  \draw[draw=gray!70!black, fill=gray!5, rounded corners=3pt, thick] (0.4, 0.8) rectangle (6.4, 4.0);
+  \node[font=\footnotesize\bfseries, text=gray!80!black] at (3.4, 3.7) {Cache Array ($S = 2^s\text{ Sets}$)};
+  \draw[draw=gray!50, fill=white] (0.6, 2.9) rectangle (6.2, 3.3);
+  \node[font=\tiny] at (1.0, 3.1) {Set 0};
+  \node[font=\tiny, text=gray!60!black] at (3.6, 3.1) {Way 0 \quad Way 1 \quad Way 2 \quad Way 3};
+  \draw[draw=targetgreen!80!black, fill=targetgreen!10, thick] (0.6, 1.8) rectangle (6.2, 2.6);
+  \node[font=\scriptsize\bfseries, targetgreen!80!black] at (1.1, 2.2) {Set $i$};
+  \foreach \w in {0,1,2,3} {
+    \draw[draw=sourceblue!70!black, fill=white] (1.6 + 1.15*\w, 1.9) rectangle (2.65 + 1.15*\w, 2.5);
+    \node[font=\tiny] at (2.12 + 1.15*\w, 2.2) {Way \w};
+  }
+  \draw[draw=gray!50, fill=white] (0.6, 1.0) rectangle (6.2, 1.4);
+  \node[font=\tiny] at (1.1, 1.2) {Set $S-1$};
+  \draw[->, thick, sourceblue!80!black] (1.6, 4.8) -- (1.6, 0.5) node[below, font=\scriptsize\bfseries] {Tag Match $\implies$ Hit};
+\end{scope}
+% Panel (b): Ulrich Drepper's Working-Set Curves
+\begin{scope}[shift={(7.8,0)}]
+  \node[font=\bfseries\small] at (3.4, 6.3) {(b) Drepper's Working-Set Latency};
+  \draw[->, thick] (0.8, 1.2) -- (6.6, 1.2) node[right, font=\scriptsize] {Size};
+  \draw[->, thick] (0.8, 1.2) -- (0.8, 5.3);
+  \node[above=1pt, font=\scriptsize] at (0.8, 5.3) {Cycles / Access};
+  \node[left, font=\tiny] at (0.8, 1.6) {4};
+  \node[left, font=\tiny] at (0.8, 2.6) {14};
+  \node[left, font=\tiny] at (0.8, 3.8) {45};
+  \node[left, font=\tiny] at (0.8, 4.9) {220};
+  \draw (0.7, 1.6) -- (0.8, 1.6); \draw (0.7, 2.6) -- (0.8, 2.6);
+  \draw (0.7, 3.8) -- (0.8, 3.8); \draw (0.7, 4.9) -- (0.8, 4.9);
+  \draw[dashed, gray!60] (2.2, 1.2) -- (2.2, 5.0);
+  \node[above, font=\tiny\bfseries, sourceblue!80!black] at (2.2, 5.0) {L1 (32K)};
+  \draw[dashed, gray!60] (3.7, 1.2) -- (3.7, 5.0);
+  \node[above, font=\tiny\bfseries, targetgreen!80!black] at (3.7, 5.0) {L2 (1M)};
+  \draw[dashed, gray!60] (5.2, 1.2) -- (5.2, 5.0);
+  \node[above, font=\tiny\bfseries, quotientorange!80!black] at (5.2, 5.0) {L3 (32M)};
+  \draw[very thick, targetgreen!80!black] (0.9, 1.6) -- (6.4, 1.6);
+  \node[above=2pt, font=\tiny\bfseries, targetgreen!80!black] at (4.5, 1.6) {Sequential (Prefetched, $\sim 4$ cyc)};
+  \draw[very thick, trapred!80!black]
+    (0.9, 1.6) -- (2.2, 1.6)
+    to[out=0, in=180] (2.5, 2.6) -- (3.7, 2.6)
+    to[out=0, in=180] (4.0, 3.8) -- (5.2, 3.8)
+    to[out=0, in=180] (5.5, 4.9) -- (6.4, 4.9);
+  \node[above=2pt, font=\tiny\bfseries, trapred!80!black] at (4.8, 4.1) {Random Chasing};
+  \node[font=\scriptsize, align=center, text=gray!80!black] at (3.6, 0.4) {
+    Hardware prefetchers hide DRAM latency for linear strides.\\
+    Random pointer-chasing exposes every cache boundary!
+  };
+\end{scope}
+\end{tikzpicture}
+\caption{Cache organization and the physical latency staircase. (a) Physical address decomposition into Tag, Set Index, and Offset in a 4-way set-associative cache. (b) Ulrich Drepper's benchmark: sequential pointer chasing remains flat at $\sim 4$ cycles across all working-set sizes due to hardware stream prefetchers, whereas random pointer chasing climbs a staircase through L1, L2, L3, and DRAM.}
+\label{ch40:fig-cache-hierarchy}
+\end{figure}
+
+\begin{connectionbox}
+\textbf{From Cache Lines to Cache-Oblivious Algorithms}\\
+In Chapter~21, we study the van Emde Boas layout and cache-oblivious
+algorithms. A traditional cache-conscious algorithm tunes its tile size $B$ directly
+to the hardware's 64-byte cache line or 4 KiB page size.
+By contrast, cache-oblivious algorithms achieve optimal cache transfers across
+\emph{all} levels of the memory hierarchy simultaneously---L1, L2, L3, DRAM, and disk---without
+knowing the cache line size $B$ or cache capacity $M$ in advance!
+Understanding that memory transfers are quantized into blocks of size $B$ allows us to
+design recursive divide-and-conquer algorithms (such as recursive matrix multiplication
+and Funnelsort) whose data layout automatically matches whichever hardware cache
+boundary is encountered.
+\end{connectionbox}
+
+\chapterline
+
+\section{Virtual Memory, Multi-Level Page Tables, and the TLB}
+
+Operating systems provide processes with private isolated address spaces via
+\textbf{Virtual Memory}, mapping virtual addresses to physical RAM frames.
+
+\subsection{The x86-64 4-Level Page Table Walk}
+
+Memory is sliced into $4\text{ KiB}$ pages ($2^{12}$ bytes). A 48-bit Virtual Address is
+translated via a 4-level radix tree rooted at CPU register \texttt{CR3}:
+\[
+    \text{48-Bit Virtual Address: } [\; \underbrace{\text{PML4}}_{9\text{ bits}} \;\big|\; \underbrace{\text{PDP}}_{9\text{ bits}} \;\big|\; \underbrace{\text{PD}}_{9\text{ bits}} \;\big|\; \underbrace{\text{PT}}_{9\text{ bits}} \;\big|\; \underbrace{\text{Offset}}_{12\text{ bits}} \;]
+\]
+Each table level holds 512 eight-byte entries ($4\text{ KiB}$).
+If a translation is not cached, the MMU performs a \textbf{Page Table Walk}, executing
+up to \textbf{four consecutive memory reads} ($\sim 240\text{ ns}$) before accessing data.
+
+\begin{walkbox}
+\textbf{Translating a Virtual Address Step-by-Step}\\
+Consider the 48-bit virtual address \texttt{0x7FFF\_DEAD\_BEEF} in binary:
+\begin{itemize}[itemsep=0pt]
+    \item Bits 47--39 (\texttt{0x0FF}): Selects entry 255 of the PML4 table specified by \texttt{CR3}. The entry holds the physical base address of a Page Directory Pointer Table.
+    \item Bits 38--30 (\texttt{0x1FE}): Selects entry 510 of the PDP table, yielding the physical base of a Page Directory Table.
+    \item Bits 29--21 (\texttt{0x15A}): Selects entry 346 of the PD table, yielding the physical base of a Page Table.
+    \item Bits 20--12 (\texttt{0x1AD}): Selects entry 429 of the PT table, yielding the 36-bit \emph{Physical Frame Number} (PFN).
+    \item Bits 11--0 (\texttt{0xEEF}): Slices into the 4 KiB physical page at byte offset \texttt{0xEEF}.
+\end{itemize}
+Four pointers are read sequentially from memory. If any entry is missing, the CPU raises
+a hardware \emph{Page Fault} exception (\texttt{\#PF}), suspending user code while the OS
+kernel allocates physical backing storage.
+\end{walkbox}
+
+\subsection{The TLB and Huge Pages}
+
+The \textbf{Translation Lookaside Buffer (TLB)} caches virtual-to-physical translations
+on-chip, resolving hits in \textbf{1 clock cycle}.
+However, a typical L2 TLB holds only $\sim 1{,}500$ entries:
+\[
+    \text{TLB Reach} = 1{,}500 \times 4\text{ KiB} = 6\text{ Megabytes}.
+\]
+
+\begin{applicationbox}
+\textbf{Huge Pages in High-Performance Systems and Databases}\\
+When traversing a 32-gigabyte database index, the TLB covers under $0.02\%$ of the memory,
+causing continuous TLB misses.
+Modern operating systems support \textbf{Huge Pages}:
+\begin{itemize}[itemsep=0pt]
+    \item \textbf{2 MiB Huge Pages}: Translation terminates at the Page Directory level, expanding a 1,500-entry TLB reach to $1{,}500 \times 2\text{ MiB} = 3.0\text{ Gigabytes}$.
+    \item \textbf{1 GiB Gigantic Pages}: Translation terminates at the PDP level, allowing a handful of entries to cover an entire server's memory space.
+\end{itemize}
+Enabling Huge Pages eliminates multi-level page table walks for large working sets.
+\end{applicationbox}
+
+\chapterline
+
+\section{Inside the Core and Across Cores: Pipeline Execution and MESI False Sharing}
+
+Inside the CPU, instructions execute out of order, while multicore systems enforce
+consistency using hardware coherence protocols.
+
+\subsection{Out-of-Order Superscalar Execution and Dependency Chains}
+
+Modern cores are speculative \textbf{Out-of-Order (OoO) Superscalar Engines}:
+\begin{enumerate}[itemsep=0pt]
+    \item \textbf{Fetch and Predict}: 16--32 bytes/cycle fetched; branches predicted speculatively.
+    \item \textbf{Decode}: x86 instructions decomposed into RISC-like micro-ops ($\mu\text{ops}$).
+    \item \textbf{Register Renaming}: Maps architectural registers to $180+$ physical registers, dissolving Write-After-Read (WAR) and Write-After-Write (WAW) hazards.
+    \item \textbf{Reservation Stations and Reorder Buffer (ROB)}: Instructions wait for operands and dispatch out of order across 6--8 execution ports ($\text{IPC} \le 4$).
+\end{enumerate}
+
+Independent operations (like multiple accumulators \texttt{s0 += a[i]; s1 += a[i+1]})
+execute 4-wide per cycle. Pointer dereferences (\texttt{curr = curr->next}) form a
+\textbf{Serializing Pointer-Dependency Chain}, stalling the execution window for hundreds
+of cycles on cache misses.
+
+\subsection{Branch Prediction Penalties and Branchless Code}
+
+When data is unpredictable (e.g. Quicksort partition \texttt{if (arr[i] < pivot)}),
+branch predictors mispredict roughly $50\%$ of the time.
+Each misprediction triggers a \textbf{Pipeline Flush}, wasting $15\text{ to }20\text{ clock cycles}$.
+Branchless code converts control dependencies into data dependencies using conditional moves:
+\begin{lstlisting}[language=C++]
+pIndex += (arr[i] < pivot); // Branchless: zero pipeline flushes
+\end{lstlisting}
+
+\subsection{Multicore Coherence and the MESI False Sharing Trap}
+
+Cores maintain coherent private caches via the \textbf{MESI Protocol}:
+\begin{itemize}[itemsep=0pt]
+    \item \textbf{Modified (M)}: Exclusive, dirty (newer than RAM), writable.
+    \item \textbf{Exclusive (E)}: Exclusive, clean (matches RAM), writable.
+    \item \textbf{Shared (S)}: Shared across multiple cores, read-only.
+    \item \textbf{Invalid (I)}: Contains no valid data; triggers cache miss.
+\end{itemize}
+
+\begin{trapbox}
+\textbf{The Silent Performance Killer: False Sharing}\\
+When two threads update independent counters sharing the same 64-byte line
+(\texttt{int64\_t cnt[2]}), each write invalidates the other core's cache.
+The line ping-pongs violently across the interconnect via Read-For-Ownership (RFO) requests,
+making two parallel threads run $10\times$ slower than a single thread.
+\textbf{Fix}: Isolate variables onto distinct cache lines with \texttt{alignas(64)}.
+\end{trapbox}
+
+\subsection{Store Buffers, Memory Ordering, and Memory Barriers}
+
+Even with the MESI protocol, waiting for an RFO invalidation across the bus would
+stall the execution core on every store instruction. To decouple execution from coherence
+delays, hardware inserts a private FIFO \textbf{Store Buffer} between each core and its L1 cache.
+
+When a store executes, the core writes the data into its Store Buffer and continues
+executing immediately. The Store Buffer drains asynchronously into L1 cache as invalidation
+acknowledgments arrive.
+
+While the local core reads its own buffered writes via \emph{Store-to-Load Forwarding},
+other cores cannot observe writes sitting in an external core's private Store Buffer.
+This gives rise to \textbf{Store-Load Reordering} in x86 Total Store Order (TSO):
+\begin{lstlisting}[language=C++]
+// Thread 0: x = 1; r1 = y;        // Thread 1: y = 1; r2 = x;
+\end{lstlisting}
+It is physically possible on real x86 hardware for both threads to observe $r_1 = 0$
+and $r_2 = 0$, because both writes are buffered locally and have not yet reached coherent
+cache memory!
+To guarantee cross-core visibility in concurrent lock-free data structures, software must
+issue hardware \textbf{Memory Barriers} (\texttt{MFENCE} on x86, \texttt{DMB} on ARM, or
+\texttt{std::atomic\_thread\_fence} in C++), forcing the core to pause until its Store
+Buffer has completely drained into coherent cache lines.
+
+\begin{labbox}
+\textbf{Measuring Memory and Pipeline Stalls with Hardware Performance Counters}\\
+Modern processors contain Hardware Performance Counters (PMUs). On Linux, you can
+directly observe the physical realities described in this chapter using \texttt{perf stat}:
+\begin{lstlisting}[language=bash]
+$ perf stat -e cycles,instructions,cache-misses,branch-misses ./sum_array
+  3,105,420,110  cycles                    #  3.91 GHz
+ 10,024,512,890  instructions              #  3.23 insn per cycle (IPC)
+        156,210  cache-misses              #  0.015% of all refs
+         12,410  branch-misses             #  0.02% of all branches
+
+$ perf stat -e cycles,instructions,cache-misses,branch-misses ./sum_list
+185,412,090,300  cycles                    #  3.89 GHz
+ 10,031,102,400  instructions              #  0.05 insn per cycle (IPC)
+  9,985,140,210  cache-misses              # 99.54% of all refs
+         14,200  branch-misses             #  0.03% of all branches
+\end{lstlisting}
+The instruction counts are virtually identical ($\sim 10^{10}$). But \texttt{sum\_array}
+retires $3.23$ instructions per cycle with almost zero cache misses, while \texttt{sum\_list}
+drops to an abysmal $0.05$ instructions per cycle because the execution pipeline spends
+$98\%$ of its clock cycles stalled waiting for DRAM cache misses!
+\end{labbox}
+
+Figure~\ref{ch40:fig-mesi-false-sharing} illustrates address translation and false sharing.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=0.92, >=Stealth, every node/.style={font=\small},
+  corebox/.style={draw=sourceblue!80!black, fill=sourceblue!10, rounded corners=3pt, thick},
+  linebox/.style={draw=trapred!80!black, fill=trapred!15, rounded corners=2pt, thick},
+  padbox/.style={draw=targetgreen!80!black, fill=targetgreen!15, rounded corners=2pt, thick}]
+% Panel (a): TLB Hit vs 4-Level Page Table Walk
+\begin{scope}[shift={(0,0)}]
+  \node[font=\bfseries\small] at (3.3, 6.2) {(a) Virtual Address Translation Paths};
+  \node[draw=gray!70!black, fill=white, rounded corners=2pt, font=\scriptsize\ttfamily] (VA) at (3.3, 5.3) {48-Bit Virtual Address};
+  \draw[corebox] (0.3, 3.5) rectangle (2.5, 4.3);
+  \node[font=\footnotesize\bfseries, sourceblue!80!black] at (1.4, 3.9) {TLB Lookup};
+  \draw[->, very thick, targetgreen!80!black] (2.2, 5.0) -| (1.4, 4.3);
+  \node[font=\tiny\bfseries, targetgreen!80!black] at (1.7, 4.7) {Fast Path};
+  \node[draw=targetgreen!80!black, fill=targetgreen!15, rounded corners=2pt, font=\scriptsize\bfseries] (PA) at (1.4, 2.2) {Physical Address};
+  \draw[->, very thick, targetgreen!80!black] (1.4, 3.5) -- (PA.north) node[midway, right, font=\tiny\bfseries] {1 cycle};
+  \draw[draw=trapred!80!black, fill=trapred!8, rounded corners=3pt, thick] (3.2, 0.8) rectangle (6.4, 4.4);
+  \node[font=\footnotesize\bfseries, trapred!80!black] at (4.8, 4.1) {Page Table Walk};
+  \node[draw, fill=white, font=\tiny, minimum width=2.6cm] (PML4) at (4.8, 3.5) {1. PML4 Table ($\text{CR3}$)};
+  \node[draw, fill=white, font=\tiny, minimum width=2.6cm] (PDP) at (4.8, 2.7) {2. Page Directory Ptr};
+  \node[draw, fill=white, font=\tiny, minimum width=2.6cm] (PD) at (4.8, 1.9) {3. Page Directory};
+  \node[draw, fill=white, font=\tiny, minimum width=2.6cm] (PT) at (4.8, 1.1) {4. Page Table};
+  \draw[->, thick, trapred!80!black] (4.4, 5.0) -| (4.8, 3.8);
+  \node[font=\tiny\bfseries, trapred!80!black] at (4.8, 4.7) {TLB Miss};
+  \draw[->, thick] (PML4) -- (PDP); \draw[->, thick] (PDP) -- (PD); \draw[->, thick] (PD) -- (PT);
+  \draw[->, thick, trapred!80!black] (PT.west) -| (PA.south) node[pos=0.3, below, font=\tiny] {$\approx 4\text{ DRAM reads}$};
+  \node[font=\scriptsize, align=center, text=gray!80!black] at (3.3, 0.2) {TLB hit: 1 cycle $\cdot$ TLB miss: up to 4 memory walks};
+\end{scope}
+% Panel (b): MESI False Sharing vs Alignment
+\begin{scope}[shift={(7.8,0)}]
+  \node[font=\bfseries\small] at (3.4, 6.2) {(b) Multicore False Sharing on 64B Line};
+  \draw[corebox] (0.4, 4.7) rectangle (2.6, 5.5);
+  \node[font=\footnotesize\bfseries] at (1.5, 5.2) {Core 0}; \node[font=\scriptsize] at (1.5, 4.9) {writes \texttt{cnt[0]}};
+  \draw[corebox] (4.2, 4.7) rectangle (6.4, 5.5);
+  \node[font=\footnotesize\bfseries] at (5.3, 5.2) {Core 1}; \node[font=\scriptsize] at (5.3, 4.9) {writes \texttt{cnt[1]}};
+  \node[font=\tiny\bfseries, trapred!80!black] at (3.4, 4.15) {Single 64-Byte Cache Line};
+  \draw[linebox] (0.6, 3.0) rectangle (6.2, 3.8);
+  \draw[thick, draw=gray!60] (3.4, 3.0) -- (3.4, 3.8);
+  \node[font=\scriptsize] at (2.0, 3.4) {\texttt{cnt[0]} ($8\text{ B}$)};
+  \node[font=\scriptsize] at (4.8, 3.4) {\texttt{cnt[1]} ($8\text{ B}$)};
+  \draw[<->, very thick, trapred!80!black] (1.5, 4.7) -- (1.5, 3.8);
+  \draw[<->, very thick, trapred!80!black] (5.3, 4.7) -- (5.3, 3.8);
+  \node[font=\tiny\bfseries, trapred!80!black] at (3.4, 2.5) {Interconnect Storm (RFO Ping-Pong)};
+  \node[font=\scriptsize\bfseries, targetgreen!80!black] at (3.4, 2.0) {Fix: Cache Line Padding (\texttt{alignas(64)})};
+  \draw[padbox] (0.4, 0.8) rectangle (3.1, 1.6);
+  \node[font=\scriptsize\ttfamily, align=center] at (1.75, 1.2) {Line A: \texttt{cnt[0]}\\State: \textbf{Modified}};
+  \draw[padbox] (3.7, 0.8) rectangle (6.4, 1.6);
+  \node[font=\scriptsize\ttfamily, align=center] at (5.05, 1.2) {Line B: \texttt{cnt[1]}\\State: \textbf{Modified}};
+  \node[font=\scriptsize, align=center, text=gray!80!black] at (3.4, 0.2) {Separate lines allow 100\% independent parallel updates.};
+\end{scope}
+\end{tikzpicture}
+\caption{Virtual memory translation and multicore cache coherence. (a) A virtual address is checked against the TLB in 1 cycle; a TLB miss forces a 4-level page table walk in DRAM. (b) False sharing occurs when two independent variables share the same 64-byte cache line, causing constant invalidation ping-pongs across the interconnect; aligning data with \texttt{alignas(64)} isolates them into distinct lines.}
+\label{ch40:fig-mesi-false-sharing}
+\end{figure}
+
+\chapterline
+
+\section{Summary: Hardware-Conscious Algorithm Design}
+
+The algorithms studied throughout this book are evaluated asymptotically, yet physical
+speed is mediated by silicon constraints:
+\begin{itemize}[itemsep=0pt]
+    \item \textbf{SRAM vs. DRAM}: 6T SRAM provides sub-nanosecond non-destructive access at high cost/power. 1T1C DRAM stores bits cheaply in capacitors, requiring destructive charge sharing, sense-amp restoration, and periodic refresh ($t_{\text{REFI}}$).
+    \item \textbf{DRAM Banks and Row Buffers}: Row Buffer Hits cost only CAS latency ($t_{\text{CL}} \approx 14\text{ ns}$). Conflicts triple access time ($t_{\text{RP}} + t_{\text{RCD}} + t_{\text{CL}} \approx 42\text{--}55\text{ ns}$) to restore and precharge before activation.
+    \item \textbf{64-Byte Cache Lines}: Memory moves exclusively in aligned 64-byte chunks. Sequential access exploits spatial locality and hardware stream prefetching.
+    \item \textbf{Set Associativity and Strides}: Power-of-two strides in matrices collapse all accesses into a single cache set, provoking catastrophic conflict misses.
+    \item \textbf{Virtual Memory and TLB Reach}: Translating virtual addresses requires a 4-level page table walk in memory. Huge Pages (2 MiB / 1 GiB) prevent repeated walks.
+    \item \textbf{Pipelines and False Sharing}: Out-of-order cores stall on serializing pointer chains. Random branches flush 15--20 pipeline stages. Co-locating independent variables on a single 64-byte line triggers false sharing, degrading scalability.
+\end{itemize}
+
+\section{Exercises}
+
+\begin{exercise}[Quicksort Partitioning: Branchy vs. Branchless Selection]
+\label{ch40:ex-quicksort-branchless}
+Consider Lomuto partitioning on an array of $n = 10^7$ uniformly distributed, random 64-bit integers.
+\begin{enumerate}[itemsep=0pt]
+    \item What is the theoretical probability that a randomly chosen element is smaller than the chosen pivot, assuming the pivot is the median? What is the expected branch misprediction rate of the condition \texttt{if (arr[i] < pivot)} on an idealized two-level branch predictor?
+    \item If a branch misprediction incurs a pipeline flush penalty of $18\text{ clock cycles}$, calculate the total CPU cycles wasted purely on branch mispredictions during one full partition pass over $n$ elements.
+    \item Write a branchless C++ implementation of Lomuto partitioning using conditional moves or bitwise operations (\texttt{pIndex += (arr[i] < pivot)}). Explain how this avoids pipeline flushes and what new data dependency constraint it introduces to the out-of-order execution engine.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Matrix Multiplication Loop Interchange and Cache Lines]
+\label{ch40:ex-matrix-loops}
+Consider multiplying two $N \times N$ dense matrices of single-precision floating point numbers ($4\text{ bytes}$ each), $C = A \times B$, where $N = 2048$. Matrices are stored in contiguous row-major order.
+Assume a CPU with a $32\text{ KiB}$, 8-way set-associative L1 data cache with 64-byte cache lines, using an LRU eviction policy. Assume no prefetching occurs.
+\begin{enumerate}[itemsep=0pt]
+    \item Analyze the naive $(i, j, k)$ loop ordering:
+\begin{lstlisting}[language=C++]
+for (int i = 0; i < N; ++i)
+    for (int j = 0; j < N; ++j)
+        for (int k = 0; k < N; ++k)
+            C[i][j] += A[i][k] * B[k][j];
+\end{lstlisting}
+    Determine the memory access stride of $B[k][j]$ across the innermost loop over $k$.
+    How many cache misses does each inner loop iteration incur on matrix $B$?
+    \item Analyze the interchanged $(i, k, j)$ loop ordering:
+\begin{lstlisting}[language=C++]
+for (int i = 0; i < N; ++i)
+    for (int k = 0; k < N; ++k)
+        for (int j = 0; j < N; ++j)
+            C[i][j] += A[i][k] * B[k][j];
+\end{lstlisting}
+    Determine the memory access strides of $A[i][k]$, $B[k][j]$, and $C[i][j]$ across
+    the innermost loop over $j$. What is the theoretical cache miss rate per inner loop
+    iteration?
+    \item Estimate the ratio of total memory traffic to DRAM between the two loop orderings.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[B-Tree Node Sizing: Cache Lines, Memory Pages, and TLB Reach]
+\label{ch40:ex-btree-sizing}
+In Chapter~18, we proved that B-tree search cost is dominated by node visits, and that node sizes should match secondary storage block sizes.
+\begin{enumerate}[itemsep=0pt]
+    \item Suppose an in-memory B-tree is designed to index $10^9$ keys entirely within 64 gigabytes of main DRAM. If each node is sized to exactly one 64-byte cache line, what is the fanout of the tree assuming 8-byte keys and 8-byte pointers? What is the height of the tree?
+    \item Now suppose the node size is increased to $4\text{ KiB}$ (matching a standard operating system page). Compare the total number of DRAM visits required to locate a key in the 64-byte node tree versus the 4 KiB node tree.
+    \item Explain the trade-off: why does the 4 KiB node tree reduce DRAM row activations, and how does the use of $2\text{ MiB}$ Huge Pages alter the TLB miss rate during the traversal from the root to the leaf?
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Cache-Conscious Hash Tables: Open Addressing vs. Chaining]
+\label{ch40:ex-hash-cache}
+In Chapter~11, we demonstrated that hash tables with separate chaining and open addressing with linear probing both achieve $O(1)$ expected lookup time.
+\begin{enumerate}[itemsep=0pt]
+    \item In separate chaining, each bucket contains a pointer to a linked list of dynamically allocated nodes. Trace the physical memory operations performed during a lookup of a non-existent key when the hash bucket is non-empty. How many cache lines and potential DRAM row buffer conflicts are touched?
+    \item In open addressing with linear probing, all keys reside in a flat contiguous array. If the load factor is $\alpha = 0.5$, how many keys on average are inspected during an unsuccessful search? How many 64-byte cache lines does this inspection touch if each key-value slot is 16 bytes?
+    \item Why does linear probing suffer severe degradation as $\alpha \to 1.0$ (primary clustering), and how does Robin Hood hashing preserve cache friendliness while bounding maximum probe sequence lengths?
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Quantifying False Sharing in Parallel Prefix Sums]
+\label{ch40:ex-false-sharing-reduction}
+A parallel reduction across $P = 8$ cores assigns each core $n/P$ elements to sum into a global array of partial results:
+\begin{lstlisting}[language=C++]
+int64_t partial_sums[8]; // Thread p writes exclusively to partial_sums[p]
+\end{lstlisting}
+\begin{enumerate}[itemsep=0pt]
+    \item If each thread updates its assigned slot \texttt{partial\_sums[p]} on every addition for $10^7$ iterations, calculate the total number of MESI invalidation requests transmitted across the processor interconnect.
+    \item If each interconnect invalidation and transfer transaction requires $40\text{ nanoseconds}$, what is the total wall-clock time spent purely in coherence stalls?
+    \item Rewrite the data structure using \texttt{alignas(64)} to guarantee that each partial sum occupies its own unique cache line. Verify that the memory footprint changes from $64\text{ bytes}$ to $512\text{ bytes}$, and explain why this eliminates interconnect saturation.
+\end{enumerate}
+\end{exercise}

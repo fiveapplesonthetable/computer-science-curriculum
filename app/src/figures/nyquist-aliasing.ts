@@ -2,7 +2,7 @@
 // Continuous sinusoid cos(2 pi f_0 t) (curve-muted) sampled at f_s = 8 Hz (dot-acc sample points)
 // along with the unique reconstructed baseband alias cos(2 pi f_alias t) (curve-acc) passing through those exact samples.
 
-import { responsiveSvg, s, attr, handle, row, button, formula, slider, clamp, scale, label, type Mount } from './lib';
+import { responsiveSvg, s, attr, handle, row, button, formula, note, slider, clamp, scale, label, type Mount } from './lib';
 
 const mount: Mount = (root) => {
   let f0 = 2.5; // signal frequency in Hz
@@ -45,6 +45,7 @@ const mount: Mount = (root) => {
   });
 
   const f = formula(root);
+  const nBox = note(root);
   const r = row(root);
   const freqSlider = slider(r, {
     label: 'Signal Freq f_0',
@@ -118,6 +119,11 @@ const mount: Mount = (root) => {
     }
 
     f.set(`f_0=${f0.toFixed(1)},\\ f_s=8,\\ f_{\\text{alias}}=${fAlias.toFixed(1)}\\text{ Hz}`);
+    nBox.set(
+      f0 <= fs / 2
+        ? `Below Nyquist limit (f₀ = ${f0.toFixed(1)} Hz ≤ f_s/2 = 4.0 Hz): at least 2 samples per cycle uniquely lock onto the true wave with zero aliasing.`
+        : `Aliasing! Because f₀ = ${f0.toFixed(1)} Hz exceeds the Nyquist limit f_s/2 = 4.0 Hz, its discrete 8 Hz samples are identical to a slower ${fAlias.toFixed(1)} Hz wave (|f₀ − 8| = ${fAlias.toFixed(1)} Hz).`,
+    );
   }
 
   view.onResize(draw);

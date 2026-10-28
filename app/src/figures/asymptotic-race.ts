@@ -1,5 +1,5 @@
 // Chapter 3: Asymptotic Growth & Big-O Contract Diagram
-import { responsiveSvg, s, attr, handle, row, button, formula, slider, clamp, scale, label, lerp, tween, type Mount } from './lib';
+import { responsiveSvg, s, attr, handle, row, button, formula, note, slider, clamp, scale, label, lerp, tween, type Mount } from './lib';
 
 const f_n = (n: number) => 0.4 * n * n + 1.8 * n + 3;
 
@@ -38,6 +38,7 @@ const mount: Mount = (root) => {
   });
 
   const f = formula(root);
+  const nBox = note(root);
   const r = row(root);
   const sld = slider(r, {
     label: 'Constant c',
@@ -77,11 +78,16 @@ const mount: Mount = (root) => {
     const y = scale(0, yMax, H - pad.b, pad.t);
 
     axGroup.replaceChildren();
+    // Horizontal tier gridlines
+    for (const frac of [0.25, 0.5, 0.75, 1.0]) {
+      const gy = y(yMax * frac);
+      s('line', { class: 'grid', x1: pad.l, x2: W - pad.r, y1: gy, y2: gy }, axGroup);
+    }
     // Axes
     s('line', { class: 'ax', x1: pad.l, x2: W - pad.r, y1: H - pad.b, y2: H - pad.b }, axGroup);
     s('line', { class: 'ax', x1: pad.l, x2: pad.l, y1: pad.t, y2: H - pad.b }, axGroup);
     label(axGroup, W - pad.r, H - pad.b + 18, 'n', 'lbl');
-    label(axGroup, pad.l + 6, pad.t - 8, 'cost', 'lbl', 'start');
+    label(axGroup, pad.l + 6, pad.t - 8, 'cost: c·n² (accent) vs f(n)', 'lbl', 'start');
 
     // Build paths (clipped to chart top pad.t)
     let dF = '';
@@ -111,6 +117,11 @@ const mount: Mount = (root) => {
     hd.move(x0, clamp(handleY, pad.t, H - pad.b));
 
     f.set(`c=${c.toFixed(2)},\\ n_0=${n0}:\\ f(n_0)=${f_n(n0).toFixed(1)}\\le ${(c * n0 * n0).toFixed(1)}`);
+    nBox.set(
+      n0 <= nMax
+        ? `For multiplier c = ${c.toFixed(2)}, the quadratic surplus (${(c - 0.4).toFixed(2)}·n²) overtakes the lower-order terms 1.8n + 3 at threshold n₀ = ${n0}, trapping f(n) ≤ c·n² inside the shaded region for all n ≥ ${n0}.`
+        : `Multiplier c = ${c.toFixed(2)} is close to the leading coefficient 0.40, pushing the crossover threshold n₀ = ${n0} past the visible window (n > ${nMax})—yet a finite n₀ still exists!`,
+    );
   }
 
   view.onResize(draw);

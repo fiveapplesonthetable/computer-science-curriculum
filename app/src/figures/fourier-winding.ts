@@ -3,7 +3,7 @@
 // around the complex origin as x(t) e^{-j 2 pi f_w t} (left panel) and plots center-of-mass magnitude
 // |\hat{x}(f_w)| vs winding frequency f_w in [0.5, 4.0] (right panel).
 
-import { responsiveSvg, s, attr, handle, row, button, formula, slider, clamp, scale, label, type Mount } from './lib';
+import { responsiveSvg, s, attr, handle, row, button, formula, note, slider, clamp, scale, label, type Mount } from './lib';
 
 const mount: Mount = (root) => {
   let fw = 2.0; // winding frequency
@@ -24,6 +24,7 @@ const mount: Mount = (root) => {
   const axX = s('line', { class: 'ax' }, gLeft);
   const axY = s('line', { class: 'ax' }, gLeft);
   const windingCurve = s('path', { class: 'curve-muted' }, gLeft);
+  const comVec = s('line', { class: 'line-acc' }, gLeft);
   const comDot = s('circle', { class: 'dot-acc', r: '6' }, gLeft);
   const lblLeft = label(gLeft, 0, 0, 'Winding Plane', 'lbl-fg', 'middle');
 
@@ -55,6 +56,7 @@ const mount: Mount = (root) => {
   });
 
   const f = formula(root);
+  const nBox = note(root);
   const r = row(root);
   const freqSlider = slider(r, {
     label: 'Winding Freq f_w',
@@ -112,6 +114,7 @@ const mount: Mount = (root) => {
     const muY = sumY / (steps + 1);
     const comPx = cx1 + muX * (r1 / 2.5);
     const comPy = cy1 - muY * (r1 / 2.5);
+    attr(comVec, { x1: cx1, y1: cy1, x2: comPx, y2: comPy });
     attr(comDot, { cx: comPx, cy: comPy });
 
     // Right spectrum plot
@@ -154,6 +157,13 @@ const mount: Mount = (root) => {
 
     const currentMag = Math.sqrt(muX * muX + muY * muY);
     f.set(`f_w = ${fw.toFixed(2)}\\text{ Hz},\\quad |\\hat{x}(f_w)| = ${currentMag.toFixed(2)}`);
+    const isRes2 = Math.abs(fw - 2.0) < 0.15;
+    const isRes3 = Math.abs(fw - 3.0) < 0.15;
+    nBox.set(
+      isRes2 || isRes3
+        ? `Resonance at f_w = ${fw.toFixed(2)} Hz! Winding matches the ${isRes2 ? '2.0 Hz' : '3.0 Hz'} cosine component in x(t), so all signal peaks line up on the right side of the complex plane and pull the center of mass far from the origin.`
+        : `Off-resonance (f_w = ${fw.toFixed(2)} Hz): the wound curve loops symmetrically around the origin in every direction, so positive and negative contributions cancel out and the center of mass stays near zero.`,
+    );
   }
 
   view.onResize(draw);
