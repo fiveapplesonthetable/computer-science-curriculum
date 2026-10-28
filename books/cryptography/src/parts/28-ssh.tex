@@ -4,7 +4,7 @@ Every cryptographic primitive we have built so far -- Diffie-Hellman, RSA, ellip
 
 When you type \texttt{ssh alice@server.example.com} and a moment later you are looking at a shell prompt on a machine three thousand miles away, an enormous amount of cryptography has just happened in under a second. A fresh key was negotiated over a hostile network. The remote machine proved it is the one you meant to reach. You proved you are allowed in. And every keystroke from that point forward is encrypted and authenticated, immune to a passive eavesdropper and -- if you set it up right -- to an active attacker sitting in the middle. This chapter takes that second apart.
 
-We will meet Alice (you, at your laptop), the server she wants to reach, and Eve, who controls the network in between -- she can read every packet, drop packets, inject packets, and impersonate either endpoint. Our job is to understand exactly what SSH does to defeat her, where the math comes from, and -- crucially -- the one place where SSH quietly hands the security decision back to a human and how often that human gets it wrong.
+We will meet Alice (you, at your laptop), the server she wants to reach, and Eve, who controls the network in between -- she can read every packet, drop packets, inject packets, and impersonate either endpoint. Our job is to understand exactly what SSH does to defeat her, where the math comes from, and the pivotal moment where SSH quietly hands the security decision back to a human and how often that human gets it wrong.
 
 \section{What problem SSH solves}
 
@@ -352,6 +352,56 @@ After authentication, the connection protocol multiplexes \emph{channels} over t
   \item \textbf{Dynamic forward} (\texttt{ssh -D 1080 server}): SSH acts as a local SOCKS proxy, sending your browser's traffic out through \texttt{server}. A poor man's VPN.
 \end{itemize}
 
+Figure~\ref{ch28:fig-port-forwarding} illustrates how local port forwarding encapsulates arbitrary TCP streams
+into encrypted SSH channels.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\scriptsize, >=stealth]
+  % Client Machine
+  \draw[draw=aliceblue!80, fill=aliceblue!10, rounded corners=3pt, thick] (-0.5, -0.2) rectangle (3.0, 3.8);
+  \node[font=\footnotesize\bfseries, text=aliceblue!90!black] at (1.25, 3.5) {Alice's Laptop};
+  
+  \node[draw=gray!60, fill=white, rounded corners=1pt, font=\tiny, align=center] (app) at (1.25, 2.7) {Local App / psql\\connects to \texttt{localhost:5432}};
+  \node[draw=aliceblue!80, fill=aliceblue!20, rounded corners=2pt, font=\tiny\bfseries, align=center] (ssh_c) at (1.25, 1.2) {SSH Client\\(\texttt{ssh -L 5432:...})};
+  \draw[->, thick] (app) -- node[right, font=\tiny]{TCP} (ssh_c);
+
+  % Bastion Server
+  \draw[draw=bobgreen!80, fill=bobgreen!10, rounded corners=3pt, thick] (5.5, -0.2) rectangle (9.0, 3.8);
+  \node[font=\footnotesize\bfseries, text=bobgreen!90!black] at (7.25, 3.5) {Bastion Server};
+  
+  \node[draw=bobgreen!80, fill=bobgreen!20, rounded corners=2pt, font=\tiny\bfseries, align=center] (sshd) at (7.25, 1.2) {SSH Daemon\\(\texttt{sshd})};
+
+  % Internal DB Server
+  \draw[draw=structurepurple!80, fill=structurepurple!10, rounded corners=3pt, thick] (10.5, 0.4) rectangle (13.5, 3.2);
+  \node[font=\footnotesize\bfseries, text=structurepurple!90!black] at (12.0, 2.9) {Private VPC};
+  \node[draw=structurepurple!60, fill=white, rounded corners=1pt, font=\tiny, align=center] (db) at (12.0, 1.5) {Internal DB Server\\\texttt{db.internal:5432}};
+
+  % Multiplexed Encrypted SSH Tunnel
+  \draw[draw=targetgreen!80, fill=targetgreen!10, rounded corners=2pt, thick] (2.8, 0.2) rectangle (5.7, 2.2);
+  \node[font=\tiny\bfseries, text=targetgreen!90!black, align=center] at (4.25, 1.9) {Single TCP Pipe (Port 22)};
+  
+  % Multiplexed channels inside tunnel
+  \draw[->, thick, sourceblue!80] (2.9, 1.5) -- node[above, font=\tiny, text=sourceblue!90!black]{Channel 0: Shell} (5.6, 1.5);
+  \draw[->, thick, quotientorange!90!black] (2.9, 1.0) -- node[above, font=\tiny, text=quotientorange!90!black]{Channel 1: Port 5432} (5.6, 1.0);
+  \draw[->, thick, gray!80] (2.9, 0.5) -- node[above, font=\tiny, text=gray!80]{Channel 2: SFTP} (5.6, 0.5);
+
+  % Bastion to DB link
+  \draw[->, thick, quotientorange!90!black] (sshd) -- node[above, font=\tiny]{Internal TCP} (db);
+
+  % Explanation banner
+  \node[draw=gray!50, fill=white, rounded corners=2pt, font=\tiny, align=left, text width=13.0cm] at (6.5, -0.9) {
+    \textbf{Local Port Forwarding (\texttt{-L})}: Alice's application connects to a local loopback socket. The SSH client wraps\\
+    raw TCP payload into \texttt{SSH\_MSG\_CHANNEL\_DATA} frames inside the encrypted tunnel. The bastion's \texttt{sshd} opens an outbound\\
+    TCP connection to the target \texttt{db.internal:5432}, relaying bytes while multiple channels share the single authenticated session.
+  };
+\end{tikzpicture}
+\caption{Port forwarding and channel multiplexing in SSH. A single encrypted and authenticated
+TCP connection carries multiple logical channels simultaneously (interactive terminal, file transfer,
+and forwarded network ports), securely tunneling traffic to internal services through a bastion host.}
+\label{ch28:fig-port-forwarding}
+\end{figure}
+
 \begin{applicationbox}
 \textbf{Where SSH shows up.} It is the universal remote-administration tool for Linux and Unix servers -- effectively every cloud instance you will ever touch is reached over SSH. \texttt{scp} and \texttt{sftp} ride the same protocol for file transfer. \texttt{git} over SSH (\texttt{git@github.com}) is how most developers push code; the \texttt{git@} login uses your public key and a forced command. Configuration-management tools (Ansible) drive fleets entirely over SSH. Bastion/jump hosts gate access to private networks. The pattern is always the same: one well-analyzed, server-authenticated, public-key-authenticated encrypted channel, reused for shells, files, ports, and version control. When you hear ``connect to the prod box,'' the cryptography underneath is this chapter.
 \end{applicationbox}
@@ -384,33 +434,65 @@ A full \texttt{ssh alice@server} from cold start runs the message flow in Figure
 
 \begin{figure}[H]
 \centering
-\begin{tikzpicture}[font=\small\ttfamily,>={Stealth[round]}]
-  % two lifelines
-  \node[font=\small\sffamily\bfseries] (cl) at (0,0) {Client (Alice)};
-  \node[font=\small\sffamily\bfseries] (sv) at (8,0) {Server};
-  \draw[gray!55] (cl) -- (0,-9.4);
-  \draw[gray!55] (sv) -- (8,-9.4);
-  % messages
-  \draw[->] (0,-0.7)  -- node[above,font=\scriptsize\ttfamily]{SSH-2.0 banner} (8,-0.7);
-  \draw[<-] (0,-1.2)  -- node[below,font=\scriptsize\ttfamily]{SSH-2.0 banner} (8,-1.2);
-  \draw[->] (0,-1.9)  -- node[above,font=\scriptsize\ttfamily]{KEXINIT (algorithms)} (8,-1.9);
-  \draw[<-] (0,-2.4)  -- node[below,font=\scriptsize\ttfamily]{KEXINIT (algorithms)} (8,-2.4);
-  \draw[->] (0,-3.1)  -- node[above,font=\scriptsize\ttfamily]{e = g\^{}x} (8,-3.1);
-  \draw[<-] (0,-3.8)  -- node[below,font=\scriptsize\ttfamily]{pk\_H, f = g\^{}y, Sign(H)} (8,-3.8);
-  \node[evered,font=\scriptsize\sffamily,align=center] at (0,-4.5)
-    {verify Sign(H);\\check pk\_H vs known\_hosts};
-  \draw[->] (0,-5.3)  -- node[above,font=\scriptsize\ttfamily]{NEWKEYS} (8,-5.3);
-  \draw[<-] (0,-5.8)  -- node[below,font=\scriptsize\ttfamily]{NEWKEYS} (8,-5.8);
-  \node[bobgreen,font=\scriptsize\sffamily] at (4,-6.3) {-- encrypted + MAC-protected below this line --};
-  \draw[->] (0,-7.0)  -- node[above,font=\scriptsize\ttfamily]{USERAUTH\_REQUEST + Sign(M)} (8,-7.0);
-  \node[evered,font=\scriptsize\sffamily,align=center] at (8,-7.7)
-    {check authorized\_keys;\\verify Sign(M)};
-  \draw[<-] (0,-8.4)  -- node[below,font=\scriptsize\ttfamily]{USERAUTH\_SUCCESS} (8,-8.4);
-  \draw[->] (0,-9.1)  -- node[above,font=\scriptsize\ttfamily]{CHANNEL\_OPEN (shell)} (8,-9.1);
+\begin{tikzpicture}[font=\scriptsize, >=stealth]
+  % Party boxes
+  \node[draw=aliceblue!80, fill=aliceblue!15, rounded corners=2pt, minimum width=2.6cm, minimum height=0.7cm, align=center] (cl) at (0, 0) {
+    \textbf{Client (Alice)}\\
+    {\tiny Checks \texttt{known\_hosts}}
+  };
+  \node[draw=bobgreen!80, fill=bobgreen!15, rounded corners=2pt, minimum width=2.6cm, minimum height=0.7cm, align=center] (sv) at (9.0, 0) {
+    \textbf{Server (Bob)}\\
+    {\tiny Holds Host Key $(pk_H, sk_H)$}
+  };
+
+  \draw[thick, gray!50] (cl) -- (0, -9.6);
+  \draw[thick, gray!50] (sv) -- (9.0, -9.6);
+
+  % Phase 1: Banner & Negotiation
+  \draw[->, thick, aliceblue!80!black] (0, -0.7) -- node[above, font=\tiny]{1. Banner: \texttt{SSH-2.0-OpenSSH\_9.6}} (9.0, -0.7);
+  \draw[<-, thick, bobgreen!80!black] (0, -1.2) -- node[above, font=\tiny]{2. Banner: \texttt{SSH-2.0-OpenSSH\_9.6}} (9.0, -1.2);
+
+  \draw[->, thick, aliceblue!80!black] (0, -1.8) -- node[above, font=\tiny]{3. \texttt{SSH\_MSG\_KEXINIT} (ciphers, KEX algorithms, MACs)} (9.0, -1.8);
+  \draw[<-, thick, bobgreen!80!black] (0, -2.3) -- node[above, font=\tiny]{4. \texttt{SSH\_MSG\_KEXINIT} (ciphers, KEX algorithms, MACs)} (9.0, -2.3);
+
+  % Phase 2: Diffie-Hellman Key Exchange
+  \draw[->, thick, aliceblue!80!black] (0, -3.0) -- node[above, font=\tiny]{5. \texttt{SSH\_MSG\_KEXDH\_INIT}: $e = g^x \bmod p$} (9.0, -3.0);
+  
+  \node[draw=bobgreen!70, fill=bobgreen!10, rounded corners=1pt, font=\tiny, align=left, text width=4.5cm] at (9.0, -3.8) {
+    Compute $K = e^y \bmod p$.\\
+    $H = \Hash(V_C \concat V_S \concat I_C \concat I_S$\\
+    $\quad\concat pk_H \concat e \concat f \concat K)$.\\
+    Sign: $s = \Sign_{sk_H}(H)$.
+  };
+
+  \draw[<-, thick, bobgreen!80!black] (0, -4.7) -- node[above, font=\tiny]{6. \texttt{SSH\_MSG\_KEXDH\_REPLY}: $pk_H$, $f = g^y \bmod p$, Signature $s$} (9.0, -4.7);
+
+  \node[draw=aliceblue!70, fill=aliceblue!10, rounded corners=1pt, font=\tiny, align=left, text width=4.2cm] at (0, -5.6) {
+    Compute $K = f^x \bmod p$, recompute $H$.\\
+    Verify $\Vrfy_{pk_H}(H, s)$.\\
+    Check $pk_H$ against \texttt{known\_hosts} (TOFU).\\
+    Derive 6 directional keys from $(K, H)$.
+  };
+
+  % Phase 3: NEWKEYS
+  \draw[->, thick, aliceblue!80!black] (0, -6.6) -- node[above, font=\tiny]{7. \texttt{SSH\_MSG\_NEWKEYS}} (9.0, -6.6);
+  \draw[<-, thick, bobgreen!80!black] (0, -7.0) -- node[above, font=\tiny]{8. \texttt{SSH\_MSG\_NEWKEYS}} (9.0, -7.0);
+
+  % Security Boundary Banner
+  \node[draw=structurepurple!80, fill=structurepurple!10, rounded corners=2pt, font=\tiny\bfseries, text=structurepurple!90!black, align=center, text width=12.0cm] at (4.5, -7.5) {
+    $\equiv$ Authenticated \& Encrypted Channel Established (Session ID $= H$) $\equiv$
+  };
+
+  % Phase 4: User Authentication & Channel Open
+  \draw[->, thick, structurepurple] (0, -8.1) -- node[above, font=\tiny]{\texttt{SSH\_MSG\_USERAUTH\_REQUEST} (publickey, $pk_{\text{user}}$, $\Sign_{sk_{\text{user}}}(H \concat \dots)$)} (9.0, -8.1);
+  \node[draw=bobgreen!70, fill=bobgreen!10, rounded corners=1pt, font=\tiny, align=center] at (9.0, -8.6) {Check \texttt{authorized\_keys} \& verify signature};
+  \draw[<-, thick, structurepurple] (0, -9.0) -- node[above, font=\tiny]{\texttt{SSH\_MSG\_USERAUTH\_SUCCESS}} (9.0, -9.0);
+
+  \draw[->, thick, structurepurple] (0, -9.5) -- node[above, font=\tiny]{\texttt{SSH\_MSG\_CHANNEL\_OPEN} (session $\to$ shell / pty)} (9.0, -9.5);
 \end{tikzpicture}
-\caption{The SSH-2 handshake as a message flow. Above the green line the transport
-layer authenticates the \emph{server} and builds the encrypted pipe; everything
-below it -- including the client's own authentication -- happens inside that pipe.}
+\caption{The full SSH-2 protocol sequence. Unauthenticated banners and algorithm lists are folded
+into the exchange hash $H$ and signed by the server's host key. Once keys are activated via
+\texttt{NEWKEYS}, user public-key authentication and multiplexed channels operate inside the secure tunnel.}
 \label{ch28:fig-handshake}
 \end{figure}
 

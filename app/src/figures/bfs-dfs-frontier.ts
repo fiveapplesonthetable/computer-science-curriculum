@@ -1,7 +1,7 @@
 // Chapter 2, graph-algorithms: BFS frontier/layered wave vs DFS traversal.
 // Default-export mount(root). Uses responsiveSvg, handle, formula, row, slider, button, and SVG theme classes.
 
-import { responsiveSvg, s, handle, row, slider, button, formula, clamp, lerp, type Mount } from './lib';
+import { responsiveSvg, s, handle, row, slider, button, formula, note, label, clamp, lerp, type Mount } from './lib';
 
 interface Vertex {
   id: string;
@@ -227,6 +227,7 @@ const mount: Mount = (root) => {
   });
   const svgEl = view.el;
 
+  const bgG = s('g', {}, svgEl);
   const edgesG = s('g', {}, svgEl);
   const nodesG = s('g', {}, svgEl);
 
@@ -267,6 +268,7 @@ const mount: Mount = (root) => {
   });
 
   const f = formula(root);
+  const nBox = note(root);
   const r = row(root);
 
   const bfsBtn = button(r, 'BFS (Layered Wave)', () => {
@@ -347,6 +349,9 @@ const mount: Mount = (root) => {
 
     const startX = sx(60);
     const endX = view.W - sx(60);
+    bgG.replaceChildren();
+    label(bgG, sx(60), 22, mode === 'bfs' ? 'BFS layered wave (FIFO queue)' : 'DFS deep branch (LIFO stack)', 'lbl', 'start');
+    s('line', { class: 'ax', x1: startX, x2: endX, y1: 220, y2: 220 }, bgG);
     const curX = lerp(startX, endX, tStep / maxStep);
     hd.move(curX, 220);
 
@@ -355,6 +360,7 @@ const mount: Mount = (root) => {
     f.set(
       `\\text{${mode.toUpperCase()}} (t=${tStep}):\\quad ${containerName} = [${containerStr}]`,
     );
+    nBox.set(st.desc);
   }
 
   view.onResize(() => {

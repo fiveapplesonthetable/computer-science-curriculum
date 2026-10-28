@@ -1,5 +1,5 @@
 // Chapter 17: Amortized Analysis & Potential Method Table Doubling
-import { responsiveSvg, s, attr, handle, row, button, formula, slider, clamp, scale, label, type Mount } from './lib';
+import { responsiveSvg, s, attr, handle, row, button, formula, note, slider, clamp, scale, label, type Mount } from './lib';
 
 const maxOps = 17;
 
@@ -57,6 +57,7 @@ const mount: Mount = (root) => {
   });
 
   const f = formula(root);
+  const nBox = note(root);
   const r1 = row(root);
   const sld = slider(r1, {
     label: 'Operations i',
@@ -84,9 +85,13 @@ const mount: Mount = (root) => {
     const x = scale(1, maxOps, xMin, xMax);
     const y = scale(0, 18, H - pad.b, pad.t);
 
+    for (const gv of [3, 6, 12, 18]) {
+      const gy = y(gv);
+      s('line', { class: 'grid', x1: xMin, x2: xMax, y1: gy, y2: gy }, axGroup);
+    }
     s('line', { class: 'ax', x1: xMin, x2: xMax, y1: H - pad.b, y2: H - pad.b }, axGroup);
     s('line', { class: 'ax', x1: xMin, x2: xMin, y1: pad.t, y2: H - pad.b }, axGroup);
-    label(axGroup, xMin + 6, pad.t - 6, 'cost / Φ', 'lbl', 'start');
+    label(axGroup, xMin + 6, pad.t - 6, 'bars: actual c_i  ·  curve: Φ_i  ·  accent: ĉ_i = 3', 'lbl', 'start');
     label(axGroup, xMax, H - pad.b + 18, 'op i', 'lbl', 'end');
 
     const handleX = x(opIdx);
@@ -117,7 +122,13 @@ const mount: Mount = (root) => {
     attr(pathAmort, { d: dAmort });
 
     const currData = getOpData(opIdx);
+    const prevPhi = opIdx > 1 ? getOpData(opIdx - 1).phi : 0;
     f.set(`i=${opIdx},\\ \\text{Cost } c_i=${currData.actualCost},\\ \\Phi_i=${currData.phi},\\ \\hat{c}_i=3`);
+    nBox.set(
+      currData.actualCost > 1
+        ? `Resize spike at op i = ${opIdx}: table doubles to capacity ${currData.cap} and copies ${currData.actualCost - 1} existing items (actual cost c_${opIdx} = ${currData.actualCost}), paid for by releasing ΔΦ = ${currData.phi - prevPhi} stored potential so ĉ_${opIdx} = 3.`
+        : `Fast push at op i = ${opIdx} (size ${currData.size}/${currData.cap}): actual cost is c_${opIdx} = 1 and potential rises by ΔΦ = +2 to Φ_${opIdx} = ${currData.phi}, banking credit for the next doubling.`,
+    );
   }
 
   view.onResize(draw);

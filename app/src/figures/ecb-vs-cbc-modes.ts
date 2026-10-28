@@ -1,5 +1,5 @@
 // Block cipher modes of operation visualizer: ECB vs CBC vs CTR.
-import { responsiveSvg, s, handle, row, button, formula, slider, clamp, label, type Mount } from './lib';
+import { responsiveSvg, s, handle, row, button, formula, note, slider, clamp, label, type Mount } from './lib';
 
 const mount: Mount = (root) => {
   let mode: 'ECB' | 'CBC' | 'CTR' = 'ECB';
@@ -18,6 +18,7 @@ const mount: Mount = (root) => {
   const rightGridG = s('g', {}, svgEl);
   const arrowsG = s('g', {}, svgEl);
   const formulaBox = formula(root);
+  const nBox = note(root);
 
   const r = row(root);
   const bECB = button(r, 'ECB', () => { mode = 'ECB'; updateButtons(); draw(); });
@@ -154,15 +155,22 @@ const mount: Mount = (root) => {
     s('line', { x1: leftX + gridSize * cellSize + 10, y1: midY, x2: rightX - 10, y2: midY, class: 'line-acc' }, arrowsG);
     label(arrowsG, midX, midY - 8, mode, 'lbl-acc', 'middle');
 
-    // Position handle
-    hd.move(W / 2, topY + gridSize * cellSize + 25);
+    // Position handle on a visible progress track
+    const trackY = topY + gridSize * cellSize + 25;
+    const x0 = Math.max(24, W / 2 - 120);
+    const x1 = Math.min(W - 24, W / 2 + 120);
+    s('line', { class: 'ax', x1, x2: x0, y1: trackY, y2: trackY }, arrowsG);
+    hd.move(x0 + (progress / 64) * (x1 - x0), trackY);
 
     if (mode === 'ECB') {
       formulaBox.set(`\\text{ECB: } C_i = E_K(P_i)`);
+      nBox.set(`ECB encrypts each block independently (${progress}/64 blocks processed): identical plaintext blocks always map to identical ciphertext blocks, leaking the global image silhouette.`);
     } else if (mode === 'CBC') {
       formulaBox.set(`\\text{CBC: } C_i = E_K(P_i \\oplus C_{i-1})`);
+      nBox.set(`CBC XORs each plaintext block P_i with the previous ciphertext block C_{i−1} before encryption (${progress}/64 blocks), scrambling repeated patterns into uniform pseudo-randomness.`);
     } else {
       formulaBox.set(`\\text{CTR: } C_i = P_i \\oplus E_K(\\text{IV} \\parallel i)`);
+      nBox.set(`CTR encrypts a unique counter block (IV || i) to generate a keystream pad for each position i (${progress}/64 blocks), so identical plaintext blocks encrypt to distinct ciphertexts in parallel.`);
     }
   }
 

@@ -1,5 +1,5 @@
 // Geometric chord-and-tangent point addition P + Q = R on elliptic curve y^2 = x^3 - 2x + 2 over R.
-import { responsiveSvg, s, handle, row, button, formula, clamp, scale, label, type Mount } from './lib';
+import { responsiveSvg, s, handle, row, button, formula, note, clamp, scale, label, type Mount } from './lib';
 
 // Elliptic curve: y^2 = x^3 - 2x + 2
 // f(x) = x^3 - 2x + 2
@@ -26,6 +26,7 @@ const mount: Mount = (root) => {
   const curveG = s('g', {}, svgEl);
   const geomG = s('g', {}, svgEl);
   const formulaBox = formula(root);
+  const nBox = note(root);
 
   const r = row(root);
   button(r, 'Reset', () => {
@@ -98,9 +99,14 @@ const mount: Mount = (root) => {
     const xSc = scale(xMin, xMax, pad, W - pad);
     const ySc = scale(yMin, yMax, H - pad, pad);
 
-    // Draw axes
+    // Draw subtle gridlines and axes
+    for (const gVal of [-2, -1, 1, 2]) {
+      s('line', { x1: xSc(xMin), y1: ySc(gVal), x2: xSc(xMax), y2: ySc(gVal), class: 'grid' }, curveG);
+      s('line', { x1: xSc(gVal), y1: ySc(yMin), x2: xSc(gVal), y2: ySc(yMax), class: 'grid' }, curveG);
+    }
     s('line', { x1: xSc(xMin), y1: ySc(0), x2: xSc(xMax), y2: ySc(0), class: 'ax' }, curveG);
     s('line', { x1: xSc(0), y1: ySc(yMin), x2: xSc(0), y2: ySc(yMax), class: 'ax' }, curveG);
+    label(curveG, pad + 4, 18, 'E : y² = x³ − 2x + 2', 'lbl', 'start');
 
     // Draw curve branches (top and bottom)
     const ptsTop: string[] = [];
@@ -181,6 +187,11 @@ const mount: Mount = (root) => {
 
     formulaBox.set(
       `P+Q = R = (${rx.toFixed(2)},\\, ${ry.toFixed(2)})`
+    );
+    nBox.set(
+      isTangent
+        ? `Point doubling (P = Q): the tangent line at P with slope λ = ${slope.toFixed(2)} intersects the curve at −R = (${x3.toFixed(2)}, ${y3.toFixed(2)}), which reflects across the x-axis to 2P = R = (${rx.toFixed(2)}, ${ry.toFixed(2)}).`
+        : `Chord-and-tangent addition: the secant line through P and Q (slope λ = ${slope.toFixed(2)}) hits the cubic at a third point −R = (${x3.toFixed(2)}, ${y3.toFixed(2)}), then reflects vertically to P + Q = R = (${rx.toFixed(2)}, ${ry.toFixed(2)}).`,
     );
   }
 

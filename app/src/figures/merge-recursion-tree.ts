@@ -1,5 +1,5 @@
 // Chapter 4: Divide-and-Conquer & Master Theorem Recursion Tree
-import { responsiveSvg, s, handle, row, button, formula, slider, clamp, scale, label, type Mount } from './lib';
+import { responsiveSvg, s, handle, row, button, formula, note, slider, clamp, scale, label, type Mount } from './lib';
 
 const mount: Mount = (root) => {
   let a = 2;
@@ -40,6 +40,7 @@ const mount: Mount = (root) => {
   });
 
   const f = formula(root);
+  const nBox = note(root);
   const r1 = row(root);
   const aSld = slider(r1, {
     label: 'Branching a',
@@ -149,6 +150,14 @@ const mount: Mount = (root) => {
           ? `\\Theta(n^{${k}}\\log n)`
           : `\\Theta(n^{\\log_2 ${a}})`;
     f.set(`T(n)=${a}T(n/2)+n^{${k}}=${regime}`);
+    const ratio = a / b_k;
+    const regimeDesc =
+      ratio < 1
+        ? `Case 3 (Root-heavy, a/2^k = ${ratio.toFixed(2)} < 1): subproblem work shrinks faster than branching multiplies it, so level d=0 dominates total work.`
+        : ratio === 1
+          ? `Case 2 (Balanced, a/2^k = 1): branching factor a = ${a} exactly cancels problem shrinkage 2^${k} = ${b_k}, so all log₂ n levels do equal work.`
+          : `Case 1 (Leaf-heavy, a/2^k = ${ratio.toFixed(2)} > 1): branching outpaces shrinkage at every depth d, so the leaves at the bottom dominate total cost.`;
+    nBox.set(regimeDesc);
   }
 
   view.onResize(draw);

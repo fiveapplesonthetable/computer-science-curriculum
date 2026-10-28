@@ -1,5 +1,5 @@
 // Interactive RSA trapdoor permutation visualizer on p=3, q=11, n=33, phi(n)=20.
-import { responsiveSvg, s, handle, row, button, formula, slider, clamp, label, type Mount } from './lib';
+import { responsiveSvg, s, handle, row, button, formula, note, slider, clamp, label, type Mount } from './lib';
 
 const p = 3;
 const q = 11;
@@ -35,6 +35,7 @@ const mount: Mount = (root) => {
   const linesG = s('g', {}, svgEl);
   const nodesG = s('g', {}, svgEl);
   const formulaBox = formula(root);
+  const nBox = note(root);
 
   const r = row(root);
   const bE3 = button(r, 'e = 3', () => { eIdx = 0; updateButtons(); draw(); });
@@ -133,6 +134,9 @@ const mount: Mount = (root) => {
 
     formulaBox.set(
       `m=${m} \\xrightarrow{m^{${e}}\\bmod 33} c=${c} \\xrightarrow{c^{${d}}\\bmod 33} ${decrypted}`
+    );
+    nBox.set(
+      `Because gcd(e=${e}, φ(33)=20) = 1, m ↦ m^${e} mod 33 is a bijection on {0..32}. Trapdoor exponent d = ${d} satisfies ${e}·${d} = ${e * d} ≡ 1 (mod 20), inverting c = ${c} back to m = ${decrypted}.`,
     );
   }
 
