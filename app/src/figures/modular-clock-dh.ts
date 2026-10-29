@@ -78,14 +78,26 @@ const mount: Mount = (root) => {
     valueText: () => `secret a = ${a}`,
     onDrag: (px, py) => {
       const cx = view.W / 2;
-      const cy = (view.H - 30) / 2 + 10;
+      const cy = (view.H - 22) / 2;
       let angle = Math.atan2(py - cy, px - cx);
-      if (angle < 0) angle += 2 * Math.PI;
-      // map angle to residue 0..16
-      const residue = Math.round((angle / (2 * Math.PI)) * p) % p;
-      a = residue === 0 ? 16 : residue;
-      sA.set(a);
-      draw();
+      let shiftedAngle = angle + Math.PI / 2;
+      if (shiftedAngle < 0) shiftedAngle += 2 * Math.PI;
+      const pickedA = Math.round((shiftedAngle / (2 * Math.PI)) * p) % p;
+
+      if (pickedA !== 0) {
+        let foundA = -1;
+        for (let i = 1; i <= 16; i++) {
+          if (modPow(g, i, p) === pickedA) {
+            foundA = i;
+            break;
+          }
+        }
+        if (foundA !== -1) {
+          a = foundA;
+          sA.set(a);
+          draw();
+        }
+      }
     },
     onKey: (_dx, dy) => {
       a = clamp(a + dy, 1, 16);

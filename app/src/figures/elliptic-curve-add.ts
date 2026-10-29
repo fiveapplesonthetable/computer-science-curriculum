@@ -126,6 +126,21 @@ const mount: Mount = (root) => {
     let slope = 0;
     let intercept = 0;
     const isTangent = Math.abs(px - qx) < 1e-4 && Math.abs(py - qy) < 1e-4;
+    const isVertical = !isTangent && Math.abs(px - qx) < 1e-4;
+
+    if (isVertical) {
+      s('line', { x1: xSc(px), y1: ySc(yMin), x2: xSc(px), y2: ySc(yMax), class: 'line-muted' }, geomG);
+      s('circle', { cx: xSc(px), cy: ySc(py), r: 6, class: 'dot' }, geomG);
+      s('circle', { cx: xSc(qx), cy: ySc(qy), r: 6, class: 'dot' }, geomG);
+      label(geomG, xSc(px), ySc(py) - 14, 'P', 'lbl-fg', 'middle');
+      label(geomG, xSc(qx) + 12, ySc(qy) - 8, 'Q', 'lbl-fg', 'start');
+      hdP.move(xSc(px), ySc(py));
+      hdQ.move(xSc(qx), ySc(qy));
+      formulaBox.set(`P+Q = \\mathcal{O} \\text{ (point at infinity)}`);
+      nBox.set(`Vertical line addition: P and Q are reflections across the x-axis. The line through them is vertical, intersecting the curve only at the point at infinity (O), so P + Q = O.`);
+      return;
+    }
+
     if (isTangent) {
       slope = (3 * px * px - 2) / (2 * py);
     } else {

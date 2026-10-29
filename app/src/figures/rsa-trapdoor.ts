@@ -114,14 +114,20 @@ const mount: Mount = (root) => {
     const getX = (val: number) => pad + (val / 32) * span;
 
     // Draw permutation mapping lines for all m or subset
+    let activeLine = null;
     for (let i = 0; i < n; i++) {
       const ci = modPow(i, e, n);
       const x1 = getX(i);
       const x2 = getX(ci);
       const isSelected = i === m;
-      const cls = isSelected ? 'line-acc' : 'line-muted';
-      const opacity = isSelected ? '1' : '0.15';
-      s('line', { x1, y1: yTop, x2, y2: yBot, class: cls, opacity }, linesG);
+      if (isSelected) {
+        activeLine = { x1, x2 };
+      } else {
+        s('line', { x1, y1: yTop, x2, y2: yBot, class: 'line-muted', opacity: '0.15' }, linesG);
+      }
+    }
+    if (activeLine) {
+      s('line', { x1: activeLine.x1, y1: yTop, x2: activeLine.x2, y2: yBot, class: 'line-acc', opacity: '1' }, linesG);
     }
 
     // Draw nodes for selected m and c
