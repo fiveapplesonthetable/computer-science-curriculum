@@ -82,6 +82,19 @@ const mount: Mount = (root) => {
     0,0,1,1,1,1,0,0,
   ];
 
+  const PRF = (x: number) => {
+    const n = Math.sin(x * 12.9898 + 78.233) * 43758.5453;
+    return (n - Math.floor(n)) > 0.5 ? 1 : 0;
+  };
+
+  const cbcCipher: number[] = [];
+  let prevC = iv % 2;
+  for (let i = 0; i < 64; i++) {
+    const c = PRF((pattern[i] ^ prevC) * 13 + i * 17 + iv);
+    cbcCipher.push(c);
+    prevC = c;
+  }
+
   function draw() {
     const { W, H } = view; void H;
     leftGridG.replaceChildren();
@@ -126,16 +139,12 @@ const mount: Mount = (root) => {
         // Transform based on mode
         let displayVal = val;
         if (mode === 'ECB') {
-          // ECB leaks pattern directly (same blocks map to same ciphertext)
           displayVal = val;
         } else if (mode === 'CBC') {
-          // CBC mixes with previous block / IV
-          const prev = idx > 0 ? pattern[idx - 1] : (iv % 2);
-          displayVal = val ^ prev;
+          displayVal = cbcCipher[idx];
         } else {
-          // CTR mixes with nonce/counter
-          const counter = (idx + iv) % 2;
-          displayVal = val ^ counter;
+          const counterVal = PRF(idx + iv * 100);
+          displayVal = val ^ counterVal;
         }
 
         s('rect', {

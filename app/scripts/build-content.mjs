@@ -754,13 +754,13 @@ function parseEnv(name, inner, level) {
     const [opts, e0] = optArg(inner, 0);
     let anchor = null;
     if (opts) {
-      const lm = /label\s*=\s*(?:\{([^}]*)\}|([^,\s\]}]+))/.exec(opts);
-      const lab = lm ? (lm[1] || lm[2]).trim() : null;
-      if (lab) {
+      const lm = /label\s*=\s*(?:\{([^}]*)\}|([^,\s\]}]+))|\\label\{([^}]*)\}/.exec(opts);
+      const lab = lm ? (lm[1] || lm[2] || lm[3]).trim() : null;
+      if (lab || /\bcaption\s*=/.test(opts)) {
         B.lstN = (B.lstN || 0) + 1;
         const num = B.cfg.unit === 'section' ? `${B.lstN}` : `${B.chapNum}.${B.lstN}`;
         anchor = `lst-${B.lstN}`;
-        B.labels[lab] = { text: `Listing ${num}`, anchor };
+        if (lab) B.labels[lab] = { text: `Listing ${num}`, anchor };
       }
     }
     let body = inner.slice(e0).replace(/^\{[^}]*\}/, '');

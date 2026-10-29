@@ -53,17 +53,24 @@ function extractPictures(code) {
   const defs = (code.match(/\\(def|pgfmathsetmacro|newcommand|colorlet)[^\n]*/g) || []).join('\n');
   while ((m = re.exec(code))) {
     if (m[1] === 'begin') { if (depth === 0) start = m.index; depth++; }
-    else { depth--; if (depth === 0) out.push(defs + '\n' + code.slice(start, m.index + m[0].length)); }
+    else {
+      depth--;
+      if (depth === 0) {
+        const pic = code.slice(start, m.index + m[0].length).replace(/(\\foreach\b[^{]*\{[\s\S]*?)\s+\}\s*\{/g, '$1} {');
+        out.push(defs + '\n' + pic);
+      }
+    }
   }
   return out;
 }
 
 function doc(preamble, codes) {
+  const cleaned = codes.map((c) => c.replace(/(\\foreach\b[^{]*\{[\s\S]*?)\s+\}\s*\{/g, '$1} {'));
   return `\\documentclass[tikz,border=3pt]{standalone}
 ${preamble}
 \\providecommand{\\chapterline}{}
 \\begin{document}
-${codes.join('\n')}
+${cleaned.join('\n')}
 \\end{document}
 `;
 }

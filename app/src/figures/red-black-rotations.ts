@@ -69,16 +69,15 @@ const mount: Mount = (root) => {
     const midX = W / 2;
     // Coordinates for configuration 0 (y is root) vs configuration 1 (x is root)
     // Root x0, y0
-    const rx0 = midX + 40, ry0 = pad.t + 30;
-    const rx1 = midX - 40, ry1 = pad.t + 30;
-    const rx = lerp(rx0, rx1, t);
-    const ry = lerp(ry0, ry1, t);
+    const rx0 = midX + 40, ry0 = pad.t + 30; // y is root at t=0
+    const lx1 = midX + 40, ly1 = pad.t + 90; // y is right child at t=1
+    const yX = lerp(rx0, lx1, t);
+    const yY = lerp(ry0, ly1, t);
 
-    // Left child lx, ly
-    const lx0 = midX - 40, ly0 = pad.t + 90;
-    const lx1 = midX + 40, ly1 = pad.t + 90;
-    const lx = lerp(lx0, lx1, t);
-    const ly = lerp(ly0, ly1, t);
+    const lx0 = midX - 40, ly0 = pad.t + 90; // x is left child at t=0
+    const rx1 = midX - 40, ry1 = pad.t + 30; // x is root at t=1
+    const xX = lerp(lx0, rx1, t);
+    const xY = lerp(ly0, ry1, t);
 
     // Subtrees alpha, beta, gamma
     const ax = midX - 95, ay = pad.t + 145;
@@ -86,14 +85,14 @@ const mount: Mount = (root) => {
     const gx = midX + 95, gy = pad.t + 145;
 
     // Edges (beta interpolates attachment from x at t=0 to y at t=1)
-    const betaParentX = lerp(lx, rx, t);
-    const betaParentY = lerp(ly, ry, t);
-    const alphaParentX = lerp(lx, rx, t);
-    const alphaParentY = lerp(ly, ry, t);
-    const gammaParentX = lerp(rx, lx, t);
-    const gammaParentY = lerp(ry, ly, t);
+    const alphaParentX = xX;
+    const alphaParentY = xY;
+    const betaParentX = lerp(xX, yX, t);
+    const betaParentY = lerp(xY, yY, t);
+    const gammaParentX = yX;
+    const gammaParentY = yY;
 
-    s('line', { class: 'line', x1: rx, y1: ry, x2: lx, y2: ly }, edgesGroup);
+    s('line', { class: 'line', x1: xX, y1: xY, x2: yX, y2: yY }, edgesGroup);
     s('line', { class: 'line', x1: alphaParentX, y1: alphaParentY, x2: ax, y2: ay - 16 }, edgesGroup);
     s('line', { class: 'line', x1: betaParentX, y1: betaParentY, x2: bx, y2: by - 16 }, edgesGroup);
     s('line', { class: 'line', x1: gammaParentX, y1: gammaParentY, x2: gx, y2: gy - 16 }, edgesGroup);
@@ -104,11 +103,11 @@ const mount: Mount = (root) => {
     }
 
     // Nodes (high-contrast rings with clear labels inside)
-    s('circle', { class: 'dot-ring', cx: rx, cy: ry, r: 16 }, nodesGroup);
-    label(nodesGroup, rx, ry + 5, t < 0.5 ? 'y' : 'x', 'lbl-acc');
+    s('circle', { class: 'dot-ring', cx: yX, cy: yY, r: 16 }, nodesGroup);
+    label(nodesGroup, yX, yY + 5, 'y', 'lbl-acc', 'middle');
 
-    s('circle', { class: 'dot-ring', cx: lx, cy: ly, r: 16 }, nodesGroup);
-    label(nodesGroup, lx, ly + 5, t < 0.5 ? 'x' : 'y', 'lbl-fg');
+    s('circle', { class: 'dot-ring', cx: xX, cy: xY, r: 16 }, nodesGroup);
+    label(nodesGroup, xX, xY + 5, 'x', 'lbl-fg', 'middle');
 
     // Subtree labels inside triangles
     label(nodesGroup, ax, ay + 4, 'α', 'lbl-fg');

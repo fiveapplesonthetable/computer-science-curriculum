@@ -58,30 +58,39 @@ const STEPS: FlowStep[] = [
   },
   {
     t: 1,
-    flow: { 's-a': 5, 's-b': 0, 'a-c': 5, 'a-b': 0, 'b-d': 0, 'c-t': 5, 'c-d': 0, 'd-t': 0 },
+    flow: { 's-a': 7, 's-b': 0, 'a-c': 7, 'a-b': 0, 'b-d': 0, 'c-t': 7, 'c-d': 0, 'd-t': 0 },
     path: ['s', 'a', 'c', 't'],
-    bottleneck: 5,
-    totalFlow: 5,
+    bottleneck: 7,
+    totalFlow: 7,
     minCut: false,
-    desc: 'Augmenting path s -> A -> C -> T with bottleneck capacity Δ = 5. |f| = 5.',
+    desc: 'Augmenting path s -> A -> C -> T with bottleneck capacity Δ = 7. |f| = 7.',
   },
   {
     t: 2,
-    flow: { 's-a': 10, 's-b': 2, 'a-c': 8, 'a-b': 2, 'b-d': 2, 'c-t': 7, 'c-d': 3, 'd-t': 5 },
-    path: ['s', 'a', 'b', 'd', 't'],
-    bottleneck: 2,
-    totalFlow: 7,
+    flow: { 's-a': 8, 's-b': 0, 'a-c': 8, 'a-b': 0, 'b-d': 0, 'c-t': 7, 'c-d': 1, 'd-t': 1 },
+    path: ['s', 'a', 'c', 'd', 't'],
+    bottleneck: 1,
+    totalFlow: 8,
     minCut: false,
-    desc: 'Augmenting path s -> A -> B -> D -> T with bottleneck Δ = 2. |f| = 7.',
+    desc: 'Augmenting path s -> A -> C -> D -> T with bottleneck Δ = 1. |f| = 8.',
   },
   {
     t: 3,
-    flow: { 's-a': 10, 's-b': 5, 'a-c': 8, 'a-b': 2, 'b-d': 5, 'c-t': 7, 'c-d': 3, 'd-t': 8 },
-    path: ['s', 'b', 'd', 't'],
-    bottleneck: 3,
+    flow: { 's-a': 10, 's-b': 0, 'a-c': 8, 'a-b': 2, 'b-d': 2, 'c-t': 7, 'c-d': 1, 'd-t': 3 },
+    path: ['s', 'a', 'b', 'd', 't'],
+    bottleneck: 2,
     totalFlow: 10,
+    minCut: false,
+    desc: 'Augmenting path s -> A -> B -> D -> T with bottleneck Δ = 2. |f| = 10.',
+  },
+  {
+    t: 4,
+    flow: { 's-a': 10, 's-b': 5, 'a-c': 8, 'a-b': 2, 'b-d': 7, 'c-t': 7, 'c-d': 1, 'd-t': 8 },
+    path: ['s', 'b', 'd', 't'],
+    bottleneck: 5,
+    totalFlow: 15,
     minCut: true,
-    desc: 'Augmenting path s -> B -> D -> T with bottleneck Δ = 3. Maximum flow |f*| = 10 reached! Min s-t cut S = {s, A, B}, T = {C, D, T} with capacity 10.',
+    desc: 'Augmenting path s -> B -> D -> T with bottleneck Δ = 5. Maximum flow |f*| = 15 reached! Min s-t cut S = {s, A, B}, T = {C, D, T} with capacity 15.',
   },
 ];
 
@@ -217,7 +226,7 @@ const mount: Mount = (root) => {
     hd.move(curX, 240);
 
     const pathTex = st.path.length ? `\\quad P = (${st.path.map((p) => p.toUpperCase()).join(' \\to ')})` : '';
-    const cutTex = st.minCut ? '\\quad |f^*| = c(S,T) = 10' : '';
+    const cutTex = st.minCut ? '\\quad |f^*| = c(S,T) = 15' : '';
     f.set(
       `\\text{Step } ${tStep}:\\quad |f| = ${st.totalFlow},\\quad \\Delta = ${st.bottleneck}${pathTex}${cutTex}`,
     );
