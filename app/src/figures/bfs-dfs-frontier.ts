@@ -127,7 +127,7 @@ const BFS_STEPS: StepState[] = [
     treeEdges: new Set(['s-a', 's-b', 'a-c', 'b-d', 'c-e', 'e-f']),
     current: '',
     queueOrStack: [],
-    desc: 'Dequeue F. Queue empty. BFS traversal complete!',
+    desc: 'Dequeue F. Queue empty. BFS traversal complete.',
   },
 ];
 
@@ -210,7 +210,7 @@ const DFS_STEPS: StepState[] = [
     treeEdges: new Set(['s-a', 'a-c', 'c-e', 'e-f', 'c-d', 'b']),
     current: 'b',
     queueOrStack: ['b'],
-    desc: 'Complete remaining branch through B to S. DFS traversal complete!',
+    desc: 'Complete remaining branch through B to S. DFS traversal complete.',
   },
 ];
 

@@ -121,8 +121,8 @@ const mount: Mount = (root) => {
     f.set(`f_0=${f0.toFixed(1)},\\ f_s=8,\\ f_{\\text{alias}}=${fAlias.toFixed(1)}\\text{ Hz}`);
     nBox.set(
       f0 <= fs / 2
-        ? `Below Nyquist limit (f₀ = ${f0.toFixed(1)} Hz ≤ f_s/2 = 4.0 Hz): at least 2 samples per cycle uniquely lock onto the true wave with zero aliasing.`
-        : `Aliasing! Because f₀ = ${f0.toFixed(1)} Hz exceeds the Nyquist limit f_s/2 = 4.0 Hz, its discrete 8 Hz samples are identical to a slower ${fAlias.toFixed(1)} Hz wave (|f₀ − 8| = ${fAlias.toFixed(1)} Hz).`,
+        ? `Below Nyquist limit (f₀ = ${f0.toFixed(1)} Hz ≤ f_s/2 = 4.0 Hz): with at least 2 samples per cycle, the samples identify the true wave and no aliasing occurs.`
+        : `Aliasing: because f₀ = ${f0.toFixed(1)} Hz exceeds the Nyquist limit f_s/2 = 4.0 Hz, its discrete 8 Hz samples are identical to a slower ${fAlias.toFixed(1)} Hz wave (|f₀ − 8| = ${fAlias.toFixed(1)} Hz).`,
     );
   }
 

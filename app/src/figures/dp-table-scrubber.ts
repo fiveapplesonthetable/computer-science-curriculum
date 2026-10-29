@@ -100,7 +100,7 @@ const mount: Mount = (root) => {
     f.set(`i=${filledCells},\\ r[${filledCells}] = p[${kCut}] + r[${predIdx}] = ${cutPrices[kCut]} + ${tableValues[predIdx]} = ${tableValues[filledCells]}`);
     nBox.set(
       filledCells === 0
-        ? 'Base case r[0] = 0: a rod of length 0 yields 0 revenue and anchors every subsequent bottom-up lookup.'
+        ? 'Base case r[0] = 0: a rod of length 0 yields 0 revenue, and every later bottom-up lookup builds on it.'
         : `To compute r[${filledCells}], DP checks all first cuts 1..${filledCells} in already-solved cells r[0..${filledCells - 1}]; the optimal cut k = ${kCut} adds price p[${kCut}] = ${cutPrices[kCut]} to precomputed r[${predIdx}] = ${tableValues[predIdx]}.`,
     );
   }

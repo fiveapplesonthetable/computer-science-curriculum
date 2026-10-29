@@ -90,7 +90,7 @@ const STEPS: FlowStep[] = [
     bottleneck: 5,
     totalFlow: 15,
     minCut: true,
-    desc: 'Augmenting path s -> B -> D -> T with bottleneck Δ = 5. Maximum flow |f*| = 15 reached! Min s-t cut S = {s, A, B}, T = {C, D, T} with capacity 15.',
+    desc: 'Augmenting path s -> B -> D -> T with bottleneck Δ = 5. Maximum flow |f*| = 15 reached. Min s-t cut S = {s, A, B}, T = {C, D, T} with capacity 15.',
   },
 ];
 

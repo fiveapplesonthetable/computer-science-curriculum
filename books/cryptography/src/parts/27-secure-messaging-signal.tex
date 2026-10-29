@@ -2,11 +2,11 @@
 
 In Chapter~26, we saw how WPA2 and WPA3 protect the local radio link while TLS
 (Chapter~25) secures connections to a server, yet the company running that server still
-sees every plaintext message. Worse, every protocol so far in this series has assumed both parties were online and willing to talk. TLS opens with a handshake: Alice and Bob exchange messages, derive a shared key, and start encrypting -- but they do it together, in real time, both sitting at their keyboards. Diffie-Hellman key exchange (Chapter~18) is the same: a live conversation. That assumption is fine for a web browser talking to a server. It is a disaster for a chat app.
+sees every plaintext message. Worse, every protocol so far in this series has assumed both parties were online and willing to talk. TLS opens with a handshake: Alice and Bob exchange messages, derive a shared key, and start encrypting -- but they do it together, in real time, both sitting at their keyboards. Diffie-Hellman key exchange (Chapter~18) is the same: a live conversation. That assumption is fine for a web browser talking to a server, but it does not work for a chat app.
 
 When Alice messages Bob on a phone, Bob is asleep. His screen is dark, his radio is off, he is in a tunnel. Alice wants to fire off ``running 10 min late'' and have it waiting when Bob wakes up, encrypted end-to-end so that not even the messaging company can read it. There is no handshake, because there is no Bob to handshake with. And Alice will send a hundred more messages over the next week, each of which must stay secret even if Bob's phone is stolen on Tuesday and Alice's is compromised on Friday.
 
-This is the \emph{asynchronous, long-lived, end-to-end} setting, and it broke every tool we had. The Signal Protocol -- born from Trevor Perrin and Moxie Marlinspike's work around 2013, descended from Off-the-Record Messaging -- is the design that solved it, and solved it so well that WhatsApp's two billion users, Google's RCS, Facebook Messenger's secret conversations, and Signal itself all run it essentially unchanged. This chapter builds it from the ground up: the goals (forward secrecy and post-compromise security), the X3DH key agreement that bootstraps a session against an offline partner, and the Double Ratchet that keeps the session secure message after message, year after year. We trace tiny numeric examples, draw the ratchet, break a naive design to see why the real one is shaped the way it is, and finish with the metadata problem and Signal's deniability property.
+This is the \emph{asynchronous, long-lived, end-to-end} setting, and none of the tools so far handle it. The Signal Protocol -- born from Trevor Perrin and Moxie Marlinspike's work around 2013, descended from Off-the-Record Messaging -- is the design that solved it. WhatsApp's two billion users, Google's RCS, Facebook Messenger's secret conversations, and Signal itself all run it essentially unchanged. This chapter builds it from the ground up: the goals (forward secrecy and post-compromise security), the X3DH key agreement that bootstraps a session against an offline partner, and the Double Ratchet that keeps the session secure message after message, year after year. We trace tiny numeric examples, draw the ratchet, break a naive design to see why the real one is shaped the way it is, and finish with the metadata problem and Signal's deniability property.
 
 \chapterline
 
@@ -27,7 +27,7 @@ What should E2EE guarantee? Four properties, in rough order of how hard they are
   \item \textbf{Confidentiality and integrity (the baseline).} Only Alice and Bob read the messages; tampering is detected. This is authenticated encryption (Chapter~16) with a key the server never learns.
   \item \textbf{Forward secrecy.} If Bob's phone is seized \emph{today} and all its keys extracted, the attacker still cannot decrypt the messages Alice sent \emph{last month}, even though she recorded every ciphertext. Past traffic stays secret despite a future total compromise.
   \item \textbf{Post-compromise security (future secrecy / self-healing).} If an attacker steals Bob's keys today and reads a few messages, the session \emph{recovers} on its own: once the attacker loses active access to the device and Alice and Bob exchange a couple more messages, the attacker is locked out again with no manual key reset.
-  \item \textbf{Authentication and deniability.} Bob is sure he is talking to Alice and not the server impersonating her -- yet, paradoxically, neither can later \emph{prove to a third party} what the other said. Genuine to the participants, deniable to the outside world.
+  \item \textbf{Authentication and deniability.} Bob is sure he is talking to Alice and not the server impersonating her -- yet, paradoxically, neither can later \emph{prove to a third party} what the other said.
 \end{itemize}
 
 \begin{focusbox}
@@ -35,7 +35,7 @@ Forward secrecy and post-compromise security point in opposite directions in tim
 \end{focusbox}
 
 \begin{connectionbox}
-Forward secrecy already appeared in Chapter~23 in the TLS setting: use an \emph{ephemeral} Diffie-Hellman key for each session and delete it afterward, so the long-term certificate key cannot decrypt recorded traffic. Signal pushes the same idea to its limit. Instead of one ephemeral key per session, it derives a fresh key per \emph{message}, and it does so without a live handshake. The number-theoretic engine underneath -- Diffie-Hellman on the elliptic curve Curve25519 (Chapter~21) and HKDF key derivation built on HMAC (Chapter~15) -- is machinery you have already met. What is new is the choreography.
+Forward secrecy already appeared in Chapter~23 in the TLS setting: use an \emph{ephemeral} Diffie-Hellman key for each session and delete it afterward, so the long-term certificate key cannot decrypt recorded traffic. Signal pushes the same idea to its limit. Instead of one ephemeral key per session, it derives a fresh key per \emph{message}, and it does so without a live handshake. The underlying primitives -- Diffie-Hellman on the elliptic curve Curve25519 (Chapter~21) and HKDF key derivation built on HMAC (Chapter~15) -- are ones you have already met. What is new is how they are combined.
 \end{connectionbox}
 
 \section{Why the Old Tools Do Not Fit}
@@ -43,14 +43,14 @@ Forward secrecy already appeared in Chapter~23 in the TLS setting: use an \emph{
 
 Before building Signal, let us watch the obvious approaches fail, because each failure motivates a piece of the real design.
 
-\textbf{Attempt 1: Just use a shared long-term key.} Alice and Bob agree on a key $k$ once (say by scanning a QR code in person) and AES-GCM every message under it forever. Confidential, authenticated, asynchronous -- and it has \emph{no} forward secrecy. Steal $k$ on Tuesday and you decrypt every message ever sent and every message that will ever be sent. One stolen key, total collapse. Unacceptable.
+\textbf{Attempt 1: Just use a shared long-term key.} Alice and Bob agree on a key $k$ once (say by scanning a QR code in person) and AES-GCM every message under it forever. Confidential, authenticated, asynchronous -- and it has \emph{no} forward secrecy. Steal $k$ on Tuesday and you decrypt every message ever sent and every message that will ever be sent. A single stolen key exposes the whole conversation.
 
-\textbf{Attempt 2: Ephemeral Diffie-Hellman per message.} Borrow the TLS trick: for each message, Alice and Bob run a fresh DH exchange, derive a one-time key, encrypt, then delete the ephemeral private keys. Now forward secrecy holds -- old keys are gone. But DH needs \emph{both} parties to contribute a fresh public value, live. Bob is asleep. There is no one to send the second half of the handshake. The asynchrony assumption kills it.
+\textbf{Attempt 2: Ephemeral Diffie-Hellman per message.} Borrow the TLS trick: for each message, Alice and Bob run a fresh DH exchange, derive a one-time key, encrypt, then delete the ephemeral private keys. Now forward secrecy holds -- old keys are gone. But DH needs \emph{both} parties to contribute a fresh public value, live. Bob is asleep, so nobody is there to send the second half of the handshake.
 
 \textbf{Attempt 3: Bob pre-publishes DH values.} Have Bob upload a stack of one-time public keys to the server in advance. When Alice wants to talk, she grabs one, does half a DH with her own ephemeral key, and sends. Bob, when he wakes, finishes the DH. This is the seed of the real idea -- and it is exactly what X3DH does. But two problems remain. First, the stack of pre-keys runs out (Bob is offline for a month, a thousand people message him). Second, and deeper: a single DH at the start gives you forward secrecy \emph{up to the start}, but once the session is running, what protects message \#500 if the session key leaks at message \#499? You need the key to keep \emph{moving}. That continuous motion is the ratchet.
 
 \begin{trapbox}
-A tempting non-fix: ``rotate the key by hashing it.'' Set $k_{i+1} = \Hash(k_i)$ and encrypt message $i$ under $k_i$. This gives forward secrecy -- $\Hash$ is one-way, so leaking $k_{500}$ does not reveal $k_{499}$ (you cannot run the hash backward). Good. But it gives \emph{no} post-compromise security. If the attacker steals $k_{500}$, she computes $k_{501}, k_{502}, \dots$ forever by hashing forward. The chain has no fresh randomness entering it, so a single compromise is permanent. This is precisely why the Double Ratchet has \emph{two} ratchets: a hash chain (cheap, forward-secret) \emph{and} a Diffie-Hellman ratchet (expensive, self-healing) that periodically injects new entropy the attacker cannot predict.
+A tempting non-fix: ``rotate the key by hashing it.'' Set $k_{i+1} = \Hash(k_i)$ and encrypt message $i$ under $k_i$. This gives forward secrecy -- $\Hash$ is one-way, so leaking $k_{500}$ does not reveal $k_{499}$ (you cannot run the hash backward). But it gives \emph{no} post-compromise security. If the attacker steals $k_{500}$, she computes $k_{501}, k_{502}, \dots$ forever by hashing forward. The chain has no fresh randomness entering it, so a single compromise is permanent. This is precisely why the Double Ratchet has \emph{two} ratchets: a hash chain (cheap, forward-secret) \emph{and} a Diffie-Hellman ratchet (expensive, self-healing) that periodically injects new entropy the attacker cannot predict.
 \end{trapbox}
 
 \section{X3DH: Agreeing on a Key With Someone Who Is Asleep}
@@ -101,7 +101,7 @@ Alice now holds $SK$. She deletes $ek_A$ -- the ephemeral private key -- and sen
   \item $DH_2$ ($ek_A \times IK^B$) mixes in \emph{Bob's} long-term identity, so Alice knows the secret is shared with the real Bob and nobody else.
   \item $DH_3$ ($ek_A \times SPK^B$) and $DH_4$ ($ek_A \times OPK^B$) mix Alice's \emph{ephemeral} key with Bob's \emph{medium-} and \emph{short-lived} keys. These provide \textbf{forward secrecy}: once $ek_A$, $spk^B$, and $opk^B$ are deleted, nobody -- not even Alice and Bob -- can recompute $SK$ from the long-term identity keys alone.
 \end{itemize}
-The cross structure is the point. $DH_1$ uses Alice's long-term and Bob's medium-term; $DH_2$ flips it. Authentication comes from the long-term keys appearing; forward secrecy comes from the ephemeral keys appearing; and because they are \emph{mixed} into one HKDF, an attacker must break \emph{every} DH to recover $SK$.
+The crossed structure matters. $DH_1$ uses Alice's long-term and Bob's medium-term; $DH_2$ flips it. Authentication comes from the long-term keys appearing; forward secrecy comes from the ephemeral keys appearing; and because they are \emph{mixed} into one HKDF, an attacker must break \emph{every} DH to recover $SK$.
 \end{whybox}
 
 \subsection{Bob's side: he catches up later}
@@ -118,13 +118,13 @@ DH_4 &= \mathrm{DH}(opk_B,\; EK_{\mathrm{pub}}),
 \end{aligned}
 \]
 
-feeds them through the same HKDF, and recovers the identical $SK$. He decrypts Alice's first message, deletes the one-time pre-key $opk_B$ he just used (so it can never be reused), and the session is open. Notice Bob did \emph{nothing} ahead of time except upload a bundle; he ran zero live round trips. That is the asynchrony win.
+feeds them through the same HKDF, and recovers the identical $SK$. He decrypts Alice's first message, deletes the one-time pre-key $opk_B$ he just used (so it can never be reused), and the session is open. Bob did \emph{nothing} ahead of time except upload a bundle; he ran zero live round trips. That is what makes the protocol asynchronous.
 
 \begin{walkbox}
 Convince yourself the four values match. $DH_3$ is $\mathrm{DH}(ek_A, SPK_{\mathrm{pub}}^B)$ for Alice and $\mathrm{DH}(spk_B, EK_{\mathrm{pub}})$ for Bob. Alice computes $ek_A \cdot (spk_B \cdot G)$; Bob computes $spk_B \cdot (ek_A \cdot G)$. Scalar multiplication on the curve is associative and commutative in the scalars, so both equal $(ek_A \cdot spk_B)\cdot G$. Same point, same $x$-coordinate, same DH output. The other three are identical in form. This is just ordinary Diffie-Hellman (Chapter~18) run four times with four pairings of the available keys.
 \end{walkbox}
 
-The whole exchange has only three arrows, and not one of them needs Bob awake when Alice acts. Figure~\ref{ch27:fig-x3dh-flow} lays out the choreography.
+The whole exchange has only three arrows, and not one of them needs Bob awake when Alice acts. Figure~\ref{ch27:fig-x3dh-flow} shows the full message flow.
 
 \begin{figure}[H]
 \centering
@@ -189,7 +189,7 @@ initial encrypted message. Bob recovers $SK$ and decrypts whenever he reconnects
 \subsection{A tiny worked example}
 \label{ch27:x3dh-toy}
 
-Curve25519 uses a 255-bit prime, far too big to trace by hand, so we shrink to a toy group: ordinary Diffie-Hellman modulo the prime $p = 23$ with generator $g = 5$. (This is multiplicative-group DH, not elliptic, but the algebra of ``four DHs combine into one secret'' is identical, and the small numbers are the whole point.) All private keys are exponents mod $22$; public keys are $g^{\text{priv}} \bmod 23$.
+Curve25519 uses a 255-bit prime, far too big to trace by hand, so we shrink to a toy group: ordinary Diffie-Hellman modulo the prime $p = 23$ with generator $g = 5$. (This is multiplicative-group DH, not elliptic, but the algebra of ``four DHs combine into one secret'' is identical, and small numbers let us check every step by hand.) All private keys are exponents mod $22$; public keys are $g^{\text{priv}} \bmod 23$.
 
 Assign private keys: Alice identity $ik_A = 6$, Alice ephemeral $ek_A = 9$; Bob identity $ik_B = 4$, signed pre-key $spk_B = 7$, one-time pre-key $opk_B = 3$. The public keys are
 \[
@@ -218,13 +218,13 @@ Toy numbers like $p=23$ are for understanding only. Real X3DH uses X25519, where
 \end{trapbox}
 
 \begin{historybox}
-X3DH descends from work by Trevor Perrin and Moxie Marlinspike at Open Whisper Systems (2013--2016) and from the Off-the-Record Messaging (OTR) protocol of Borisov, Goldberg, and Brewer (2004), which first married forward secrecy and deniability for instant messaging. OTR, though, was \emph{synchronous} -- both parties had to be online. The leap to asynchronous operation, so a message could be sent to an offline recipient with forward secrecy intact, is what made Signal usable as a real phone app. The X3DH and Double Ratchet specifications were published in 2016 (and formally analyzed by Cohn-Gordon et al.\ in 2017); the same year, WhatsApp finished rolling Signal's protocol out to over a billion users, instantly making it the most widely deployed end-to-end key agreement on Earth.
+X3DH descends from work by Trevor Perrin and Moxie Marlinspike at Open Whisper Systems (2013--2016) and from the Off-the-Record Messaging (OTR) protocol of Borisov, Goldberg, and Brewer (2004), which first married forward secrecy and deniability for instant messaging. OTR, though, was \emph{synchronous} -- both parties had to be online. The leap to asynchronous operation, so a message could be sent to an offline recipient with forward secrecy intact, is what made Signal usable as a real phone app. The X3DH and Double Ratchet specifications were published in 2016 (and formally analyzed by Cohn-Gordon et al.\ in 2017); the same year, WhatsApp finished rolling Signal's protocol out to over a billion users, making it the most widely deployed end-to-end key agreement in use.
 \end{historybox}
 
 \section{The Double Ratchet: Keys That Never Stop Moving}
 \label{ch27:double-ratchet}
 
-X3DH gives Alice and Bob one shared secret $SK$. If they just used $SK$ to key AES-GCM for every message, they would be back at Attempt~1 -- one stolen key, total collapse. The \textbf{Double Ratchet} takes $SK$ as a seed and from it derives a fresh key for \emph{every single message}, in a way that gives both forward secrecy and post-compromise security. It is called ``double'' because it combines two distinct ratcheting mechanisms.
+X3DH gives Alice and Bob one shared secret $SK$. If they just used $SK$ to key AES-GCM for every message, they would be back at Attempt~1, where one stolen key exposes everything. The \textbf{Double Ratchet} takes $SK$ as a seed and from it derives a fresh key for \emph{every single message}, in a way that gives both forward secrecy and post-compromise security. It is called ``double'' because it combines two distinct ratcheting mechanisms.
 
 \begin{intuitionbox}
 A ratchet is a gear that turns only one way -- a socket wrench, a zip tie, a car's parking pawl. Once it clicks forward it cannot click back. The cryptographic analogue: a key-derivation step you can run forward to get the next key but cannot reverse to recover the previous one. Run it on every message and the past is sealed off behind you. The Double Ratchet has a cheap one-way gear (a hash chain) for per-message keys and an asymmetric gear (Diffie-Hellman) that, in addition to turning forward, mixes in fresh randomness so a captured key goes stale. One gives forward secrecy; the other adds self-healing.
@@ -245,7 +245,7 @@ The message key $MK_i$ encrypts message $i$ (via AES + HMAC authenticated encryp
 \end{whybox}
 
 \begin{trapbox}
-The symmetric ratchet alone does \emph{not} self-heal -- it has the exact weakness of the ``hash the key forward'' non-fix from Section~\ref{ch27:why-old-fails}. If the attacker grabs $CK_{i+1}$, she derives every future message key on that chain forever. Forward secrecy: yes. Post-compromise security: no. That is the entire reason a second ratchet exists. The symmetric ratchet is the lightweight engine for messages sent in a row; the DH ratchet, next, is what periodically slams the door on a past compromise.
+The symmetric ratchet alone does \emph{not} self-heal -- it has the exact weakness of the ``hash the key forward'' non-fix from Section~\ref{ch27:why-old-fails}. If the attacker grabs $CK_{i+1}$, she derives every future message key on that chain forever. Forward secrecy: yes. Post-compromise security: no. That is why a second ratchet exists. The symmetric ratchet handles messages sent in a row cheaply; the DH ratchet, next, periodically recovers from a past compromise.
 \end{trapbox}
 
 \subsection{Ratchet two: the Diffie-Hellman ratchet}
@@ -377,7 +377,7 @@ DH_{\mathrm{out}} = (B_2)^{a_1} = 11^{4} = g^{9\cdot 4} = g^{36} = g^{36\bmod 22
 The root steps to $RK_2 = r(40, 13) = (5\cdot 40 + 7\cdot 13)\bmod 97 = (200 + 91)\bmod 97 = 291\bmod 97 = 0$, and that $RK_2 = 0$ seeds a brand-new symmetric chain for the new direction. The attacker, knowing $RK_1 = 40$, still cannot reach $RK_2$: she would need $DH_{\mathrm{out}} = (B_2)^{a_1}$, and although she sees both public values $B_2 = 11$ and $A_1 = 4$ on the wire, recovering the secret from them is the discrete-log problem. With the real X25519 group that is infeasible; her stolen $b_1 = 6$ is useless because Bob retired it. From message 11 onward she is locked out -- the session healed itself with one DH round trip's worth of fresh entropy.
 
 \begin{walkbox}
-Why could the attacker not just keep reading? She holds $RK_1$, Bob's \emph{old} private $b_1$, and the old chain keys. But the new chain hangs off $RK_2 = r(RK_1, DH_{\mathrm{out}})$, and $DH_{\mathrm{out}} = a_1 \cdot b_2 \cdot G$ depends on Bob's \emph{new} private $b_2$, which she never captured. She knows $RK_1$ -- the first argument to $r$ -- yet the second argument is exactly the value she cannot compute. One unknown input to a one-way mixer is enough: $RK_2$ is opaque, and every chain key below it with it. The lazy variant of Exercise~\ref{ch27:ex-rootkdf} that drops the old $RK$ would still self-heal \emph{here} (the fresh DH carries the rescue), but mixing $RK$ in additionally guards against an attacker who learns a single $DH_{\mathrm{out}}$; see that exercise for the case it saves.
+Why could the attacker not just keep reading? She holds $RK_1$, Bob's \emph{old} private $b_1$, and the old chain keys. But the new chain hangs off $RK_2 = r(RK_1, DH_{\mathrm{out}})$, and $DH_{\mathrm{out}} = a_1 \cdot b_2 \cdot G$ depends on Bob's \emph{new} private $b_2$, which she never captured. She knows $RK_1$ -- the first argument to $r$ -- yet the second argument is exactly the value she cannot compute. One unknown input to a one-way mixer is enough: $RK_2$ is opaque, and every chain key below it with it. The lazy variant of Exercise~\ref{ch27:ex-rootkdf} that drops the old $RK$ would still self-heal \emph{here} (the fresh DH output is enough), but mixing $RK$ in additionally guards against an attacker who learns a single $DH_{\mathrm{out}}$; see that exercise for the case it saves.
 \end{walkbox}
 
 \subsection{Out-of-order and lost messages}
@@ -386,7 +386,7 @@ Why could the attacker not just keep reading? She holds $RK_1$, Bob's \emph{old}
 Networks reorder and drop messages, so Bob may receive message 5 before message 3. Each message header carries its chain step number $i$. If Bob is expecting step 3 and sees step 5, he advances his receiving chain from $CK_3$ to $CK_5$, derives $MK_3, MK_4$ along the way, and \emph{stores} those skipped message keys in case 3 and 4 arrive later. He decrypts 5 immediately with $MK_5$. When 3 and 4 finally show up, he pulls their stored keys, decrypts, and deletes them.
 
 \begin{trapbox}
-Storing skipped message keys is a forward-secrecy hazard and a denial-of-service hazard. A held key is a key that has not been deleted, so it can be stolen. And an attacker could send a header claiming step number $2^{31}$, trying to make Bob derive and store two billion keys, exhausting his memory. Real implementations cap the number of skipped keys (Signal uses a few thousand) and the maximum chain-skip per step, refusing messages that would blow the limit. Forward secrecy is in tension with reliability here, and the cap is the negotiated truce.
+Storing skipped message keys is a forward-secrecy hazard and a denial-of-service hazard. A held key is a key that has not been deleted, so it can be stolen. And an attacker could send a header claiming step number $2^{31}$, trying to make Bob derive and store two billion keys, exhausting his memory. Real implementations cap the number of skipped keys (Signal uses a few thousand) and the maximum chain-skip per step, refusing messages that would blow the limit. Forward secrecy is in tension with reliability here, and the cap is a compromise between the two.
 \end{trapbox}
 
 \section{A Toy Double Ratchet in Code}
@@ -454,7 +454,7 @@ Sealed sender hides the sender's identity from the server but \emph{not} traffic
 \end{trapbox}
 
 \begin{applicationbox}
-\textbf{Who runs the Signal Protocol.} The Double Ratchet and X3DH (or its successor, PQXDH, which adds a post-quantum KEM alongside X25519 -- see Chapter~35) are not academic. They secure: Signal itself; \textbf{WhatsApp} (every chat, ~2 billion users, since 2016); \textbf{Google Messages} RCS end-to-end mode; \textbf{Facebook Messenger} and \textbf{Instagram} DMs (now default E2EE); and \textbf{Skype}'s private conversations. The protocol is also a formal-verification success story: researchers (Cohn-Gordon, Cremers, Dowling, Garratt, Stebila, 2017) produced a machine-checked analysis of its key-secrecy and post-compromise guarantees, a rare thing for a deployed protocol. This is why it is called the modern gold standard -- it is widely deployed \emph{and} provably analyzed.
+\textbf{Who runs the Signal Protocol.} The Double Ratchet and X3DH (or its successor, PQXDH, which adds a post-quantum KEM alongside X25519 -- see Chapter~35) are not academic. They secure: Signal itself; \textbf{WhatsApp} (every chat, ~2 billion users, since 2016); \textbf{Google Messages} RCS end-to-end mode; \textbf{Facebook Messenger} and \textbf{Instagram} DMs (now default E2EE); and \textbf{Skype}'s private conversations. The protocol is also a formal-verification success story: researchers (Cohn-Gordon, Cremers, Dowling, Garratt, Stebila, 2017) produced a machine-checked analysis of its key-secrecy and post-compromise guarantees, a rare thing for a deployed protocol. This combination of wide deployment \emph{and} formal analysis is why it is treated as the reference design for secure messaging.
 \end{applicationbox}
 
 \section{Authentication, Deniability, and the Safety Number}
@@ -468,24 +468,24 @@ Two subtle properties round out the design: how Alice knows she is really talkin
 X3DH authenticates the session against Bob's \emph{identity key}, but how does Alice know that identity key truly belongs to her friend and not to the server impersonating him? The server hands out the bundle, after all -- a malicious server could substitute its own identity key, run a person-in-the-middle, and relay. This is the same trust-the-directory problem that certificates solve for TLS (Chapter~24), but Signal has no certificate authorities. Instead it uses \textbf{safety numbers}: a short fingerprint derived from \emph{both} parties' identity keys, displayed as a 60-digit number (or a QR code). Alice and Bob compare it out of band -- read it aloud on a phone call, scan the QR in person. If the numbers match, no person-in-the-middle sits between them, because the attacker's substituted key would produce a different fingerprint.
 
 \begin{attackbox}
-\textbf{The unverified-key window.} Most users never compare safety numbers. Until they do, a malicious or compromised server \emph{could} have substituted identity keys at session setup and be reading everything -- a classic person-in-the-middle. Signal mitigates this with a visible warning: ``Your safety number with Bob has changed.'' If the server swaps Bob's key mid-conversation, Alice's app flags it, prompting the out-of-band check. The attack is detectable but not prevented by cryptography alone; it relies on users acting on the warning. This is the residual trust in any E2EE system without a verified public-key infrastructure -- the math is airtight, the key \emph{distribution} is where the soft spot remains.
+\textbf{The unverified-key window.} Most users never compare safety numbers. Until they do, a malicious or compromised server \emph{could} have substituted identity keys at session setup and be reading everything -- a classic person-in-the-middle. Signal mitigates this with a visible warning: ``Your safety number with Bob has changed.'' If the server swaps Bob's key mid-conversation, Alice's app flags it, prompting the out-of-band check. The attack is detectable but not prevented by cryptography alone; it relies on users acting on the warning. This is the residual trust in any E2EE system without a verified public-key infrastructure -- the cryptography is sound, but key \emph{distribution} remains the weak point.
 \end{attackbox}
 
 \subsection{Deniability: authentic now, deniable later}
 \label{ch27:deniability-property}
 
-Here is the property that surprises people. When Bob receives Alice's message, he is cryptographically convinced it came from Alice -- the X3DH secret could only be computed by someone holding Alice's identity private key. Yet Bob \emph{cannot} take that ciphertext to a journalist and prove Alice wrote it. How can it be both authenticated and deniable?
+This property surprises many people. When Bob receives Alice's message, he is cryptographically convinced it came from Alice -- the X3DH secret could only be computed by someone holding Alice's identity private key. Yet Bob \emph{cannot} take that ciphertext to a journalist and prove Alice wrote it. How can it be both authenticated and deniable?
 
 \begin{whybox}
-\textbf{Why deniability holds.} Authentication in X3DH comes from a \emph{shared} Diffie-Hellman secret, not a \emph{signature}. A digital signature (Chapter~22) is non-repudiable on purpose: only Alice's private key produces it, so it proves \emph{to anyone} that Alice signed. A shared DH secret is different -- it can be computed by \emph{either} party. The MAC that authenticates a Signal message is keyed by a secret that Bob also knows, because he is a participant in the DH. So Bob could have forged \emph{any} message ``from Alice'' to himself: he had the shared key, and a valid MAC under a key both parties hold proves only that \emph{one of the two of them} made it. To an outside judge, a transcript Bob presents is indistinguishable from one Bob fabricated. Bob is convinced in the moment (he knows \emph{he} did not forge it), but he cannot transfer that conviction to a third party. Authentic to the participant, deniable to the world.
+\textbf{Why deniability holds.} Authentication in X3DH comes from a \emph{shared} Diffie-Hellman secret, not a \emph{signature}. A digital signature (Chapter~22) is non-repudiable on purpose: only Alice's private key produces it, so it proves \emph{to anyone} that Alice signed. A shared DH secret is different -- it can be computed by \emph{either} party. The MAC that authenticates a Signal message is keyed by a secret that Bob also knows, because he is a participant in the DH. So Bob could have forged \emph{any} message ``from Alice'' to himself: he had the shared key, and a valid MAC under a key both parties hold proves only that \emph{one of the two of them} made it. To an outside judge, a transcript Bob presents is indistinguishable from one Bob fabricated. Bob is convinced in the moment (he knows \emph{he} did not forge it), but he cannot transfer that conviction to a third party.
 \end{whybox}
 
 \begin{intuitionbox}
-The split is between \emph{interactive} and \emph{transferable} authentication. A wax seal you watch someone press convinces you, standing there; a photo of the seal convinces no one, because photos are forgeable. Signal gives Bob the standing-there conviction -- the live cryptographic check -- without giving him a transferable artifact. This is deliberate. A whistleblower wants their source's app to confirm the source is genuine, yet wants no court-admissible proof tying the source to the words. Off-the-Record Messaging coined this goal, and Signal inherits it: be sure, but leave no receipt.
+The split is between \emph{interactive} and \emph{transferable} authentication. A wax seal you watch someone press convinces you, standing there; a photo of the seal convinces no one, because photos are forgeable. Signal gives Bob the standing-there conviction -- the live cryptographic check -- without giving him a transferable artifact. This is deliberate. A whistleblower wants their source's app to confirm the source is genuine, yet wants no court-admissible proof tying the source to the words. Off-the-Record Messaging introduced this goal, and Signal inherits it.
 \end{intuitionbox}
 
 \begin{connectionbox}
-Deniability is the mirror image of digital signatures (Chapter~22), and the contrast sharpens both. Signatures buy \emph{non-repudiation}: the signer cannot deny it, which is what you want for contracts, software updates, and certificates. Messaging wants the opposite. The same DH-versus-signature distinction explains why TLS certificates use signatures (a CA must be held accountable for what it vouches) while Signal authenticates with shared secrets (no participant should be held accountable to outsiders for private words). Same toolbox, opposite goal, opposite primitive.
+Deniability is the mirror image of digital signatures (Chapter~22). Signatures buy \emph{non-repudiation}: the signer cannot deny it, which is what you want for contracts, software updates, and certificates. Messaging wants the opposite. The same DH-versus-signature distinction explains why TLS certificates use signatures (a CA must be held accountable for what it vouches) while Signal authenticates with shared secrets (no participant should be held accountable to outsiders for private words).
 \end{connectionbox}
 
 \section{Putting It All Together}
@@ -503,10 +503,10 @@ Trace one full session from cold start, naming each property as it is earned:
   \item \textbf{Verification.} Out-of-band safety-number comparison closes the person-in-the-middle window. Throughout, authentication rests on shared DH secrets, so the transcript stays \emph{deniable}.
 \end{enumerate}
 
-Every guarantee from Section~\ref{ch27:e2e-goals} is delivered by a specific, nameable mechanism. That tight correspondence between goal and gear -- plus the asynchronous operation, plus the machine-checked proofs -- is why the Signal Protocol is the design every other secure messenger now copies.
+Every guarantee from Section~\ref{ch27:e2e-goals} is delivered by a specific, nameable mechanism. This direct mapping from goal to mechanism, together with asynchronous operation and machine-checked proofs, is why most other secure messengers have adopted the Signal Protocol's design.
 
 \begin{aestheticbox}
-Notice how little raw machinery Signal requires. Two familiar primitives -- Diffie-Hellman key agreement and a hash-based KDF -- are arranged in a loop to achieve guarantees neither provides alone: per-message forward secrecy from the one-way hash chain, post-compromise recovery from fresh Diffie-Hellman shares, asynchronous setup from pre-published keys, and deniability from shared-secret authentication. Nothing here relies on a new hardness assumption or an exotic primitive; all four properties come from the order in which standard operations run and when old keys are erased.
+Signal requires very little machinery. Two familiar primitives -- Diffie-Hellman key agreement and a hash-based KDF -- are arranged in a loop to achieve guarantees neither provides alone: per-message forward secrecy from the one-way hash chain, post-compromise recovery from fresh Diffie-Hellman shares, asynchronous setup from pre-published keys, and deniability from shared-secret authentication. Nothing here relies on a new hardness assumption or an exotic primitive; all four properties come from the order in which standard operations run and when old keys are erased.
 \end{aestheticbox}
 
 Signal solves end-to-end messaging between people whose phones are only intermittently

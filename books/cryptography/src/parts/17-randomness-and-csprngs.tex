@@ -2,24 +2,24 @@
 
 In Chapter~16 we saw how a single repeated nonce destroys AES-GCM, which points to a question we have put off for sixteen chapters: where do fresh random bits actually come from? Every secret in this book starts as a coin flip -- an AES key is $128$ coin flips; a nonce, an initialization vector, a password salt, or an ephemeral key is a request for bits no adversary can predict -- and producing them on a deterministic machine is a genuine engineering problem whose failure means broken plaintexts and exposed keys.
 
-This is the chapter where we stop taking the dice for granted. We will separate \emph{true} physical randomness from \emph{pseudo} randomness stretched from a small seed, define what makes a generator \emph{cryptographically} secure, look at OS entropy pipelines and process forking, and autopsy three famous randomness disasters: the Debian OpenSSL key collapse, the \texttt{Dual\_EC\_DRBG} backdoor, and repeated-nonce signatures.
+In this chapter we stop taking random bits for granted. We will separate \emph{true} physical randomness from \emph{pseudo} randomness stretched from a small seed, define what makes a generator \emph{cryptographically} secure, look at OS entropy pipelines and process forking, and examine three well-known randomness failures: the Debian OpenSSL key collapse, the \texttt{Dual\_EC\_DRBG} backdoor, and repeated-nonce signatures.
 
 \chapterline
 
 \section{Why Cryptography Lives or Dies on Randomness}
 \label{ch17:why-randomness}
 
-Recall the one-time pad: it achieves perfect secrecy, but \emph{only} when the key is uniformly random and never reused. Strip the randomness away and the same algorithm gives perfect insecurity. That is the pattern for the whole field. The algorithm is public (Kerckhoffs); the only thing standing between Eve and the plaintext is a quantity she cannot guess. If she \emph{can} guess it -- because it came from a predictable source -- the public algorithm becomes a public decryption procedure that she runs as easily as Bob does.
+Recall the one-time pad: it achieves perfect secrecy, but \emph{only} when the key is uniformly random and never reused. Without the randomness, the same algorithm gives no security at all. The same is true across cryptography. The algorithm is public (Kerckhoffs); the only thing standing between Eve and the plaintext is a quantity she cannot guess. If she \emph{can} guess it -- because it came from a predictable source -- the public algorithm becomes a public decryption procedure that she runs as easily as Bob does.
 
 \begin{intuitionbox}
-A cipher is a lockbox whose combination is your key. Kerckhoffs says the lockbox design is printed on the side; security rests entirely on the combination being unguessable. Now suppose the factory sets every combination by reading the wall clock at manufacturing time. The boxes are still ``random'' in the loose sense that you cannot easily predict any one of them in advance -- but an attacker who knows the trick just tries the few thousand plausible timestamps and opens them all. The combination space did not shrink because the math changed; it shrank because the \emph{source} of the combination had far less unpredictability than its length suggested. Randomness in cryptography is never about the size of the number. It is about how much an adversary can narrow it down.
+A cipher is a lockbox whose combination is your key. Kerckhoffs says the lockbox design is printed on the side; security rests entirely on the combination being unguessable. Now suppose the factory sets every combination by reading the wall clock at manufacturing time. The boxes are still ``random'' in the loose sense that you cannot easily predict any one of them in advance -- but an attacker who knows the trick just tries the few thousand plausible timestamps and opens them all. The combination space did not shrink because the math changed; it shrank because the \emph{source} of the combination had far less unpredictability than its length suggested. In cryptography what matters is how far an adversary can narrow the value down, not how long it is.
 \end{intuitionbox}
 
-Here is the quantity that actually matters, and it is not ``how many bits long is the value.'' It is \emph{how many guesses the best attacker needs}. We measure that with min-entropy. If a random variable $X$ takes value $x$ with probability $p_x$, its min-entropy is
+The quantity that matters is \emph{how many guesses the best attacker needs}, not how many bits long the value is. We measure that with min-entropy. If a random variable $X$ takes value $x$ with probability $p_x$, its min-entropy is
 \[
   H_\infty(X) \;=\; -\log_2 \max_x p_x .
 \]
-The max picks out the \emph{most likely} value -- the attacker's first guess. If the most likely outcome has probability $2^{-128}$, then $H_\infty = 128$ and even the optimal attacker needs about $2^{128}$ tries; the value is worth its full length. But if some outcome has probability $2^{-20}$ -- say a flawed generator only ever produces one of a million distinct keys -- then $H_\infty = 20$ no matter how many bits the key occupies in memory. A ``$256$-bit key'' with $20$ bits of min-entropy offers only $20$ bits of real security, regardless of its width in memory.
+The max picks out the \emph{most likely} value -- the attacker's first guess. If the most likely outcome has probability $2^{-128}$, then $H_\infty = 128$ and even the optimal attacker needs about $2^{128}$ tries; the value is worth its full length. But if some outcome has probability $2^{-20}$ -- say a flawed generator only ever produces one of a million distinct keys -- then $H_\infty = 20$ no matter how many bits the key occupies in memory. A ``$256$-bit key'' with $20$ bits of min-entropy offers only $20$ bits of real security.
 
 \begin{focusbox}
 Min-entropy, not Shannon entropy, is the right measure for cryptography. Shannon entropy $H = -\sum_x p_x \log_2 p_x$ averages over all outcomes and answers ``how many bits to encode this on average.'' An attacker does not care about the average; she guesses the \emph{single most likely} value first. A source that emits one fixed value $99.9\%$ of the time and a uniform $127$-bit string the rest has Shannon entropy of about $0.14$ bits -- but more to the point a min-entropy of only $-\log_2(0.999) \approx 0.0014$ bits. You crack it on the first guess almost always. Always size a key by its worst case, which is min-entropy.
@@ -43,7 +43,7 @@ There are two fundamentally different ways to get bits that look random, and a r
 \textbf{Pseudorandomness} comes from a deterministic algorithm: feed in a short \emph{seed} and it stretches it into an arbitrarily long stream of bits that \emph{look} random to anyone who does not know the seed. The same seed always produces the same stream -- that determinism is a feature (reproducibility, speed) and a danger (predictability if the seed leaks). A pseudorandom generator manufactures no new entropy. If the seed has $128$ bits of min-entropy, the gigabyte of output it produces still has only $128$ bits of min-entropy; the generator has spread that unpredictability thin, not created more.
 
 \begin{intuitionbox}
-Think of true randomness as mining raw ore and pseudorandomness as stamping coins. The mine (your diode, your interrupt timings) produces a trickle of irregular, impure metal -- real value, but slow and ugly. The mint (your CSPRNG) takes a lump of that metal as a seed and stamps out millions of identical-looking coins fast and cheaply. The mint creates no new gold; it only spreads the gold from the seed across all the coins. Spend the seed's gold twice -- reuse or leak the seed -- and every coin you ever stamped from it is counterfeit. So the real engineering question is never ``true or pseudo?'' It is: gather enough true entropy \emph{once} to seed the mint, then let the mint do the bulk production.
+Think of true randomness as mining raw ore and pseudorandomness as stamping coins. The mine (your diode, your interrupt timings) produces a trickle of irregular, impure metal -- real value, but slow and ugly. The mint (your CSPRNG) takes a lump of that metal as a seed and stamps out millions of identical-looking coins fast and cheaply. The mint creates no new gold; it only spreads the gold from the seed across all the coins. Spend the seed's gold twice -- reuse or leak the seed -- and every coin you ever stamped from it is counterfeit. So a real system uses both: gather enough true entropy \emph{once} to seed the mint, then let the mint do the bulk production.
 \end{intuitionbox}
 
 \begin{formalbox}
@@ -55,7 +55,7 @@ that maps an $n$-bit seed to a longer $\ell(n)$-bit output (it ``stretches'' the
 \end{formalbox}
 
 \begin{trapbox}
-\textbf{``It passes the statistical tests, so it is secure.''} Statistical test batteries (Diehard, TestU01, NIST SP 800-22) check whether output is \emph{distinguishable from random by generic statistics} -- bias, runs, correlations. Passing them is necessary but nowhere near sufficient for cryptography. A linear congruential generator, $x_{i+1} = (a x_i + c) \bmod m$, can pass many such tests, yet given a handful of consecutive outputs you can solve for $a$, $c$, $m$ and predict every future and past value with linear algebra. The Mersenne Twister, default in Python's \texttt{random} and many languages, passes essentially every statistical test and is still completely predictable: observe $624$ consecutive $32$-bit outputs and you can reconstruct its entire internal state and clone it. Statistical randomness is a property of the \emph{output}; cryptographic randomness is a property of the output \emph{relative to an adversary who is allowed to think}.
+\textbf{``It passes the statistical tests, so it is secure.''} Statistical test batteries (Diehard, TestU01, NIST SP 800-22) check whether output is \emph{distinguishable from random by generic statistics} -- bias, runs, correlations. Passing them is necessary but nowhere near sufficient for cryptography. A linear congruential generator, $x_{i+1} = (a x_i + c) \bmod m$, can pass many such tests, yet given a handful of consecutive outputs you can solve for $a$, $c$, $m$ and predict every future and past value with linear algebra. The Mersenne Twister, default in Python's \texttt{random} and many languages, passes essentially every statistical test and is still completely predictable: observe $624$ consecutive $32$-bit outputs and you can reconstruct its entire internal state and clone it. Statistical randomness is a property of the \emph{output}; cryptographic randomness is a property of the output \emph{relative to an adversary who analyzes the generator}.
 \end{trapbox}
 
 \begin{example}[Breaking an LCG with two outputs]
@@ -68,13 +68,13 @@ Subtract the first from the second to kill $c$:
 \[
   117 - 33 \equiv (33 - 5)\,a \;\Longrightarrow\; 84 \equiv 28\,a \pmod{2^{31}}.
 \]
-Now $28 = 4\cdot 7$ and $84 = 4\cdot 21$, and $\gcd(4,2^{31})=4$ divides $84$, so we can divide the congruence by $4$: $21 \equiv 7a \pmod{2^{29}}$. The inverse of $7$ modulo $2^{29}$ exists ($7$ is odd), and $7^{-1} \equiv 383479223 \pmod{2^{29}}$, giving $a \equiv 21 \cdot 383479223 \equiv 3 \pmod{2^{29}}$, hence $a = 3$. Back-substitute: $c = 33 - 5\cdot 3 = 18$. Predict the next value: $x_3 = (3\cdot 117 + 18) \bmod 2^{31} = 369$. We recovered the entire generator and all of its future and past output from \emph{three} samples and a couple of modular operations. No amount of statistical polish changes this: the structure that makes an LCG fast -- a single affine update -- is exactly the structure that lets two equations unmask it. Cryptographic security is about resisting an adversary who solves equations, not one who runs chi-squared tests.
+Now $28 = 4\cdot 7$ and $84 = 4\cdot 21$, and $\gcd(4,2^{31})=4$ divides $84$, so we can divide the congruence by $4$: $21 \equiv 7a \pmod{2^{29}}$. The inverse of $7$ modulo $2^{29}$ exists ($7$ is odd), and $7^{-1} \equiv 383479223 \pmod{2^{29}}$, giving $a \equiv 21 \cdot 383479223 \equiv 3 \pmod{2^{29}}$, hence $a = 3$. Back-substitute: $c = 33 - 5\cdot 3 = 18$. Predict the next value: $x_3 = (3\cdot 117 + 18) \bmod 2^{31} = 369$. We recovered the entire generator and all of its future and past output from \emph{three} samples and a couple of modular operations. Better statistical behavior does not help: the single affine update that makes an LCG fast is also what lets two equations reveal its parameters. Cryptographic security is about resisting an adversary who solves equations, not one who runs chi-squared tests.
 \end{example}
 
 \section{What Makes a Generator \emph{Cryptographically} Secure}
 \label{ch17:csprng-def}
 
-A garden-variety PRG (good enough for a physics simulation) and a \emph{cryptographically secure} PRG (CSPRNG) are graded on different exams. The simulation only needs output that is unbiased and uncorrelated enough that statistical estimates converge. A CSPRNG must defeat an active, intelligent adversary who knows the algorithm, sees part of the output, and is trying to predict the rest. Two extra properties separate the two.
+An ordinary PRG (good enough for a physics simulation) and a \emph{cryptographically secure} PRG (CSPRNG) are held to different standards. The simulation only needs output that is unbiased and uncorrelated enough that statistical estimates converge. A CSPRNG must defeat an active, intelligent adversary who knows the algorithm, sees part of the output, and is trying to predict the rest. Two extra properties separate the two.
 
 \begin{definition}[Next-bit unpredictability]
 \label{ch17:def-nextbit}
@@ -101,7 +101,7 @@ A PRG is next-bit unpredictable if and only if it is indistinguishable from unif
 \end{theorem}
 
 \begin{whybox}
-\textbf{Why next-bit unpredictability already gives you indistinguishability.} One direction is intuitive and worth internalizing, because it is the reason ``predict the next bit'' is the right informal test. Suppose some distinguisher $D$ \emph{can} tell $G$'s output from random with advantage $\eps$. Build a next-bit predictor from it via a \emph{hybrid argument}. Consider strings that are ``real for the first $i$ bits, then random for the rest,'' as $i$ slides from $0$ (fully random) to $\ell$ (fully real). $D$ behaves differently at the two ends by $\eps$, so by averaging there must be some position $i$ where swapping bit $i$ from random to real shifts $D$'s output by at least $\eps/\ell$. That single sensitive position is a leak: it means bit $i$ is \emph{correlated} with the earlier real bits in a way $D$ detects. Run $D$, and when it leans toward ``real,'' bet that bit $i$ matched the prediction; when it leans ``random,'' bet the opposite. That betting rule predicts bit $i$ from bits $1\ldots i{-}1$ with advantage $\eps/\ell$ over chance. So ``no distinguisher'' and ``no predictor'' stand or fall together: any statistical edge an adversary finds can be sharpened into a prediction, and any prediction is a statistical edge. This is why we can design CSPRNGs by asking only the local question -- ``can you guess the next bit?'' -- and get the global guarantee for free.
+\textbf{Why next-bit unpredictability already gives you indistinguishability.} One direction is intuitive, and it is the reason ``predict the next bit'' is the right informal test. Suppose some distinguisher $D$ \emph{can} tell $G$'s output from random with advantage $\eps$. Build a next-bit predictor from it via a \emph{hybrid argument}. Consider strings that are ``real for the first $i$ bits, then random for the rest,'' as $i$ slides from $0$ (fully random) to $\ell$ (fully real). $D$ behaves differently at the two ends by $\eps$, so by averaging there must be some position $i$ where swapping bit $i$ from random to real shifts $D$'s output by at least $\eps/\ell$. That single sensitive position is a leak: it means bit $i$ is \emph{correlated} with the earlier real bits in a way $D$ detects. Run $D$, and when it leans toward ``real,'' bet that bit $i$ matched the prediction; when it leans ``random,'' bet the opposite. That betting rule predicts bit $i$ from bits $1\ldots i{-}1$ with advantage $\eps/\ell$ over chance. So ``no distinguisher'' and ``no predictor'' stand or fall together: any statistical edge an adversary finds can be sharpened into a prediction, and any prediction is a statistical edge. This is why we can design CSPRNGs by asking only the local question -- ``can you guess the next bit?'' -- and get the global guarantee for free.
 \end{whybox}
 
 For a cryptographic generator we demand more than even these, because a CSPRNG holds long-lived internal state and the attacker may eventually compromise it. Two state-compromise properties:
@@ -176,13 +176,13 @@ You can turn any secure block cipher into a CSPRNG. Take a random $128$-bit key 
 \[
   G(k) \;=\; \Enc_k(0)\,\concat\,\Enc_k(1)\,\concat\,\Enc_k(2)\,\concat\cdots
 \]
-Each block is the cipher applied to a fresh counter value. If AES is a secure pseudorandom permutation -- which is exactly the assumption Chapter~12 rests on -- then its outputs on distinct inputs are indistinguishable from independent random blocks, so $G$ is a CSPRNG. This is not a toy; it is essentially the core of the CTR\_DRBG construction in NIST SP 800-90A, the most widely deployed CSPRNG family on the planet. Backtracking resistance is added by periodically replacing $k$ with fresh cipher output and discarding the old key.
+Each block is the cipher applied to a fresh counter value. If AES is a secure pseudorandom permutation -- which is exactly the assumption Chapter~12 rests on -- then its outputs on distinct inputs are indistinguishable from independent random blocks, so $G$ is a CSPRNG. This construction is used in practice: it is essentially the core of the CTR\_DRBG construction in NIST SP 800-90A, the most widely deployed CSPRNG family on the planet. Backtracking resistance is added by periodically replacing $k$ with fresh cipher output and discarding the old key.
 \end{example}
 
 \section{Where Entropy Actually Comes From}
 \label{ch17:entropy-sources}
 
-A CSPRNG is a deterministic mint; it needs a seed of real, physical, unpredictable bits to stamp. Where does a computer -- a machine engineered to be perfectly deterministic and repeatable -- find unpredictability? It scavenges it from the few places where physics leaks into the digital world.
+A CSPRNG is a deterministic mint; it needs a seed of real, physical, unpredictable bits to stamp. Where does a computer -- a machine engineered to be perfectly deterministic and repeatable -- find unpredictability? It collects it from the few places where physical processes affect the machine's behavior.
 
 \begin{description}
   \item[Hardware noise sources.] Modern CPUs ship a dedicated entropy source. Intel's \texttt{RDRAND}/\texttt{RDSEED} and AMD's equivalent sample thermal noise in a metastable latch (a circuit deliberately balanced on a knife edge so noise tips it $0$ or $1$). This is the fastest true-random source available, but it is opaque silicon you cannot audit -- which, as we will see, makes some people nervous.
@@ -193,7 +193,7 @@ A CSPRNG is a deterministic mint; it needs a seed of real, physical, unpredictab
 The raw bits from any of these are \emph{biased} and \emph{correlated} -- a diode might emit $0$ sixty percent of the time, interrupt timestamps share high bits. You cannot use them directly as a key. You run them through an \emph{entropy extractor} (in practice a cryptographic hash or a keyed construction) that compresses many biased input bits into fewer, nearly uniform output bits.
 
 \begin{whybox}
-\textbf{Why hashing concentrates entropy.} Suppose you collect $1000$ raw bits from a biased, correlated source, but you can argue they jointly contain at least $256$ bits of min-entropy -- meaning no particular $1000$-bit pattern has probability above $2^{-256}$. Feed them into SHA-256. The output is $256$ bits. The \emph{leftover hash lemma} (and in practice the random-oracle heuristic) tells us that hashing a source with $k$ bits of min-entropy down to somewhat fewer than $k$ bits yields output statistically close to uniform. Intuitively, a good hash spreads its input chaotically across all $2^{256}$ outputs, so the input's unpredictability -- however lumpily distributed across the raw bits -- gets stirred into near-uniform unpredictability across the digest. The catch is the bookkeeping: you must \emph{conservatively estimate} how much min-entropy the raw input really carries, because if you over-credit it (assume $256$ when it is really $40$), the polished output looks uniform but is only $40$ bits strong. Entropy estimation is the genuinely hard, genuinely dangerous part of the whole pipeline.
+\textbf{Why hashing concentrates entropy.} Suppose you collect $1000$ raw bits from a biased, correlated source, but you can argue they jointly contain at least $256$ bits of min-entropy -- meaning no particular $1000$-bit pattern has probability above $2^{-256}$. Feed them into SHA-256. The output is $256$ bits. The \emph{leftover hash lemma} (and in practice the random-oracle heuristic) tells us that hashing a source with $k$ bits of min-entropy down to somewhat fewer than $k$ bits yields output statistically close to uniform. Intuitively, a good hash spreads its input chaotically across all $2^{256}$ outputs, so the input's unpredictability -- however lumpily distributed across the raw bits -- gets stirred into near-uniform unpredictability across the digest. The catch is the bookkeeping: you must \emph{conservatively estimate} how much min-entropy the raw input really carries, because if you over-credit it (assume $256$ when it is really $40$), the polished output looks uniform but is only $40$ bits strong. Entropy estimation is the hardest and most error-prone part of the pipeline.
 \end{whybox}
 
 \begin{connectionbox}
@@ -215,7 +215,7 @@ Notice you need \emph{more} than $128$ flips even though each flip is one bit --
 
 \begin{example}[Sizing an extractor with the leftover-hash tax]
 \label{ch17:extractor-tax}
-Now run those biased flips through an extractor and watch the bookkeeping bite. From Example~\ref{ch17:biased-coin}, $174$ flips of the $p=0.6$ coin carry about $128$ bits of min-entropy. We want output within statistical distance $\eps = 2^{-64}$ of uniform -- a comfortable cryptographic margin. The leftover hash lemma caps the safe output length at
+Now run those biased flips through an extractor and see what the bookkeeping costs. From Example~\ref{ch17:biased-coin}, $174$ flips of the $p=0.6$ coin carry about $128$ bits of min-entropy. We want output within statistical distance $\eps = 2^{-64}$ of uniform -- a comfortable cryptographic margin. The leftover hash lemma caps the safe output length at
 \[
   m \;\le\; k - 2\log_2\!\frac{1}{\eps} \;=\; 128 - 2\cdot 64 \;=\; 0 \text{ bits}.
 \]
@@ -239,7 +239,7 @@ Put the pieces together and you get the architecture every modern operating syst
 \end{enumerate}
 
 \begin{applicationbox}
-\textbf{What to actually call.} On Linux/modern Unix, call \texttt{getrandom()} (or read \texttt{/dev/urandom} once it is seeded); in Python use \texttt{secrets} or \texttt{os.urandom}; in Go use \texttt{crypto/rand}; in Java \texttt{SecureRandom}; in the browser \texttt{crypto.getRandomValues}; on Windows \texttt{BCryptGenRandom}. These all funnel to the OS CSPRNG. You should essentially \emph{never} build your own generator or seed one yourself -- the OS has already solved entropy collection, reseeding, and fork safety better than you will. The one rule with teeth: at boot, before the pool is initialized, \texttt{/dev/urandom} historically returned low-entropy output without complaint. The modern fix is \texttt{getrandom()} with no flags, which \emph{blocks} until the pool is seeded. Use it.
+\textbf{What to actually call.} On Linux/modern Unix, call \texttt{getrandom()} (or read \texttt{/dev/urandom} once it is seeded); in Python use \texttt{secrets} or \texttt{os.urandom}; in Go use \texttt{crypto/rand}; in Java \texttt{SecureRandom}; in the browser \texttt{crypto.getRandomValues}; on Windows \texttt{BCryptGenRandom}. These all funnel to the OS CSPRNG. You should essentially \emph{never} build your own generator or seed one yourself -- the OS has already solved entropy collection, reseeding, and fork safety better than you will. The one caveat: at boot, before the pool is initialized, \texttt{/dev/urandom} historically returned low-entropy output without complaint. The modern fix is \texttt{getrandom()} with no flags, which \emph{blocks} until the pool is seeded. Use it.
 \end{applicationbox}
 
 \begin{trapbox}
@@ -301,21 +301,21 @@ Put the pieces together and you get the architecture every modern operating syst
   \draw[->, thick, targetgreen!80!black] (pool.south) -- ++(0,-0.65) -| (core.south)
     node[pos=0.25, below=2pt, font=\scriptsize, align=center] {Periodic reseed folds fresh physical entropy\\into live state (Prediction Resistance)};
 \end{tikzpicture}
-\caption{The operating system randomness pipeline. Physical noise is continually gathered into an entropy pool where online health tests and min-entropy accounting monitor source viability. Once initialized, the pool seeds a deterministic CSPRNG (such as ChaCha20 or AES-CTR), which emits unlimited high-speed cryptographic bits via \texttt{getrandom()}. Periodic reseeding re-locks the generator against past state leaks.}
+\caption{The operating system randomness pipeline. Physical noise is continually gathered into an entropy pool where online health tests and min-entropy accounting monitor source viability. Once initialized, the pool seeds a deterministic CSPRNG (such as ChaCha20 or AES-CTR), which emits unlimited high-speed cryptographic bits via \texttt{getrandom()}. Periodic reseeding restores security after a state leak.}
 \label{ch17:fig-arch}
 \end{figure}
 
 \subsection{Fork Safety: When One Becomes Two}
 \label{ch17:fork}
 
-A CSPRNG is deterministic: same state, same output. Usually that is fine -- the state keeps advancing. But \texttt{fork()} clones a process \emph{including its memory}, and that is exactly the situation where determinism bites. If an application keeps a userspace CSPRNG (its own copy of the state, seeded once at startup) and then forks, parent and child now hold \emph{identical} generator state. They will produce the \emph{same} ``random'' stream -- the same session keys, the same nonces -- independently, each unaware of the other.
+A CSPRNG is deterministic: same state, same output. Usually that is fine -- the state keeps advancing. But \texttt{fork()} clones a process \emph{including its memory}, and that is exactly where determinism becomes a problem. If an application keeps a userspace CSPRNG (its own copy of the state, seeded once at startup) and then forks, parent and child now hold \emph{identical} generator state. They will produce the \emph{same} ``random'' stream -- the same session keys, the same nonces -- independently, each unaware of the other.
 
 \begin{attackbox}
 \textbf{Fork-induced nonce reuse.} Picture a web server that seeds an in-process CSPRNG at startup, then forks worker processes to handle connections. Every worker inherits the identical seed. Worker A and worker B each generate what they think is a fresh random nonce for AES-GCM -- and produce the \emph{same} nonce for different messages under the same key. A repeated GCM nonce is catastrophic: it leaks the XOR of the two plaintexts and, worse, lets an attacker recover the GHASH authentication key and forge tags. One careless fork turns a correct AEAD scheme into a broken one. The same bug sank some early TLS deployments and is a recurring cause of duplicate ECDSA nonces (see \S\ref{ch17:nonce-reuse}).
 \end{attackbox}
 
 \begin{whybox}
-\textbf{Why the OS interface is fork-safe and a userspace cache is not.} \texttt{getrandom()} and \texttt{/dev/urandom} go to the kernel, which has \emph{one} CSPRNG state shared across all processes; the kernel serializes access, so parent and child reading after a fork get different bytes -- there is no per-process copy to clone. A userspace library that caches generator state in process memory loses this for free. The fixes are: (1) just call the OS each time (simplest and recommended); (2) detect forks by comparing the cached PID against \texttt{getpid()} and reseed on mismatch -- fragile, because PIDs wrap around and recycle; or (3) on modern Linux, register the seed buffer with \texttt{MADV\_WIPEONFORK} so the child's copy is zeroed at fork, forcing a reseed before use. OpenSSL, after being burned, now mixes the PID and a fork-generation counter into its DRBG precisely to survive this.
+\textbf{Why the OS interface is fork-safe and a userspace cache is not.} \texttt{getrandom()} and \texttt{/dev/urandom} go to the kernel, which has \emph{one} CSPRNG state shared across all processes; the kernel serializes access, so parent and child reading after a fork get different bytes -- there is no per-process copy to clone. A userspace library that caches generator state in process memory loses this for free. The fixes are: (1) just call the OS each time (simplest and recommended); (2) detect forks by comparing the cached PID against \texttt{getpid()} and reseed on mismatch -- fragile, because PIDs wrap around and recycle; or (3) on modern Linux, register the seed buffer with \texttt{MADV\_WIPEONFORK} so the child's copy is zeroed at fork, forcing a reseed before use. OpenSSL, after being hit by this bug, now mixes the PID and a fork-generation counter into its DRBG precisely to survive this.
 \end{whybox}
 
 \begin{implementbox}
@@ -359,7 +359,7 @@ Run it: the two \texttt{ToyDRBG} lines after the fork print \emph{identical} hex
 \subsection{Health Tests: Catching a Source That Dies}
 \label{ch17:health}
 
-A physical entropy source is a piece of hardware, and hardware fails -- a noise diode degrades, a ring oscillator locks to a fixed value, RDSEED returns all-ones because a power rail sagged. The terrifying part is that a \emph{stuck} source still produces output; it just produces \emph{predictable} output. A CSPRNG dutifully stretches that into key material, and nothing downstream looks wrong. So a real entropy pipeline runs \emph{online health tests} on the raw source, before extraction, to catch a source that has died.
+A physical entropy source is a piece of hardware, and hardware fails -- a noise diode degrades, a ring oscillator locks to a fixed value, RDSEED returns all-ones because a power rail sagged. The danger is that a \emph{stuck} source still produces output; it just produces \emph{predictable} output. A CSPRNG dutifully stretches that into key material, and nothing downstream looks wrong. So a real entropy pipeline runs \emph{online health tests} on the raw source, before extraction, to catch a source that has died.
 
 \begin{description}
   \item[Repetition Count Test.] Flag if the same raw sample value repeats more than a cutoff number of times in a row -- the signature of a stuck output. NIST SP 800-90B sets the cutoff from the claimed per-sample min-entropy $H$: roughly $C = 1 + \lceil 20 / H \rceil$ for a false-positive rate near $2^{-20}$. A source claiming $H = 1$ bit/sample trips after about $21$ identical samples.
@@ -367,13 +367,13 @@ A physical entropy source is a piece of hardware, and hardware fails -- a noise 
 \end{description}
 
 \begin{whybox}
-\textbf{Why test the raw source and not the CSPRNG output.} You cannot health-test the output of a good CSPRNG -- by design it looks uniform even when seeded from a totally dead source, so a statistical test on it tells you nothing about the seed. The only place the truth is visible is \emph{upstream}, on the raw physical samples before they are whitened. This is why the architecture separates ``estimate and test the source'' from ``stretch with the CSPRNG'': the health test guards the one stage where degradation is still detectable. Put the test after the hash and you are testing your hash function, not your diode.
+\textbf{Why test the raw source and not the CSPRNG output.} You cannot health-test the output of a good CSPRNG -- by design it looks uniform even when seeded from a totally dead source, so a statistical test on it tells you nothing about the seed. A failure is visible only \emph{upstream}, on the raw physical samples before they are whitened. This is why the architecture separates ``estimate and test the source'' from ``stretch with the CSPRNG'': the health test guards the one stage where degradation is still detectable. Put the test after the hash and you are testing your hash function, not your diode.
 \end{whybox}
 
 \section{Famous RNG Failures}
 \label{ch17:failures}
 
-Abstractions about min-entropy and reseeding land harder once you have watched real keys fall out of broken generators. Three cases, each teaching a distinct lesson: a bug that shrank the keyspace, a backdoor baked into a standard, and a misuse that leaks the secret key directly.
+The ideas of min-entropy and reseeding are easier to appreciate after seeing real keys recovered from broken generators. We look at three cases, each with a distinct lesson: a bug that shrank the keyspace, a backdoor baked into a standard, and a misuse that leaks the secret key directly.
 
 \subsection{Debian OpenSSL (2008): The 15-Bit Keyspace}
 \label{ch17:debian}
@@ -385,11 +385,11 @@ Abstractions about min-entropy and reseeding land harder once you have watched r
 \end{attackbox}
 
 \begin{intuitionbox}
-The math was flawless. RSA was as hard as ever; AES unbroken. The whole edifice collapsed because the seed -- the one input that must be unpredictable -- had about $15$ bits of entropy instead of $128$+. A $2048$-bit RSA key with $15$ bits of seed entropy is, to an attacker with the table, a $15$-bit key. This is the chapter's thesis in one incident: \emph{your cryptography is exactly as strong as the unpredictability of its random seed, and not one bit stronger.}
+Nothing was wrong with the mathematics: RSA was as hard as ever and AES was unbroken. The keys were weak because the seed -- the one input that must be unpredictable -- had about $15$ bits of entropy instead of $128$+. A $2048$-bit RSA key with $15$ bits of seed entropy is, to an attacker with the table, a $15$-bit key. This incident illustrates the main point of this chapter: \emph{your cryptography is only as strong as the unpredictability of its random seed.}
 \end{intuitionbox}
 
 \begin{trapbox}
-\textbf{The meta-lesson: do not silence the tool by gutting the security.} The change looked like a clean fix for a memory-safety warning. The author had no way to know that the ``uninitialized read'' was load-bearing entropy. The takeaway is twofold: security-critical code needs comments explaining clearly \emph{why} unusual-looking lines exist, and changes to crypto libraries need review by people who understand the crypto, not just the C. ``It still compiles and the warning is gone'' is not a passing test for a CSPRNG.
+\textbf{The meta-lesson: do not silence the tool by gutting the security.} The change looked like a clean fix for a memory-safety warning. The author had no way to know that the ``uninitialized read'' was an essential source of entropy. The takeaway is twofold: security-critical code needs comments explaining clearly \emph{why} unusual-looking lines exist, and changes to crypto libraries need review by people who understand the crypto, not just the C. ``It still compiles and the warning is gone'' is not a passing test for a CSPRNG.
 \end{trapbox}
 
 \subsection{Dual\_EC\_DRBG (c.\ 2006--2013): A Standardized Backdoor}
@@ -400,7 +400,7 @@ The math was flawless. RSA was as hard as ever; AES unbroken. The whole edifice 
 \end{historybox}
 
 \begin{attackbox}
-\textbf{How the backdoor works (the shape of it).} The generator's state $s$ advances and emits bits derived from two EC points. Output block $r$ is computed essentially as $r = x\big(s \cdot Q\big)$ -- the $x$-coordinate of the point $s\cdot Q$ -- truncated by a few bits. Here is the trap: $P$ and $Q$ are fixed public points, but suppose they were chosen so that $Q = d \cdot P$ for a secret scalar $d$ known only to the designer. The state update uses $P$; the output uses $Q$. Someone who knows $d$ can take an observed output $r$, recover the full point $s\cdot Q$ (only a few truncated bits to brute-force, since the curve equation pins down the candidates), and then -- because $Q = dP$ -- compute $d^{-1}(s\cdot Q) = s\cdot P$, which is precisely the value used to derive the \emph{next} state. With the next state in hand, the backdoor holder predicts all future output. One generator output, and the holder of $d$ owns the stream: every key, every nonce.
+\textbf{How the backdoor works (the shape of it).} The generator's state $s$ advances and emits bits derived from two EC points. Output block $r$ is computed essentially as $r = x\big(s \cdot Q\big)$ -- the $x$-coordinate of the point $s\cdot Q$ -- truncated by a few bits. $P$ and $Q$ are fixed public points, but suppose they were chosen so that $Q = d \cdot P$ for a secret scalar $d$ known only to the designer. The state update uses $P$; the output uses $Q$. Someone who knows $d$ can take an observed output $r$, recover the full point $s\cdot Q$ (only a few truncated bits to brute-force, since the curve equation pins down the candidates), and then -- because $Q = dP$ -- compute $d^{-1}(s\cdot Q) = s\cdot P$, which is precisely the value used to derive the \emph{next} state. With the next state in hand, the backdoor holder predicts all future output. A single generator output therefore gives the holder of $d$ every later key and nonce.
 \end{attackbox}
 
 Figure~\ref{ch17:fig-dualec} traces the asymmetry: normal advancement moves left-to-right from state $s_t$ through $s_t \cdot P$ to the next state $s_{t+1}$, while anyone holding the secret trapdoor $d^{-1}$ (where $Q = dP$) can invert the published output $x(s_t \cdot Q)$ upward into $s_t \cdot P$ and compute $s_{t+1}$ directly.
@@ -435,16 +435,16 @@ Figure~\ref{ch17:fig-dualec} traces the asymmetry: normal advancement moves left
   % Callout box
   \node[trap] at (8.5, -0.4) {\textbf{Secret Trapdoor ($Q = d \cdot P$):} \\ $d^{-1}(s_t \cdot Q) = d^{-1}(d \cdot s_t P) = s_t \cdot P \implies s_{t+1}$};
 \end{tikzpicture}
-\caption{The \texttt{Dual\_EC\_DRBG} kleptographic backdoor. An observer who knows the secret discrete logarithm $d$ relating the standard points $Q = d \cdot P$ lifts one observed output $r_t$ to the curve point $s_t \cdot Q$ and multiplies by $d^{-1}$ to recover $s_t \cdot P$, unlocking the next internal state $s_{t+1}$ and all subsequent outputs.}
+\caption{The \texttt{Dual\_EC\_DRBG} kleptographic backdoor. An observer who knows the secret discrete logarithm $d$ relating the standard points $Q = d \cdot P$ lifts one observed output $r_t$ to the curve point $s_t \cdot Q$ and multiplies by $d^{-1}$ to recover $s_t \cdot P$, exposing the next internal state $s_{t+1}$ and all subsequent outputs.}
 \label{ch17:fig-dualec}
 \end{figure}
 
 \begin{whybox}
-\textbf{Why this case is the most chilling.} Debian was a bug -- a mistake anyone could have made and anyone could find by reading the diff. \texttt{Dual\_EC} was, by all available evidence, a deliberate, \emph{mathematically invisible} backdoor in a published international standard, exploitable only by whoever generated the constants $P$ and $Q$. To everyone else it looked like an ordinary (if slow) CSPRNG; you could audit the algorithm line by line and find nothing, because the secret was not in the code but in the \emph{provenance of two numbers}. This is the origin of the modern demand for \emph{nothing-up-my-sleeve} constants: cryptographic parameters must be derived from public, arbitrary values (digits of $\pi$, hashes of fixed strings) so that no designer could have chosen them to hide a trapdoor. When you cannot explain \emph{where a constant came from}, treat it as hostile.
+\textbf{Why this case is the most troubling.} Debian was a bug -- a mistake anyone could have made and anyone could find by reading the diff. \texttt{Dual\_EC} was, by all available evidence, a deliberate, \emph{mathematically invisible} backdoor in a published international standard, exploitable only by whoever generated the constants $P$ and $Q$. To everyone else it looked like an ordinary (if slow) CSPRNG; you could audit the algorithm line by line and find nothing, because the secret was not in the code but in the \emph{provenance of two numbers}. This is the origin of the modern demand for \emph{nothing-up-my-sleeve} constants: cryptographic parameters must be derived from public, arbitrary values (digits of $\pi$, hashes of fixed strings) so that no designer could have chosen them to hide a trapdoor. When you cannot explain \emph{where a constant came from}, treat it as hostile.
 \end{whybox}
 
 \begin{focusbox}
-The practical takeaway is not ``avoid elliptic curves'' -- ECC is excellent and Chapter~21 is devoted to it. It is: \emph{prefer simple, fast, auditable generators with transparently derived constants}, and be suspicious of any primitive that is mysteriously slow, mysteriously biased, or mysteriously favored. CTR\_DRBG (AES) and the ChaCha20-based and HMAC\_DRBG constructions have no such smell; use them.
+The practical takeaway is not to avoid elliptic curves -- ECC is excellent and Chapter~21 is devoted to it. Instead, \emph{prefer simple, fast, auditable generators with transparently derived constants}, and be suspicious of any primitive that is mysteriously slow, mysteriously biased, or mysteriously favored. CTR\_DRBG (AES) and the ChaCha20-based and HMAC\_DRBG constructions show none of these warning signs; use them.
 \end{focusbox}
 
 \subsection{Repeated Nonces in Digital Signatures: The Secret Key Falls Out}
@@ -471,7 +471,7 @@ Now $k$ is known. Plug it back into $s_1 \equiv k^{-1}(h_1 + xr) \pmod n$ and so
 \[
   \boxed{\,x \equiv \frac{s_1\,k - h_1}{r} \bmod n\,}.
 \]
-Two public signatures with a repeated nonce, a handful of modular operations, and Alice's long-term private key is exposed (Figure~\ref{ch17:fig-nonce}). No lattice, no factoring, no brute force -- just two linear equations in two unknowns.
+Two public signatures with a repeated nonce, a handful of modular operations, and Alice's long-term private key is exposed (Figure~\ref{ch17:fig-nonce}). The attack needs no lattices, factoring, or brute force, only two linear equations in two unknowns.
 \end{attackbox}
 
 \begin{example}[Working it with tiny numbers]
@@ -546,7 +546,7 @@ The recovery in Example~\ref{ch17:nonce-tiny} needed only that $n$ be prime so i
 \section{Getting Randomness Right on a Real System}
 \label{ch17:getting-it-right}
 
-Pulling the chapter together into a checklist you can apply. The good news is that the correct path is also the easy one: lean on the OS, and resist the urge to be clever.
+The checklist below pulls the chapter together. The good news is that the correct path is also the easy one: lean on the OS, and resist the urge to be clever.
 
 \begin{description}
   \item[Use the OS CSPRNG, period.] Rely directly on platform APIs like \texttt{getrandom()}, \texttt{os.urandom}, \texttt{secrets}, \texttt{crypto/rand}, \texttt{SecureRandom}, or \texttt{BCryptGenRandom}. The kernel handles collection, extraction, reseeding, and fork safety. Do not reimplement it.
@@ -559,11 +559,11 @@ Pulling the chapter together into a checklist you can apply. The good news is th
 \end{description}
 
 \begin{applicationbox}
-\textbf{In the protocols you know.} TLS 1.3 draws the client and server random fields, the ephemeral ECDHE private keys, and session-ticket secrets from the OS CSPRNG; a predictable client-random or ECDHE key would let an eavesdropper derive the session keys. WiFi's WPA3 SAE and the older WPA2 four-way handshake need unpredictable nonces (the $A$nonce/$S$nonce) -- the KRACK family of attacks abused nonce \emph{reuse} forced by handshake replays, the same nonce-reuse theme from \S\ref{ch17:nonce-reuse}. Signal generates fresh ephemeral Diffie-Hellman keys for its Double Ratchet on every message; a compromised RNG there would unravel forward secrecy entirely. In every case, the protocol's careful security proof silently assumes a uniform random tape, and the OS CSPRNG is what supplies it.
+\textbf{In the protocols you know.} TLS 1.3 draws the client and server random fields, the ephemeral ECDHE private keys, and session-ticket secrets from the OS CSPRNG; a predictable client-random or ECDHE key would let an eavesdropper derive the session keys. WiFi's WPA3 SAE and the older WPA2 four-way handshake need unpredictable nonces (the $A$nonce/$S$nonce) -- the KRACK family of attacks abused nonce \emph{reuse} forced by handshake replays, the same nonce-reuse theme from \S\ref{ch17:nonce-reuse}. Signal generates fresh ephemeral Diffie-Hellman keys for its Double Ratchet on every message; a compromised RNG there would break forward secrecy. In every case, the protocol's careful security proof silently assumes a uniform random tape, and the OS CSPRNG is what supplies it.
 \end{applicationbox}
 
 \begin{focusbox}
-The whole chapter compresses to one sentence: \emph{collect real physical entropy once, seed a good CSPRNG with it, then stretch -- and let the operating system do all three for you.} Every disaster in \S\ref{ch17:failures} came from violating some part of that sentence -- a seed without entropy (Debian), a CSPRNG you cannot trust (Dual\_EC), or output reused where it had to be fresh (nonce reuse). Get the random bits right and the math in the rest of the book actually protects something. Get them wrong and none of it matters.
+The chapter can be summarized in one sentence: \emph{collect real physical entropy once, seed a good CSPRNG with it, then stretch -- and let the operating system do all three for you.} Every disaster in \S\ref{ch17:failures} came from violating some part of that sentence -- a seed without entropy (Debian), a CSPRNG you cannot trust (Dual\_EC), or output reused where it had to be fresh (nonce reuse). If the random bits are weak, the mathematics in the rest of the book protects nothing.
 \end{focusbox}
 
 \begin{connectionbox}
