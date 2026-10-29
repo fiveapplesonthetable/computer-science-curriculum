@@ -120,7 +120,7 @@ const mount: Mount = (root) => {
     nBox.set(
       n0 <= nMax
         ? `For multiplier c = ${c.toFixed(2)}, the quadratic surplus (${(c - 0.4).toFixed(2)}·n²) overtakes the lower-order terms 1.8n + 3 at threshold n₀ = ${n0}, trapping f(n) ≤ c·n² inside the shaded region for all n ≥ ${n0}.`
-        : `Multiplier c = ${c.toFixed(2)} is close to the leading coefficient 0.40, pushing the crossover threshold n₀ = ${n0} past the visible window (n > ${nMax})—yet a finite n₀ still exists!`,
+        : `Multiplier c = ${c.toFixed(2)} is close to the leading coefficient 0.40, so the crossover threshold n₀ = ${n0} lies past the visible window (n > ${nMax}), but a finite n₀ still exists.`,
     );
   }
 

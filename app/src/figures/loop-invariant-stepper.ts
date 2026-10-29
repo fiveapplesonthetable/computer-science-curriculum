@@ -16,7 +16,7 @@ const steps: Step[] = [
   },
   {
     html: `<strong>Termination (${texHtml('j = n+1')}):</strong> The loop terminates when ${texHtml('j = n+1')}. Substituting ${texHtml('j = n+1')} into the invariant shows ${texHtml('A[1..n]')} is sorted.`,
-    why: 'Conclusion guarantees full array sorting.',
+    why: 'Conclusion: the whole array is sorted.',
   },
 ];
 
@@ -128,7 +128,7 @@ const mount: Mount = (root) => {
       jVal === 2
         ? 'Initialization (j = 2): the single-element prefix A[1..1] = [2] has no out-of-order pairs, so the invariant holds before the first iteration.'
         : jVal <= n
-          ? `Maintenance (j = ${jVal}): A[1..${jVal - 1}] is sorted before inserting key A[${jVal}] = ${sampleArr[jVal - 1]} into its proper rank.`
+          ? `Maintenance (j = ${jVal}): A[1..${jVal - 1}] is sorted before inserting key A[${jVal}] = ${sampleArr[jVal - 1]} into its correct position.`
           : `Termination (j = ${n + 1}): the loop exits when j > n; substituting j = ${n + 1} into the invariant proves the entire array A[1..${n}] is sorted.`;
     nBox.set(stageTxt);
   }

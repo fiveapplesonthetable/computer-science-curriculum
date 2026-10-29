@@ -122,7 +122,7 @@ export const chapters: Record<string, Placement[]> = {
       ref: 'definition-1',
       where: 'after',
       fig: 'modular-clock-dh',
-      caption: 'Powers of a generator g wrap around the prime clock Z/17Z, turning exponentiation into a one-way scramble.',
+      caption: 'Powers of a generator g wrap around the prime clock Z/17Z: computing g^x mod p is easy, but recovering x from the result (the discrete logarithm) is believed to be hard.',
     },
   ],
   'cryptography/13': [

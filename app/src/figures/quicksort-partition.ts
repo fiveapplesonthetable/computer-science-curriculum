@@ -108,7 +108,7 @@ const mount: Mount = (root) => {
         ? `Start of partition: pivot x = ${pivotVal} sits at the right end; scan pointer j = 0 has not inspected any elements yet.`
         : jIdx < n
           ? `After scanning ${jIdx} element(s), ${iCount} element(s) ≤ ${pivotVal} are packed in the left region and ${jIdx - iCount} element(s) > ${pivotVal} sit in the middle region.`
-          : `Scan complete: ${iCount} elements ≤ ${pivotVal} lie to the left of index ${iIdx + 1}, ready for the final swap placing pivot ${pivotVal} at its exact sorted rank!`;
+          : `Scan complete: ${iCount} elements ≤ ${pivotVal} lie to the left of index ${iIdx + 1}, ready for the final swap that puts pivot ${pivotVal} in its sorted position.`;
     nBox.set(scanDesc);
   }
 

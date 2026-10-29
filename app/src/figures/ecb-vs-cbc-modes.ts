@@ -176,7 +176,7 @@ const mount: Mount = (root) => {
       nBox.set(`ECB encrypts each block independently (${progress}/64 blocks processed): identical plaintext blocks always map to identical ciphertext blocks, leaking the global image silhouette.`);
     } else if (mode === 'CBC') {
       formulaBox.set(`\\text{CBC: } C_i = E_K(P_i \\oplus C_{i-1})`);
-      nBox.set(`CBC XORs each plaintext block P_i with the previous ciphertext block C_{i−1} before encryption (${progress}/64 blocks), scrambling repeated patterns into uniform pseudo-randomness.`);
+      nBox.set(`CBC XORs each plaintext block P_i with the previous ciphertext block C_{i−1} before encryption (${progress}/64 blocks), so repeated plaintext patterns no longer show in the ciphertext.`);
     } else {
       formulaBox.set(`\\text{CTR: } C_i = P_i \\oplus E_K(\\text{IV} \\parallel i)`);
       nBox.set(`CTR encrypts a unique counter block (IV || i) to generate a keystream pad for each position i (${progress}/64 blocks), so identical plaintext blocks encrypt to distinct ciphertexts in parallel.`);

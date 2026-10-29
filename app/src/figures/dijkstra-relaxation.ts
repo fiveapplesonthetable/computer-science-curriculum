@@ -98,7 +98,7 @@ const STEPS: DijkstraStep[] = [
     u: 't',
     d: { s: 0, a: 3, b: 2, c: 8, d: 10, t: 11 },
     settled: new Set(['s', 'b', 'a', 'c', 'd', 't']),
-    desc: 'Extract min T. Shortest path tree complete! d[T] = 11.',
+    desc: 'Extract min T. Shortest path tree complete: d[T] = 11.',
   },
 ];
 

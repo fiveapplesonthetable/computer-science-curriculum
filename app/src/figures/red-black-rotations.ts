@@ -120,7 +120,7 @@ const mount: Mount = (root) => {
         ? 'Right-heavy root y with left child x: subtree β sits between x and y as the right child of x, while α is at depth 2.'
         : t > 0.85
           ? 'After right rotation (x is root, y is right child): subtree β re-attaches as the left child of y, keeping in-order sequence α < x < β < y < γ intact.'
-          : 'During rotation: pointers rewire in O(1) time—x rises, y descends, and middle subtree β hands off from x.right to y.left.',
+          : 'During rotation: a constant number of pointers change in O(1) time; x moves up, y moves down, and the middle subtree β moves from x.right to y.left.',
     );
   }
 

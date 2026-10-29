@@ -161,7 +161,7 @@ const mount: Mount = (root) => {
     const isRes3 = Math.abs(fw - 3.0) < 0.15;
     nBox.set(
       isRes2 || isRes3
-        ? `Resonance at f_w = ${fw.toFixed(2)} Hz! Winding matches the ${isRes2 ? '2.0 Hz' : '3.0 Hz'} cosine component in x(t), so all signal peaks line up on the right side of the complex plane and pull the center of mass far from the origin.`
+        ? `Resonance at f_w = ${fw.toFixed(2)} Hz: the winding matches the ${isRes2 ? '2.0 Hz' : '3.0 Hz'} cosine component in x(t), so all signal peaks line up on the right side of the complex plane and pull the center of mass far from the origin.`
         : `Off-resonance (f_w = ${fw.toFixed(2)} Hz): the wound curve loops symmetrically around the origin in every direction, so positive and negative contributions cancel out and the center of mass stays near zero.`,
     );
   }
