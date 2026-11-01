@@ -1,0 +1,827 @@
+\chapter{Kotlin From Java 6: Null-Safety, Algebraic Hierarchies, and Coroutines on the JVM}
+\label{ch:kotlin-null-sealed-coroutines}
+
+In Chapter~9 we saw one path away from Java~6: TypeScript abandons the JVM altogether, treats types as mathematical sets of shapes, and erases every static annotation down to dynamic JavaScript objects on V8. That design fits browser interfaces and Node.js gateways well, yet it comes with real trade-offs: numbers default to 64-bit IEEE-754 floats unless you reach for \texttt{bigint}, there is only one user-space thread per V8 isolate, and no nominal class descriptors survive at runtime to guard external boundaries automatically.
+
+Now ask a different engineering question---the exact question JetBrains faced in 2010 while maintaining millions of lines of Java~6 IDE and server code: \emph{what if we keep the JVM itself---HotSpot's C2 JIT compiler, mature concurrent garbage collectors, profiling tools, and twenty years of existing Java libraries---and only want to fix the static language sitting on top of it?}
+
+Look back at our list of Java~6 pain points from Chapter~1:
+\begin{enumerate}
+  \item \textbf{Billion-dollar nullability:} every reference type \texttt{Account} implicitly includes \texttt{null}, turning every dot (\texttt{acct.getOwner().trim()}) into a runtime \texttt{NullPointerException} gamble.
+  \item \textbf{Ceremony and mutability by default:} an immutable three-field value record requires 65 lines of constructors, getters, \texttt{equals}, \texttt{hashCode}, and \texttt{toString}.
+  \item \textbf{Wrapper boxing tax:} giving a primitive \texttt{long} account ID its own type \texttt{class AccountId} costs a 16-byte JVM object header plus pointer indirection on every instance.
+  \item \textbf{Closed sum types require the Visitor pattern:} modeling a fixed set of payment outcomes demands four classes and a double-dispatch visitor interface.
+  \item \textbf{One-thread-per-request concurrency:} every blocking JDBC or HTTP call ties up a 1~MB operating-system kernel thread, hitting an out-of-memory wall long before CPU or network bandwidth saturates.
+\end{enumerate}
+
+Kotlin solves all five problems while compiling down to standard JVM \texttt{.class} files that call Java~6 JARs---and can be called back \emph{from} Java~6 code---within the exact same process and heap. The cleanest way for a Java~6 and C/Rust programmer to master Kotlin is never to treat its features as black-box syntax sugar. Instead, for every construct we meet in this chapter, we will look at \textbf{both} the clean Kotlin surface code \textbf{and} the exact JVM bytecode (decompiled back into equivalent Java~6) that \texttt{kotlinc} emits underneath. The bytecode shows what each feature costs, from nullable primitives and \texttt{@JvmInline} value classes to \texttt{reified} generics and \texttt{suspend} coroutines.
+
+\chapterline
+
+\section{Bridging Java 6 to Kotlin: Same Bytecode Machine, Sharper Lens}
+\label{ch10:java6-to-kotlin-bridge}
+
+When \texttt{kotlinc} compiles a Kotlin file, it does not invoke a custom runtime VM. It emits standard JVM bytecode instructions (\texttt{aload}, \texttt{invokestatic}, \texttt{invokevirtual}, \texttt{checkcast}, \texttt{tableswitch}) plus a tiny runtime JAR (\texttt{kotlin-stdlib}, roughly 1.7~MB) and a \texttt{@kotlin.Metadata} annotation attached to each generated \texttt{.class} header so other Kotlin files can read Kotlin-specific type information (such as nullability, \texttt{sealed} subclasses, and \texttt{inline} bodies) that raw Java~6 bytecode descriptors could not express on their own.
+
+Let us warm up by translating four everyday Kotlin idioms straight down to the Java~6 bytecode \texttt{kotlinc} generates:
+
+\begin{enumerate}
+  \item \textbf{\texttt{val} vs.\ \texttt{var} and Properties (Not Raw Fields):}
+  In Kotlin, \texttt{val} declares a read-only binding (like Java~6 \texttt{final}), while \texttt{var} declares a reassignable binding. When declared on a class, \texttt{val balanceCents: Long} is \emph{not} a raw public Java field; \texttt{kotlinc} emits a \texttt{private final long balanceCents} backing field together with a public \texttt{getBalanceCents()} method. If Java~6 code calls \texttt{acct.getBalanceCents()} and Kotlin code writes \texttt{acct.balanceCents}, both execute the exact same \texttt{invokevirtual getBalanceCents()J} instruction---and you can later replace the stored backing field with a computed custom getter \texttt{val isOverdrawn: Boolean get() = balanceCents < 0L} without breaking binary compatibility.
+  \item \textbf{Default Arguments via Synthetic Bitmask Bridges:}
+  Java~6 requires writing three telescopic method overloads just to give two parameters default values. In Kotlin, you write one declaration:
+\begin{lstlisting}[language=Kotlin]
+fun openAccount(owner: String, currency: String = "USD", overdraftLimit: Long = 0L)
+\end{lstlisting}
+and \texttt{kotlinc} emits two methods in bytecode: the real 3-argument method, plus a synthetic bridge \texttt{openAccount\$default} that takes the same three arguments followed by an \texttt{int mask} and an unused \texttt{Object} marker. The bridge inspects bits of \texttt{mask} (\texttt{(mask \& 2) != 0}, \texttt{(mask \& 4) != 0}) to fill in whichever arguments the call site omitted. Adding a \texttt{@JvmOverloads} annotation tells \texttt{kotlinc} to emit the classic telescopic Java~6 overloads as well, so legacy Java callers get the defaults too.
+  \item \textbf{Extension Functions Compile to Static Receiver-First Methods:}
+  In Java~6 codebases, every project grows a drawer full of \texttt{StringUtils}, \texttt{CollectionUtils}, and \texttt{MoneyUtils} classes because you cannot add methods to \texttt{java.lang.String}. Kotlin lets you write a \emph{receiver type} right before the function name:
+\end{enumerate}
+
+\begin{lstlisting}[language=Kotlin]
+// File: IbanStrings.kt
+package ledger.util
+
+fun String.maskedIban(): String {
+    if (this.length <= 8) return "****"
+    return this.take(4) + "..." + this.takeLast(4)
+}
+
+// Caller reads like a natural method call on String:
+val safeLog = "DE89370400440532013000".maskedIban() // "DE89...3000"
+\end{lstlisting}
+
+How can Kotlin add \texttt{maskedIban()} to \texttt{java.lang.String} when \texttt{java.lang.String} is \texttt{final} inside \texttt{rt.jar}? It doesn't touch \texttt{java.lang.String} at all. Run \texttt{javap -c ledger.util.IbanStringsKt} and look at the decompiled Java~6 equivalent:
+
+\begin{lstlisting}[language=Java]
+// Exact JVM equivalent emitted by kotlinc for IbanStrings.kt:
+public final class IbanStringsKt {
+    public static final String maskedIban(String $this$maskedIban) {
+        Intrinsics.checkNotNullParameter($this$maskedIban, "<this>");
+        if ($this$maskedIban.length() <= 8) return "****";
+        return StringsKt.take($this$maskedIban, 4) + "..."
+             + StringsKt.takeLast($this$maskedIban, 4);
+    }
+}
+\end{lstlisting}
+
+\begin{trapbox}
+\textbf{Extension Functions Dispatch Statically, Never Virtually.} Because \texttt{a.describe()} on an extension function compiles to \texttt{invokestatic ExtensionsKt.\allowbreak{}describe(DeclaredType a)} rather than \texttt{invokevirtual}, the JVM chooses which extension function to call based on the \textbf{compile-time declared type} of the variable, \emph{not} the runtime class of the heap object. If you define both \texttt{fun Account.tag() = "base"} and \texttt{fun CorporateAccount.tag() = "corp"}, and then write \texttt{val x: Account = CorporateAccount(...); println(x.tag())}, it prints \texttt{"base"}. Use member methods inside an interface or sealed hierarchy whenever you want polymorphic runtime dispatch; use extension functions for stateless helpers attached to a type from the outside.
+\end{trapbox}
+
+\section{Nullability in the Type System: Splitting Every Reference Set in Two}
+\label{ch10:nullability-type-system}
+
+In Java~6, the reference type \texttt{String} actually represents the mathematical union $\mathrm{String} \cup \{\texttt{null}\}$, and the compiler refuses to let you name the subset $\mathrm{String}$ \emph{without} \texttt{null}. In Rust (Chapter~5), references are never null and optionality is an explicit sum type \texttt{Option<String>}. In TypeScript with \texttt{strictNullChecks} (Chapter~9), optionality is the explicit set union \texttt{string | null}.
+
+Kotlin brings that exact set-theoretic split onto the JVM. Every type \texttt{T} in Kotlin has two distinct forms:
+\begin{itemize}
+  \item \textbf{\texttt{T} (non-null):} guaranteed at compile time never to hold \texttt{null}.
+  \item \textbf{\texttt{T?} (nullable):} the mathematical union $[\![ \texttt{T} ]\!] \cup \{\texttt{null}\}$.
+\end{itemize}
+Because $[\![ \texttt{T} ]\!] \subsetneq [\![ \texttt{T?} ]\!]$, \textbf{every non-null type \texttt{T} is a subtype of its nullable counterpart \texttt{T?}} ($\texttt{String} <: \texttt{String?}$). Passing a \texttt{String} to a parameter expecting \texttt{String?} always succeeds; passing a \texttt{String?} to a parameter expecting \texttt{String} is a hard compile error.
+
+At the bottom of Kotlin's lattice sits \texttt{Nothing} ($\emptyset$, the exact twin of TypeScript's \texttt{never} and Rust's \texttt{!}), which is a subtype of every type \texttt{T}---while \texttt{Nothing?} ($\emptyset \cup \{\texttt{null}\} = \{\texttt{null}\}$) is the type of the literal \texttt{null} itself. At the top sits \texttt{Any} (the root of all non-null types, unifying both reference classes and primitives like \texttt{Int}) below \texttt{Any?} (the universal top type).
+
+\subsection{Zero-Wrapper Reference Nullability vs.\ Boxed Nullable Primitives}
+
+Now ask the systems-programmer question: \textbf{what does \texttt{String?} vs.\ \texttt{String}---and \texttt{Long?} vs.\ \texttt{Long}---cost in JVM memory?}
+
+In Java~8, the library team introduced \texttt{java.\allowbreak{}util.\allowbreak{}Optional<String>}. Unfortunately, \texttt{Optional} is an ordinary heap-allocated class: wrapping a \texttt{String} reference inside \texttt{Optional.of(s)} allocates an \emph{extra} 16-byte JVM object header plus 8-byte reference field (24 bytes with alignment) around the \texttt{String} pointer.
+
+Kotlin's \texttt{String?} pays \textbf{zero wrapper overhead}. The reason: at the hardware level, a 64-bit JVM reference pointer already has the all-zero bit pattern \texttt{0x0000000000000000} reserved for \texttt{null} (the exact niche optimization we saw for Rust's \texttt{Option<\&T>} in Chapter~5). Therefore, in JVM bytecode:
+\begin{itemize}
+  \item Both \texttt{owner: String} and \texttt{memo: String?} compile to the \textbf{exact same bare JVM reference descriptor \texttt{Ljava/lang/String;}}. No \texttt{Optional} wrapper object is ever allocated.
+  \item To protect non-null Kotlin parameters against untyped or Java~6 callers passing \texttt{null} across a JAR boundary, \texttt{kotlinc} injects a cheap guard call (\texttt{Intrinsics.\allowbreak{}checkNotNullParameter}, passing the argument and its name) at the entry of public methods accepting non-null references, failing fast at the boundary instead of letting \texttt{null} corrupt an internal data structure ten calls deeper.
+\end{itemize}
+
+Now contrast reference types with 64-bit integers (\texttt{Long}). Every one of the $2^{64}$ bit patterns of a raw JVM primitive \texttt{long} (\texttt{J}) represents a valid signed integer from $-2^{63}$ to $2^{63}-1$; there is \emph{no spare bit pattern} left over to represent \texttt{null}. Here is what \texttt{kotlinc} must emit for \texttt{Long} vs.\ \texttt{Long?} (Figure~\ref{ch10:fig-kotlin-null-lattice}):
+\begin{itemize}
+  \item \textbf{\texttt{val cents: Long}} compiles to a raw 8-byte JVM primitive \texttt{long} (\texttt{J}) directly in a CPU register or stack slot---zero heap allocation, zero object header.
+  \item \textbf{\texttt{val optionalFee: Long?}} \emph{must} compile to a boxed heap reference \texttt{Ljava/lang/Long;}. Whenever \texttt{optionalFee} is non-null (outside \texttt{Long.valueOf}'s tiny $-128..127$ cache), it points to a 24-byte heap object (16-byte JVM header + 8-byte \texttt{long}).
+\end{itemize}
+
+\begin{trapbox}
+\textbf{Beware \texttt{Long?} and \texttt{Double?} Inside Million-Element Loops.} In Rust, \texttt{Option<i64>} occupies 16 bytes \emph{inline on the stack or inside a flat \texttt{Vec<Option<i64>>}} (an 8-byte tag+padding word next to the 8-byte \texttt{i64}, zero pointers, zero heap headers). On today's pre-Valhalla JVM, \texttt{Array<Long?>} or \texttt{List<Long>} allocates boxed \texttt{java.lang.Long} heap objects, scattering 24-byte nodes across memory. In hot financial aggregation loops on Kotlin/JVM, use Kotlin's specialized primitive array \texttt{LongArray} (which compiles to JVM \texttt{long[]}, a contiguous flat slab of 8-byte integers) and domain sentinels or parallel bitsets rather than \texttt{List<Long?>}.
+\end{trapbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,
+  nn/.style={draw=targetgreen!85!black,fill=targetgreen!9,rounded corners=3pt,thick,align=center,inner sep=4.5pt,minimum width=3.9cm},
+  nu/.style={draw=sourceblue!85,fill=sourceblue!8,rounded corners=3pt,thick,align=center,inner sep=4.5pt,minimum width=4.2cm},
+  plat/.style={draw=quotientorange!90,fill=quotientorange!10,rounded corners=3pt,thick,dashed,align=center,inner sep=4.5pt,minimum width=3.1cm},
+  sub/.style={->,thick,gray!75!black}]
+
+  % Column labels
+  \node[font=\bfseries\footnotesize,text=targetgreen!75!black] at (0, 4.95) {NON-NULL LADDER (\texttt{T})};
+  \node[font=\bfseries\footnotesize,text=sourceblue!85!black]  at (5.6, 4.95) {NULLABLE LADDER (\texttt{T?})};
+  \node[font=\bfseries\footnotesize,text=quotientorange!85!black] at (10.5, 4.95) {JAVA 6 BRIDGE};
+
+  % Row Top: Any / Any?
+  \node[nn] (any)  at (0, 4.0)   {\textbf{\texttt{Any}}\\ {\scriptsize non-null root}};
+  \node[nu] (anyq) at (5.6, 4.0) {\textbf{\texttt{Any?}}\\ {\scriptsize \texttt{Ljava/lang/Object;} ($\mathcal{U}$)}};
+
+  % Row Mid-1: String / String?
+  \node[nn] (str)  at (0, 2.5)   {\textbf{\texttt{String}}\\ {\scriptsize \texttt{Ljava/lang/String;} (0B box)}};
+  \node[nu] (strq) at (5.6, 2.5) {\textbf{\texttt{String?}}\\ {\scriptsize \texttt{Ljava/lang/String;} (\textbf{0B box.})}};
+  \node[plat] (strp) at (10.5, 2.5) {\textbf{\texttt{String!}}\\ {\scriptsize legacy Java return}\\ {\scriptsize unchecked null.}};
+
+  % Row Mid-2: Long / Long?
+  \node[nn] (lng)  at (0, 1.0)   {\textbf{\texttt{Long}}\\ {\scriptsize primitive \texttt{J} (8B stack)}};
+  \node[nu] (lngq) at (5.6, 1.0) {\textbf{\texttt{Long?}}\\ {\scriptsize \texttt{Ljava/lang/Long;} (\textbf{24B heap.})}};
+
+  % Row Bottom: Nothing / Nothing?
+  \node[nn,draw=structurepurple!85,fill=structurepurple!10] (not)  at (0, -0.5)   {\textbf{\texttt{Nothing}} ($\emptyset$)\\ {\scriptsize \texttt{throw} / \texttt{return}}};
+  \node[nu,draw=structurepurple!85,fill=structurepurple!10] (notq) at (5.6, -0.5) {\textbf{\texttt{Nothing?}} ($\{\texttt{null}\}$)\\ {\scriptsize type of literal \texttt{null}}};
+
+  % Vertical subtype arrows
+  \draw[sub] (not) -- (lng);
+  \draw[sub] (lng) -- (str) node[midway,fill=white,inner sep=1pt,font=\tiny,text=gray]{both $<: \texttt{Any}$};
+  \draw[sub] (str) -- (any);
+
+  \draw[sub] (notq) -- (lngq);
+  \draw[sub] (strq) -- (anyq);
+  \draw[sub] (lngq.east) .. controls (8.1, 1.4) and (8.1, 3.5) .. (anyq.east);
+
+  % Horizontal T <: T? arrows
+  \draw[sub,targetgreen!75!black] (any)  -- node[above,font=\scriptsize]{$<:$} (anyq);
+  \draw[sub,targetgreen!75!black] (str)  -- node[above,font=\scriptsize]{$<:$} (strq);
+  \draw[sub,quotientorange!85!black] (lng) -- node[above,font=\scriptsize]{boxes.} (lngq);
+  \draw[sub,structurepurple!85] (not) -- node[above,font=\scriptsize]{$<:$} (notq);
+
+  % Platform type dashed arrows
+  \draw[<->,dashed,thick,quotientorange!90] (strq.east) -- (strp.west);
+\end{tikzpicture}
+\caption{Kotlin's split subtype hierarchy and JVM descriptors. Every non-null type \texttt{T} embeds into \texttt{T?}. Reference types (\texttt{String?}) reuse the null pointer niche with zero wrapper allocation, whereas nullable primitives (\texttt{Long?}) must box onto the JVM heap as \texttt{java.lang.Long}. Unannotated Java~6 methods surface as platform types (\texttt{String!}).}
+\label{ch10:fig-kotlin-null-lattice}
+\end{figure}
+
+\subsection{Safe Calls, Elvis with \texttt{Nothing}, Smart Casts, and Platform Types}
+
+Once \texttt{null} is isolated inside \texttt{T?}, Kotlin gives you concise, composable operators that compile directly into tight null-branching bytecode with zero allocations:
+
+\begin{lstlisting}[language=Kotlin]
+class Customer(val name: String, val taxCountry: String?)
+class Account(val id: Long, val owner: Customer?)
+
+fun resolveWithholdingCountry(account: Account?): String {
+    // 1. Safe-call chain `?.` short-circuits to null on the first null link;
+    // 2. Elvis `?:` supplies the right-hand fallback when the left side is null:
+    return account?.owner?.taxCountry ?: "US"
+}
+
+fun requireOwnerName(account: Account?): String {
+    // Because `throw ...` has type `Nothing` (empty set!), `Customer? ?: Nothing`
+    // narrows `owner` directly to non-null `Customer` for the rest of the function!
+    val owner: Customer = account?.owner
+        ?: throw IllegalArgumentException("Account has no owner")
+    return owner.name.trim() // `owner` is guaranteed non-null here!
+}
+\end{lstlisting}
+
+Consider \texttt{val owner: Customer = account?.owner ?: throw ...} in \texttt{requireOwnerName}. Why does Kotlin allow a \texttt{throw} (or an early \texttt{return}) on the right-hand side of the Elvis operator \texttt{?:}? Apply the exact same set algebra we learned in Chapter~9. The left side of \texttt{?:} has type \texttt{Customer?}, which is $[\![ \texttt{Customer} ]\!] \cup \{\texttt{null}\}$. When \texttt{?:} handles the \texttt{null} case, the right side evaluates an expression of type \texttt{Nothing} ($\emptyset$). Thus the combined expression has type:
+\[
+  \bigl([\![ \texttt{Customer} ]\!] \setminus \{\texttt{null}\}\bigr) \;\cup\; [\![ \texttt{Nothing} ]\!]
+  \;=\; [\![ \texttt{Customer} ]\!] \cup \emptyset
+  \;=\; [\![ \texttt{Customer} ]\!].
+\]
+Compare this directly to Rust's \texttt{let Some(owner) = ... else \{ return ... \}} from Chapter~5: early-exit guards flatten nested \texttt{if (x != null)} pyramids into straight-line code.
+
+Just like TypeScript's control-flow narrowing, \texttt{kotlinc} also performs \textbf{smart casts}: after \texttt{if (x != null)} or \texttt{if (x is CorporateAccount)}, \texttt{x} automatically narrows to non-null \texttt{T} or \texttt{CorporateAccount}. Notice one soundness rule where Kotlin is \emph{stricter} than TypeScript: \texttt{kotlinc} refuses to smart-cast a mutable \texttt{var} property (or a \texttt{val} with a custom getter) on an object, because another JVM thread could mutate that field between your \texttt{if (acct.owner != null)} check and your \texttt{acct.owner.name} read. Bind it to a local immutable variable first (\texttt{val owner = acct.owner; if (owner != null) ...})---local stack-frame slots are thread-private on the JVM, so the smart cast is 100\% thread-safe.
+
+\begin{trapbox}
+\textbf{Guarding the Java 6 Boundary: Platform Types (\texttt{T!}).} What happens when Kotlin calls a legacy Java~6 method without \texttt{@Nullable} or \texttt{@NotNull} annotations, such as \texttt{java.sql.ResultSet.\allowbreak{}getString("memo")}? If Kotlin forced every unannotated Java return value to be \texttt{String?}, calling Java libraries would require thousands of redundant null checks; if Kotlin assumed \texttt{String}, the first SQL \texttt{NULL} would silently violate non-null guarantees. So \texttt{kotlinc} assigns unannotated Java values a \textbf{platform type}, printed in compiler diagnostics as \texttt{String!} (``\texttt{String} of unknown nullability''). If you assign a \texttt{String!} straight into \texttt{val s: String = rs.getString("memo")}, \texttt{kotlinc} emits an immediate runtime \texttt{checkNotNullExpressionValue} check that throws \texttt{NullPointerException} right on the assignment line if SQL returned \texttt{NULL}. Rule of thumb when calling Java~6 APIs: \emph{always write an explicit type annotation} (\texttt{val memo: String? = rs.getString("memo")}) at the exact line where a Java value enters Kotlin, locking down \texttt{String!} immediately.
+\end{trapbox}
+
+\section{Data, Value, and Sealed Types: Algebraic Modeling on the JVM}
+\label{ch10:data-value-sealed}
+
+With nullability tamed, let us bring the algebraic data types we loved in Rust and OCaml (Parts~II and~III) onto the JVM---and measure their exact object-header and bytecode costs.
+
+\subsection{\texttt{data class}: Value Equality and Copy Without Boilerplate}
+
+In Java~6, \texttt{Object.equals} defaults to pointer identity (\texttt{==}), so every domain value object (\texttt{Posting}, \texttt{Money}, \texttt{DateRange}) needs manual \texttt{equals}, \texttt{hashCode}, and \texttt{toString} implementations. Prefixing a Kotlin class with \texttt{data} instructs \texttt{kotlinc} to generate \texttt{equals}, \texttt{hashCode}, \texttt{toString}, \texttt{copy}, and \texttt{component1()}..\texttt{componentN()} destructuring methods directly from the primary constructor properties:
+
+\begin{lstlisting}[language=Kotlin]
+data class LedgerPosting(
+    val accountId: AccountId,
+    val amountCents: Long,
+    val currency: String,
+)
+
+val p1 = LedgerPosting(AccountId(1001L), 25_00L, "USD")
+val p2 = p1.copy(amountCents = 30_00L) // Immutable update; p1 is untouched!
+val (acct, cents, curr) = p2           // Calls component1(), component2(), component3()
+\end{lstlisting}
+
+Notice Kotlin's equality operators (the reverse of Java~6): in Kotlin, \textbf{\texttt{a == b} compiles to null-safe structural \texttt{equals()}} (\texttt{Intrinsics.areEqual(a, b)}), while \textbf{\texttt{a === b} tests raw JVM heap pointer identity}. You will never again lose an afternoon in production because someone wrote \texttt{currency == "USD"} in Java~6 on a freshly allocated \texttt{String} and got \texttt{false}.
+
+\begin{trapbox}
+\textbf{Two Subtle \texttt{data class} Traps in Financial Code:}
+\begin{enumerate}
+  \item \textbf{Positional destructuring swaps same-typed fields silently.} Writing \texttt{val (from, to) = transfer} compiles to \texttt{val from = transfer.component1(); val to = transfer.component2();} purely by \emph{parameter position}, ignoring variable names. If a teammate later reorders \texttt{data class Transfer(val toAccount: AccountId, val fromAccount: AccountId)}, every destructuring site silently debits the recipient and credits the sender with zero compiler warnings. Prefer explicit property access (\texttt{transfer.fromAccount}) on records with multiple fields of the same type.
+  \item \textbf{Never put raw \texttt{ByteArray} or \texttt{LongArray} in a \texttt{data class} without overriding \texttt{equals}/\texttt{hashCode}.} On the JVM, array \texttt{.equals()} checks pointer identity, not element contents (\texttt{Arrays.equals}), so two \texttt{data class HmacDigest(val bytes: ByteArray)} instances containing identical SHA-256 bytes will evaluate \texttt{d1 == d2} to \texttt{false}. Wrap byte buffers in an immutable \texttt{ByteString} or override \texttt{equals}/\texttt{hashCode} with \texttt{contentEquals}/\texttt{contentHashCode}.
+\end{enumerate}
+\end{trapbox}
+
+\subsection{\texttt{@JvmInline value class}: Zero-Header Domain Types on the JVM}
+
+Recall from Chapter~1 why disciplined Java~6 engineers often gave up on strongly typed wrappers like \texttt{AccountId} and \texttt{UsdCents} in high-throughput services: on a 64-bit JVM (even with compressed OOPs), wrapping an 8-byte \texttt{long} inside \texttt{final class AccountId \{ private final long raw; \}} adds a 12-to-16-byte JVM object header plus alignment padding (24 bytes total on the heap) \emph{plus} an 8-byte pointer in the referring object, tripling memory footprint and causing L1 cache misses.
+
+In Rust, \texttt{struct AccountId(i64)} has zero runtime header: at machine level it is just an \texttt{i64} in a CPU register. In TypeScript (Chapter~9), branded intersections \texttt{bigint \& \{ [Brand]: never \}} achieved the same zero-wrapper result by erasing the brand. How does Kotlin achieve zero-allocation nominal wrappers on the JVM? Via \textbf{\texttt{@JvmInline value class}}:
+
+\begin{lstlisting}[language=Kotlin]
+@JvmInline
+value class AccountId(val raw: Long) {
+    init {
+        require(raw > 0L) { "AccountId must be positive, got $raw" }
+    }
+}
+
+@JvmInline
+value class UsdCents(val raw: Long) {
+    operator fun plus(other: UsdCents): UsdCents = UsdCents(this.raw + other.raw)
+    operator fun minus(other: UsdCents): UsdCents = UsdCents(this.raw - other.raw)
+}
+
+fun bookDebit(account: AccountId, amount: UsdCents): UsdCents {
+    return amount + UsdCents(150L) // + $1.50 wire fee
+}
+\end{lstlisting}
+
+Now inspect the decompiled JVM bytecode emitted by \texttt{kotlinc} for \texttt{bookDebit}:
+
+\begin{lstlisting}[language=Java]
+// Exact JVM bytecode signature emitted by kotlinc (decompiled to Java):
+// Notice the mangled suffix `-4k8pQ2A` and raw `long` (J) parameters & return!
+public static final long bookDebit_4k8pQ2A/* $FF was: bookDebit-4k8pQ2A */(
+    long account,
+    long amount
+) {
+    return UsdCents.constructor_impl(amount + UsdCents.constructor_impl(150L));
+}
+\end{lstlisting}
+
+Three details in that bytecode matter:
+\begin{enumerate}
+  \item \textbf{Zero heap allocation on the fast path:} Both \texttt{AccountId} and \texttt{UsdCents} were completely unboxed into raw 64-bit JVM \texttt{long} values passed in CPU registers. Even the call \texttt{UsdCents.\allowbreak{}constructor\_\allowbreak{}impl(150L)} is a static method returning primitive \texttt{long} (running the \texttt{init} validation check without allocating an object).
+  \item \textbf{Why is the method name mangled to \texttt{bookDebit-4k8pQ2A}?} Think about two things: first, what if you overload \texttt{fun settle(x: UsdCents)} and \texttt{fun settle(x: EurCents)} in the same class? After unboxing, \emph{both} would have the JVM signature \texttt{settle(J)V}, which the JVM classfile verifier rejects as a duplicate method. Hashing the Kotlin value-class types into a suffix (\texttt{-4k8pQ2A} vs.\ \texttt{-9m2zR1B}) keeps their JVM descriptors distinct. Second, a hyphen \texttt{-} is legal in JVM bytecode method names and \emph{illegal} in Java source identifiers---which prevents legacy Java~6 code from accidentally calling \texttt{bookDebit(rawLong1, rawLong2)} with swapped raw \texttt{long}s.
+  \item \textbf{When does a \texttt{value class} still box onto the heap?} Exactly like Java~6 \texttt{int} $\to$ \texttt{Integer}, \texttt{kotlinc} generates a hidden wrapper class used \emph{only} when polymorphism or nullability forces an object pointer: when an \texttt{AccountId} is typed as nullable \texttt{AccountId?}, upcast to an interface \texttt{Any} or \texttt{Comparable<AccountId>}, or stored inside an erased generic collection \texttt{List<AccountId>} (because on today's JVM, \texttt{java.util.List<E>} stores \texttt{Object[]} pointers).
+\end{enumerate}
+
+\subsection{\texttt{sealed interface} and Exhaustive \texttt{when}: Sum Types on the JVM}
+
+Now let us compare how Java~6, Rust, TypeScript, and Kotlin represent a closed sum type of payment authorization outcomes. In Kotlin, marking an \texttt{interface} or \texttt{class} as \textbf{\texttt{sealed}} restricts all direct implementations to live in the same package and compilation module, allowing \texttt{kotlinc} (and the JVM's \texttt{PermittedSubclasses} classfile attribute on JDK~17+) to know the complete, closed universe of variants at compile time:
+
+\begin{lstlisting}[language=Kotlin]
+sealed interface AuthOutcome {
+    data class Approved(
+        val authCode: String,
+        val authorizedAmount: UsdCents,
+    ) : AuthOutcome
+
+    data class Declined(
+        val reason: String,
+        val retryAfterSeconds: Int?,
+    ) : AuthOutcome
+
+    // `data object` = single JVM static singleton (zero allocation per return!)
+    data object LedgerTemporarilyOffline : AuthOutcome
+}
+
+fun httpStatusFor(outcome: AuthOutcome): Int = when (outcome) {
+    is AuthOutcome.Approved -> {
+        // Smart-cast automatically to Approved: `outcome.authCode` is in scope!
+        200
+    }
+    is AuthOutcome.Declined -> if (outcome.retryAfterSeconds != null) 429 else 422
+    AuthOutcome.LedgerTemporarilyOffline -> 503
+    // NO `else` branch needed -- and adding a 4th subtype breaks compilation here!
+}
+\end{lstlisting}
+
+\texttt{when (outcome)} works as a value-returning \emph{expression} (not merely a C/Java~6 statement that can accidentally fall through if you forget \texttt{break}). Because \texttt{AuthOutcome} is \texttt{sealed}, \texttt{kotlinc} verifies that the three arms (\texttt{Approved}, \texttt{Declined}, and the offline singleton) cover every subtype of \texttt{AuthOutcome}---and emits a chain of JVM \texttt{instanceof} + \texttt{checkcast} instructions (or a \texttt{tableswitch}/\texttt{invokedynamic} type switch on modern targets).
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,
+  cell/.style={draw,thick,minimum height=0.72cm,align=center,inner sep=3pt},
+  hdr/.style={cell,draw=trapred!80,fill=trapred!10,font=\scriptsize\bfseries},
+  pay/.style={cell,draw=targetgreen!80!black,fill=targetgreen!10,font=\scriptsize},
+  ptr/.style={cell,draw=sourceblue!80,fill=sourceblue!10,font=\scriptsize}]
+
+  % 1. Java 6 Boxed AccountId
+  \node[anchor=west,font=\bfseries\footnotesize,text=trapred!85!black] at (0, 3.35)
+    {1. Java 6 \texttt{class AccountId} (Heap: 24 B + 8 B ref)};
+  \node[ptr,minimum width=1.9cm] (jref) at (0.95, 2.65) {stack ref (8B)};
+  \node[hdr,minimum width=3.0cm] (jhdr) at (4.5, 2.65) {JVM Header (16B)};
+  \node[pay,minimum width=2.2cm] (jraw) at (7.1, 2.65) {\texttt{long raw} (8B)};
+  \draw[->,thick,sourceblue!80!black] (jref.east) -- (jhdr.west);
+
+  % 2. Kotlin @JvmInline value class AccountId
+  \node[anchor=west,font=\bfseries\footnotesize,text=targetgreen!80!black] at (0, 1.65)
+    {2. Kotlin \texttt{@JvmInline value class AccountId} (Stack/Reg: 8 B, 0 heap.)};
+  \node[pay,minimum width=3.1cm] (kval) at (1.55, 0.95) {\texttt{long raw} (8B in reg)};
+  \node[anchor=west,font=\scriptsize,text=gray!75!black] at (3.4, 0.95)
+    {Same machine word as Rust \texttt{struct AccountId(i64)}.};
+
+  % 3. Rust enum vs Kotlin sealed interface
+  \node[anchor=west,font=\bfseries\footnotesize,text=targetgreen!80!black] at (0, -0.05)
+    {3. Rust \texttt{enum AuthOutcome} (Inline on stack: tag + max variant, 0 ptr)};
+  \node[ptr,minimum width=2.3cm,draw=structurepurple!85,fill=structurepurple!10] (rtag) at (1.15, -0.75) {tag + pad (8B)};
+  \node[pay,minimum width=4.8cm,right=0pt of rtag] (rpay) {largest variant payload inline (32B)};
+
+  \node[anchor=west,font=\bfseries\footnotesize,text=sourceblue!85!black] at (0, -1.75)
+    {4. Kotlin \texttt{sealed interface AuthOutcome} (JVM pointer $\to$ heap subclass)};
+  \node[ptr,minimum width=1.9cm] (kref) at (0.95, -2.45) {stack ref (8B)};
+  \node[hdr,minimum width=3.0cm] (khdr) at (4.5, -2.45) {\texttt{Approved} Hdr (16B)};
+  \node[pay,minimum width=3.5cm,right=0pt of khdr] (kpay) {\texttt{authCode*} + \texttt{long} (16B)};
+  \draw[->,thick,sourceblue!80!black] (kref.east) -- (khdr.west);
+\end{tikzpicture}
+\caption{Physical memory layouts compared. Kotlin's \texttt{@JvmInline value class} eliminates the 16-byte JVM object header on single-field wrappers, matching Rust's newtypes. For multi-field sum types, Rust packs the discriminant tag and union payload flat on the stack, whereas Kotlin's \texttt{sealed interface} uses a standard JVM reference to a heap-allocated variant subclass (except \texttt{data object} variants, which reuse one global singleton).}
+\label{ch10:fig-jvm-rust-layouts}
+\end{figure}
+
+Figure~\ref{ch10:fig-jvm-rust-layouts} makes the exact trade-off between Rust's \texttt{enum} and Kotlin's \texttt{sealed interface} transparent. At the type-system level, both give you closed algebraic sum types and compiler-enforced exhaustiveness. At the hardware level, Rust's \texttt{enum} lives inline on the stack (or flat inside a \texttt{Vec<AuthOutcome>}), whereas Kotlin's \texttt{Approved} variant is still a heap-allocated JVM object (though HotSpot's C2 JIT escape analysis can scalar-replace short-lived \texttt{Approved} objects that do not escape an inlined call chain, and zero-field variants declared \texttt{data object} allocate once at class initialization and never again).
+
+\section{Functions, Receivers, Inline Reification, and Sequences}
+\label{ch10:functions-inline-reified-sequences}
+
+In Java~6, passing a two-line predicate into a method meant writing an eight-line anonymous inner class (\texttt{new Predicate<LedgerPosting>() \{ public boolean apply(LedgerPosting p) \{ ... \} \}}), generating a synthetic \texttt{MyService\$1.class} file on disk and allocating a heap object every time local variables were captured. Kotlin treats functions as first-class types (\texttt{(LedgerPosting) -> Boolean}), yet if you stopped there, every higher-order helper on the JVM would still pay a closure-allocation and virtual-dispatch tax. Let us see how \texttt{kotlinc} eliminates both taxes---and defeats Java~6 generics erasure along the way.
+
+\subsection{Lambdas with Receivers (\texttt{T.() -> R}): How Type-Safe Builders Work}
+
+First, let us demystify one of Kotlin's signature features: \textbf{function types with a receiver}, written \texttt{Receiver.() -> ReturnType}. Beginners who encounter Kotlin Gradle scripts, Ktor routes, or SQL/HTML builders often wonder how a block like \texttt{journalEntry \{ debit(...); credit(...) \}} brings \texttt{debit} and \texttt{credit} into scope without an import or object prefix.
+
+There is zero compiler special-casing behind Kotlin DSLs. Recall from Section~\ref{ch10:java6-to-kotlin-bridge} that an extension function \texttt{fun String.maskedIban()} is simply a static function whose first parameter is named \texttt{this}. A \textbf{lambda with receiver} \texttt{JournalBuilder.() -> Unit} is the exact same idea applied to a function value: at the JVM bytecode level, it is a one-argument function \texttt{Function1<JournalBuilder, Unit>} where inside the braces \texttt{\{ ... \}}, that first parameter is bound to the implicit receiver \texttt{this}.
+
+\begin{lstlisting}[language=Kotlin]
+@DslMarker
+annotation class LedgerDsl
+
+@LedgerDsl
+class JournalBuilder(private val description: String) {
+    private val legs = mutableListOf<LedgerPosting>()
+
+    fun debit(account: AccountId, cents: Long, currency: String = "USD") {
+        require(cents > 0L)
+        legs.add(LedgerPosting(account, -cents, currency))
+    }
+
+    fun credit(account: AccountId, cents: Long, currency: String = "USD") {
+        require(cents > 0L)
+        legs.add(LedgerPosting(account, +cents, currency))
+    }
+
+    fun build(): List<LedgerPosting> {
+        val net = legs.sumOf { it.amountCents }
+        check(net == 0L) { "Unbalanced journal '$description': net = $net cents" }
+        return legs.toList()
+    }
+}
+
+// Trailing lambda with receiver `JournalBuilder.() -> Unit`:
+inline fun journalEntry(
+    description: String,
+    setup: JournalBuilder.() -> Unit,
+): List<LedgerPosting> {
+    val builder = JournalBuilder(description)
+    builder.setup() // Equivalent to `setup.invoke(builder)`!
+    return builder.build()
+}
+
+// Call site: reads like a custom language, fully type-checked by kotlinc!
+val postings = journalEntry("Invoice #4092 settlement") {
+    debit(AccountId(1010L), 250_00L)   // Implicitly `this.debit(...)` on JournalBuilder
+    credit(AccountId(4000L), 250_00L)  // Implicitly `this.credit(...)` on JournalBuilder
+}
+\end{lstlisting}
+
+Notice two details in those thirty lines:
+\begin{enumerate}
+  \item In Kotlin, whenever the \emph{last} parameter of a function is itself a function type, callers may move the lambda braces \emph{outside} the parentheses (\texttt{journalEntry("...") \{ ... \}}). Combine trailing lambdas with a receiver type \texttt{JournalBuilder.() -> Unit}, and you get type-safe builders in twenty lines of ordinary Kotlin.
+  \item What does \texttt{@DslMarker} do? If builders nest (\texttt{ledger \{ journalEntry \{ ... \} \}}), both the outer \texttt{LedgerBuilder} and the inner \texttt{JournalBuilder} would normally be implicit \texttt{this} receivers in scope, letting someone accidentally call an outer \texttt{journalEntry} method inside an inner block. Annotating builder classes with the same \texttt{@DslMarker} meta-annotation hides outer implicit receivers unless explicitly qualified (\texttt{this@ledger}).
+\end{enumerate}
+
+\subsection{\texttt{inline} Functions and \texttt{reified T}: Defeating Closure Allocation and JVM Erasure}
+
+Look back at the keyword \texttt{inline} on \texttt{inline fun journalEntry(...)} above. Why did we write \texttt{inline}, and what happens in JVM bytecode without it?
+
+Suppose we write a helper \texttt{withDatabaseTx(conn) \{ ... \}} \emph{without} \texttt{inline}, and call it inside a hot settlement loop where the lambda captures two local variables \texttt{accountId} and \texttt{amountCents}. Without \texttt{inline}, \texttt{kotlinc} must compile that lambda into an object implementing the interface \texttt{Function0} (from \texttt{kotlin.\allowbreak{}jvm.\allowbreak{}functions}) whose constructor stores \texttt{accountId} and \texttt{amountCents} in fields---allocating a fresh closure object on the JVM heap on every single iteration, plus an \texttt{invokeinterface} call.
+
+Marking the higher-order function \textbf{\texttt{inline}} tells \texttt{kotlinc} to perform C++/Rust-style call-site expansion on \emph{both} the higher-order function \emph{and} every lambda passed to it:
+
+\begin{lstlisting}[language=Kotlin]
+inline fun <T> timedOperation(metricName: String, block: () -> T): T {
+    val startNs = System.nanoTime()
+    try {
+        return block()
+    } finally {
+        val elapsedNs = System.nanoTime() - startNs
+        Metrics.recordLatency(metricName, elapsedNs)
+    }
+}
+\end{lstlisting}
+
+When a caller writes \texttt{val ok = timedOperation("post\_tx") \{ repo.save(tx) \}}, \texttt{kotlinc} splices the bytecode of \texttt{timedOperation} and \texttt{repo.save(tx)} straight into the caller's method body: \textbf{zero \texttt{Function0} class, zero heap closure allocation, and zero virtual call}. Even better, because the lambda's bytecode now sits directly inside the caller's method frame, writing a bare \texttt{return} inside \texttt{timedOperation \{ if (invalid) return ... \}} performs a \textbf{non-local return} straight out of the enclosing function---making custom control-flow helpers (\texttt{synchronized}, \texttt{use}, \texttt{forEach}) behave identically to built-in \texttt{for} and \texttt{if} statements. (If an \texttt{inline} function passes a lambda on to another execution context such as a thread pool where non-local \texttt{return} cannot jump across stack frames, Kotlin requires marking that parameter \texttt{crossinline}, or \texttt{noinline} if it must remain a real heap function object.)
+
+Now watch the second payoff of \texttt{inline}---solving one of Java~6's most annoying generics limitations. In Java~6, because generic type arguments erase to \texttt{Object} in bytecode, you can \emph{never} write \texttt{if (x instanceof T)} or \texttt{T.class}:
+
+\begin{lstlisting}[language=Java]
+// Java 6: forced to pass an explicit `Class<T> clazz` token everywhere!
+public static <T> T decodeJson(String raw, Class<T> clazz) {
+    return OBJECT_MAPPER.readValue(raw, clazz);
+}
+// Call site repeats the type name:
+TransferReq req = decodeJson(body, TransferReq.class);
+\end{lstlisting}
+
+Wait: why did Java~6 lose \texttt{T}? Because a normal generic method is compiled \emph{once} into a single bytecode body shared by all callers, so inside that single shared body \texttt{T} is unknown. What about a Kotlin \textbf{\texttt{inline}} function? Its bytecode is \emph{not} shared---it is pasted straight into each call site, and \textbf{at the call site the compiler knows the exact concrete type argument \texttt{TransferReq}}. Adding the modifier \textbf{\texttt{reified}} on an \texttt{inline} type parameter instructs \texttt{kotlinc} to embed the actual runtime \texttt{Class} token at every inlined call site:
+
+\begin{lstlisting}[language=Kotlin]
+inline fun <reified T : Any> decodeJson(raw: String): T {
+    // Legal ONLY because `inline` + `reified` substitutes the concrete Class<T> at call sites!
+    return OBJECT_MAPPER.readValue(raw, T::class.java)
+}
+
+inline fun <reified E : LedgerEvent> List<LedgerEvent>.filterVariant(): List<E> {
+    val out = ArrayList<E>()
+    for (item in this) {
+        if (item is E) out.add(item) // Real JVM `instanceof` emitted for concrete E!
+    }
+    return out
+}
+
+// Call sites: zero Class<T> boilerplate, checked at runtime by the JVM!
+val req: TransferReq = decodeJson(rawBody) // Inlines `ldc TransferReq.class`!
+\end{lstlisting}
+
+\begin{intuitionbox}
+\textbf{Four Generics Strategies Compared.} The four generics designs in this book line up on one spectrum:
+\begin{itemize}
+  \item \textbf{TypeScript:} 100\% compile-time erasure; neither \texttt{List} nor \texttt{T} leaves a nominal runtime descriptor.
+  \item \textbf{Java~6 (and non-inline Kotlin):} type-argument erasure; the container \texttt{ArrayList} exists at runtime, while \texttt{<T>} erases to \texttt{Object} plus \texttt{checkcast} at callers.
+  \item \textbf{Kotlin \texttt{inline <reified T>}:} call-site bytecode inlining substitutes the concrete \texttt{T::class.java} and \texttt{instanceof} instructions at each caller without needing VM changes.
+  \item \textbf{C++ Templates \& Rust Generics:} full compile-time monomorphization generates distinct native machine-code functions \emph{and} specialized flat memory layouts (\texttt{Vec<i64>} vs.\ \texttt{Vec<Posting>}). Note what Kotlin \texttt{reified} \emph{cannot} do: you still cannot declare a class \texttt{class Cache<reified T>} because class fields live on the heap across methods and cannot be ``inlined''.
+\end{itemize}
+\end{intuitionbox}
+
+\subsection{Eager \texttt{Iterable} Extensions vs.\ Lazy \texttt{Sequence<T>}}
+
+Here is a performance trap that catches almost every developer arriving in Kotlin from Java~8 \texttt{Stream}s or Rust \texttt{Iterator}s. Compare these two pipelines over a list of one million ledger postings:
+
+\begin{lstlisting}[language=Kotlin]
+// Pipeline A: EAGER `Iterable` extensions -- allocates TWO intermediate ArrayLists!
+val firstThreeLargeIdsEager: List<AccountId> = postings
+    .filter { it.amountCents >= 100_000_00L } // Allocates full List #1 of all matches!
+    .map { it.accountId }                     // Allocates full List #2 of all AccountIds!
+    .take(3)                                  // Copies first 3, throws the rest to GC!
+
+// Pipeline B: LAZY `Sequence<T>` -- zero intermediate lists, stops on match #3!
+val firstThreeLargeIdsLazy: List<AccountId> = postings
+    .asSequence()
+    .filter { it.amountCents >= 100_000_00L } // Builds lightweight Sequence stage
+    .map { it.accountId }                     // Builds lightweight Sequence stage
+    .take(3)                                  // Pulls elements ONE BY ONE until 3 match!
+    .toList()                                 // Terminal op materializes 3-element List
+\end{lstlisting}
+
+Why did Kotlin make standard \texttt{List.filter} and \texttt{List.map} \emph{eager} instead of lazy? The answer is in how \texttt{Iterable.filter} is implemented in \texttt{kotlin-stdlib}: it is an \textbf{\texttt{inline}} function containing a plain \texttt{for} loop. When you transform a small 10-element list with a single \texttt{.map \{ ... \}}, an eager \texttt{inline} loop allocates \emph{zero} closure or iterator-stage objects and runs as fast as a hand-written Java~6 \texttt{for} loop. However, the moment you chain \emph{multiple} stages (\texttt{filter} $\to$ \texttt{map} $\to$ \texttt{take} or \texttt{firstOrNull}) over thousands of elements, horizontal eager evaluation materializes an entire intermediate \texttt{ArrayList} after every dot. Calling \texttt{.asSequence()} switches to vertical pull-based lazy evaluation---just like Rust's \texttt{iter().filter(...).map(...).take(3).collect()}---advancing one element through all stages before touching the next element.
+
+\section{Kotlin Coroutines Under the Hood: CPS State Machines and Structured Concurrency}
+\label{ch10:coroutines-cps-structured}
+
+We now reach the centerpiece of server-side and Android Kotlin engineering: \textbf{coroutines}.
+
+Let us start with the hardware arithmetic that broke Java~6's one-thread-per-request server model. Suppose our payment gateway receives $100{,}000$ concurrent checkout requests during a flash sale. Each request spends $0.2$~ms of actual CPU time validating signatures, and $150$~ms waiting on network I/O (a PostgreSQL query plus an external card-network HTTPS call).
+
+In Java~6 (classic Tomcat or blocking thread pools), every \texttt{java.lang.Thread} wraps a 1:1 operating-system kernel thread (\texttt{pthread} on Linux):
+\begin{itemize}
+  \item Each JVM thread reserves a contiguous \textbf{1~MB native call stack} by default (\texttt{-Xss1m}) so deep recursive Java/C JNI calls cannot overflow into neighboring memory, plus kernel \texttt{task\_struct} bookkeeping. Multiplied by $100{,}000$ concurrent requests, thread stacks alone need \textbf{$100\text{ GB}$ of reserved stack address space}. Long before that, the process hits the operating system's per-process thread limit or \texttt{ulimit -u}, and the JVM fails, at under $10\%$ CPU load, with \texttt{java.lang.\allowbreak{}OutOfMemoryError: unable to create new native thread}.
+  \item Even at $10{,}000$ threads, parking and waking kernel threads across \texttt{futex}/\texttt{epoll} system calls incurs $\sim 1.5\text{--}3\,\mu\text{s}$ per context switch plus L1/L2 instruction- and data-cache thrashing across 10,000 disjoint 1~MB stacks.
+\end{itemize}
+
+To escape the 1~MB-per-connection wall in Java~6/7/8, engineers turned to asynchronous callbacks (Netty \texttt{ChannelFutureListener}, \texttt{CompletableFuture.thenCompose}). Callbacks solved the memory problem---100,000 small heap state objects fit in under 20~MB---but at a high cost in readability: simple \texttt{for} loops, \texttt{try/catch/finally} resource cleanup, and sequential step-by-step control flow turned into deeply nested callback pyramids whose exception stack traces started in an anonymous Netty event-loop thread with all caller context erased.
+
+Kotlin asks a clean compiler question: \textbf{what if you write ordinary sequential code with normal loops and \texttt{try/finally}, mark suspending functions with one keyword \texttt{suspend}, and let \texttt{kotlinc} automatically rewrite that sequential function into a tiny, zero-thread-blocking heap state machine?}
+
+\subsection{Inside \texttt{kotlinc}: Continuation-Passing Style (CPS) and the \texttt{label} Switch}
+
+Let us write a realistic twelve-line \texttt{suspend} function with two network suspension points, and then inspect the \emph{exact} Java~6 equivalent state machine that \texttt{kotlinc} generates.
+
+\begin{lstlisting}[language=Kotlin]
+suspend fun settleWire(txId: Long, feeCents: Long): Receipt {
+    // State 0: runs up to Suspension Point #1
+    val account: Account = fetchAccountAsync(txId)
+    // State 1: resumes here once `account` arrives over the socket!
+    val debitedCents: Long = account.balanceCents - feeCents
+    val receipt: Receipt = postClearingHouseAsync(account.id, debitedCents)
+    // State 2: resumes here once `receipt` arrives!
+    auditLog(txId, receipt.confirmationCode)
+    return receipt
+}
+\end{lstlisting}
+
+The function \texttt{settleWire} makes two calls to other \texttt{suspend} functions: \texttt{fetchAccountAsync} and \texttt{postClearing\-HouseAsync}. Those two points divide the function body into \textbf{three sequential basic blocks (States 0, 1, and 2)}. Notice which local variables must stay alive \emph{across} suspension points:
+\begin{itemize}
+  \item \texttt{txId} and \texttt{feeCents} are alive across Suspension Point~\#1 (and \texttt{txId} is still needed after Suspension Point~\#2 for \texttt{auditLog}).
+  \item \texttt{account} is computed at the end of State~0 and consumed in State~1; it is never used in State~2.
+\end{itemize}
+If \texttt{settleWire} surrenders its underlying JVM OS thread while waiting 80~ms for \texttt{fetchAccountAsync} to hear back from PostgreSQL, it \emph{cannot} leave \texttt{txId} and \texttt{feeCents} sitting on the JVM thread stack---another coroutine is about to use that exact OS thread stack two microseconds from now.
+
+So \texttt{kotlinc} performs two mechanical transformations:
+\begin{enumerate}
+  \item \textbf{Continuation-Passing Style (CPS) signature rewrite:} Every \texttt{suspend fun foo(args): R} receives one extra hidden trailing parameter \texttt{Continuation<? super R> \$completion}, and its JVM return type changes from \texttt{R} to \textbf{\texttt{Object}}. Why \texttt{Object}? Because a suspending call can return \emph{either} an immediate \texttt{Receipt} (fast path: data was already in cache, zero suspension needed) \emph{or} the special singleton sentinel \texttt{CoroutineSingletons.\allowbreak{}COROUTINE\_SUSPENDED}, signaling to its caller: ``I have registered a callback on the socket; unwind the JVM stack immediately and free this OS worker thread.''
+  \item \textbf{State-machine \texttt{ContinuationImpl} class:} \texttt{kotlinc} generates a compact state-machine class holding an \texttt{int label} field ($0, 1, 2$) plus fields (\texttt{J\$0}, \texttt{J\$1}, \texttt{L\$0}) for only those local variables whose lifetimes cross a suspension boundary.
+\end{enumerate}
+
+Here is the decompiled Java~6 code corresponding directly to \texttt{kotlinc}'s bytecode for \texttt{settleWire}:
+
+\begin{lstlisting}[language=Java]
+// Simplified Java 6 decompilation of kotlinc's CPS state machine for `settleWire`:
+public static final Object settleWire(
+    long txId,
+    long feeCents,
+    Continuation<? super Receipt> $completion
+) {
+    // Re-entering from resumeWith? Reuse existing state machine; else allocate once!
+    SettleWireCont sm;
+    if ($completion instanceof SettleWireCont
+            && (((SettleWireCont) $completion).label & Integer.MIN_VALUE) != 0) {
+        sm = (SettleWireCont) $completion;
+        sm.label -= Integer.MIN_VALUE;
+    } else {
+        sm = new SettleWireCont($completion);
+    }
+
+    Object $result = sm.result;
+    Object SUSPENDED = CoroutineSingletons.COROUTINE_SUSPENDED;
+
+    switch (sm.label) {
+        case 0: {
+            ResultKt.throwOnFailure($result); // Rethrow if resumed with an exception
+            sm.J$0 = txId;                    // Spill `txId` to heap frame
+            sm.J$1 = feeCents;                // Spill `feeCents` to heap frame
+            sm.label = 1;                     // Next resume enters `case 1:`!
+            $result = fetchAccountAsync(txId, sm);
+            if ($result == SUSPENDED) {
+                return SUSPENDED;             // Unwind JVM stack -> OS thread is FREE!
+            }
+            // Fast path: if already complete, fall straight through to case 1!
+        }
+        case 1: {
+            feeCents = sm.J$1;                // Restore `feeCents`
+            txId = sm.J$0;                    // Restore `txId`
+            ResultKt.throwOnFailure($result);
+            Account account = (Account) $result;
+            long debitedCents = account.getBalanceCents() - feeCents;
+
+            sm.J$0 = txId;                    // Keep `txId` for State 2
+            sm.label = 2;                     // Next resume enters `case 2:`!
+            $result = postClearingHouseAsync(account.getId(), debitedCents, sm);
+            if ($result == SUSPENDED) {
+                return SUSPENDED;             // Unwind JVM stack -> OS thread is FREE!
+            }
+        }
+        case 2: {
+            txId = sm.J$0;                    // Restore `txId`
+            ResultKt.throwOnFailure($result);
+            Receipt receipt = (Receipt) $result;
+            auditLog(txId, receipt.getConfirmationCode());
+            return receipt;                   // Normal completion!
+        }
+        default:
+            throw new IllegalStateException("Invalid coroutine state");
+    }
+}
+\end{lstlisting}
+
+Reading that \texttt{switch (sm.label)} block from top to bottom answers two questions.
+\begin{itemize}
+  \item \textbf{How much memory does a suspended coroutine take?} \texttt{SettleWireCont} holds a JVM object header, a reference to the caller's continuation, the coroutine context and intercepted-continuation references inherited from \texttt{ContinuationImpl}, an \texttt{int label}, \texttt{Object result}, and two \texttt{long} slots \texttt{J\$0}, \texttt{J\$1}---\textbf{under 64 bytes on the JVM heap} with compressed pointers, compared to $1{,}048{,}576$~bytes for a parked OS thread. Spawning $100{,}000$ concurrent coroutines waiting on sockets consumes a few dozen megabytes of young-generation heap instead of $100$~GB of kernel stacks.
+  \item \textbf{What happens when the PostgreSQL socket finishes reading?} Netty/NIO's selector wakes up on a worker thread and invokes \texttt{sm.resumeWith(Result.success(account))}. Inside \texttt{BaseContinuationImpl.resumeWith}, a non-recursive loop sets \texttt{sm.result = account}, flips the sign bit on \texttt{sm.label}, and calls \texttt{settleWire(0L, 0L, sm)}, which jumps straight to \texttt{case 1:} in a single \texttt{tableswitch} instruction. And if the socket failed with an \texttt{IOException}, the continuation is resumed with \texttt{Result.\allowbreak{}failure(ex)}; it enters \texttt{case 1:}, where the \texttt{throwOnFailure} call rethrows the exception right inside any surrounding \texttt{try/catch/finally} block.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,
+  state/.style={draw=sourceblue!85,fill=sourceblue!8,rounded corners=3pt,thick,align=center,inner sep=4.5pt,minimum width=3.9cm},
+  heap/.style={draw=structurepurple!85,fill=structurepurple!9,rounded corners=3pt,thick,align=left,inner sep=5pt},
+  io/.style={draw=quotientorange!85,fill=quotientorange!10,rounded corners=3pt,thick,align=center,inner sep=4pt,minimum width=3.6cm},
+  arr/.style={->,thick}]
+
+  % Left column: State machine states
+  \node[font=\bfseries\footnotesize,text=sourceblue!85!black] at (0, 4.15) {\texttt{switch (sm.label)} IN BYTECODE};
+
+  \node[state] (s0) at (0, 3.1)
+    {\textbf{\texttt{case 0:} Entry}\\ {\scriptsize spill \texttt{J\$0=txId}, \texttt{J\$1=fee}; \texttt{label=1}}\\ {\scriptsize call \texttt{fetchAccountAsync(txId, sm)}}};
+
+  \node[state] (s1) at (0, 1.05)
+    {\textbf{\texttt{case 1:} After DB Read}\\ {\scriptsize restore \texttt{txId, fee}; compute \texttt{debited}}\\ {\scriptsize \texttt{label=2}; \texttt{postClearingHouseAsync(...)}}};
+
+  \node[state,draw=targetgreen!85!black,fill=targetgreen!10] (s2) at (0, -1.0)
+    {\textbf{\texttt{case 2:} After Clearing}\\ {\scriptsize restore \texttt{txId}; \texttt{auditLog(...)}}\\ {\scriptsize \textbf{return \texttt{receipt}}}};
+
+  % Right top: Heap Continuation object
+  \node[heap] (cont) at (7.7, 3.25)
+    {\textbf{\texttt{SettleWireCont} ($<$ 64 B heap)}\\
+     {\scriptsize \texttt{completion: Continuation<Receipt>}}\\
+     {\scriptsize \texttt{label: int} $\in \{0, 1, 2\}$}\\
+     {\scriptsize \texttt{J\$0: long} (\texttt{txId}), \texttt{J\$1: long} (\texttt{feeCents})}\\
+     {\scriptsize \texttt{result: Object}}};
+
+  % Right bottom: Non-blocking Event Loop / Dispatcher
+  \node[io] (ev) at (7.7, 0.25)
+    {\textbf{Non-Blocking I/O + Pool}\\ {\scriptsize OS thread freed on \texttt{SUSPENDED}.}\\ {\scriptsize Socket ready $\Rightarrow$ \texttt{sm.resumeWith()}}};
+
+  % Fast path vertical dashed
+  \draw[arr,dashed,targetgreen!75!black] (s0) -- node[left,font=\scriptsize,text=targetgreen!75!black]{cached} (s1);
+  \draw[arr,dashed,targetgreen!75!black] (s1) -- node[left,font=\scriptsize,text=targetgreen!75!black]{cached} (s2);
+
+  % Suspend / resume arrows
+  \draw[arr,quotientorange!85!black] ([yshift=-6pt]s0.east) -- node[pos=0.45,above right=0pt and 2pt,font=\scriptsize]{\texttt{SUSPENDED}} ([yshift=8pt]ev.west);
+  \draw[arr,sourceblue!85!black] ([yshift=1pt]ev.west) -- node[above=1pt,sloped,font=\scriptsize]{resumes \texttt{label=1}} ([yshift=4pt]s1.east);
+  \draw[arr,quotientorange!85!black] ([yshift=-8pt]s1.east) -- node[below=1pt,sloped,font=\scriptsize]{\texttt{SUSPENDED}} ([yshift=-8pt]ev.west);
+  \draw[arr,targetgreen!80!black] (ev.south west) -- node[below=1pt,sloped,font=\scriptsize]{resumes \texttt{label=2}} (s2.east);
+
+  \draw[<->,dotted,thick,structurepurple!85] ([yshift=6pt]s0.east) -- ([yshift=6pt]cont.west);
+\end{tikzpicture}
+\caption{How \texttt{kotlinc} compiles a \texttt{suspend} function into a Continuation-Passing Style (CPS) state machine. Each suspension point splits the function into numbered \texttt{switch (sm.label)} cases; local variables live across suspension boundaries spill into a small (under 64-byte) \texttt{ContinuationImpl} heap object while the underlying OS worker thread is completely released.}
+\label{ch10:fig-cps-state-machine}
+\end{figure}
+
+\begin{connectionbox}
+\textbf{Kotlin CPS Coroutines vs.\ Rust \texttt{Future} State Machines (Preview of Chapter 12).} Both Kotlin and Rust choose \emph{stackless} coroutines (compiling \texttt{suspend}/\texttt{async} functions into \texttt{label}-switched state machines, unlike Go's 2~KB \emph{stackful} goroutines in Chapter~11), yet they differ in one key memory detail:
+\begin{itemize}
+  \item \textbf{Kotlin (push-resumed CPS, per-frame heap object):} when \texttt{A()} calls suspending \texttt{B()} which calls suspending \texttt{C()}, suspending allocates three small linked \texttt{ContinuationImpl} objects on the JVM heap ($A \leftarrow B \leftarrow C$). Because the JVM already has a fast bump-pointer generational allocator, a few dozen bytes per suspended frame is cheap and permits arbitrary recursive \texttt{suspend} calls naturally.
+  \item \textbf{Rust (pull-polled \texttt{Future::poll}, single flat inline struct):} in Rust, an \texttt{async fn A()} awaiting \texttt{B()} awaiting \texttt{C()} compiles all three nested state machines into \textbf{one contiguous inline \texttt{enum} value} whose exact byte size is computed at compile time---requiring only \emph{one} heap allocation for the entire top-level task on \texttt{tokio::spawn}, and \emph{zero} allocations on nested \texttt{.await} calls. The price of that flat inline layout is that self-referential borrows across \texttt{.await} points cannot move in memory, requiring Rust's \texttt{Pin<\&mut Self>} type (Chapter~12).
+\end{itemize}
+\end{connectionbox}
+
+\subsection{Dispatchers and Structured Concurrency: Taming Background Work}
+
+Knowing how a single coroutine suspends is half the story; the other half is deciding \emph{which thread pool executes each resumption} and \emph{who owns the lifecycle of spawned coroutines}.
+
+In \texttt{kotlinx.coroutines}, a \textbf{\texttt{CoroutineDispatcher}} governs thread scheduling:
+\begin{itemize}
+  \item \textbf{\texttt{Dispatchers.Default}:} a work-stealing pool sized to the number of CPU cores ($\max(2, N_{\text{cores}})$), designed strictly for CPU-bound calculation (hashing, JSON parsing, sorting).
+  \item \textbf{\texttt{Dispatchers.IO}:} an elastic thread pool (defaulting up to $\max(64, N_{\text{cores}})$ threads, sharing underlying worker threads with \texttt{Default} to avoid extra context switches.) designed strictly to wrap \textbf{legacy blocking Java~6 calls} (JDBC \texttt{Connection} queries, blocking file I/O). You hop onto it with \texttt{withContext(\allowbreak{}Dispatchers.IO) \{ ... \}} around the blocking call.
+  \item \textbf{\texttt{Dispatchers.Main}:} single UI event-loop thread (on Android/Desktop), keeping UI mutations race-free just like browser JavaScript.
+\end{itemize}
+
+Even more important than dispatchers is \textbf{Structured Concurrency}, pioneered in production by Roman Elizarov and the Kotlin team. Think about why \texttt{new Thread(runnable).start()} in Java~6 (or \texttt{go fn()} without cancellation discipline) causes resource leaks in large servers: once launched, a detached thread has no lexical parent. If a user cancels their HTTP request after 10~ms, or if one of two parallel fraud-check RPCs fails after 5~ms, detached background tasks keep burning database connections in the dark, and unhandled exceptions vanish into \texttt{UncaughtExceptionHandler}.
+
+Kotlin enforces a strict lexical invariant: \textbf{you cannot call \texttt{launch} or \texttt{async} out of thin air---every coroutine must be spawned inside a \texttt{CoroutineScope} whose \texttt{Job} forms a strict parent--child tree} (Figure~\ref{ch10:fig-structured-concurrency}):
+
+\begin{lstlisting}[language=Kotlin]
+data class EnrichedAccount(val account: Account, val riskScore: Int, val fxRate: BigDecimal)
+
+// `coroutineScope` creates a lexical child scope; it NEVER returns until ALL children finish!
+suspend fun loadEnrichedAccount(accountId: Long): EnrichedAccount = coroutineScope {
+    // Spawn two concurrent child coroutines in parallel:
+    val riskDeferred = async { fetchFraudRiskScoreAsync(accountId) }
+    val fxDeferred   = async { fetchSpotFxRateAsync("USD", "EUR") }
+    val account      = fetchAccountAsync(accountId)
+
+    // If `fetchFraudRiskScoreAsync` throws an IOException after 5ms:
+    // 1. `fxDeferred` is AUTOMATICALLY cancelled immediately!
+    // 2. `coroutineScope` waits for `fxDeferred` cleanup (`finally` blocks), then rethrows!
+    EnrichedAccount(
+        account = account,
+        riskScore = riskDeferred.await(),
+        fxRate = fxDeferred.await(),
+    )
+}
+\end{lstlisting}
+
+Memorize the three guarantees of Kotlin's parent--child \texttt{Job} tree:
+\begin{enumerate}
+  \item \textbf{Lifetime containment (no leaked background work):} a \texttt{coroutineScope \{ ... \}} block cannot return to its caller until every child coroutine launched inside it has reached a terminal state (completed or finished cancelling).
+  \item \textbf{Downward cancellation:} cancelling the parent scope (for instance, when an HTTP client disconnects or \texttt{withTimeout(250.milliseconds)} expires) recursively cancels every descendant coroutine in the subtree.
+  \item \textbf{Upward failure propagation (\texttt{coroutineScope} vs.\ \texttt{supervisorScope}):} in a standard \texttt{coroutineScope}, if \emph{any} child throws an uncaught exception (other than a cancellation exception), it immediately notifies the parent, which cancels all sibling children before propagating the exception upward---exactly right when computing one unified answer like \texttt{EnrichedAccount}. Conversely, when a server loop or batch processor launches \emph{independent} tasks where failure of task~\#1 must \emph{not} abort task~\#2, wrap them in \textbf{\texttt{supervisorScope \{ ... \}}}, which keeps downward cancellation intact while turning off upward sibling-killing.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,
+  job/.style={draw=sourceblue!85,fill=sourceblue!8,rounded corners=3pt,thick,align=center,inner sep=4.5pt,minimum width=3.0cm},
+  sup/.style={draw=targetgreen!85!black,fill=targetgreen!9,rounded corners=3pt,thick,align=center,inner sep=4.5pt,minimum width=3.2cm},
+  fail/.style={draw=trapred!85,fill=trapred!12,rounded corners=3pt,very thick,align=center,inner sep=4.5pt,minimum width=2.8cm}]
+
+  % Left Panel: coroutineScope (All-or-Nothing)
+  \node[font=\bfseries\footnotesize,text=sourceblue!85!black] at (2.2, 3.35)
+    {A. \texttt{coroutineScope} (All-or-Nothing)};
+  \node[job] (p1) at (2.2, 2.35) {\textbf{Parent \texttt{Job}}\\ {\scriptsize cancels siblings on error}};
+  \node[fail] (c1) at (0.5, 0.45) {\textbf{Child 1: Risk}\\ {\scriptsize throws \texttt{IOException}.}};
+  \node[job] (c2) at (3.9, 0.45) {\textbf{Child 2: FX}\\ {\scriptsize auto-cancelled.}};
+
+  \draw[->,very thick,trapred!85] (c1.north) -- node[left=2pt,font=\scriptsize\bfseries,text=trapred!85]{1. fails} (p1.south west);
+  \draw[->,very thick,quotientorange!90!black] (p1.south east) -- node[right=2pt,font=\scriptsize\bfseries,text=quotientorange!90!black]{2. cancel()} (c2.north);
+
+  % Divider
+  \draw[dashed,gray!55] (6.15, -0.3) -- (6.15, 3.5);
+
+  % Right Panel: supervisorScope (Fault Isolation)
+  \node[font=\bfseries\footnotesize,text=targetgreen!80!black] at (10.1, 3.35)
+    {B. \texttt{supervisorScope} (Independent Tasks)};
+  \node[sup] (p2) at (10.1, 2.35) {\textbf{\texttt{SupervisorJob}}\\ {\scriptsize isolates child failures}};
+  \node[fail] (s1) at (8.4, 0.45) {\textbf{Batch Tx \#1}\\ {\scriptsize fails locally}};
+  \node[sup] (s2) at (11.8, 0.45) {\textbf{Batch Tx \#2}\\ {\scriptsize \textbf{keeps running.}}};
+
+  \draw[->,thick,gray!70,dashed] (s1.north) -- node[left=2pt,font=\scriptsize,text=gray!75!black]{blocked} (p2.south west);
+  \draw[->,thick,targetgreen!80!black] (p2.south east) -- node[right=2pt,font=\scriptsize,text=targetgreen!75!black]{unaffected} (s2.north);
+\end{tikzpicture}
+\caption{Failure propagation in structured concurrency. Left: in \texttt{coroutineScope}, an uncaught failure in Child~1 propagates up to the parent \texttt{Job}, which immediately cancels Child~2 before rethrowing. Right: in \texttt{supervisorScope}, Child~1's failure is handled locally without cancelling sibling Batch~Tx~\#2, though cancelling the \texttt{SupervisorJob} from above still cancels all children.}
+\label{ch10:fig-structured-concurrency}
+\end{figure}
+
+\begin{trapbox}
+\textbf{Two Coroutine Cancellation Traps That Freeze Production Servers:}
+\begin{enumerate}
+  \item \textbf{Swallowing \texttt{CancellationException} inside \texttt{catch (e: Exception)}.} How does Kotlin cancel a suspended coroutine? By resuming its continuation with a \texttt{kotlinx.coroutines.\allowbreak{}CancellationException}. If you write a retry loop \texttt{while (true) \{ try \{ doRpc() \} catch (e: Exception) \{ log.warn(e) \} \}}, your broad \texttt{catch (e: Exception)} catches \texttt{CancellationException}, logs it, and keeps looping forever---turning the coroutine into an unkillable zombie. Always rethrow cancellation: \texttt{catch (e: CancellationException) \{ throw e \}} (or use \texttt{runCatching} carefully, rethrowing if \texttt{!coroutineContext.isActive}).
+  \item \textbf{Cooperative CPU loops must check \texttt{ensureActive()}.} Unlike Java~6's deprecated \texttt{Thread.stop()}, coroutine cancellation never asynchronously corrupts memory mid-instruction; it checks for cancellation \emph{at suspension points} (\texttt{delay}, \texttt{withContext}, non-blocking socket calls). A tight CPU loop \texttt{while (i < 1\_000\_000\_000) \{ hash() \}} has zero suspension points and will ignore cancellation unless you call \texttt{ensureActive()} or \texttt{yield()} periodically inside the loop.
+\end{enumerate}
+\end{trapbox}
+
+\subsection{Cold \texttt{Flow<T>} vs.\ Hot \texttt{Channel<T>} and \texttt{StateFlow<T>}}
+
+What if a suspending operation produces not one value (\texttt{suspend fun}: $0\text{ or }1$ async result), and not a synchronous pull stream (\texttt{Sequence<T>}: blocks caller thread), but an \emph{asynchronous stream of values over time}---such as streaming ten million PostgreSQL ledger rows over a cursor or subscribing to live FX ticks? Kotlin separates asynchronous streams cleanly into \textbf{cold} and \textbf{hot} primitives:
+
+\begin{itemize}
+  \item \textbf{Cold \texttt{Flow<T>} (lazy suspending recipe, with automatic backpressure):} Building a flow such as \texttt{val rows = flow \{ ... \}}, whose body loops over a database cursor and calls \texttt{emit(row)} for each row, starts \emph{zero} I/O and allocates no background coroutine. Nothing runs until a consumer invokes the terminal suspending call \texttt{rows.collect \{ writeCsv(it) \}}. Even better: \texttt{emit(value)} inside \texttt{flow \{ ... \}} is itself a \textbf{\texttt{suspend} function} that directly calls the collector's lambda. If \texttt{writeCsv} takes 5~ms on slow disk I/O, \texttt{emit} suspends the database producer for 5~ms automatically---giving you lossless, zero-configuration \textbf{backpressure} without reactive-streams ceremony.
+  \item \textbf{Hot \texttt{Channel<T>} and \texttt{StateFlow<T>} (active concurrent communication):} Whereas each \texttt{.collect()} on a cold \texttt{Flow} starts a fresh execution, a \textbf{\texttt{Channel<T>}} is a hot, thread-safe, suspending bounded queue between independent coroutines (\texttt{send} suspends when the buffer is full; \texttt{receive} suspends when empty---the exact Communicating Sequential Processes model we will study at the core of Go in Chapter~11.), and a \textbf{\texttt{StateFlow<T>}} holds a single current state value (such as live circuit-breaker health or FX snapshot) broadcast to all current subscribers.
+\end{itemize}
+
+\begin{connectionbox}
+\textbf{Looking Ahead to Chapter 11 (Go and the Grand Synthesis).} Chapters~9 and~10 covered two designs. TypeScript gave us structural set types with 100\% compile-time erasure on a single-threaded event loop; Kotlin kept the nominal JVM heap and bytecode ecosystem while adding null-safety, \texttt{@JvmInline} value types, \texttt{sealed} sum hierarchies, and compiler-generated CPS coroutine state machines. Notice that in \emph{both} TypeScript (\texttt{async}/\texttt{await}) and Kotlin (\texttt{suspend}), functions split into two ``colors'': synchronous functions vs.\ asynchronous/suspending functions. In Chapter~11, we meet \textbf{Go}---a language that threw out classes, exceptions, and function coloring altogether in favor of flat value structs, 16-byte implicit structural interfaces, and a runtime M:N scheduler running millions of 2~KB \emph{stackful} goroutines---and then bring all eight languages of this book together in one unified engineering synthesis.
+\end{connectionbox}
+
+\section{Exercises}
+\label{ch10:exercises}
+
+\begin{exercise}[Reference Niche Optimization vs.\ Nullable Primitive Boxing]
+\label{ex:ch10-null-bytecode}
+Write down the exact JVM field descriptors emitted by \texttt{kotlinc} for all four properties of \texttt{class Snapshot(val id: Long, val parentId: Long?, val currency: String, val note: String?)}.
+\begin{enumerate}
+  \item On a 64-bit JVM with 16-byte object headers and 8-byte references, compute the total heap memory (including any referenced \texttt{java.lang.Long} wrapper object when \texttt{parentId = 50000L}) consumed by one \texttt{Snapshot} instance, and explain why \texttt{note: String?} costs zero extra wrapper bytes over \texttt{currency: String} while \texttt{parentId: Long?} costs an extra 24-byte heap allocation.
+  \item Compare this layout byte for byte against Rust's \texttt{struct Snapshot \{ id: i64, parent\_id: Option<i64>, currency: String, note: Option<String> \}}.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[\texttt{@JvmInline value class} Mangling and Boxing Boundaries]
+\label{ex:ch10-value-class-boxing}
+Define two inline value classes \texttt{UsdCents(val raw: Long)} and \texttt{EurCents(val raw: Long)}, each annotated with \texttt{@JvmInline}.
+\begin{enumerate}
+  \item Identify every line that allocates a heap wrapper object in the following snippet: (a) \texttt{val a = UsdCents(500L)}; (b) \texttt{val b: UsdCents? = a}; (c) \texttt{val xs: List<UsdCents> = listOf(a)}; (d) \texttt{val arr = LongArray(1000)}.
+  \item Design a zero-boxing \texttt{@JvmInline} value class \texttt{UsdCentsArray} wrapping a private \texttt{LongArray}, with \texttt{operator fun get(index: Int): UsdCents} and \texttt{operator fun set(index: Int, \allowbreak{}value: UsdCents)} so a million-element array of \texttt{UsdCents} occupies one flat $8\text{ MB}$ slab on the JVM heap with full compile-time currency type safety.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Extension Dispatch vs.\ \texttt{sealed interface} Dispatch]
+\label{ex:ch10-dispatch-puzzle}
+Suppose \texttt{sealed interface FeeRule} has two implementations: \texttt{data object ZeroFee} and \texttt{data class FlatFee(val cents: Long)}. A colleague defines two overloaded extension functions, \texttt{FeeRule.label()} returning \texttt{"generic"} and \texttt{FlatFee.label()} returning \texttt{"flat"}.
+\begin{enumerate}
+  \item What does \texttt{val r: FeeRule = FlatFee(150L); println(r.label())} print, and what exact JVM instruction (\texttt{invokestatic} vs.\ \texttt{invokeinterface}) does \texttt{kotlinc} emit?
+  \item Rewrite \texttt{label()} cleanly in two idiomatic ways---once as a polymorphic member property on \texttt{FeeRule}, and once as a single extension function using an exhaustive \texttt{when (this)} expression---and explain the trade-off when adding new variants vs.\ adding new operations (the classic \emph{Expression Problem} from Part~III).
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Tracing \texttt{inline}, \texttt{noinline}, \texttt{crossinline}, and \texttt{reified}]
+\label{ex:ch10-inline-reified}
+Explain why each of the following three Kotlin snippets fails to compile without a modifier change, and fix each one:
+\begin{enumerate}
+  \item \texttt{fun <T : Any> checkType(x: Any): Boolean = x is T} (without \texttt{inline}/\texttt{reified}).
+  \item An \texttt{inline fun runOnPool} taking an \texttt{Executor} and a \texttt{block: () -> Unit}, whose body runs \texttt{exec.execute \{ block() \}} (why can't a non-\texttt{crossinline} lambda be invoked inside another object or lambda?).
+  \item A 4-stage \texttt{Iterable} pipeline chaining \texttt{.filter}, \texttt{.map}, \texttt{.filter}, and \texttt{.firstOrNull()} over a 2,000,000-element \texttt{List<Tx>} where the very first element matches all predicates: count the intermediate list allocations before and after adding \texttt{.asSequence()}.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Hand-Compiling a \texttt{suspend} Loop into a CPS State Machine]
+\label{ex:ch10-hand-compile-cps}
+Consider the suspending retry helper:
+\begin{lstlisting}[language=Kotlin]
+suspend fun fetchWithRetry(id: Long, maxAttempts: Int): Account {
+    var attempt = 1
+    while (attempt < maxAttempts) {
+        try {
+            return fetchAccountAsync(id)
+        } catch (e: IOException) {
+            delay(50L * attempt)
+            attempt += 1
+        }
+    }
+    return fetchAccountAsync(id)
+}
+\end{lstlisting}
+\begin{enumerate}
+  \item Count the suspension points in \texttt{fetchWithRetry} and list the exact \texttt{label} states ($0, 1, \dots$) and spilled fields on the generated \texttt{ContinuationImpl} subclass.
+  \item Trace why catching only \texttt{IOException} (rather than \texttt{Exception} or \texttt{Throwable}) lets a 100~ms \texttt{withTimeout} on an outer scope cancel the retry loop immediately during \texttt{delay}, whereas catching \texttt{Exception} would delay or defeat cancellation.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[\texttt{coroutineScope} vs.\ \texttt{supervisorScope} in a Ledger Settlement Batch]
+\label{ex:ch10-structured-concurrency}
+You are implementing two endpoints: (A) \texttt{transferWithAudit(cmd)}, which concurrently checks fraud limits and AML sanctions before booking a single transfer (if either check fails, the transfer must abort immediately and cancel the other check); and (B) \texttt{settleEndOfDayBatch(accountIds)}, which settles 500 independent merchant accounts with bounded concurrency of 16 at a time (if merchant~\#42 fails, the remaining 499 merchants must still settle, while server shutdown must still cancel all 500).
+Write idiomatic Kotlin coroutine skeletons for both (A) and (B), specifying whether each uses \texttt{coroutineScope} or \texttt{supervisorScope} (plus \texttt{Semaphore(16)}) and verifying zero leaked coroutines in every error scenario.
+\end{exercise}

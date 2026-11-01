@@ -191,4 +191,32 @@ export const chapters: Record<string, Placement[]> = {
       caption: 'Drag the signal frequency f₀ past the Nyquist limit f_s / 2: the discrete samples fold onto a slower alias wave.',
     },
   ],
+
+  // ---------------- Programming Languages From the Ground Up ----------------
+  'languages/3': [
+    {
+      ref: 'definition-1',
+      where: 'after',
+      fig: 'rust-borrow-timeline',
+      caption: 'Drag across program lines to watch Rust enforce Aliasing XOR Mutability and end borrows at their last read via Non-Lexical Lifetimes.',
+    },
+  ],
+  'languages/12': [
+    {
+      ref: 'intuitionbox-1',
+      where: 'after',
+      fig: 'async-poll-statemachine',
+      caption: 'Scrub through Future::poll transitions to see an async fn reuse a single 64-byte inline enum frame across .await suspension points.',
+    },
+  ],
+
+  // ---------------- Databases and PostgreSQL From the Ground Up ----------------
+  'databases/5': [
+    {
+      ref: 'formalbox-1',
+      where: 'after',
+      fig: 'postgres-mvcc-snapshot',
+      caption: 'Drag the reader snapshot horizon xmax across a 4-tuple heap chain (including an aborted update at tx 105) to evaluate HeapTupleSatisfiesMVCC live.',
+    },
+  ],
 };

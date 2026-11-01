@@ -1,0 +1,1292 @@
+\chapter{Thinking Functionally: From Imperative Loops through OCaml and Haskell to Rust}
+\label{ch07:functional-thinking}
+
+In Part~II we opened the hood on Rust's memory and type machinery: single ownership
+and borrowing in Chapter~3, region lifetimes in Chapter~4, algebraic \texttt{struct}
+and \texttt{enum} layouts in Chapter~5, and Chapter~6's separation of flat data from
+behavior through traits such as \texttt{FeePolicy}, static monomorphization, and
+16-byte \texttt{\&dyn FeePolicy} fat pointers. You can now read a Rust type signature
+and draw the exact stack and heap bytes it governs.
+
+Yet engineers arriving from Java~6 and C often hit a second wall when writing their
+first thousand lines of Rust. Their code compiles, yet every function starts with
+four \texttt{let mut} accumulators and boolean flags, every conditional mutates an
+outer variable across three branches, and every fallible lookup drowns in nested
+\texttt{match} statements. They are writing imperative Java~6 in Rust syntax---and
+the borrow checker pushes back because mutable state smeared across wide scopes
+creates overlapping borrows.
+
+Here is the historical connection that explains idiomatic Rust: although Rust took its
+curly braces and flat memory model from C and C++, its control flow, algebraic types,
+pattern matching, traits, closures, and error pipelines descend directly from two
+functional languages---\textbf{OCaml} and \textbf{Haskell}. Read without the academic
+jargon, both languages teach a small set of practical engineering habits:
+compute by reducing expressions to values rather than mutating places step by step;
+push side effects to explicit boundaries; make absence and failure ordinary values;
+and compose small functions into pipelines. Studying OCaml and Haskell alongside Rust
+shows where those ideas came from \emph{and} how ownership lets Rust compile them
+into zero-allocation, register-tight machine loops without a garbage collector.
+
+\chapterline
+
+\section{Rewiring the \texttt{for}-Loop Brain: Statements vs.\ Expressions}
+\label{ch07:statements-vs-expressions}
+
+Java~6 and C split their grammar into two unequal categories: \emph{statements},
+which execute in sequence to mutate memory places or jump elsewhere, and
+\emph{expressions}, which evaluate to values (\texttt{a + b}, \texttt{x > 0}).
+Because \texttt{if}/\texttt{else}, \texttt{switch}, \texttt{for}, and \texttt{\{...\}}
+blocks are statements in Java~6, they cannot hand back values directly. That grammar
+trains your fingers to compute by \emph{place-mutation}: declare an empty variable in
+an outer scope, walk through branches that overwrite it, and hope every path left it
+consistent.
+
+Consider summarizing settled USD postings in a ledger batch using Chapter~6's
+\texttt{FeePolicy} (\texttt{fee\_\allowbreak{}in\_\allowbreak{}cents}) to deduct fees on credits and assign a
+reserve status string. In Java~6 we reach for outer mutable slots:
+
+\begin{lstlisting}[language=Java]
+// Java 6: computation via step-by-step place-mutation
+public static BatchSummary summarizeUsd(
+        List<Posting> postings, FeePolicy feePolicy) {
+    long total = 0L;
+    for (int i = 0; i < postings.size(); i++) {
+        Posting p = postings.get(i);
+        if (p.isSettled() && "USD".equals(p.getCurrency())) {
+            if (p.isCredit()) {
+                long gross = p.getAmountCents();
+                total += gross - feePolicy.feeInCents(gross);
+            } else {
+                total -= p.getAmountCents();
+            }
+        }
+    }
+
+    String status;
+    if (total >= 10000000L) {
+        status = "INSTITUTIONAL_SURPLUS";
+    } else if (total >= 0L) {
+        status = "STANDARD_POSITIVE";
+    } else {
+        status = "DEFICIT_WATCH";
+    }
+    return new BatchSummary(total, status);
+}
+\end{lstlisting}
+
+Notice three maintenance hazards hidden inside this everyday method:
+\begin{enumerate}
+  \item \textbf{Split declaration and initialization.} \texttt{String status;} creates
+    a named slot before any value exists. If a teammate initializes
+    \texttt{String status = null;} during a six-branch refactor to silence Java's
+    definite-assignment check and forgets one \texttt{else if} arm, \texttt{null}
+    escapes silently into production. In C or C++, reading an uninitialized
+    \texttt{int64\_t total;} on a missed branch is immediate undefined behavior.
+  \item \textbf{Temporal coupling and wide mutable scope.} Both \texttt{total} and
+    \texttt{status} remain mutable until \texttt{return}. Reordering two statements
+    below the loop can silently read half-updated state.
+  \item \textbf{Entangled loop mechanics.} One \texttt{for} body mixes index stepping,
+    USD settlement filtering, credit/debit sign logic, fee deduction, and summation.
+\end{enumerate}
+
+\subsection{Everything is an Expression: Java~6 vs.\ OCaml vs.\ Rust}
+
+In OCaml and Rust, \texttt{if}/\texttt{else}, \texttt{match}, and \texttt{\{...\}}
+blocks are \emph{expressions} that evaluate directly to typed values. Compare the
+same settled-USD calculation in OCaml and in Rust:
+
+\begin{lstlisting}[language=OCaml]
+(* OCaml: match, if/else, and let-in blocks all evaluate to values *)
+type direction = Credit | Debit
+type posting = {
+  settled : bool; usd : bool; dir : direction; cents : int64
+}
+
+let signed_net (fee_fn : int64 -> int64) (p : posting) : int64 =
+  match p.dir with
+  | Credit ->
+      let fee = fee_fn p.cents in
+      Int64.sub p.cents fee
+  | Debit -> Int64.neg p.cents
+
+let summarize_usd (posts : posting list) (fee_fn : int64 -> int64) =
+  let total =
+    posts
+    |> List.filter (fun p -> p.settled && p.usd)
+    |> List.map (signed_net fee_fn)
+    |> List.fold_left Int64.add 0L
+  in
+  let status =
+    if total >= 10000000L then "INSTITUTIONAL_SURPLUS"
+    else if total >= 0L then "STANDARD_POSITIVE"
+    else "DEFICIT_WATCH"
+  in
+  (total, status)
+\end{lstlisting}
+
+\begin{lstlisting}[language=Rust]
+// Rust: blocks { ... tail_expr }, if, and match bind immutable values
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Direction { Credit, Debit }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Currency { Usd, Eur }
+
+pub struct Posting {
+    pub settled: bool,
+    pub currency: Currency,
+    pub dir: Direction,
+    pub amount_cents: i64,
+}
+
+pub trait FeePolicy {
+    fn fee_in_cents(&self, amount_cents: i64) -> i64;
+}
+
+pub fn signed_net<P: FeePolicy>(policy: &P, p: &Posting) -> i64 {
+    match p.dir {
+        Direction::Credit => {
+            let fee = policy.fee_in_cents(p.amount_cents);
+            p.amount_cents - fee // tail expression: value of this block!
+        }
+        Direction::Debit => -p.amount_cents,
+    }
+}
+
+pub fn summarize_usd<P: FeePolicy>(
+    postings: &[Posting],
+    policy: &P,
+) -> (i64, &'static str) {
+    let total: i64 = postings
+        .iter()
+        .filter(|p| p.settled && p.currency == Currency::Usd)
+        .map(|p| signed_net(policy, p))
+        .sum();
+
+    let status = if total >= 10_000_000 {
+        "INSTITUTIONAL_SURPLUS"
+    } else if total >= 0 {
+        "STANDARD_POSITIVE"
+    } else {
+        "DEFICIT_WATCH"
+    };
+    (total, status)
+}
+\end{lstlisting}
+
+Every mutable outer slot disappeared. \texttt{total} and \texttt{status} are bound
+once, immutably, at the exact instant their values are ready. Inside the
+\texttt{Direction::Credit} arm, the block \texttt{\{ let fee = ...; p.amount\_cents - fee \}}
+scopes \texttt{fee} locally, evaluates its tail expression without a semicolon, and
+hands the resulting \texttt{i64} out as the value of the arm. Delete the final
+\texttt{else} branch of \texttt{status}, and the program refuses to compile because
+every arm of an expression must produce the exact same type.
+
+\begin{focusbox}
+\textbf{Statements Mutate Places; Expressions Reduce to Values.} Whenever you catch
+yourself declaring \texttt{let mut result;} above an \texttt{if} or \texttt{match} in
+Rust, rewrite it as \texttt{let result = match ... \{ ... \};}. You eliminate
+uninitialized gaps, shrink mutable borrow lifetimes to zero, and force the type
+checker to verify that every branch produces a compatible value.
+\end{focusbox}
+
+\subsection{Why \texttt{;} Yields \texttt{()} and Why C/Java \texttt{void} Breaks Generics}
+
+Why does omitting the semicolon on \texttt{p.amount\_\allowbreak{}cents - fee} return
+the \texttt{i64}, while adding \texttt{;} fails with ``expected \texttt{i64}, found
+\texttt{()}''? Because Rust borrowed OCaml's \textbf{unit type} \texttt{()} instead of
+C and Java's \texttt{void}.
+
+In C and Java~6, \texttt{void} is a syntactic keyword meaning ``no value at all.'' You
+cannot declare \texttt{void x;} or plug \texttt{void} into a type parameter \texttt{<T>}:
+\begin{itemize}
+  \item Java~6 had to invent \emph{both} \texttt{Runnable} (\texttt{void run()}) and
+    \texttt{Callable<V>} (\texttt{V call()}), plus the uninstantiable class
+    \texttt{java.lang.Void} whose sole value is \texttt{null}---forcing every
+    \texttt{Callable<Void>} implementation to end with \texttt{return null;}.
+  \item C++ libraries must specialize \texttt{Promise<void>} separately from
+    \texttt{Promise<T>} because \texttt{T val = f();} fails to parse when \texttt{T}
+    is \texttt{void}.
+\end{itemize}
+
+\begin{definition}[The Zero-Byte Unit Type \texttt{()}]
+\label{ch07:def-unit-type}
+The \emph{unit type} (written \texttt{unit} with sole value \texttt{()} in OCaml, and
+\texttt{()} for both the type and its sole value in Haskell and Rust) is the 0-element
+product type inhabited by exactly one value. Because distinguishing among $1$
+possibility requires $\log_2(1) = 0$ bits, \texttt{std::mem::size\_of::<()>() == 0}.
+\end{definition}
+
+Making \texttt{()} a genuine zero-sized type (\emph{ZST}) unifies three rules cleanly:
+\begin{enumerate}
+  \item Writing \texttt{fn record\_metric(x: i64)} is exact shorthand for
+    \texttt{fn record\_metric(x: i64) -> ()}.
+  \item Placing \texttt{;} after an expression evaluates the expression, drops its
+    result, and evaluates the block to \texttt{()}. Likewise, \texttt{if cond \{ work(); \}}
+    without \texttt{else} compiles \emph{only} when its body yields \texttt{()},
+    matching the implicit \texttt{else \{ () \}}.
+  \item Generic types work uniformly with zero overhead: \texttt{Result<(), LedgerError>}
+    carries zero payload bytes in its \texttt{Ok(())} variant, and Rust's standard
+    \texttt{HashSet<K>} is a thin wrapper around \texttt{HashMap<K, ()>}
+    generating zero value-storage bytes or instructions.
+\end{enumerate}
+
+\section{OCaml's Direct DNA in Rust}
+\label{ch07:ocaml-dna}
+
+\begin{historybox}
+In the 1970s at Edinburgh, Robin Milner designed \textbf{ML} (\emph{Meta Language})
+to script proof tactics inside the LCF theorem prover, inventing polymorphic
+Hindley--Milner type inference and abstract module types so no buggy tactic could ever
+forge an invalid theorem of type \texttt{thm}. At INRIA in France, Xavier Leroy,
+Damien Doligez, J\'er\^ome Vouillon, and colleagues evolved Milner's ML through Caml into
+\textbf{OCaml} (1996), pairing ML's expressive type system with a fast native-code
+compiler (\texttt{ocamlopt}) and a low-latency generational garbage collector.
+
+When \textbf{Graydon Hoare} started Rust in 2006, he wrote the entire original Rust
+bootstrap compiler (\texttt{rustboot}, roughly 38{,}000 lines of code developed from
+2006 to 2010 before \texttt{rustc} became self-hosting in 2011) \emph{in OCaml}. That
+is why Rust's \texttt{let}, \texttt{fn}, \texttt{match}, \texttt{Option}/\texttt{Result},
+\texttt{()} unit values, and tick-prefixed lifetimes (\texttt{'a}, echoing OCaml's
+polymorphic type variables \texttt{'a}) carry unmistakable ML DNA.
+\end{historybox}
+
+Let us put real, runnable OCaml side by side with Java~6 and Rust to master five ML
+ideas---and pinpoint exactly where Rust's lack of a garbage collector changes the
+underlying data structures.
+
+\subsection{Immutability by Default, Shadowing, and \texttt{ref} Cells vs.\ \texttt{let mut}}
+
+In OCaml, \texttt{let} bindings are permanently immutable. Multi-step pipelines use
+\emph{lexical shadowing} to bind clean intermediate stages, while genuine mutation
+requires allocating an explicit mutable heap cell (\texttt{'a ref}) created with
+\texttt{ref}, read with \texttt{!}, and overwritten with \texttt{:=}:
+
+\begin{lstlisting}[language=OCaml]
+(* OCaml: immutable shadowing vs explicit heap-allocated ref cell *)
+let clamp_after_fee (raw_cents : int) (bps : int) : int =
+  let cents = max 0 raw_cents in
+  let fee   = (cents * bps) / 10000 in
+  let cents = cents - fee in  (* shadows earlier cents; does not mutate! *)
+  max 0 cents
+
+let count_positive (xs : int list) : int =
+  let count = ref 0 in (* allocates 16B mutable cell on GC heap *)
+  List.iter (fun x -> if x > 0 then count := !count + 1) xs;
+  !count
+\end{lstlisting}
+
+\begin{happeningbox}
+\textbf{OCaml's 63-Bit Tagged Integers vs.\ Rust's Unboxed \texttt{let mut}.}
+Because OCaml compiles polymorphic functions once without monomorphization, its
+moving garbage collector must distinguish integers from pointers at runtime inside
+any 64-bit register. OCaml reserves bit~0 of every 64-bit word as a tag: heap
+pointers are 8-byte aligned (ending in \texttt{0}), while immediate \texttt{int}s,
+\texttt{bool}s, and \texttt{()} set bit~0 to \texttt{1} (\texttt{(n << 1) | 1}),
+giving 63-bit signed integers with zero boxing. (Full 64-bit \texttt{int64} values
+box on the heap unless locally unboxed by \texttt{ocamlopt}.) Rust has no GC and
+monomorphizes generics, so \texttt{let mut count: usize = 0;} mutates a raw 64-bit
+stack/register integer in place with zero heap allocation, using borrow checking
+(\texttt{\&mut count}) rather than a heap \texttt{ref} box when a closure mutates it.
+\end{happeningbox}
+
+\subsection{Algebraic Variants and Structural Pattern Matching}
+
+Compare an OCaml algebraic variant representing credits, debits, and inline-record
+reversals with its direct Rust \texttt{enum} mirror:
+
+\begin{lstlisting}[language=OCaml]
+(* OCaml: algebraic variant + structural match with 'when' guards *)
+type posting =
+  | Credit of int64
+  | Debit of int64
+  | Reversal of { orig_id : int; reason : string }
+
+let net_delta (frozen : bool) (p : posting) : (int64, string) result =
+  match (frozen, p) with
+  | (_, Credit c) when c > 0L -> Ok c
+  | (true, Debit _) -> Error "account frozen"
+  | (false, Debit c) when c > 0L -> Ok (Int64.neg c)
+  | (false, Reversal { orig_id; reason }) when orig_id > 0 ->
+      if String.length reason >= 3 then Ok 0L else Error "short reason"
+  | _ -> Error "invalid posting"
+\end{lstlisting}
+
+\begin{lstlisting}[language=Rust]
+// Rust: identical variant modeling and 2D tuple + guard matching
+pub enum PostingOp {
+    Credit(i64),
+    Debit(i64),
+    Reversal { orig_id: u32, reason: String },
+}
+
+pub fn net_delta(
+    frozen: bool, p: &PostingOp,
+) -> Result<i64, &'static str> {
+    match (frozen, p) {
+        (_, PostingOp::Credit(c)) if *c > 0 => Ok(*c),
+        (true, PostingOp::Debit(_)) => Err("account frozen"),
+        (false, PostingOp::Debit(c)) if *c > 0 => Ok(-*c),
+        (false, PostingOp::Reversal { orig_id, reason })
+            if *orig_id > 0 =>
+        {
+            if reason.len() >= 3 { Ok(0) } else { Err("short reason") }
+        }
+        _ => Err("invalid posting"),
+    }
+}
+\end{lstlisting}
+
+Instead of Java~6 \texttt{instanceof} ladders or sprawling Visitor boilerplates, both
+languages match the pair \texttt{(frozen, p)} as a flat 2D truth table and verify
+exhaustiveness at compile time.
+
+\subsection{Persistent Data Structures and Structural Sharing (\texttt{x :: xs})}
+
+If OCaml lists are immutable, does prepending an element onto a 10{,}000-item list
+copy all 10{,}000 items? Never. An OCaml \texttt{'a list} is either empty (\texttt{[]})
+or an immutable heap \textbf{cons cell} \texttt{x :: xs} storing head \texttt{x} and
+a pointer to tail \texttt{xs}:
+
+\begin{lstlisting}[language=OCaml]
+(* OCaml: O(1) persistent updates share the exact same immutable tail *)
+let base = [20; 30; 40] (* 20 :: 30 :: 40 :: [] -> 3 cons cells *)
+let a    = 10 :: base   (* 1 new cons cell pointing to base *)
+let b    = 99 :: base   (* 1 new cons cell ALSO pointing to base *)
+\end{lstlisting}
+
+As Figure~\ref{ch07:fig-structural-sharing} illustrates, only \textbf{five} cons cells
+exist in RAM. Because every cell is permanently immutable, \texttt{a} and \texttt{b}
+safely alias \texttt{base} without defensive \texttt{new ArrayList<>(base)} copies.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Stealth,
+  rootbox/.style={draw=sourceblue!85!black,fill=sourceblue!10,rounded corners=2pt,thick,minimum width=1.45cm,minimum height=0.58cm,font=\footnotesize\ttfamily},
+  ptr/.style={->,thick,gray!80!black}]
+
+  \node[font=\bfseries\scriptsize,text=sourceblue!85!black] at (0.85, 2.25) {BINDINGS};
+  \node[rootbox] (ra) at (0.85, 1.45) {a};
+  \node[rootbox] (rb) at (0.85, -0.05) {b};
+  \node[rootbox] (rbase) at (0.85, -1.25) {base};
+
+  \node[font=\bfseries\scriptsize,text=quotientorange!85!black] at (3.45, 2.25) {NEW ($\Oh(1)$)};
+  \draw[quotientorange!85!black,fill=quotientorange!12,thick,rounded corners=2pt] (2.55, 1.1) rectangle (4.35, 1.8);
+  \draw[quotientorange!85!black,thick] (3.55, 1.1) -- (3.55, 1.8);
+  \node[font=\footnotesize\ttfamily\bfseries] at (3.05, 1.45) {10};
+  \fill[gray!80!black] (3.95, 1.45) circle (2pt);
+
+  \draw[quotientorange!85!black,fill=quotientorange!12,thick,rounded corners=2pt] (2.55, -0.4) rectangle (4.35, 0.3);
+  \draw[quotientorange!85!black,thick] (3.55, -0.4) -- (3.55, 0.3);
+  \node[font=\footnotesize\ttfamily\bfseries] at (3.05, -0.05) {99};
+  \fill[gray!80!black] (3.95, -0.05) circle (2pt);
+
+  \node[font=\bfseries\scriptsize,text=targetgreen!80!black] at (8.6, 2.25) {SHARED IMMUTABLE TAIL (\texttt{base}, SAFE ALIASING)};
+  \draw[targetgreen!80!black,fill=targetgreen!9,thick,rounded corners=2pt] (5.45, 0.35) rectangle (7.25, 1.05);
+  \draw[targetgreen!80!black,thick] (6.45, 0.35) -- (6.45, 1.05);
+  \node[font=\footnotesize\ttfamily\bfseries] at (5.95, 0.7) {20};
+  \fill[gray!80!black] (6.85, 0.7) circle (2pt);
+
+  \draw[targetgreen!80!black,fill=targetgreen!9,thick,rounded corners=2pt] (8.05, 0.35) rectangle (9.85, 1.05);
+  \draw[targetgreen!80!black,thick] (9.05, 0.35) -- (9.05, 1.05);
+  \node[font=\footnotesize\ttfamily\bfseries] at (8.55, 0.7) {30};
+  \fill[gray!80!black] (9.45, 0.7) circle (2pt);
+
+  \draw[targetgreen!80!black,fill=targetgreen!9,thick,rounded corners=2pt] (10.65, 0.35) rectangle (12.65, 1.05);
+  \draw[targetgreen!80!black,thick] (11.65, 0.35) -- (11.65, 1.05);
+  \node[font=\footnotesize\ttfamily\bfseries] at (11.15, 0.7) {40};
+  \node[font=\scriptsize\ttfamily,text=gray!75!black] at (12.15, 0.7) {[]};
+
+  \draw[ptr] (ra.east) -- (2.55, 1.45);
+  \draw[ptr] (rb.east) -- (2.55, -0.05);
+  \draw[ptr,quotientorange!85!black] (3.95, 1.45) to[out=0,in=155] (5.45, 0.83);
+  \draw[ptr,quotientorange!85!black] (3.95, -0.05) to[out=0,in=205] (5.45, 0.57);
+  \draw[ptr,sourceblue!80!black] (rbase.east) to[out=0,in=235] (5.65, 0.35);
+  \draw[ptr] (6.85, 0.7) -- (8.05, 0.7);
+  \draw[ptr] (9.45, 0.7) -- (10.65, 0.7);
+
+  \node[draw=structurepurple!75!black,fill=structurepurple!7,rounded corners=3pt,thick,
+        text width=12.5cm,align=left,inner sep=5pt,font=\scriptsize] at (6.4, -2.95) {
+    \textbf{\color{structurepurple!90!black}GC Nursery vs.\ Rust \texttt{Vec<T>}:}
+    Each OCaml cons cell occupies 24B (8B GC header + 8B head + 8B tail pointer). OCaml's bump-pointer minor nursery allocates \texttt{10 :: base} in $\sim$2 instructions and collects dead cells in bulk. Because Rust has \textbf{no GC}, sharing tails requires \texttt{Rc<Node<T>>} (adding 16B ref-count headers + pointer-chasing cache misses), so idiomatic Rust favors flat contiguous \texttt{Vec<T>} buffers and slices (\texttt{\&[T]}) paired with lazy iterators.
+  };
+\end{tikzpicture}
+\caption{Persistent structural sharing in OCaml: \texttt{a = 10 :: base} and \texttt{b = 99 :: base} allocate one cons cell each while sharing the immutable tail \texttt{[20; 30; 40]}.}
+\label{ch07:fig-structural-sharing}
+\end{figure}
+
+\subsection{Currying, Partial Application, Pipes (\texttt{|>}), and Tail Recursion}
+
+Every multi-argument OCaml function is \textbf{curried}: \texttt{apply\_bps} below has
+type \texttt{int -> int -> int}, meaning \texttt{int -> (int -> int)}. Supplying just
+the first argument (\texttt{apply\_bps 25}) returns a partially applied closure
+\texttt{int -> int} ready to drop straight into a \texttt{|>} (\texttt{let (|>) x f = f x})
+pipeline alongside \texttt{List.filter}, \texttt{List.map}, and \texttt{List.fold\_left}:
+
+\begin{lstlisting}[language=OCaml]
+(* OCaml: currying, partial application, |> pipe, and tail recursion *)
+let apply_bps (bps : int) (cents : int) : int =
+  cents - ((cents * bps) / 10000)
+
+let net_after_25bps : int -> int = apply_bps 25
+
+let settled_batch_total (amounts : int list) : int =
+  amounts
+  |> List.filter (fun c -> c > 0)
+  |> List.map net_after_25bps
+  |> List.fold_left ( + ) 0
+
+(* Explicit-accumulator tail recursion compiles to a register jump *)
+let sum_tail_recursive (xs : int list) : int =
+  let rec loop acc remaining =
+    match remaining with
+    | [] -> acc
+    | x :: rest -> loop (acc + x) rest (* tail call: reuses frame! *)
+  in
+  loop 0 xs
+\end{lstlisting}
+
+Look at \texttt{List.fold\_left} and \texttt{loop}: instead of mutating an outer variable,
+the running state rides explicitly in \texttt{acc}. Because \texttt{loop (acc + x) rest}
+is the final action of the function (\textbf{tail position}), \texttt{ocamlopt}'s
+\textbf{Tail-Call Optimization (TCO)} updates the CPU registers holding \texttt{acc}
+and \texttt{remaining} and jumps back to the top of \texttt{loop}---consuming $\Oh(1)$
+stack space across ten million nodes. (Rust does not \emph{guarantee} tail calls,
+partly because RAII \texttt{Drop} destructors must run after a callee returns, so a
+call that looks like it is in tail position often is not. Idiomatic Rust uses a loop
+or \texttt{Iterator::fold}, which compiles directly to a machine loop.)
+
+\subsection{Hindley--Milner Inference, \texttt{fn} Boundaries, and Modules}
+
+Write a polymorphic list transformer in OCaml with zero type annotations:
+
+\begin{lstlisting}[language=OCaml]
+let rec map_postings xs f =
+  match xs with
+  | [] -> []
+  | x :: rest -> (f x) :: (map_postings rest f)
+(* Inferred: val map_postings : 'a list -> ('a -> 'b) -> 'b list *)
+\end{lstlisting}
+
+Using \textbf{Hindley--Milner type inference} (Algorithm~W), OCaml assigns fresh type
+variables to \texttt{xs} and \texttt{f}, collects equations from \texttt{x :: rest}
+and \texttt{f x}, and solves (\emph{unifies}) them to deduce the most general type
+\texttt{'a list -> ('a -> 'b) -> 'b list}.
+
+\begin{whybox}
+\textbf{Why Rust Stops Hindley--Milner at \texttt{fn} Boundaries.}
+Inside a function body, Rust uses Hindley--Milner-style unification (\texttt{let mut v = Vec::new();}
+is inferred from a later \texttt{v.push(5\_i64)}). Yet Rust mandates explicit parameter
+and return types on every \texttt{fn} header for three engineering reasons:
+\begin{enumerate}
+  \item \textbf{Strictly local error messages:} a mistake inside function $B$ always
+    fails inside $B$ against $B$'s signature rather than silently changing $B$'s
+    inferred type and triggering a baffling unification clash three modules away.
+  \item \textbf{SemVer contracts:} editing a function body cannot accidentally break
+    callers' type or lifetime bounds.
+  \item \textbf{Tractable traits + parallel checking:} trait-based method lookup,
+    lifetime subtyping, and deref coercions would make whole-program inference
+    fragile and slow; explicit \texttt{fn} headers let \texttt{rustc} check each
+    function body on its own.
+\end{enumerate}
+\end{whybox}
+
+Even in OCaml, production engineers seal module boundaries behind explicit signatures
+(\texttt{module type} / \texttt{sig ... end}), hiding internal representations just as
+Rust uses \texttt{mod} with private struct fields:
+
+\begin{lstlisting}[language=OCaml]
+module type FEE_POLICY = sig
+  type t
+  val make_bps     : int -> t option
+  val fee_in_cents : t -> int64 -> int64
+end
+
+module TieredBps : FEE_POLICY = struct
+  type t = int (* hidden outside TieredBps! *)
+  let make_bps b = if b >= 0 && b <= 10000 then Some b else None
+  let fee_in_cents bps cents =
+    Int64.div (Int64.mul cents (Int64.of_int bps)) 10000L
+end
+\end{lstlisting}
+
+\section{Haskell's Big Ideas Without the Ivory-Tower Fog}
+\label{ch07:haskell-ideas}
+
+Released in 1990 by Simon Peyton Jones, Philip Wadler, Paul Hudak, John Hughes, and
+colleagues, \textbf{Haskell} pushed functional design to a clean extreme: pure
+functions everywhere, lazy evaluation by default, and ad-hoc overloading through
+typeclasses. Let us strip the academic mist off Haskell's four biggest ideas and see
+how each one maps into everyday Rust.
+
+\subsection{Referential Transparency vs.\ Rust's Controlled Local Mutation}
+
+\begin{definition}[Referential Transparency]
+\label{ch07:def-referential-transparency}
+An expression $e$ is \emph{referentially transparent} if replacing $e$ anywhere with
+its evaluated value leaves program behavior completely unchanged. A function is
+\emph{pure} if its output depends solely on its explicit arguments and it produces
+zero observable side effects (no mutation of external state, no I/O).
+\end{definition}
+
+Pure functions give you algebraic substitution, zero hidden temporal coupling, trivial
+unit tests, and race-free parallelism. Compare sorting and deduplicating ledger
+amounts in pure Haskell versus owned-value Rust:
+
+\begin{lstlisting}[language=Haskell]
+-- Haskell: pure transformation allocating new immutable list nodes
+import Data.List (sort)
+
+sortAndDedup :: [Int] -> [Int]
+sortAndDedup xs = dedup (sort xs)
+  where
+    dedup [] = []
+    dedup [y] = [y]
+    dedup (y1 : y2 : rest)
+      | y1 == y2  = dedup (y2 : rest)
+      | otherwise = y1 : dedup (y2 : rest)
+\end{lstlisting}
+
+\begin{lstlisting}[language=Rust]
+// Rust: in-place L1-cache mutation inside, 100-percent pure to callers!
+pub fn sort_and_dedup(mut items: Vec<i64>) -> Vec<i64> {
+    items.sort_unstable(); // mutates flat buffer in place, 0 heap allocs
+    items.dedup();         // linear in-place compaction
+    items
+}
+\end{lstlisting}
+
+Consider \texttt{sort\_and\_dedup(mut items: Vec<i64>) -> Vec<i64>}. Inside its
+body, it mutates array slots in L1 cache with zero garbage-collector churn. Yet to
+\emph{every caller in the program}, \texttt{sort\_and\_dedup} is \textbf{100 percent
+referentially transparent}. Because \texttt{items} is moved in by value (and even on
+borrowed helpers, \texttt{\&mut} forbids any external alias from existing), no outside
+observer can witness the in-place swaps. This is the style PL engineers call
+\emph{functional in the large, imperative in the small}.
+
+\subsection{Lazy Evaluation vs.\ Zero-Allocation Demand-Driven Iterators}
+
+Haskell evaluates expressions \emph{lazily} (call-by-need): an unevaluated expression
+is packaged as a heap \textbf{thunk} \texttt{[code\_ptr | env]} and forced only when
+downstream pattern matching demands it. That lets Haskell compose pipelines over
+infinite lists cleanly:
+
+\begin{lstlisting}[language=Haskell]
+-- Haskell: [1..] is infinite, yet 'take 5' pulls only until 5 evens arrive
+firstFiveEvenSquares :: [Int]
+firstFiveEvenSquares =
+  take 5 (filter even (map (\x -> x * x) [1..]))
+-- Evaluates to [4, 16, 36, 64, 100] and halts!
+\end{lstlisting}
+
+\begin{trapbox}
+\textbf{Heap Thunks and Haskell's \texttt{foldl} Space Leak.}
+Pervasive laziness has a sharp hardware cost: every suspended computation is a heap
+object, and lazy accumulators silently build long chains of thunks. In Haskell,
+\texttt{foldl (+) 0 [1..1000000]} does \emph{not} add integers as it walks the list;
+it allocates one million nested heap thunks \texttt{(((0 + 1) + 2) + ...)}, blowing
+memory when forced at the end unless you switch to strict \texttt{Data.List.foldl'}.
+\end{trapbox}
+
+Look at how Rust achieves the exact same pull-based infinite pipeline in a strict
+language with \textbf{zero heap thunks}:
+
+\begin{lstlisting}[language=Rust]
+// Rust: pull-based laziness encoded as flat stack state machines
+pub fn first_five_even_squares() -> Vec<i64> {
+    (1_i64..)                      // 8-byte RangeFrom<i64> on stack
+        .map(|x| x * x)            // wraps RangeFrom in stack Map struct
+        .filter(|x| (x & 1) == 0)  // wraps Map in stack Filter struct
+        .take(5)                   // pulls .next() until 5 items match
+        .collect()                 // [4, 16, 36, 64, 100]
+}
+\end{lstlisting}
+
+Every expression in Rust is strict, so an \texttt{i64} is always a raw 8-byte integer,
+never a thunk. Laziness is opt-in through the \texttt{Iterator} trait, where each
+stage advances on stack registers one element at a time when \texttt{.next(\&mut self)}
+is pulled.
+
+\subsection{Typeclasses (\texttt{Eq}, \texttt{Ord}, \texttt{Show}, \texttt{FeePolicy}) $\to$ Rust Traits}
+
+In 1989, Philip Wadler and Stephen Blott introduced Haskell \textbf{typeclasses} to
+support principled ad-hoc polymorphism (\texttt{Eq}, \texttt{Ord}, \texttt{Show})
+without OOP class hierarchies. Put Haskell's \texttt{class}/\texttt{instance} right
+next to Chapter~6's Rust \texttt{trait}/\texttt{impl}:
+
+\begin{lstlisting}[language=Haskell]
+-- Haskell: typeclass + separate instance + constrained generic function
+class FeePolicy a where
+  feeInCents :: a -> Int -> Int
+
+data FlatBps = FlatBps Int deriving (Eq, Ord, Show)
+
+instance FeePolicy FlatBps where
+  feeInCents (FlatBps bps) cents = div (cents * bps) 10000
+
+netCredit :: FeePolicy p => p -> Int -> Int
+netCredit policy cents = cents - feeInCents policy cents
+\end{lstlisting}
+
+\begin{lstlisting}[language=Rust]
+// Rust: direct descendant -- traits + derive + monomorphized bounds
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct FlatBps(pub i64);
+
+impl FeePolicy for FlatBps {
+    fn fee_in_cents(&self, cents: i64) -> i64 {
+        (cents * self.0) / 10_000
+    }
+}
+
+pub fn net_credit<P: FeePolicy>(policy: &P, cents: i64) -> i64 {
+    cents - policy.fee_in_cents(cents)
+}
+\end{lstlisting}
+
+Rust traits are Wadler--Blott typeclasses compiled via C++-style monomorphization (or
+explicit \texttt{\&dyn FeePolicy} fat pointers). Unlike Java~6 interfaces, which attach
+to heap objects via \texttt{this} headers, typeclasses and traits attach to \emph{types}
+---allowing static factories like \texttt{Default::default() -> Self}, retroactive
+implementations on existing types, and global \emph{coherence} (orphan rules).
+
+\subsection{Functors (\texttt{.map()}) and Monads (\texttt{.and\_then()} and \texttt{?})}
+
+Suppose validating a ledger debit runs four fallible steps in sequence:
+\texttt{parse\_id -> find\_account -> active\_limit -> check\_headroom}, followed by a
+pure cent-to-dollar scaling step. In Java~6 returning \texttt{null} on failure, four
+dependent steps create a deeply indented \texttt{if (x != null)} pyramid:
+
+\begin{lstlisting}[language=Java]
+// Java 6: nested null-check pyramid
+public static Long checkDebitDollars(
+        LedgerBook book, String rawId, long debitCents) {
+    Long id = parseId(rawId);
+    if (id != null) {
+        Account acct = book.findAccount(id);
+        if (acct != null) {
+            Long limit = activeLimit(acct);
+            if (limit != null) {
+                Long headroom = checkHeadroom(limit, debitCents);
+                if (headroom != null) {
+                    return headroom / 100L;
+                }
+            }
+        }
+    }
+    return null;
+}
+\end{lstlisting}
+
+Functional languages flatten this staircase with two exact abstractions:
+
+\begin{enumerate}
+  \item \textbf{Functor (\texttt{fmap} in Haskell, \texttt{.map()} in OCaml/Rust):}
+    lifts an \emph{infallible} function $f : A \to B$ into a context $F\langle A\rangle \to F\langle B\rangle$
+    (\texttt{Maybe a}/\texttt{Option<A>}, \texttt{Either e a}/\texttt{Result<A, E>}, or
+    \texttt{Iterator}), obeying identity (\texttt{x.map(|a| a) == x}) and composition
+    (\texttt{x.map(f).map(g) == x.map(|a| g(f(a)))}---the mathematical license for
+    \emph{loop fusion}).
+  \item \textbf{Why \texttt{.map()} alone nests wrappers:} \texttt{find\_account} has
+    type \texttt{u64 -> Option<\&Account>}. Calling \texttt{parse\_id(raw).map(|id| find\_account(book, id))}
+    wraps the inner \texttt{Option} inside a second \texttt{Some}, yielding
+    \texttt{Option<Option<\&Account>>}.
+  \item \textbf{Monad (\texttt{>>=} ``bind'' in Haskell, \texttt{Option.bind} in OCaml,
+    \texttt{.and\_then()} in Rust):} takes $M\langle A\rangle$ and a context-producing
+    step $A \to M\langle B\rangle$, runs the step if a value is present, and
+    \emph{flattens one layer} so the output stays a flat $M\langle B\rangle$.
+\end{enumerate}
+
+Compare Haskell's \texttt{>>=} and \texttt{do}-notation directly beside Rust's
+\texttt{.and\_then()} and \texttt{?} operator on the exact same four-step pipeline:
+
+\begin{lstlisting}[language=Haskell]
+-- Haskell: monadic bind (>>=) and equivalent do-notation
+checkDebitBind :: LedgerBook -> String -> Int -> Maybe Int
+checkDebitBind book raw debit =
+  parseId raw
+    >>= (\acctId   -> findAccount book acctId)
+    >>= (\acct     -> activeLimit acct)
+    >>= (\limit    -> checkHeadroom limit debit)
+    >>= (\headroom -> Just (div headroom 100))
+
+checkDebitDo :: LedgerBook -> String -> Int -> Maybe Int
+checkDebitDo book raw debit = do
+  acctId   <- parseId raw
+  acct     <- findAccount book acctId
+  limit    <- activeLimit acct
+  headroom <- checkHeadroom limit debit
+  Just (div headroom 100)
+\end{lstlisting}
+
+\begin{lstlisting}[language=Rust]
+// Rust: .and_then() + .map() chain vs identical '?' operator
+pub fn check_debit_chain(
+    book: &LedgerBook, raw: &str, debit_cents: i64,
+) -> Option<i64> {
+    parse_id(raw)
+        .and_then(|id| book.find_account(id))
+        .and_then(|acct| active_limit(acct))
+        .and_then(|limit| check_headroom(limit, debit_cents))
+        .map(|headroom| headroom / 100)
+}
+
+pub fn check_debit(
+    book: &LedgerBook, raw: &str, debit_cents: i64,
+) -> Option<i64> {
+    let id = parse_id(raw)?;
+    let acct = book.find_account(id)?;
+    let limit = active_limit(acct)?;
+    let headroom = check_headroom(limit, debit_cents)?;
+    Some(headroom / 100)
+}
+\end{lstlisting}
+
+Look at \texttt{checkDebitDo} and \texttt{check\_debit}: a Monad is simply a
+\textbf{programmable semicolon}. Between each line, \texttt{<-} in Haskell and
+\texttt{?} in Rust inspect the \texttt{Maybe}/\texttt{Option} (or \texttt{Either}/\texttt{Result})
+tag, unwrapping \texttt{Some}/\texttt{Ok} values along the top rail and diverting
+\texttt{None}/\texttt{Err} onto a short-circuit bypass rail (Figure~\ref{ch07:fig-railway-monad}).
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Stealth,
+  swbox/.style={draw=sourceblue!85!black,fill=sourceblue!9,rounded corners=3pt,thick,align=center,minimum width=2.2cm,minimum height=0.92cm,font=\scriptsize},
+  purebox/.style={draw=structurepurple!85!black,fill=structurepurple!9,rounded corners=3pt,thick,align=center,minimum width=2.05cm,minimum height=0.92cm,font=\scriptsize},
+  okline/.style={->,very thick,targetgreen!80!black},
+  errline/.style={->,very thick,trapred!80!black}]
+
+  \node[font=\scriptsize\ttfamily\bfseries,text=gray!80!black] (inp) at (-0.65, 1.05) {raw};
+  \node[swbox] (s1) at (1.35, 1.05) {\textbf{\texttt{parse\_id}}\\[-1pt]{\tiny \texttt{str -> Option<u64>}}};
+  \node[swbox] (s2) at (4.15, 1.05) {\textbf{\texttt{find\_account}}\\[-1pt]{\tiny \texttt{.and\_then} / \texttt{?}}};
+  \node[swbox] (s3) at (6.95, 1.05) {\textbf{\texttt{check\_headroom}}\\[-1pt]{\tiny \texttt{.and\_then} / \texttt{?}}};
+  \node[purebox] (s4) at (9.75, 1.05) {\textbf{\texttt{|h| h / 100}}\\[-1pt]{\tiny Functor \texttt{.map()}}};
+
+  \node[font=\scriptsize\ttfamily\bfseries,text=targetgreen!80!black] (okout) at (11.95, 1.05) {Some(d)};
+  \node[font=\scriptsize\ttfamily\bfseries,text=trapred!80!black] (errout) at (11.95, -0.6) {None};
+
+  \draw[okline] (inp.east) -- (s1.west);
+  \draw[okline] (s1.east) -- node[above,font=\tiny\ttfamily,text=targetgreen!80!black] {id} (s2.west);
+  \draw[okline] (s2.east) -- node[above,font=\tiny\ttfamily,text=targetgreen!80!black] {lim} (s3.west);
+  \draw[okline] (s3.east) -- node[above,font=\tiny\ttfamily,text=targetgreen!80!black] {h} (s4.west);
+  \draw[okline] (s4.east) -- (okout.west);
+
+  \draw[trapred!80!black,very thick] (1.35, -0.6) -- (11.0, -0.6);
+  \draw[errline] (11.0, -0.6) -- (errout.west);
+  \draw[errline] (s1.south) -- node[right,font=\tiny\ttfamily,text=trapred!80!black] {None} (1.35, -0.6);
+  \draw[errline] (s2.south) -- node[right,font=\tiny\ttfamily,text=trapred!80!black] {None} (4.15, -0.6);
+  \draw[errline] (s3.south) -- node[right,font=\tiny\ttfamily,text=trapred!80!black] {None} (6.95, -0.6);
+
+  \node[font=\tiny,text=structurepurple!85!black,align=center] at (9.75, 0.18) {(pure $A \to B$:\\[-1pt]no switch track)};
+  \node[font=\tiny\bfseries,text=targetgreen!80!black] at (5.6, 1.85) {TOP RAIL (\texttt{Some(T)} / \texttt{Ok(T)}): unwrapped value passed into next stage};
+  \node[font=\tiny\bfseries,text=trapred!80!black] at (5.6, -1.02) {BYPASS RAIL (\texttt{None} / \texttt{Err(E)}): short-circuits remaining pipeline};
+\end{tikzpicture}
+\caption{Railway-oriented pipeline: monadic bind (\texttt{.and\_then} / \texttt{?}) splices two-track switches without nesting \texttt{Option<Option<T>>}, whereas functor \texttt{.map} lifts a single-track function $A \to B$ onto the top rail.}
+\label{ch07:fig-railway-monad}
+\end{figure}
+
+
+\section{Zero-Cost Closures in Rust: Anonymous Structs and \texttt{Fn}, \texttt{FnMut}, \texttt{FnOnce}}
+\label{ch07:rust-closures}
+
+Every higher-order pipeline we wrote in OCaml and Haskell passed closures---anonymous
+functions that capture variables from their enclosing scope (\texttt{fun p -> p.cents >= min\_cents}).
+Before we see how Rust compiles iterator chains into single machine loops, we have to
+answer a fundamental hardware question: \emph{where do a closure's captured variables
+live in memory, and how does the CPU jump to its code?}
+
+In C, a plain function pointer \texttt{bool (*pred)(const Posting*)} is just an 8-byte
+instruction address. It has nowhere to store a captured threshold \texttt{min\_cents},
+which is why C APIs like \texttt{qsort\_r} or \texttt{pthread\_create} force you to
+pack state into a separate struct and thread an untyped \texttt{void *ctx} pointer
+by hand.
+
+In Java~6 (anonymous inner classes like \texttt{new Predicate<Posting>() \{ ... \}}
+capturing \texttt{final long minCents}) and in OCaml and Haskell, the compiler packs
+captured variables into a \textbf{heap-allocated closure record}: a GC header, a
+function or vtable pointer, and the captured fields. Passing a closure passes a
+pointer to that heap block, and invoking it performs an \emph{indirect call} through
+the code pointer---which allocates on the heap and blocks the compiler from inlining
+tiny arithmetic bodies unless a JIT compiler later devirtualizes the call site.
+
+Rust borrows C++11's unboxed lambda insight and strengthens it with ownership: in
+Rust, \textbf{every closure expression generates its own unique, anonymous compiler
+\texttt{struct} type} that stores its captured variables inline on the stack with zero
+heap allocation and dispatches statically by default.
+
+\subsection{Exact Compiler Desugaring of Three Ledger Closures}
+
+To remove all mystery from Rust closures, let us trace three closures in our financial
+ledger---one reading a threshold, one counting rejected items, and one flushing an
+owned audit batch---and write down the exact \texttt{struct} and method signature
+\texttt{rustc} synthesizes for each:
+
+\begin{lstlisting}[language=Rust]
+// Three Rust closures with three distinct capture & call modes:
+#[derive(Clone)]
+pub struct AuditEntry { pub post_id: u64, pub note: String }
+
+pub fn demo_three_closures(
+    min_cents: i64,
+    mut rejected_count: usize,
+    staged_audit: Vec<AuditEntry>,
+) {
+    // 1. Borrows &min_cents immutably -> implements Fn, FnMut, FnOnce
+    let above_floor = |cents: i64| cents >= min_cents;
+
+    // 2. Mutates &mut rejected_count -> implements FnMut, FnOnce (NOT Fn)
+    let mut track_rejects = |cents: i64| -> bool {
+        if cents < min_cents {
+            rejected_count += 1;
+            false
+        } else {
+            true
+        }
+    };
+
+    // 3. Moves staged_audit out on call -> implements FnOnce ONLY
+    let flush_audit = || -> usize {
+        let consumed: Vec<AuditEntry> = staged_audit; // moves Vec out!
+        consumed.len()
+    };
+
+    let _ = above_floor(500);
+    let _ = track_rejects(100);
+    let _ = flush_audit();
+}
+\end{lstlisting}
+
+Under the hood, \texttt{rustc} inspects how each closure body uses each outer variable
+(choosing the least restrictive capture mode: shared borrow \texttt{\&T} first,
+mutable borrow \texttt{\&mut T} second, move \texttt{T} third) and synthesizes three
+ordinary flat structs right in \texttt{demo\_three\_closures}'s stack frame:
+
+\begin{lstlisting}[language=Rust]
+// Conceptual desugaring generated by rustc (simplified trait signatures):
+pub trait MyFnOnce<Arg> {
+    type Output;
+    fn call_once(self, arg: Arg) -> Self::Output;
+}
+pub trait MyFnMut<Arg>: MyFnOnce<Arg> {
+    fn call_mut(&mut self, arg: Arg) -> Self::Output;
+}
+pub trait MyFn<Arg>: MyFnMut<Arg> {
+    fn call(&self, arg: Arg) -> Self::Output;
+}
+
+// 1. Closure 'above_floor': 8 bytes on stack (1 shared reference)
+struct __ClosureEnv1<'a> { min_cents: &'a i64 }
+
+impl<'a> MyFn<i64> for __ClosureEnv1<'a> {
+    fn call(&self, cents: i64) -> bool { cents >= *self.min_cents }
+}
+// (Plus MyFnMut and MyFnOnce impls delegating to self.call(cents)!)
+
+// 2. Closure 'track_rejects': 16 bytes on stack (&i64 + &mut usize)
+struct __ClosureEnv2<'a, 'b> {
+    min_cents: &'a i64,
+    rejected_count: &'b mut usize,
+}
+
+impl<'a, 'b> MyFnMut<i64> for __ClosureEnv2<'a, 'b> {
+    fn call_mut(&mut self, cents: i64) -> bool {
+        if cents < *self.min_cents {
+            *self.rejected_count += 1;
+            false
+        } else {
+            true
+        }
+    }
+}
+// Not MyFn(&self): mutating *self.rejected_count requires &mut self!
+
+// 3. Closure 'flush_audit': 24 bytes on stack (ptr + len + cap of Vec)
+struct __ClosureEnv3 { staged_audit: Vec<AuditEntry> }
+
+impl MyFnOnce<()> for __ClosureEnv3 {
+    type Output = usize;
+    fn call_once(self, _arg: ()) -> usize {
+        let consumed: Vec<AuditEntry> = self.staged_audit; // moves Vec!
+        consumed.len()
+    }
+}
+// Not MyFnMut(&mut self): a 2nd call would read a moved-from Vec!
+\end{lstlisting}
+
+Look at what happens to both memory and instruction dispatch:
+\begin{itemize}
+  \item \textbf{Zero heap allocation.} \texttt{\_\_ClosureEnv2} occupies 16 stack bytes.
+    Capture-free closures (\texttt{|x: i64| x * 2}) occupy \textbf{0 bytes} and coerce
+    to bare C-style function pointers \texttt{fn(i64) -> i64}.
+  \item \textbf{Static dispatch that LLVM can inline.} Passing \texttt{track\_rejects} to
+    a generic \texttt{retain} bounded by \texttt{F: FnMut(i64) -> bool} monomorphizes it for
+    \texttt{F = \_\_ClosureEnv2}; LLVM sees the exact call target statically and inlines
+    the body straight into the loop in optimized builds (while \texttt{\&dyn Fn(i64) -> bool} or
+    \texttt{Box<dyn Fn(i64) -> bool>} remains available when runtime heterogeneity is needed).
+\end{itemize}
+
+\subsection{Why the Hierarchy Runs \texttt{Fn: FnMut: FnOnce}, and the \texttt{move} Trap}
+
+At first glance, the subtrait bound \texttt{Fn: FnMut: FnOnce} looks backward to many
+engineers: ``Wait---doesn't \texttt{Fn} allow \emph{more} ways to call a closure than
+\texttt{FnOnce}? Why is \texttt{Fn} a subtrait of \texttt{FnOnce}?''
+
+Read the hierarchy as \textbf{callee requirements vs.\ closure capabilities}
+(Figure~\ref{ch07:fig-closures-layout-hierarchy}):
+\begin{enumerate}
+  \item \textbf{\texttt{FnOnce(self)} is the weakest demand a function can place on a
+    callback:} ``Give me something I can call \emph{at most once} by consuming it''
+    (used by \texttt{Option::unwrap\_or\_else} and \texttt{std::thread::spawn}).
+    \emph{Every} closure in Rust satisfies \texttt{FnOnce}. Why? Because if you hand
+    \texttt{unwrap\_or\_else} a pure \texttt{Fn(\&self)} closure like
+    \texttt{above\_floor}, \texttt{unwrap\_or\_else} takes ownership of \texttt{self},
+    borrows \texttt{\&self} once to run \texttt{Fn::call}, and drops it. Thus the set
+    of \texttt{Fn} closures is a \emph{subset} of \texttt{FnOnce} closures ($\texttt{Fn} \subset \texttt{FnMut} \subset \texttt{FnOnce}$).
+  \item \textbf{\texttt{FnMut(\&mut self)} asks for sequential repeatability:} ``I may
+    call your closure zero, one, or many times in sequence, giving it unique
+    \texttt{\&mut self} access each time'' (used by \texttt{Iterator::map},
+    \texttt{Iterator::filter}, and \texttt{Vec::retain}). Both \texttt{FnMut} and
+    \texttt{Fn} closures qualify; consuming \texttt{FnOnce}-only closures are rejected.
+  \item \textbf{\texttt{Fn(\&self)} is the strictest demand:} ``I may call your closure
+    many times through shared \texttt{\&self} borrows, possibly from several threads at
+    once when the closure is also \texttt{Sync}'' (used by
+    \texttt{rayon}'s parallel \texttt{par\_\allowbreak{}iter().\allowbreak{}map(...)}
+    across CPU cores). Only closures that never mutate or consume captures qualify.
+\end{enumerate}
+
+\begin{trapbox}
+\textbf{The Classic \texttt{move |...|} Myth: Capture Mode $\neq$ Call Trait.}
+One of the most persistent misconceptions in Rust is believing that writing
+\texttt{move |x| ...} turns a closure into an \texttt{FnOnce}-only closure. \textbf{False.}
+\begin{itemize}
+  \item The \texttt{move} keyword controls \emph{how captured variables enter the
+    closure struct} when the closure is constructed (moving ownership into the struct's
+    fields instead of storing \texttt{\&} borrows, so the closure can outlive the
+    current stack frame).
+  \item \texttt{Fn}, \texttt{FnMut}, and \texttt{FnOnce} are determined solely by
+    \emph{what the closure body does to its fields when called}.
+\end{itemize}
+Look at this three-line proof:
+\begin{lstlisting}[language=Rust]
+let currency = String::from("USD");
+// 'currency' is MOVED into the closure struct, yet body only reads &str!
+let is_ccy = move |code: &str| code == currency.as_str();
+assert!(is_ccy("USD") && !is_ccy("EUR")); // implements Fn -- call 1000x!
+\end{lstlisting}
+Here \texttt{is\_ccy} owns a 24-byte \texttt{String} field inside its struct (so it is
+\texttt{'static} and safe to send to another thread), yet calling \texttt{is\_ccy("USD")}
+only borrows \texttt{\&self.currency}. Therefore \texttt{is\_ccy} implements \textbf{\texttt{Fn}},
+\texttt{FnMut}, \emph{and} \texttt{FnOnce}.
+\end{trapbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Stealth]
+  % LEFT PANEL: Memory Layout Comparison
+  \node[font=\bfseries\scriptsize,text=sourceblue!90!black] at (2.8, 3.05) {MEMORY \& DISPATCH LAYOUT};
+
+  % Java / OCaml Heap Closure
+  \node[draw=quotientorange!85!black,fill=quotientorange!9,rounded corners=3pt,thick,
+        minimum width=5.5cm,minimum height=1.7cm] at (2.8, 1.85) {};
+  \node[font=\scriptsize\bfseries,text=quotientorange!90!black,anchor=west] at (0.18, 2.45) {Java 6 / OCaml: heap closure};
+  \node[draw=quotientorange!80!black,fill=white,thick,font=\tiny\ttfamily,minimum width=1.15cm,minimum height=0.52cm] (jptr) at (0.85, 1.55) {clos\_ptr};
+  \node[draw=quotientorange!85!black,fill=white,thick,font=\tiny\ttfamily,align=center,minimum width=3.1cm,minimum height=0.78cm] (jheap) at (3.75, 1.55)
+    {GC hdr $|$ code\_ptr $|$ env\\[-1pt]{\tiny indirect jump + heap alloc}};
+  \draw[->,thick,quotientorange!85!black] (jptr.east) -- (jheap.west);
+
+  % Rust Stack Closure
+  \node[draw=targetgreen!85!black,fill=targetgreen!9,rounded corners=3pt,thick,
+        minimum width=5.5cm,minimum height=1.75cm] at (2.8, -0.2) {};
+  \node[font=\scriptsize\bfseries,text=targetgreen!90!black,anchor=west] at (0.18, 0.42) {Rust: unboxed stack closure};
+  \node[draw=targetgreen!85!black,fill=white,thick,font=\tiny\ttfamily,align=center,text width=4.7cm] at (2.8, -0.45)
+    {\_\_ClosureEnv2 on the stack (16B):\\[-1pt]
+     [\&min\_cents | \&mut rejected]\\[-1pt]
+     {\tiny\rmfamily concrete type, direct call, LLVM can inline}};
+
+  % RIGHT PANEL: FnOnce >= FnMut >= Fn Nested Capability Rings
+  \node[font=\bfseries\scriptsize,text=structurepurple!90!black] at (9.65, 3.05) {CAPABILITY SETS (\texttt{Fn: FnMut: FnOnce})};
+
+  % Outer FnOnce
+  \draw[draw=trapred!80!black,fill=trapred!7,rounded corners=5pt,thick] (6.2, -1.08) rectangle (13.1, 2.7);
+  \node[font=\scriptsize\bfseries,text=trapred!85!black,anchor=north west] at (6.35, 2.62)
+    {\texttt{FnOnce(self)}: callable once};
+  \node[font=\tiny\ttfamily,text=gray!85!black,anchor=north west] at (6.35, 2.22)
+    {APIs: Option::unwrap\_or\_else, thread::spawn};
+
+  % Middle FnMut
+  \draw[draw=sourceblue!85!black,fill=sourceblue!8,rounded corners=4pt,thick] (6.55, -0.92) rectangle (12.75, 1.65);
+  \node[font=\scriptsize\bfseries,text=sourceblue!90!black,anchor=north west] at (6.7, 1.57)
+    {\texttt{FnMut(\&mut self)}: repeated calls};
+  \node[font=\tiny\ttfamily,text=gray!85!black,anchor=north west] at (6.7, 1.18)
+    {APIs: Iterator::map, filter, fold, Vec::retain};
+
+  % Inner Fn
+  \draw[draw=targetgreen!85!black,fill=targetgreen!12,rounded corners=3pt,thick] (6.9, -0.75) rectangle (12.4, 0.62);
+  \node[font=\scriptsize\bfseries,text=targetgreen!90!black,anchor=north west] at (7.05, 0.54)
+    {\texttt{Fn(\&self)}: shared calls};
+  \node[font=\tiny\ttfamily,text=gray!85!black,anchor=north west] at (7.05, 0.14)
+    {APIs: rayon::par\_iter, \&dyn Fn callbacks};
+  \node[font=\tiny,text=targetgreen!85!black,anchor=north west] at (7.05, -0.25)
+    {Every \texttt{Fn} closure also satisfies \texttt{FnMut} \& \texttt{FnOnce}!};
+\end{tikzpicture}
+\caption{Left: Heap-allocated closure indirection in Java~6/OCaml versus Rust's flat stack-allocated closure struct. Right: Nested closure trait sets mapping receiver borrows (\texttt{self}, \texttt{\&mut self}, \texttt{\&self}) to standard combinators.}
+\label{ch07:fig-closures-layout-hierarchy}
+\end{figure}
+
+\section{Zero-Cost Iterator Pipelines, \texttt{Result} Transposition, and Loop Fusion}
+\label{ch07:iterator-pipelines}
+
+Now put stack-allocated closures together with pull-based iterators, and look at what
+happens when Rust compiles a multi-stage functional pipeline.
+
+In strict OCaml (\texttt{List.filter} followed by \texttt{List.map}) or JavaScript
+(\texttt{arr.filter(...).map(...)}), each stage runs \emph{eagerly} from start to
+finish, allocating a brand-new heap list or array of intermediate results before the
+next stage even begins. On a batch of $100{,}000$ ledger postings, chaining two
+\texttt{filter}s and two \texttt{map}s allocates four intermediate heap collections
+and traverses RAM five times.
+
+In Rust, the entire iterator ecosystem rests on one tiny trait with one required
+state-machine method:
+
+\begin{lstlisting}[language=Rust]
+pub trait Iterator {
+    type Item;
+    fn next(&mut self) -> Option<Self::Item>;
+    // 70+ default combinator methods (map, filter, fold, collect, ...)
+}
+\end{lstlisting}
+
+Trace every type and byte when we run our settled-USD batch fold in Rust:
+
+\begin{lstlisting}[language=Rust]
+pub fn net_settled_usd<P: FeePolicy>(
+    postings: &[Posting], policy: &P,
+) -> i64 {
+    postings
+        .iter()
+        .filter(|p| p.settled && p.currency == Currency::Usd)
+        .map(|p| signed_net(policy, p))
+        .fold(0_i64, |acc, delta| acc + delta)
+}
+\end{lstlisting}
+
+What sits in memory right before \texttt{.fold(...)} runs?
+\begin{enumerate}
+  \item \texttt{postings.iter()} creates \texttt{std::slice::Iter<'\_, Posting>}---just
+    two raw pointers (\texttt{ptr} and \texttt{end}, 16 bytes on the stack).
+  \item \texttt{.filter(...)} wraps that \texttt{Iter} plus the 0-byte stateless
+    predicate closure inside a stack struct \texttt{Filter<Iter<'\_, Posting>, Pred>}
+    (still 16 bytes).
+  \item \texttt{.map(...)} wraps \texttt{Filter} plus the 8-byte closure struct holding
+    \texttt{\&policy} inside \texttt{Map<Filter<\allowbreak{}Iter<'\_, Posting>, Pred>, Mapper>}
+    (24 bytes flat on the stack, \textbf{zero heap allocations}).
+  \item Finally, \texttt{fold} runs \texttt{while let Some(d) = self.\allowbreak{}next() \{ acc += d; \}}.
+    Because every adapter and closure type is statically known, LLVM inlines
+    \texttt{Map::next}, \texttt{Filter::next}, and \texttt{Iter::next} into
+    \textbf{one fused machine loop} (Figure~\ref{ch07:fig-eager-vs-fusion})---often
+    faster than \texttt{for i in 0..\allowbreak{}postings.len()} because advancing
+    \texttt{ptr} up to \texttt{end} eliminates per-step array bounds checks.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Stealth,
+  ebox/.style={draw=trapred!80!black,fill=trapred!8,rounded corners=2pt,thick,align=center,minimum height=0.68cm,font=\scriptsize},
+  fbox/.style={draw=targetgreen!85!black,fill=targetgreen!10,rounded corners=2pt,thick,align=center,text width=12.35cm,inner sep=4pt,font=\scriptsize}]
+
+  % Top: Eager Pipeline
+  \node[font=\bfseries\scriptsize,text=trapred!85!black,anchor=west] at (0.0, 2.05)
+    {Eager Collection Pipeline (OCaml \texttt{List.map} / JS \texttt{Array.map}): 2 Heap Allocs, 3 RAM Passes};
+  \node[ebox,minimum width=1.9cm] (e0) at (1.0, 1.35) {Input List};
+  \node[ebox,minimum width=1.9cm] (e1) at (3.7, 1.35) {\texttt{filter}};
+  \node[ebox,minimum width=2.2cm,fill=quotientorange!15,draw=quotientorange!85!black] (e2) at (6.55, 1.35) {Heap Alloc \#1};
+  \node[ebox,minimum width=1.7cm] (e3) at (9.15, 1.35) {\texttt{map}};
+  \node[ebox,minimum width=2.2cm,fill=quotientorange!15,draw=quotientorange!85!black] (e4) at (11.75, 1.35) {Heap Alloc \#2};
+  \draw[->,thick,trapred!80!black] (e0) -- (e1);
+  \draw[->,thick,trapred!80!black] (e1) -- (e2);
+  \draw[->,thick,trapred!80!black] (e2) -- (e3);
+  \draw[->,thick,trapred!80!black] (e3) -- (e4);
+
+  % Bottom: Rust Fused Pull Pipeline
+  \node[font=\bfseries\scriptsize,text=targetgreen!85!black,anchor=west] at (0.0, 0.35)
+    {Rust Fused Iterator State Machine (\texttt{Map<Filter<Iter>>}): 0 Heap Allocs, 1 Register Loop};
+  \node[fbox] at (6.38, -0.35)
+    {Contiguous \texttt{\&[Posting]} slice $\longrightarrow$ \textbf{Single LLVM-Fused Loop:} advance \texttt{ptr}, branch on \texttt{settled \&\& Usd}, subtract fee in register, add to \texttt{acc}};
+\end{tikzpicture}
+\caption{Eager pipelines materialize a full heap collection between every stage; Rust's pull-based adapter structs inline and fuse into a single allocation-free pass over flat memory.}
+\label{ch07:fig-eager-vs-fusion}
+\end{figure}
+
+\subsection{Ownership Entry Points, Combinators, and \texttt{Result} Transposition}
+
+To read and write idiomatic Rust pipelines effortlessly, keep three groups of tools at
+your fingertips:
+
+\begin{enumerate}
+  \item \textbf{Three ownership entry points (mirroring \texttt{\&T}, \texttt{\&mut T}, \texttt{T}):}
+    \begin{itemize}
+      \item \texttt{xs.iter()} yields shared references \texttt{\&T}, leaving \texttt{xs} intact afterwards.
+      \item \texttt{xs.iter\_mut()} yields exclusive references \texttt{\&mut T} to update elements in place.
+      \item \texttt{xs.into\_iter()} consumes \texttt{xs} and moves owned \texttt{T} values out one by one.
+    \end{itemize}
+  \item \textbf{Work-saving structural adapters:}
+    \begin{itemize}
+      \item \texttt{filter\_map(|x| ... -> Option<B>)} fuses filtering and transforming
+        into one pattern match---never write \texttt{.filter(|x| x.is\_some()).map(|x| x.unwrap())}.
+      \item \texttt{flat\_map(|entry| entry.postings.iter())} flattens nested slices
+        (one journal entry $\to$ its double-entry legs) without allocating intermediate \texttt{Vec}s.
+      \item \texttt{enumerate()}, \texttt{zip(other)}, \texttt{chunks(64)}, and
+        \texttt{windows(2)} eliminate manual index arithmetic (for instance,
+        \texttt{balances.windows(2).map(|w| w[1] - w[0])} computes daily balance deltas
+        with zero risk of \texttt{i - 1} underflow).
+    \end{itemize}
+  \item \textbf{Short-circuiting fallible iteration (\texttt{try\_fold} and \texttt{collect::<Result<Vec<T>, E>>()}):}
+    What if parsing or arithmetic inside a pipeline can fail with \texttt{Result<T, E>}?
+    Rust's \texttt{From\allowbreak{}Iterator} trait implements a clean \textbf{type transposition}:
+    an \texttt{Iterator<Item = Result<T, E>>} can be collected directly into a
+    \texttt{Result<Vec<T>, E>}.
+\end{enumerate}
+
+\begin{lstlisting}[language=Rust]
+// Short-circuiting Result transposition + O(1)-space checked try_fold
+pub fn parse_and_checked_sum(
+    raw_lines: &[&str],
+) -> Result<i64, &'static str> {
+    // 1. Transposes Iterator<Item = Result<i64, E>> -> Result<Vec<i64>, E>
+    //    Stops pulling IMMEDIATELY on the first Err!
+    let amounts: Vec<i64> = raw_lines
+        .iter()
+        .map(|s| s.trim().parse::<i64>().map_err(|_| "bad integer"))
+        .collect::<Result<Vec<i64>, &'static str>>()?;
+
+    // 2. try_fold threads a fallible accumulator. On its own (fed by the
+    //    parsing map directly) it needs no Vec at all -- see Exercise 7.1.
+    amounts.iter().try_fold(0_i64, |acc, &x| {
+        acc.checked_add(x).ok_or("i64 balance overflow")
+    })
+}
+\end{lstlisting}
+
+Look at \texttt{.collect::<Result<Vec<i64>, \&'static str>>()?}. If line~3 of
+$10{,}000$ lines contains \texttt{"abc"}, \texttt{collect} sees \texttt{Err("bad integer")},
+halts the iterator immediately without parsing lines~4 through $10{,}000$, drops the
+partially populated \texttt{Vec}, and returns \texttt{Err}. And when you only need a
+scalar aggregate rather than a \texttt{Vec}, \texttt{try\_fold} threads a fallible
+accumulator in $\Oh(1)$ stack space with the exact same instant short-circuiting.
+
+\subsection{Engineering Judgment: When a Plain \texttt{for} Loop Wins}
+
+Thinking functionally does \emph{not} mean outlawing \texttt{for} loops or playing
+combinator golf. Remember that \texttt{for x in xs} in Rust already desugars to
+\texttt{IntoIterator::into\_iter(xs)}. Experienced Rust engineers prefer a plain
+\texttt{for} loop over a contorted iterator chain in three clear situations:
+\begin{enumerate}
+  \item \textbf{Early function returns or multi-level loop exits:} if finding a fraud
+    flag inside a loop should immediately \texttt{return Ok(Decision::Freeze)} from
+    the enclosing function while updating a side log, \texttt{for} + \texttt{return}
+    is far clearer than encoding exits inside \texttt{ControlFlow}.
+  \item \textbf{Coupled multi-variable state machines:} when each step conditionally
+    mutates three hash maps and a sliding watermark, threading a 4-tuple
+    \texttt{(map1, map2, map3, mark)} through \texttt{.fold(...)} hurts readability.
+    Encapsulate that local mutation inside a pure outer function (just like
+    \texttt{sort\_and\_dedup}) and use a clean \texttt{for} loop inside.
+  \item \textbf{Asynchronous \texttt{.await} points:} synchronous closures passed to
+    \texttt{Iterator::map} cannot \texttt{.await} an SQLx query directly, whereas
+    \texttt{for cmd in batch \{ execute(\&pool, cmd).await?; \}} interacts naturally
+    with Chapter~12's async state machines and the \texttt{?} operator.
+\end{enumerate}
+
+\section{Exercises}
+\label{ch07:exercises}
+
+\begin{exercise}[Refactoring Imperative Java~6 into OCaml and Zero-Allocation Rust]
+Consider a Java~6 method scanning raw cent strings: it skips blank strings, parses
+integers, ignores non-positive numbers, deducts a 20-basis-point fee (\texttt{c - (c * 20) / 10000}),
+and returns \texttt{null} if any non-blank string fails to parse or if the running
+64-bit sum overflows.
+\begin{enumerate}
+  \item Write this pipeline in idiomatic \textbf{OCaml} using \texttt{int64},
+    \texttt{List.filter}, and a recursive or \texttt{fold\_left} short-circuiting pass
+    returning \texttt{int64 option}.
+  \item Write the pipeline in \textbf{Rust} with \emph{zero} \texttt{Vec} allocations
+    by combining \texttt{.iter()}, \texttt{.filter(...)} on trimmed slices, and
+    \texttt{.try\_fold(0\_i64, ...)} returning \texttt{Option<i64>}. Verify that a
+    malformed string at index~0 never parses index~1.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Counting Cons Cells and Pointer Overhead: OCaml vs.\ Rust]
+Trace the following OCaml definitions on a 64-bit machine where each cons cell
+occupies 24 bytes (8B GC header + 8B head + 8B tail pointer):
+\begin{lstlisting}[language=OCaml]
+let s0 = [100; 200; 300; 400]
+let s1 = 50 :: s0
+let s2 = 75 :: (List.tl s0)
+\end{lstlisting}
+\begin{enumerate}
+  \item Draw the memory graph for \texttt{s0}, \texttt{s1}, and \texttt{s2}. How many
+    cons cells and total heap bytes exist across all three lists combined?
+  \item Suppose you model this exact shared-tail graph in safe Rust without a GC using
+    \texttt{enum List \{ Nil, Cons(i64, Rc<List>) \}}. Given that \texttt{Rc<T>}'s
+    heap allocation stores \texttt{(strong\_count: usize, weak\_count: usize, payload: T)},
+    calculate the exact byte size of one \texttt{Rc<List>} node (accounting for
+    \texttt{List}'s tag + alignment) and compare cache-line locality against a flat
+    \texttt{Vec<i64>}.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Manual Rust Closure Desugaring and Trait Classification]
+For each Rust closure below (assuming 64-bit Linux where \texttt{\&T} is 8B,
+\texttt{String} and \texttt{Vec<T>} are 24B), write down (i) the exact fields of the
+compiler-generated \texttt{struct \_\_ClosureEnv}, (ii) its stack byte size, and (iii)
+which subset of \texttt{\{Fn, FnMut, FnOnce\}} it implements:
+\begin{lstlisting}[language=Rust]
+let rate: i64 = 35;
+let c1 = |amt: i64| (amt * rate) / 10_000;
+
+let allow: Vec<u64> = vec![1, 2, 9];
+let c2 = move |id: u64| allow.contains(&id);
+
+let mut max_seen: i64 = 0;
+let c3 = |x: i64| { if x > max_seen { max_seen = x; } };
+
+let logs: Vec<String> = vec![];
+let c4 = || logs.into_iter().count();
+\end{lstlisting}
+Explain specifically why \texttt{c2} has \texttt{move} yet differs in trait capability
+from \texttt{c4}.
+\end{exercise}
+
+\begin{exercise}[Custom Zero-Allocation Lazy \texttt{Iterator}]
+Implement \texttt{Iterator<Item = i64>} for the following lazy adapter over any
+signed-delta iterator \texttt{I: Iterator<Item = i64>}:
+\begin{lstlisting}[language=Rust]
+pub struct RunningBalances<I> {
+    pub iter: I, pub balance: i64, pub tripped: bool,
+}
+\end{lstlisting}
+On each \texttt{next} call, add the next delta to \texttt{balance}; if \texttt{balance < 0}
+(an overdraft), set \texttt{tripped = true} and return \texttt{None} on that step and all
+later calls; otherwise yield \texttt{Some(balance)}. Show that chaining this adapter
+with \texttt{.take(3)} allocates zero heap bytes.
+\end{exercise}
+
+\begin{exercise}[Proving the Three Monad Laws on \texttt{Option::and\_then}]
+For any pure Rust functions \texttt{f: fn(i64) -> Option<i64>} and
+\texttt{g: fn(i64) -> Option<i64>}, state and prove by exhaustive case analysis on
+\texttt{m = None} and \texttt{m = Some(v)} that \texttt{Option} obeys all three monad
+laws:
+\begin{enumerate}
+  \item \textbf{Left identity:} \texttt{Some(x).and\_then(f) == f(x)}.
+  \item \textbf{Right identity:} \texttt{m.and\_then(Some) == m}.
+  \item \textbf{Associativity:} \texttt{m.and\_then(f).and\_then(g) == m.and\_then(|x| f(x).and\_then(g))}.
+\end{enumerate}
+Finally, give a concrete example with two impure closures \texttt{h1} and \texttt{h2}
+that push a label into a shared \texttt{RefCell<Vec<String>>} log. Run them over a
+three-element \texttt{Vec} first as two eager passes (map with \texttt{h1} and
+\texttt{collect}, then map with \texttt{h2} and \texttt{collect}) and then as one
+fused lazy chain, and show that the log records the side effects in a different
+order. This is why rewriting pipelines freely (loop fusion) is only safe for pure
+stages.
+\end{exercise}

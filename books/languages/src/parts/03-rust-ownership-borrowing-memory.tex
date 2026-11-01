@@ -1,0 +1,956 @@
+\chapter{Ownership, Moves, and Borrowing: Seeing Through the Rust Lens}
+
+Chapter~1 covered what Java~6 gets from a tracing garbage collector and what it costs: 16-byte object headers, pointer chasing across cache lines, and stop-the-world pauses. Chapter~2 covered modern C++, where destructors free memory at the closing brace of a scope and values sit contiguously in arrays, but where a dangling reference or an invalidated iterator can read freed memory without any warning.
+
+Before Rust, a systems language picked one of those two designs. Either a garbage collector manages object lifetimes and you pay its latency and memory cost, or you manage lifetimes yourself in C or C++ and some use-after-free bugs and data races reach production.
+
+Rust frees memory deterministically, with no garbage collector, and still rejects use-after-free and data races at compile time. It does this by enforcing one rule about how pointers may coexist, checked by the part of the compiler called the \emph{borrow checker}. This chapter states that rule, shows the bytes each pointer type occupies, and then derives moves, borrows, slice splitting, reference counting, and mutexes from the rule.
+
+\chapterline
+
+\section{The Single Root Bug Behind Two Different Worlds}
+\label{ch03:aliasing-xor-mutability}
+
+Before writing a line of Rust, let us put two short, single-threaded bugs side by side --- one in modern C++, one in Java~6. Neither program spawns a thread, neither uses raw \texttt{malloc} or \texttt{delete}, and yet both fail for the exact same structural reason.
+
+First, look at seven lines of C++ processing a list of ledger postings (in minor currency units, cents):
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+#include <iostream>
+#include <vector>
+
+void append_bonus_if_positive(std::vector<int64_t>& postings) {
+  const int64_t& first = postings[0]; // Alias 1: borrows element 0
+  if (first > 0) {
+    postings.push_back(500);          // Alias 2: mutates the vector!
+    std::cout << "Triggered by posting: " << first << "\n"; // BUG!
+  }
+}
+\end{lstlisting}
+
+Walk through what happens in memory when \texttt{postings} enters this function with length $4$ and capacity $4$. On line~6, \texttt{first} stores the raw 64-bit machine address of element $0$ inside the heap buffer owned by \texttt{postings}. Even though \texttt{first} is marked \texttt{const}, \texttt{const} in C++ only means ``\emph{I} promise not to mutate through \texttt{first}''; it does not stop anyone else from mutating or freeing the memory behind it.
+
+On line~8, \texttt{postings.push\_back(500)} sees that length equals capacity. To grow, the vector allocates a fresh 8-element heap buffer, copies the four existing \texttt{int64\_t} values into the new buffer, writes \texttt{500} into slot $4$, and calls \texttt{delete[]} on the \emph{old} heap buffer. Now step onto line~9: \texttt{first} still holds the address of the old, freed buffer. Reading \texttt{first} is a textbook \textbf{use-after-free} in clean, single-threaded C++. Under light load the old bytes might happen to sit untouched in the allocator's free list and print the expected number in every unit test; under production load another request allocates that exact chunk for an HTTP header, and \texttt{first} reads garbage bytes or crashes the process.
+
+Now write the analogous loop in Java~6:
+
+\begin{lstlisting}[language=Java]
+import java.util.ArrayList;
+import java.util.List;
+
+public class LedgerAdjuster {
+  public static void appendBonusForPositives(List<Long> postings) {
+    for (Long amount : postings) {        // Alias 1: hidden Iterator<Long>
+      if (amount.longValue() > 0L) {
+        postings.add(Long.valueOf(500L)); // Alias 2: mutates ArrayList!
+      }
+    }
+  }
+}
+\end{lstlisting}
+
+Java's garbage collector prevents a raw memory-corruption crash here: even if \texttt{ArrayList.add} allocates a larger \texttt{Object[]} backing array, the old array stays alive in the GC heap as long as any reference points to it. Yet when you run this method on a non-empty list with a positive entry, it blows up on the next loop step with \texttt{java.util.ConcurrentModificationException} --- in a program with only one thread. Why? Because the \texttt{for}-each loop holds an internal \texttt{Iterator} cursor over \texttt{postings} while the loop body mutates \texttt{postings} behind the iterator's back. Java's \texttt{ArrayList} keeps an integer counter \texttt{modCount} on every list instance, increments it on every \texttt{add} or \texttt{remove}, and checks \texttt{modCount == expectedModCount} on every \texttt{iterator.next()} call, paying a runtime branch on every element so that the bug becomes an exception instead of silently skipped or repeated elements.
+
+Worse, \texttt{modCount} only guards standard collection iterators. When two components in a Java~6 service hold references to the same mutable \texttt{OrderDraft} object --- say a risk-scoring cache and a fee calculator --- mutating \texttt{draft.setAmountCents(0)} through one reference silently alters what the other component observes mid-calculation, with no exception at all.
+
+\begin{intuitionbox}
+Strip away C++ destructors and Java garbage collection, and ask: what two ingredients had to collide in \emph{every single one} of those failures?
+\begin{enumerate}
+  \item \textbf{Aliasing:} Two or more live access paths (\texttt{postings} and \texttt{first}; the loop's \texttt{Iterator} and \texttt{postings}; two object references \texttt{a} and \texttt{b}, or two threads) reach overlapping bytes of memory at the same time.
+  \item \textbf{Mutation:} At least one of those paths modifies (or reallocates) the underlying state while another path expects that state to hold still.
+\end{enumerate}
+Aliasing \emph{without} mutation is completely harmless: fifty readers can inspect the same immutable configuration table or UTF-8 string across threads without interfering with one another. Mutation \emph{without} aliasing is just as harmless: if you hold the \emph{only} pointer to a buffer in the entire program, you can overwrite it, resize it, or free it, and nobody else's pointer can possibly dangle because nobody else has one. Trouble only begins when \textbf{aliasing and mutation happen simultaneously}.
+\end{intuitionbox}
+
+Rust turns that observation into a rule the compiler checks.
+
+\begin{definition}[The Aliasing XOR Mutability Law]
+\label{ch03:def-aliasing-xor-mut}
+At every point in a safe Rust program's execution, any value in memory may be accessed through:
+\begin{itemize}
+  \item \textbf{Shared read-only borrows (\texttt{\&T}):} any number of simultaneous aliases ($1, 2, \dots, n$), through none of which the value may be mutated; \textbf{or}
+  \item \textbf{An exclusive mutable borrow (\texttt{\&mut T}) or unique owner (\texttt{T}):} exactly \emph{one} active access path through which the value may be read and mutated, with zero other live readers or writers.
+\end{itemize}
+Never both at the same time. For this reason, Rustaceans often read \texttt{\&T} aloud as ``\emph{shared} reference'' and \texttt{\&mut T} as ``\emph{unique} (or \emph{exclusive}) reference.''
+\end{definition}
+
+If you have used \texttt{java.util.concurrent.locks.ReentrantReadWriteLock} in Java, you already know this rule: a read-write lock permits either many concurrent \texttt{readLock()} holders \emph{or} a single exclusive \texttt{writeLock()} holder. The difference is that Java's \texttt{ReentrantReadWriteLock} executes atomic CPU instructions at runtime, risks deadlocks, and only protects code that remembers to acquire the lock. Rust runs the read-write lock check \emph{inside the compiler} across every variable, struct field, slice, and thread in your program, and emits zero lock instructions in the compiled binary.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small, >=Stealth]
+  % Grid headers
+  \node[font=\bfseries\footnotesize, text=gray!70!black] at (2.4, 4.55) {SINGLE ACCESS PATH};
+  \node[font=\bfseries\footnotesize, text=gray!70!black] at (8.2, 4.55) {MULTIPLE ALIASED PATHS};
+
+  \node[font=\bfseries\footnotesize, text=gray!70!black, rotate=90] at (-0.65, 3.15) {IMMUTABLE};
+  \node[font=\bfseries\footnotesize, text=gray!70!black, rotate=90] at (-0.65, 0.95) {MUTABLE};
+
+  % Top-left: Single + Immutable
+  \draw[rounded corners=4pt, thick, draw=sourceblue!80, fill=sourceblue!7] (0, 2.20) rectangle (4.8, 4.05);
+  \node[font=\bfseries\small, text=sourceblue!90!black] at (2.4, 3.62) {Owned \texttt{let x: T}};
+  \node[font=\footnotesize, align=center] at (2.4, 2.88) {One owner, read-only binding.\\Zero aliases, zero mutation.\\Safe in Java, C++, and Rust.};
+
+  % Top-right: Aliased + Immutable
+  \draw[rounded corners=4pt, thick, draw=targetgreen!80, fill=targetgreen!8] (5.2, 2.20) rectangle (11.2, 4.05);
+  \node[font=\bfseries\small, text=targetgreen!85!black] at (8.2, 3.62) {Shared Borrows \texttt{\&T} / \texttt{Arc<T>}};
+  \node[font=\footnotesize, align=center] at (8.2, 2.88) {$N$ readers, $0$ writers.\\Cache-friendly, race-free sharing.\\Allowed freely by Rust.};
+
+  % Bottom-left: Single + Mutable
+  \draw[rounded corners=4pt, thick, draw=quotientorange!85, fill=quotientorange!8] (0, 0.0) rectangle (4.8, 1.85);
+  \node[font=\bfseries\small, text=quotientorange!85!black] at (2.4, 1.42) {Unique \texttt{let mut x} / \texttt{\&mut T}};
+  \node[font=\footnotesize, align=center] at (2.4, 0.68) {$1$ writer, $0$ other readers.\\In-place mutation \& reallocation.\\Allowed freely by Rust.};
+
+  % Bottom-right: Aliased + Mutable (DANGER)
+  \draw[rounded corners=4pt, very thick, draw=trapred!90, fill=trapred!10] (5.2, 0.0) rectangle (11.2, 1.85);
+  \node[font=\bfseries\small, text=trapred!90!black] at (8.2, 1.42) {Aliasing $+$ Mutation (BANNED)};
+  \node[font=\footnotesize, align=center, text=trapred!85!black] at (8.2, 0.68) {C++ use-after-free, iterator invalidation,\\Java \texttt{ConcurrentModificationException},\\data races. Rejected at compile time!};
+\end{tikzpicture}
+\caption{The $2 \times 2$ design matrix of aliasing and mutability. Java~6 defaults almost every object variable into the bottom-right quadrant (shared references to mutable objects) and relies on GC plus discipline to survive. C++ lets raw pointers and references enter the bottom-right quadrant unchecked. Safe Rust allows the first three quadrants at full machine speed and forbids the bottom-right quadrant unless gated by explicit synchronization (\S\ref{ch03:interior-mutability}).}
+\label{ch03:fig-aliasing-quadrant}
+\end{figure}
+
+When the compiler rejects a program with a borrow error, find the two access paths that overlap in Figure~\ref{ch03:fig-aliasing-quadrant}'s bottom-right box: \emph{which two paths alias the same memory while one of them mutates it, and what would break if the vector reallocated or a second thread ran at that point?} Answering that question usually tells you how to restructure the code, as the examples later in this chapter show.
+
+\section{Ownership and Exact Byte Layouts on Stack and Heap}
+\label{ch03:ownership-byte-layouts}
+
+To enforce Aliasing XOR Mutability without a garbage collector, Rust starts by giving every allocated resource a single, unambiguous home.
+
+\begin{definition}[The Three Rules of Ownership]
+\label{ch03:def-ownership-rules}
+Every value in Rust obeys three compile-time rules:
+\begin{enumerate}
+  \item Every value has a single \textbf{owner} (a variable, a struct field, or a collection slot).
+  \item There can be \textbf{only one owner at a time} (unless ownership is explicitly shared through a reference-counted smart pointer such as \texttt{Rc<T>} or \texttt{Arc<T>}, covered in \S\ref{ch03:shared-ownership-rc-arc}).
+  \item When the owner goes out of scope (and ownership has not been moved elsewhere), the value is \textbf{dropped} deterministically right at that point: the compiler inserts a call to \texttt{Drop::drop}, freeing heap buffers, closing sockets, or rolling back uncommitted database transactions in reverse order of declaration.
+\end{enumerate}
+\end{definition}
+
+If you read Chapter~2 carefully, Rule~3 looks just like C++ RAII (\emph{Resource Acquisition Is Initialization}), and at runtime it compiles to the exact same machine code: deterministic calls at scope exit, with no background GC threads scanning object graphs. Where Rust parts ways with both Java~6 and C++ is in how values sit in memory and how ownership moves between variables. Let us look directly at the bytes on a 64-bit machine (\texttt{usize} $= 8$ bytes).
+
+\subsection{\texttt{String} (24 Bytes Owned) versus \texttt{\&str} (16-Byte Fat Slice)}
+
+In Java~6, a \texttt{java.lang.String} involves two levels of indirection. Even the 6-character currency pair \texttt{"EURUSD"} requires:
+\begin{itemize}
+  \item an 8-byte reference in your local variable or object field, pointing to
+  \item a heap \texttt{String} object (16-byte JVM mark$+$klass header, an 8-byte reference to a \texttt{char[]}, plus three 4-byte \texttt{int} fields \texttt{offset}, \texttt{count}, and \texttt{hash} --- padded to 32 or 40 bytes), pointing to
+  \item a separate heap \texttt{char[]} array (another 16-byte array header $+$ length, followed by UTF-16 two-byte characters).
+\end{itemize}
+Reading the characters of a Java~6 \texttt{String} chases two heap pointers and touches two separate cache lines.
+
+In Rust, an owned \texttt{String} is a flat, 24-byte struct sitting directly inside the owning stack frame (or directly inline inside an owning struct --- zero object header, zero extra indirection):
+\begin{itemize}
+  \item \texttt{ptr: *mut u8} (offset $0..8$, 8 bytes): non-null machine address of the UTF-8 byte buffer on the heap.
+  \item \texttt{len: usize} (offset $8..16$, 8 bytes): how many initialized UTF-8 bytes the string currently holds.
+  \item \texttt{cap: usize} (offset $16..24$, 8 bytes): total byte capacity allocated on the heap before reallocation is needed.
+\end{itemize}
+When \texttt{let mut pair = String::with\_capacity(8); pair.push\_str("EURUSD");} runs, the stack frame holds the three 64-bit words $(\texttt{ptr}, 6, 8)$, and the heap holds just the raw UTF-8 bytes \texttt{E U R U S D} followed by two unused capacity bytes --- no object header on the stack, no object header in front of the \texttt{u8} array beyond the allocator's internal size class. When \texttt{pair} goes out of scope, \texttt{Drop} passes \texttt{ptr} and \texttt{cap} straight to the allocator's \texttt{dealloc}.
+
+Now suppose a function only wants to \emph{inspect} text --- say, parsing the base currency \texttt{"EUR"} out of \texttt{"EURUSD"} or checking a string literal \texttt{"USD"}. Allocating a new heap \texttt{String} just to read three letters would be wasteful, and taking \texttt{\&String} (an 8-byte pointer to a 24-byte \texttt{String} on the stack, which then points to the heap) would force callers with a string literal \texttt{"USD"} (baked into the binary's read-only \texttt{.rodata} segment, with no heap allocation at all) to heap-allocate a \texttt{String} first.
+
+Rust solves this with \texttt{\&str}, a \textbf{16-byte fat pointer} (or \emph{string slice}) consisting of just two 64-bit registers:
+\begin{itemize}
+  \item \texttt{ptr: *const u8} (offset $0..8$, 8 bytes): address of the first UTF-8 byte of the view.
+  \item \texttt{len: usize} (offset $8..16$, 8 bytes): byte length of the view.
+\end{itemize}
+Notice what is \emph{missing} from \texttt{\&str}: there is no \texttt{cap} field. Because \texttt{\&str} is a borrowed view that neither grows nor frees memory, capacity is none of its business. A single function \texttt{fn parse\_currency(code: \&str)} compiled once into machine code accepts:
+\begin{enumerate}
+  \item \texttt{\&pair[0..3]} --- a 3-byte window into our heap-allocated \texttt{String}, passed in two CPU registers (\texttt{rdi = pair.ptr}, \texttt{rsi = 3});
+  \item \texttt{"USD"} --- a string literal of type \texttt{\&'static str} pointing directly into the executable's read-only \texttt{.rodata} data segment (\texttt{rdi = addr\_in\_rodata}, \texttt{rsi = 3}); or
+  \item a slice of a fixed stack buffer \texttt{[u8; 64]} read off a network socket and validated as UTF-8 via \texttt{std::str::from\_utf8(\&buf[..n])} --- zero heap allocations from network card to parser.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small, >=Stealth]
+  % Column titles
+  \node[font=\bfseries\footnotesize, text=sourceblue!90!black] at (2.2, 6.25) {STACK FRAME (64-bit words)};
+  \node[font=\bfseries\footnotesize, text=targetgreen!85!black] at (9.5, 6.25) {HEAP \& BINARY SEGMENTS};
+
+  % 1. Owned String `pair` (24 bytes)
+  \node[anchor=west, font=\footnotesize\bfseries, text=sourceblue!90!black] at (0.0, 5.55) {\texttt{pair: String} (24 bytes, owner)};
+  \draw[thick, draw=sourceblue!85, fill=sourceblue!8] (0.0, 4.70) rectangle (1.6, 5.25);
+  \draw[thick, draw=sourceblue!85, fill=sourceblue!8] (1.6, 4.70) rectangle (3.0, 5.25);
+  \draw[thick, draw=sourceblue!85, fill=sourceblue!8] (3.0, 4.70) rectangle (4.4, 5.25);
+  \node[font=\scriptsize] at (0.8, 4.97) {\texttt{ptr}};
+  \node[font=\scriptsize] at (2.3, 4.97) {\texttt{len = 6}};
+  \node[font=\scriptsize] at (3.7, 4.97) {\texttt{cap = 8}};
+  \node[font=\tiny, text=gray!75!black] at (0.0, 4.52) {0};
+  \node[font=\tiny, text=gray!75!black] at (1.6, 4.52) {8};
+  \node[font=\tiny, text=gray!75!black] at (3.0, 4.52) {16};
+  \node[font=\tiny, text=gray!75!black] at (4.4, 4.52) {24};
+
+  % Heap UTF-8 buffer
+  \node[anchor=west, font=\scriptsize\bfseries, text=targetgreen!85!black] at (6.5, 5.55) {Heap allocation (8 bytes: 6 used, 2 spare)};
+  \foreach \i/\ch in {0/E, 1/U, 2/R, 3/U, 4/S, 5/D} {
+    \pgfmathsetmacro{\x}{6.5 + \i*0.68}
+    \draw[thick, draw=targetgreen!80, fill=targetgreen!10] (\x, 4.70) rectangle (\x+0.68, 5.25);
+    \node[font=\ttfamily\footnotesize] at (\x+0.34, 4.97) {\ch};
+  }
+  \foreach \i in {6, 7} {
+    \pgfmathsetmacro{\x}{6.5 + \i*0.68}
+    \draw[thick, draw=gray!55, fill=gray!12] (\x, 4.70) rectangle (\x+0.68, 5.25);
+    \node[font=\scriptsize, text=gray!65!black] at (\x+0.34, 4.97) {--};
+  }
+
+  % Arrow from pair.ptr around the top cleanly above labels
+  \draw[->, thick, sourceblue!85] (0.8, 5.25) to[out=28, in=152] (6.65, 5.25);
+
+  % 2. Borrowed slice `quote: &str = &pair[3..6]` (16 bytes)
+  \node[anchor=west, font=\footnotesize\bfseries, text=quotientorange!90!black] at (0.0, 3.80) {\texttt{quote: \&str = \&pair[3..6]} (16 bytes)};
+  \draw[thick, draw=quotientorange!85, fill=quotientorange!10] (0.0, 2.95) rectangle (1.6, 3.50);
+  \draw[thick, draw=quotientorange!85, fill=quotientorange!10] (1.6, 2.95) rectangle (3.0, 3.50);
+  \node[font=\scriptsize] at (0.8, 3.22) {\texttt{ptr}};
+  \node[font=\scriptsize] at (2.3, 3.22) {\texttt{len = 3}};
+  \node[font=\tiny, text=gray!75!black] at (0.0, 2.77) {0};
+  \node[font=\tiny, text=gray!75!black] at (1.6, 2.77) {8};
+  \node[font=\tiny, text=gray!75!black] at (3.0, 2.77) {16};
+
+  % Brace under USD + arrow from bottom of quote.ptr cleanly underneath offset labels
+  \draw[decorate, decoration={brace, mirror, amplitude=3pt}, thick, quotientorange!90!black] (8.54, 4.62) -- (10.58, 4.62) node[midway, below=3pt, font=\tiny, text=quotientorange!90!black] {3-byte window};
+  \draw[->, thick, quotientorange!90!black] (0.55, 2.95) to[out=-26, in=245] (8.72, 4.65);
+
+  % 3. Static literal `lit: &'static str = "JPY"` (16 bytes)
+  \node[anchor=west, font=\footnotesize\bfseries, text=structurepurple!95!black] at (0.0, 2.00) {\texttt{lit: \&str = "JPY"} (16 bytes)};
+  \draw[thick, draw=structurepurple!85, fill=structurepurple!10] (0.0, 1.15) rectangle (1.6, 1.70);
+  \draw[thick, draw=structurepurple!85, fill=structurepurple!10] (1.6, 1.15) rectangle (3.0, 1.70);
+  \node[font=\scriptsize] at (0.8, 1.42) {\texttt{ptr}};
+  \node[font=\scriptsize] at (2.3, 1.42) {\texttt{len = 3}};
+
+  % Binary .rodata segment
+  \node[anchor=west, font=\scriptsize\bfseries, text=structurepurple!95!black] at (6.5, 2.00) {Read-only binary \texttt{.rodata}};
+  \foreach \i/\ch in {0/J, 1/P, 2/Y} {
+    \pgfmathsetmacro{\x}{6.5 + \i*0.68}
+    \draw[thick, draw=structurepurple!80, fill=structurepurple!10] (\x, 1.15) rectangle (\x+0.68, 1.70);
+    \node[font=\ttfamily\footnotesize] at (\x+0.34, 1.42) {\ch};
+  }
+  % Route from bottom of lit.ptr underneath len=3 box to .rodata[0]
+  \draw[->, thick, structurepurple!85] (0.8, 1.15) to[out=-16, in=200] (6.5, 1.25);
+
+  % 4. Box<i64> (8 bytes)
+  \node[anchor=west, font=\footnotesize\bfseries, text=sourceblue!90!black] at (0.0, 0.40) {\texttt{boxed: Box<i64>} (8 bytes, owner)};
+  \draw[thick, draw=sourceblue!85, fill=sourceblue!8] (0.0, -0.45) rectangle (1.6, 0.10);
+  \node[font=\scriptsize] at (0.8, -0.17) {\texttt{ptr}};
+  \node[anchor=west, font=\scriptsize\bfseries, text=targetgreen!85!black] at (6.5, 0.40) {Heap \texttt{i64} (8 bytes)};
+  \draw[thick, draw=targetgreen!80, fill=targetgreen!10] (6.5, -0.45) rectangle (8.54, 0.10);
+  \node[font=\ttfamily\footnotesize] at (7.52, -0.17) {125\_000};
+  \draw[->, thick, sourceblue!85] (1.6, -0.17) -- (6.5, -0.17);
+\end{tikzpicture}
+\caption{Exact 64-bit memory layouts of \texttt{String} (24-byte owning triple), \texttt{\&str} (16-byte non-owning fat slice able to point into a heap \texttt{String} or directly into read-only executable \texttt{.rodata}), and \texttt{Box<i64>} (8-byte unique owning pointer).}
+\label{ch03:fig-string-str-vec-layout}
+\end{figure}
+
+\subsection{\texttt{Vec<T>} versus \texttt{\&[T]}, and \texttt{Box<T>}}
+
+The exact same pairing repeats for general contiguous collections:
+\begin{itemize}
+  \item \textbf{\texttt{Vec<T>} (24 bytes on stack: \texttt{ptr}, \texttt{len}, \texttt{cap}):} owns a contiguous heap array of \texttt{cap} slots, the first \texttt{len} of which hold initialized \texttt{T} values packed back-to-back with \emph{zero} per-element pointers or headers. If \texttt{Account} is a 24-byte struct, a \texttt{Vec<Account>} of $1{,}000$ accounts is one single $24{,}000$-byte heap allocation through which the CPU hardware prefetcher streams linearly. (Compare Java~6's \texttt{ArrayList<Account>}: an array of $1{,}000$ references scattered across $1{,}000$ individually heap-allocated \texttt{Account} objects, each carrying a 16-byte JVM header)
+  \item \textbf{\texttt{\&[T]} and \texttt{\&mut [T]} (16 bytes on stack: \texttt{ptr}, \texttt{len}):} borrowed slice views into any contiguous sequence of \texttt{T} --- whether backed by a heap \texttt{Vec<T>}, a fixed stack array \texttt{[T; N]}, or memory-mapped file bytes.
+  \item \textbf{\texttt{Box<T>} (8 bytes on stack: \texttt{ptr}):} unique ownership of a single \texttt{T} placed on the heap. Coming from Java~6, newcomers often wrap structs in \texttt{Box<Order>} out of habit because Java puts every object on the heap. In Rust, default to plain stack/inline values (\texttt{Order}), and reach for \texttt{Box<T>} only for three concrete engineering reasons: (1)~recursive types like AST or tree nodes whose size would otherwise be infinite (Chapter~5), (2)~moving a multi-kilobyte struct around by copying an 8-byte pointer instead of \texttt{memcpy}-ing $4{,}096$ bytes, or (3)~holding a dynamically sized trait object \texttt{Box<dyn Pricing>} (Chapter~6).
+\end{itemize}
+
+\begin{trapbox}
+\textbf{Never write \texttt{\&String} or \texttt{\&Vec<T>} in function parameters when \texttt{\&str} or \texttt{\&[T]} suffices.} If you write \texttt{fn total(xs: \&Vec<i64>) -> i64}, a caller holding a fixed stack array \texttt{[10, 20, 30]} or a sub-slice \texttt{\&vec[1..5]} cannot call your function without allocating a brand-new heap \texttt{Vec<i64>}. Worse, inside \texttt{total}, reading an element through \texttt{\&Vec<i64>} chases two pointers (caller stack $\to$ \texttt{Vec} header $\to$ heap elements) instead of reading \texttt{ptr} directly from the 16-byte \texttt{\&[i64]} register pair. Meanwhile, callers who \emph{do} own a \texttt{Vec<i64>} or \texttt{String} can still pass \texttt{\&my\_vec} or \texttt{\&my\_string} effortlessly because Rust automatically deref-coerces \texttt{\&Vec<T>} to \texttt{\&[T]} and \texttt{\&String} to \texttt{\&str}.
+\end{trapbox}
+
+You do not have to take any byte count in this book on faith. Because Rust knows exact type layouts at compile time, we can verify every layout with \texttt{const} assertions checked by \texttt{rustc} before a binary is even emitted:
+
+\begin{lstlisting}[language=Rust]
+use std::mem::size_of;
+
+pub struct Account {
+    pub id: u64,            // 8 bytes
+    pub balance_cents: i64, // 8 bytes
+    pub currency: [u8; 3],  // 3 bytes + 5 bytes trailing alignment padding
+}
+
+const _: () = assert!(size_of::<Account>() == 24);
+const _: () = assert!(size_of::<String>() == 24);
+const _: () = assert!(size_of::<&str>() == 16);
+const _: () = assert!(size_of::<Vec<Account>>() == 24);
+const _: () = assert!(size_of::<&[Account]>() == 16);
+const _: () = assert!(size_of::<Box<Account>>() == 8);
+\end{lstlisting}
+
+\section{Bitwise Copy, Destructive Move, and Explicit Clone}
+\label{ch03:copy-move-clone}
+
+Here is what the simplest statement in programming, \texttt{b = a;}, does in Java~6, C++, and Rust:
+\begin{itemize}
+  \item In \textbf{Java~6}, \texttt{b = a;} copies the bits for the eight primitive types (\texttt{int}, \texttt{long}, \texttt{double}, \dots), and for \emph{every class type} copies the 8-byte object reference so \texttt{a} and \texttt{b} now alias the same mutable heap object.
+  \item In \textbf{C++}, \texttt{b = a;} on a \texttt{std::string} or \texttt{std::vector} invokes the \emph{copy assignment operator}, which calls \texttt{malloc} and duplicates the entire heap buffer behind the scenes. If you want to transfer ownership cheaply instead, you must write \texttt{b = std::move(a);}, invoking C++11's \emph{move constructor/assignment}.
+\end{itemize}
+
+Here is the subtle detail from Chapter~2 that makes C++ moves surprisingly tricky: in C++, \textbf{moves are non-destructive}. When you write \texttt{std::string b = std::move(a);}, variable \texttt{a} is still an in-scope C++ object whose destructor \texttt{\~{}basic\_string()} \emph{must} still execute when the enclosing block hits \texttt{\}}. Therefore, C++'s move constructor has to copy \texttt{a}'s three words into \texttt{b} \emph{and} overwrite \texttt{a} into a valid ``empty shell'' (setting \texttt{a.ptr = nullptr, a.len = 0}) so \texttt{a}'s destructor does not double-free \texttt{b}'s buffer. Even worse, nothing in the C++ type system stops a programmer five lines later from accidentally reading \texttt{a} in its hollowed-out moved-from state --- a classic source of production bugs known as \emph{use-after-move}.
+
+Rust avoids both the hidden copy and the hollowed-out shell with a different rule.
+
+\begin{focusbox}
+\textbf{How \texttt{let b = a;} works physically in Rust.} At the machine level, \emph{every} variable-to-variable assignment, function argument pass, and return value in Rust is a shallow, bitwise \texttt{memcpy} of \texttt{size\_of::<T>()} stack bytes (and LLVM routinely optimizes even that \texttt{memcpy} away into registers). Rust \textbf{never} implicitly invokes user-defined copy constructors or deep heap allocations on \texttt{=}.
+
+The \emph{only} difference between a \textbf{Move} and a \textbf{Copy} happens in the compiler's static tracker right after those stack bytes are copied:
+\begin{enumerate}
+  \item \textbf{Destructive Move (the default for all types):} After copying the 24 stack bytes of \texttt{a: String} into \texttt{b}, the compiler marks slot \texttt{a} \textbf{statically uninitialized}. Touching \texttt{a} again is a compile-time error, and \textbf{no destructor runs on \texttt{a} at scope exit}.
+  \item \textbf{\texttt{Copy} (opt-in for plain self-contained bit values):} If type \texttt{T} implements the marker trait \texttt{Copy} (like \texttt{i64}, \texttt{bool}, a 3-byte \texttt{Currency([u8; 3])}, or a shared reference \texttt{\&U}), both \texttt{a} and \texttt{b} remain live and usable after the bitwise copy.
+\end{enumerate}
+\end{focusbox}
+
+This example shows why a language without a garbage collector needs destructive moves to prevent double frees:
+
+\begin{lstlisting}[language=Rust]
+fn process_memo() {
+    let a = String::from("WIRE-9941"); // Heap alloc #1 (9 bytes)
+    let b = a;                         // 24-byte stack copy; `a` is now dead!
+
+    // println!("{}", a);
+    // ^ COMPILE ERROR: borrow of moved value: `a`
+
+    println!("Processing {}", b);
+} // Only `b` is live here -> Drop frees Heap alloc #1 exactly ONCE.
+\end{lstlisting}
+
+Look at what would happen if \texttt{a} remained usable after \texttt{let b = a;} without cloning the heap buffer: both \texttt{a.ptr} and \texttt{b.ptr} would hold the exact same heap address, creating two mutable aliases to the same buffer during \texttt{process\_memo} \emph{and} causing \texttt{Drop} to call \texttt{free()} twice on the same pointer at \texttt{\}} (a heap-corrupting \textbf{double free}). By killing \texttt{a} statically at line~3, Rust transfers unique ownership in three register moves --- zero \texttt{nullptr} writes into \texttt{a}, zero branch inside \texttt{a}'s non-existent destructor, and zero possibility of use-after-move.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small, >=Stealth]
+  % Left panel: C++11 non-destructive move
+  \begin{scope}[shift={(0,0)}]
+    \node[font=\bfseries\footnotesize, text=trapred!85!black] at (3.25, 4.55) {C++11: \texttt{b = std::move(a)} (Non-Destructive)};
+    \draw[rounded corners=3pt, draw=gray!50, fill=gray!4] (0.0, 0.0) rectangle (6.5, 4.25);
+
+    \node[anchor=west, font=\scriptsize\bfseries] at (0.25, 3.90) {1. \texttt{a} hollowed out (still in scope!):};
+    \draw[thick, draw=trapred!75, fill=trapred!8] (0.25, 3.15) rectangle (2.15, 3.65);
+    \draw[thick, draw=trapred!75, fill=trapred!8] (2.15, 3.15) rectangle (3.55, 3.65);
+    \node[font=\scriptsize, text=trapred!85!black] at (1.20, 3.40) {\texttt{ptr = null}};
+    \node[font=\scriptsize, text=trapred!85!black] at (2.85, 3.40) {\texttt{len = 0}};
+
+    \node[anchor=west, font=\scriptsize\bfseries] at (0.25, 2.75) {2. \texttt{b} takes buffer pointer:};
+    \draw[thick, draw=sourceblue!80, fill=sourceblue!8] (0.25, 1.95) rectangle (2.15, 2.45);
+    \draw[thick, draw=sourceblue!80, fill=sourceblue!8] (2.15, 1.95) rectangle (3.55, 2.45);
+    \node[font=\scriptsize] at (1.20, 2.20) {\texttt{ptr = 0x7f10}};
+    \node[font=\scriptsize] at (2.85, 2.20) {\texttt{len = 9}};
+
+    % Heap box
+    \draw[thick, draw=targetgreen!80, fill=targetgreen!10] (4.45, 1.95) rectangle (6.25, 2.45);
+    \node[font=\ttfamily\scriptsize] at (5.35, 2.20) {WIRE-9941};
+    \draw[->, thick, sourceblue!85] (1.20, 1.95) to[out=-20, in=202] (4.45, 2.05);
+
+    \node[anchor=west, font=\scriptsize, text=trapred!85!black, align=left] at (0.25, 0.90)
+      {$\bullet$ Extra runtime writes to zero out \texttt{a}\\
+       $\bullet$ \texttt{\~{}string()} still runs on \texttt{a} at \texttt{\}}\\
+       $\bullet$ Reading \texttt{a} compiles (use-after-move bug!)};
+  \end{scope}
+
+  % Right panel: Rust destructive move
+  \begin{scope}[shift={(7.1,0)}]
+    \node[font=\bfseries\footnotesize, text=targetgreen!85!black] at (3.25, 4.55) {Rust: \texttt{let b = a;} (Destructive Move)};
+    \draw[rounded corners=3pt, draw=gray!50, fill=gray!4] (0.0, 0.0) rectangle (6.5, 4.25);
+
+    \node[anchor=west, font=\scriptsize\bfseries] at (0.25, 3.90) {1. \texttt{a} marked uninitialized at compile time:};
+    \draw[thick, dashed, draw=gray!65, fill=gray!15] (0.25, 3.15) rectangle (4.35, 3.65);
+    \node[font=\scriptsize\itshape, text=gray!65!black] at (2.30, 3.40) {statically dead slot (untouched)};
+
+    \node[anchor=west, font=\scriptsize\bfseries] at (0.25, 2.75) {2. \texttt{b} receives 24-byte bitwise copy:};
+    \draw[thick, draw=sourceblue!80, fill=sourceblue!8] (0.25, 1.95) rectangle (2.15, 2.45);
+    \draw[thick, draw=sourceblue!80, fill=sourceblue!8] (2.15, 1.95) rectangle (3.55, 2.45);
+    \node[font=\scriptsize] at (1.20, 2.20) {\texttt{ptr = 0x7f10}};
+    \node[font=\scriptsize] at (2.85, 2.20) {\texttt{len = 9}};
+
+    % Heap box
+    \draw[thick, draw=targetgreen!80, fill=targetgreen!10] (4.45, 1.95) rectangle (6.25, 2.45);
+    \node[font=\ttfamily\scriptsize] at (5.35, 2.20) {WIRE-9941};
+    \draw[->, thick, sourceblue!85] (1.20, 1.95) to[out=-20, in=202] (4.45, 2.05);
+
+    \node[anchor=west, font=\scriptsize, text=targetgreen!80!black, align=left] at (0.25, 0.90)
+      {$\bullet$ Zero writes to \texttt{a} (pure bitwise copy)\\
+       $\bullet$ \texttt{Drop} runs ONLY on \texttt{b} at \texttt{\}}\\
+       $\bullet$ Reading \texttt{a} is a compile-time error!};
+  \end{scope}
+\end{tikzpicture}
+\caption{Why Rust's destructive move is both safer and faster than C++11's \texttt{std::move}. C++ must leave \texttt{a} in a valid empty state and run its destructor at scope exit; Rust invalidates \texttt{a} inside the type checker.}
+\label{ch03:fig-cpp-vs-rust-move}
+\end{figure}
+
+\begin{formalbox}
+\textbf{What if ownership is moved inside only one branch of an \texttt{if}?} Suppose \texttt{if flag \{ drop(a); \}} moves and drops \texttt{a} only when \texttt{flag} is \texttt{true}. At compile time, touching \texttt{a} after the \texttt{if} is rejected because \texttt{a} \emph{might} have been moved. At runtime, how does the closing brace \texttt{\}} know whether to drop \texttt{a}? Only in such dynamically conditional moves does \texttt{rustc} allocate a tiny 1-byte boolean \textbf{drop flag} on the stack frame, setting it to \texttt{false} inside the branch that moved \texttt{a}, and checking that stack byte at scope exit. For all straight-line moves, the cost is zero instructions.
+\end{formalbox}
+
+\subsection{When Is a Type Allowed to Be \texttt{Copy}? And When Do We \texttt{.clone()}?}
+
+For a 64-bit integer \texttt{let x: i64 = 5000; let y = x;}, invalidating \texttt{x} would be silly: an \texttt{i64} owns no heap buffer, file descriptor, or database lock --- its 8 stack bytes \emph{are} the entire value. The same is true for a compact 3-byte currency code \texttt{Currency(*b"USD")} or a 16-byte money value \texttt{Money \{ minor: i64, currency: Currency \}}. You opt your own small value types into \texttt{Copy} explicitly:
+
+\begin{lstlisting}[language=Rust]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Currency(pub [u8; 3]);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Money {
+    pub minor_units: i64,
+    pub currency: Currency,
+}
+\end{lstlisting}
+
+Can you slap \texttt{\#[derive(Copy, Clone)]} onto \texttt{Account} if \texttt{Account} contains an owned \texttt{owner\_name: String}? Try it, and \texttt{rustc} refuses immediately: \texttt{the trait `Copy` cannot be implemented for this type; field `owner\_name` does not implement `Copy`}. In fact, Rust enforces a strict theorem connecting \texttt{Copy} and \texttt{Drop}:
+
+\begin{theorem}[Mutual Exclusion of \texttt{Copy} and \texttt{Drop}]
+\label{ch03:thm-copy-xor-drop}
+No Rust type \texttt{T} can implement both \texttt{Copy} and \texttt{Drop}. A type may implement \texttt{Copy} only if every one of its fields is itself \texttt{Copy} and the type requires no custom cleanup logic on scope exit.
+\end{theorem}
+
+\begin{proof}
+Suppose a type \texttt{T} implemented both \texttt{Copy} (meaning \texttt{let b = a;} duplicates \texttt{T}'s stack bytes while leaving \texttt{a} live) and \texttt{Drop} (meaning \texttt{T} owns an external resource cleaned up by \texttt{Drop::drop(\&mut self)} when each live variable exits scope). Then \texttt{let b = a;} would produce two bitwise-identical owners of the same external resource, and at scope exit \texttt{Drop::drop} would run on both \texttt{b} and \texttt{a}, freeing or closing that resource twice. Forbidding \texttt{Copy + Drop} ensures bitwise duplication never aliases owned resources.
+\end{proof}
+
+Aliasing XOR Mutability also decides which reference types are \texttt{Copy}:
+\begin{itemize}
+  \item A \textbf{shared reference \texttt{\&T} implements \texttt{Copy}} (for \emph{every} \texttt{T}, even when \texttt{T} itself is a non-\texttt{Copy} \texttt{String} or \texttt{Vec}). Why? Because \texttt{\&T} only grants read access, and Aliasing XOR Mutability allows any number of simultaneous readers. Copying the 8-byte pointer \texttt{\&Account} creates one more reader.
+  \item An \textbf{exclusive mutable reference \texttt{\&mut T} is NOT \texttt{Copy}}. If \texttt{let r2 = r1;} copied \texttt{r1: \&mut Account} while leaving \texttt{r1} usable, you would instantly hold \emph{two} active mutable references to the same \texttt{Account}, breaking Aliasing XOR Mutability. Moving \texttt{r1} into \texttt{r2} invalidates \texttt{r1}.
+\end{itemize}
+
+Finally, what if you want a second, independent heap copy of a \texttt{String} or a \texttt{Vec<Account>}? You call \texttt{.clone()} explicitly: \texttt{let b = a.clone();}. This makes performance review easier than in C++, because in Rust neither \texttt{=} nor passing an argument can hide an $O(n)$ heap allocation. Every deep copy says \texttt{.clone()} right on the page.
+
+\section{Borrowing, Reborrowing, and Splitting Slices}
+\label{ch03:borrowing-reborrowing-slices}
+
+If passing a non-\texttt{Copy} value into a function always moved it, every helper would have to take \texttt{Account} by value and hand it back as \texttt{(Account, Result)} so the caller could keep using the account afterward.
+
+Instead, callers lend temporary access via \textbf{borrowing} --- creating either a shared reference \texttt{\&T} or an exclusive mutable reference \texttt{\&mut T}. Watch how the borrow checker handles our opening C++ and Java ledger bug at compile time:
+
+\begin{lstlisting}[language=Rust]
+fn append_bonus_if_positive(postings: &mut Vec<i64>) {
+    let first: &i64 = &postings[0]; // Shared borrow of `postings` starts
+    if *first > 0 {
+        postings.push(500);         // Needs `&mut postings` while `first` is live!
+        println!("Triggered by posting: {}", first);
+    }
+}
+\end{lstlisting}
+
+Feed those seven lines to \texttt{rustc} and read the exact diagnostic it prints:
+
+\begin{lstlisting}
+error[E0502]: cannot borrow `*postings` as mutable because it is also borrowed as immutable
+ --> src/lib.rs:4:9
+  |
+2 |     let first: &i64 = &postings[0];
+  |                        -------- immutable borrow occurs here
+3 |     if *first > 0 {
+4 |         postings.push(500);
+  |         ^^^^^^^^^^^^^^^^^^ mutable borrow occurs here
+5 |         println!("Triggered by posting: {}", first);
+  |                                              ----- immutable borrow later used here
+\end{lstlisting}
+
+The diagnostic names the three lines that form the Aliasing $+$ Mutation triangle: line~2 creates an alias into the heap buffer (\texttt{first}), line~4 attempts to mutate (and potentially reallocate) the vector, and line~5 reads through the alias afterward. And notice the instant fix: copy the 8-byte integer out (\texttt{let first: i64 = postings[0];}) \emph{or} finish reading \texttt{first} before calling \texttt{postings.push(500)}:
+
+\begin{lstlisting}[language=Rust]
+fn append_bonus_if_positive_fixed(postings: &mut Vec<i64>) {
+    let first_ref: &i64 = &postings[0];
+    if *first_ref > 0 {
+        let saved: i64 = *first_ref; // Last read of `first_ref` ends its borrow!
+        postings.push(500);          // Safe: zero aliases into `postings` remain.
+        println!("Triggered by posting: {}", saved);
+    }
+}
+\end{lstlisting}
+
+Wait --- why did \texttt{first\_ref}'s borrow end right at line~4 instead of lasting all the way down to the closing brace on line~7? Because modern Rust uses \textbf{Non-Lexical Lifetimes (NLL)}, tracking borrows up to their \emph{last actual use} along the control-flow graph rather than stubbornly locking variables until \texttt{\}}. Chapter~4 opens up the NLL region solver in full detail.
+
+\subsection{Implicit Reborrowing: Why Doesn't Passing \texttt{\&mut T} Move It?}
+
+Pause for a puzzle that trips up observant C++ and Java programmers who pay close attention to types. At the end of \S\ref{ch03:copy-move-clone}, we proved that \texttt{\&mut Account} is \textbf{not} \texttt{Copy}. Now read the following completely valid Rust code:
+
+\begin{lstlisting}[language=Rust]
+pub fn apply_fee(acct: &mut Account, fee_cents: i64) {
+    acct.balance_cents -= fee_cents;
+}
+
+pub fn snapshot_balance(acct: &Account) -> i64 {
+    acct.balance_cents
+}
+
+pub fn close_month(r: &mut Account) -> i64 {
+    apply_fee(r, 250);       // Wait: why didn't passing `r` move and kill `r`?!
+    apply_fee(r, 100);       // `r` still works on the very next line!
+    snapshot_balance(r)      // And coerces cleanly from `&mut Account` to `&Account`!
+}
+\end{lstlisting}
+
+If \texttt{r: \&mut Account} is not \texttt{Copy}, why didn't passing \texttt{r} into the first \texttt{apply\_fee(r, 250)} move \texttt{r} and make line~11 a compile error?
+
+Because whenever a target type is known to be a reference (\texttt{\&mut Account} or \texttt{\&Account}), the Rust compiler automatically inserts a \textbf{reborrow}: it rewrites \texttt{apply\_fee(r, 250)} into \texttt{apply\_fee(\&mut *r, 250)}, and \texttt{snapshot\_balance(r)} into \texttt{snapshot\_balance(\&*r)}.
+
+\begin{intuitionbox}
+Reborrowing works like a stack of temporary permissions:
+\begin{enumerate}
+  \item Owner \texttt{acct: Account} sits at the bottom of the permission stack.
+  \item \texttt{r: \&mut Account} borrows exclusive access from \texttt{acct}. While \texttt{r} is active, \texttt{acct} itself is frozen.
+  \item Calling \texttt{apply\_fee(\&mut *r, 250)} creates a shorter-lived reborrow \texttt{r\_sub: \&mut Account} on top of \texttt{r}. For the duration of \texttt{apply\_fee}, \emph{both} \texttt{acct} and \texttt{r} are frozen; \texttt{r\_sub} is the only usable pointer to the account.
+  \item As soon as \texttt{apply\_fee} returns, \texttt{r\_sub} pops off the stack, and exclusive access returns intact to \texttt{r}.
+\end{enumerate}
+At no microsecond were two \texttt{\&mut Account} references simultaneously usable. Only the topmost reference on the reborrow stack is active at any instant.
+\end{intuitionbox}
+
+When does implicit reborrowing \emph{not} kick in? When you pass \texttt{r} to a generic parameter, as in \texttt{fn identity<T>(x: T) -> T}, the signature does not say the argument is a reference. \texttt{T} becomes \texttt{\&mut Account}, and \texttt{r} moves. Writing \texttt{identity(\&mut *r)} reborrows explicitly and keeps \texttt{r} usable.
+
+\subsection{Disjoint Struct Fields and Splitting Slices (\texttt{split\_at\_mut})}
+
+As soon as you build real domain structs --- say a \texttt{LedgerEngine} holding both a fee table and a vector of accounts --- you run into a natural question: what if a method needs to \emph{read} \texttt{self.fee\_bps} while \emph{mutating} \texttt{self.accounts}?
+
+\begin{lstlisting}[language=Rust]
+pub struct LedgerEngine {
+    pub fee_bps: i64,
+    pub accounts: Vec<Account>,
+}
+
+impl LedgerEngine {
+    // Pitfall: helper borrows ALL of `&self`, including `self.accounts`!
+    fn compute_fee_bad(&self, amount: i64) -> i64 {
+        (amount * self.fee_bps) / 10_000
+    }
+
+    pub fn charge_all(&mut self, amount: i64) {
+        for acct in &mut self.accounts {
+            // Calling `self.compute_fee_bad(amount)` here FAILS to compile:
+            // `self.accounts` is mutably borrowed by the loop, while
+            // `&self` asks to borrow the entire `LedgerEngine` struct!
+            let fee = (amount * self.fee_bps) / 10_000; // OK: disjoint field!
+            acct.balance_cents -= fee;
+        }
+    }
+}
+\end{lstlisting}
+
+Notice why line~17 compiles while calling \texttt{self.compute\_fee\_bad(amount)} would fail:
+\begin{itemize}
+  \item Inside a single function body, Rust's borrow checker understands \textbf{disjoint field projection}: \texttt{self.accounts} and \texttt{self.fee\_bps} are different fields, so they occupy non-overlapping bytes of the struct, so \texttt{\&mut self.accounts} and \texttt{\&self.fee\_bps} can coexist safely.
+  \item Across a method boundary, however, Rust checks function bodies strictly against their \emph{signatures} (so changing a helper's implementation never silently breaks callers). A signature \texttt{fn compute\_fee\_bad(\&self, ...)} claims a shared borrow of \emph{every} field of \texttt{LedgerEngine}, colliding with \texttt{\&mut self.accounts}. The idiomatic Rust fix is clean: make the helper take only the field it actually needs (\texttt{fn compute\_fee(fee\_bps: i64, amount: i64) -> i64}), or factor configuration fields into a sub-struct (\texttt{\&self.config}).
+\end{itemize}
+
+Now push that same geometric question one step further: what if you have a contiguous slice \texttt{accounts: \&mut [Account]} and need to move funds from index \texttt{from\_idx} to index \texttt{to\_idx}? If you write:
+
+\begin{lstlisting}[language=Rust]
+// FAILS TO COMPILE: cannot borrow `accounts[_]` as mutable more than once!
+// let src = &mut accounts[from_idx];
+// let dst = &mut accounts[to_idx];
+\end{lstlisting}
+
+The compiler must reject those two lines because \texttt{from\_idx} and \texttt{to\_idx} are runtime integers. What if a caller passes \texttt{from\_idx == 3} and \texttt{to\_idx == 3}? Then \texttt{src} and \texttt{dst} would be \textbf{two simultaneous \texttt{\&mut Account} references pointing to the exact same 24 bytes in memory}, violating Aliasing XOR Mutability (and in banking logic, potentially crediting an account from itself or miscomputing a balance check).
+
+How do we obtain two simultaneous \texttt{\&mut Account} references into the same slice safely? We check \texttt{from\_idx != to\_idx} and call the standard library's \texttt{split\_at\_mut(mid)} method, which cuts one \texttt{\&mut [T]} at index \texttt{mid} into two non-overlapping mutable sub-slices \texttt{(\&mut [T], \&mut [T])} covering \texttt{0..mid} and \texttt{mid..len}:
+
+\begin{lstlisting}[language=Rust]
+pub fn transfer_in_slice(
+    accounts: &mut [Account],
+    from_idx: usize,
+    to_idx: usize,
+    amount_cents: i64,
+) -> Result<(), &'static str> {
+    if from_idx == to_idx {
+        return Err("source and destination must be distinct accounts");
+    }
+    if amount_cents <= 0 {
+        return Err("transfer amount must be positive");
+    }
+    let (from_acct, to_acct) = if from_idx < to_idx {
+        let (left, right) = accounts.split_at_mut(to_idx);
+        (&mut left[from_idx], &mut right[0])
+    } else {
+        let (left, right) = accounts.split_at_mut(from_idx);
+        (&mut right[0], &mut left[to_idx])
+    };
+    if from_acct.currency != to_acct.currency {
+        return Err("currency mismatch");
+    }
+    if from_acct.balance_cents < amount_cents {
+        return Err("insufficient funds");
+    }
+    from_acct.balance_cents -= amount_cents;
+    to_acct.balance_cents += amount_cents;
+    Ok(())
+}
+\end{lstlisting}
+
+To convince \texttt{rustc} that \texttt{from\_acct} and \texttt{to\_acct} never alias, the function had to handle \texttt{from\_idx == to\_idx} up front. Under the hood (as we will build from scratch in Chapter~4), \texttt{split\_at\_mut} is six lines of pointer arithmetic verified once in \texttt{core::slice}, exposing a completely safe interface with zero heap allocations. (In modern Rust since 1.86, slices even provide a convenience wrapper \texttt{get\_disjoint\_mut([from\_idx, to\_idx])} built on this exact principle.)
+
+\section{Shared Ownership: \texttt{Rc<T>} versus \texttt{Arc<T>}}
+\label{ch03:shared-ownership-rc-arc}
+
+Single ownership handles 90\% of systems code cleanly: an HTTP request owns its parsed payload, a transaction owns its vector of postings, and helper functions borrow \texttt{\&T} or \texttt{\&mut T} views on the way down the call stack.
+
+Occasionally, however, a piece of data genuinely has \emph{multiple co-equal owners} whose lifetimes do not nest neatly inside a single call frame. Imagine an in-memory \texttt{FeeSchedule} loaded from PostgreSQL every five minutes: forty in-flight request handlers are currently pricing transfers against version~$k$ of that schedule when version~$k+1$ arrives. You want version~$k$ to stay alive in memory until the last of those forty handlers finishes, and then drop immediately.
+
+In Java~6, you hand all forty handlers a normal object reference and let the garbage collector eventually sweep version~$k$. In C++11, you reach for \texttt{std::shared\_ptr<FeeSchedule>}. Notice two silent costs baked into C++'s \texttt{std::shared\_ptr<T>}:
+\begin{enumerate}
+  \item Every copy and destruction of \texttt{std::shared\_ptr<T>} executes an \textbf{atomic hardware read-modify-write instruction} (\texttt{LOCK XADD} on x86-64) on the control block's reference count --- even in a purely single-threaded GUI, compiler pass, or event loop that never spawns a thread. Atomic increments stall CPU store buffers and bounce cache lines across cores, costing roughly $5\times$ to $15\times$ more than an ordinary register increment.
+  \item \texttt{std::shared\_ptr<FeeSchedule>} hands out mutable \texttt{FeeSchedule\&} access by default. Two threads sharing a \texttt{shared\_ptr<FeeSchedule>} have thread-safe \emph{reference counts}, while mutating the \texttt{FeeSchedule} fields themselves is an instant, undefined-behavior data race.
+\end{enumerate}
+
+Rust splits reference-counted shared ownership into two distinct smart pointers so you never pay for thread synchronization you do not use, and never accidentally mutate aliased data:
+
+\begin{itemize}
+  \item \textbf{\texttt{Rc<T>} (Reference Counted --- Single-Threaded Only):} An 8-byte non-null pointer on the stack pointing to a heap allocation containing \texttt{(strong\_count: usize, weak\_count: usize, value: T)} laid out contiguously in a single heap block. Calling \texttt{Rc::clone(\&sched)} increments \texttt{strong\_count} with a plain, non-atomic CPU \texttt{add} instruction and returns another 8-byte \texttt{Rc<T>} pointer. Better still, \texttt{Rc<T>} intentionally opts \emph{out} of Rust's \texttt{Send} and \texttt{Sync} concurrency marker traits: if you try to pass an \texttt{Rc<T>} into \texttt{std::thread::spawn}, \textbf{your program fails to compile} rather than suffering a reference-count race at runtime.
+  \item \textbf{\texttt{Arc<T>} (Atomically Reference Counted --- Thread-Safe):} Identical 8-byte stack pointer and contiguous heap block \texttt{(strong: AtomicUsize, weak: AtomicUsize, value: T)}, except \texttt{Arc::clone(\&sched)} and \texttt{Drop} use hardware atomic operations (\texttt{Ordering::Relaxed} on increment, \texttt{Release}/\texttt{Acquire} fence on decrement to zero). Whenever \texttt{T} is safe to share across threads, \texttt{Arc<T>} can be cloned across worker threads freely.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small, >=Stealth]
+  % Left: Two stack frames / tasks holding Arc handles
+  \node[font=\bfseries\footnotesize, text=sourceblue!90!black] at (1.5, 3.65) {WORKER STACK FRAMES};
+
+  \node[anchor=west, font=\scriptsize\bfseries] at (0.0, 3.05) {\texttt{handler\_1: Arc<FeeSchedule>} (8B)};
+  \draw[thick, draw=sourceblue!85, fill=sourceblue!8] (0.0, 2.30) rectangle (2.6, 2.85);
+  \node[font=\scriptsize] at (1.3, 2.57) {\texttt{ptr = 0x55a0}};
+
+  \node[anchor=west, font=\scriptsize\bfseries] at (0.0, 1.55) {\texttt{handler\_2: Arc<FeeSchedule>} (8B)};
+  \draw[thick, draw=sourceblue!85, fill=sourceblue!8] (0.0, 0.80) rectangle (2.6, 1.35);
+  \node[font=\scriptsize] at (1.3, 1.07) {\texttt{ptr = 0x55a0}};
+
+  % Right: Single contiguous Heap ArcInner<FeeSchedule>
+  \node[font=\bfseries\footnotesize, text=targetgreen!85!black] at (9.0, 3.65) {SINGLE HEAP BLOCK (\texttt{ArcInner<FeeSchedule>})};
+
+  % Header words
+  \draw[thick, draw=quotientorange!85, fill=quotientorange!10] (5.1, 1.55) rectangle (7.4, 2.65);
+  \node[font=\scriptsize, align=center] at (6.25, 2.10) {\texttt{strong}\\\texttt{AtomicUsize = 2}};
+  \node[font=\tiny, text=gray!75!black] at (5.1, 1.35) {0};
+
+  \draw[thick, draw=quotientorange!85, fill=quotientorange!10] (7.4, 1.55) rectangle (9.7, 2.65);
+  \node[font=\scriptsize, align=center] at (8.55, 2.10) {\texttt{weak}\\\texttt{AtomicUsize = 1}};
+  \node[font=\tiny, text=gray!75!black] at (7.4, 1.35) {8};
+
+  % Inline payload T
+  \draw[thick, draw=targetgreen!85, fill=targetgreen!10] (9.7, 1.55) rectangle (12.9, 2.65);
+  \node[font=\scriptsize, align=center] at (11.3, 2.10) {Inline \texttt{FeeSchedule}\\\texttt{flat: 1500, bps: 12}};
+  \node[font=\tiny, text=gray!75!black] at (9.7, 1.35) {16};
+  \node[font=\tiny, text=gray!75!black] at (12.9, 1.35) {32};
+
+  % Arrows from stack handles cleanly avoiding text
+  \draw[->, thick, sourceblue!85] (2.6, 2.57) to[out=0, in=165] (5.1, 2.35);
+  \draw[->, thick, sourceblue!85] (2.6, 0.98) to[out=-8, in=215] (5.1, 1.72);
+\end{tikzpicture}
+\caption{Exact memory layout of \texttt{Arc<FeeSchedule>} (and \texttt{Rc<FeeSchedule>}, with non-atomic \texttt{Cell<usize>} counters). Dereferencing either handle yields only \texttt{\&FeeSchedule} (shared read-only). When \texttt{strong} drops to $0$, \texttt{FeeSchedule} is dropped in place; when \texttt{weak} also hits $0$, the 32-byte block is freed.}
+\label{ch03:fig-rc-arc-layout}
+\end{figure}
+
+Note the caption of Figure~\ref{ch03:fig-rc-arc-layout}: \textbf{dereferencing \texttt{Rc<T>} or \texttt{Arc<T>} only ever gives you \texttt{\&T}, never \texttt{\&mut T}.} Why? Because the purpose of \texttt{Rc} and \texttt{Arc} is that \emph{multiple handles can alias the same heap allocation}, and by Aliasing XOR Mutability (\S\ref{ch03:aliasing-xor-mutability}), aliased memory cannot be mutated directly. (The one exception is \texttt{Arc::get\_mut(\&mut arc)} or copy-on-write \texttt{Arc::make\_mut(\&mut arc)}, which checks at runtime whether \texttt{strong\_count == 1 \&\& weak\_count == 0}: if you happen to be the \emph{sole} owner right now, it hands you \texttt{\&mut T} in place; if others are sharing it, \texttt{make\_mut} clones \texttt{T} into a private allocation before mutating.)
+
+\begin{remark}[Reference Cycles and \texttt{Weak<T>}]
+Unlike a tracing garbage collector, reference counting cannot collect isolated cycles: if node~$A$ holds an \texttt{Rc} to node~$B$ and node~$B$ holds an \texttt{Rc} back to node~$A$, both \texttt{strong\_count}s stay $\ge 1$ forever and leak memory (safe Rust considers leaking memory undesirable, though memory-safe --- no dangling pointer is created). Whenever a parent-child relationship exists, parents own children via \texttt{Rc<Node>} (\texttt{strong}) while children point upward via \texttt{Weak<Node>} (\texttt{Rc::downgrade(\&parent)}), which increments \texttt{weak\_count} without keeping the value alive; reading a \texttt{Weak<Node>} requires calling \texttt{.upgrade() -> Option<Rc<Node>>} to check whether the parent still exists. Even better, as Chapter~8 shows, idiomatic Rust usually represents graphs as a flat \texttt{Vec<Node>} indexed by integer IDs (\texttt{NodeId(u32)}), avoiding reference-counted pointer webs altogether.
+\end{remark}
+
+\section{Controlled Interior Mutability: \texttt{Cell}, \texttt{RefCell}, and \texttt{Mutex}}
+\label{ch03:interior-mutability}
+
+By now a practical question should be nagging at you: \emph{what if two parts of a program genuinely DO need to share ownership of a cache, metrics counter, or account ledger AND mutate it over time?}
+
+Dropping Aliasing XOR Mutability here would bring back the Java~6 and C++ bugs from \S\ref{ch03:aliasing-xor-mutability}. Instead, Rust provides \textbf{interior mutability} containers --- types that let you mutate an inner value through a shared reference \texttt{\&Container}, \textbf{because the container itself enforces Aliasing XOR Mutability dynamically or structurally at its boundary.} (All of them are built on a single compiler-blessed primitive called \texttt{UnsafeCell<T>}, whose mechanics we inspect in Chapter~4.)
+
+Pick the container by asking two simple questions: \emph{is this shared on a single thread or across multiple threads}, and \emph{do callers need references inside the data or just value swaps?}
+
+\subsection{1. \texttt{Cell<T>}: Zero-Byte-Overhead Value Replacement (Single-Threaded)}
+
+Suppose a single-threaded \texttt{QuoteClient} struct needs to increment a \texttt{request\_count: u64} every time \texttt{fetch\_quote(\&self, symbol: \&str)} is called through a shared \texttt{\&QuoteClient} reference. Wrap the counter in \texttt{std::cell::Cell<u64>}:
+
+\begin{lstlisting}[language=Rust]
+use std::cell::Cell;
+
+pub struct QuoteClient {
+    endpoint: String,
+    request_count: Cell<u64>, // Exact same 8 bytes in memory as a plain `u64`!
+}
+
+impl QuoteClient {
+    pub fn fetch_quote(&self, symbol: &str) -> String {
+        let next = self.request_count.get() + 1; // Copies 8 bytes out
+        self.request_count.set(next);            // Overwrites 8 bytes in place
+        format!("{}:{}#{}", self.endpoint, symbol, next)
+    }
+}
+\end{lstlisting}
+
+Why is \texttt{self.request\_count.set(next)} completely sound through a shared \texttt{\&self} without any lock or runtime borrow counter? \textbf{Because \texttt{Cell<T>} never gives out a \texttt{\&T} or \texttt{\&mut T} reference to the bytes inside it.} You can only copy values out (\texttt{.get()} when \texttt{T: Copy}), overwrite the whole value (\texttt{.set(new\_val)}), or swap a non-\texttt{Copy} value in and out atomically on one thread (\texttt{.replace(new\_val)} / \texttt{.take()}). Since no pointer into a \texttt{Cell<T>}'s interior can ever exist, overwriting its contents can never invalidate a dangling reference --- and because \texttt{Cell<T>} is \texttt{!Sync} (cannot be shared across threads), no second thread can race with those writes. \texttt{size\_of::<Cell<u64>>()} is $8$~bytes, and \texttt{.set()} compiles down to a single \texttt{mov} instruction.
+
+\subsection{2. \texttt{RefCell<T>}: Single-Threaded Runtime Borrow Checking}
+
+What if you are on a single thread and hold a large \texttt{Vec<Posting>} or \texttt{HashMap} inside an \texttt{Rc<...>}, where copying the entire collection in and out of a \texttt{Cell} on every read would be absurd? You want real \texttt{\&Vec<Posting>} and \texttt{\&mut Vec<Posting>} access, checked dynamically at runtime instead of compile time. That is \texttt{std::cell::RefCell<T>}.
+
+In memory on a 64-bit machine, \texttt{RefCell<T>} stores \texttt{T} alongside one extra 8-byte signed integer \texttt{borrow: Cell<isize>}:
+\begin{itemize}
+  \item $\texttt{borrow} == 0$: currently unborrowed.
+  \item $\texttt{borrow} > 0$: currently borrowed immutably by $\texttt{borrow}$ active \texttt{Ref<'\_, T>} smart-pointer guards. Calling \texttt{.borrow()} increments \texttt{borrow} by $1$; when each \texttt{Ref} guard drops at scope exit, its \texttt{Drop} implementation decrements \texttt{borrow} by $1$.
+  \item $\texttt{borrow} == -1$: currently borrowed mutably by \textbf{one} exclusive \texttt{RefMut<'\_, T>} guard. When that \texttt{RefMut} guard drops, \texttt{borrow} resets to $0$.
+\end{itemize}
+
+If your code calls \texttt{.borrow\_mut()} while \texttt{borrow != 0} (or calls \texttt{.borrow()} while \texttt{borrow == -1}), \texttt{RefCell} catches the Aliasing $+$ Mutation violation immediately on that exact line and \textbf{panics} (unwinding the thread cleanly before a single byte of undefined behavior can occur; if you prefer a recoverable \texttt{Result}, call \texttt{.try\_borrow\_mut()}).
+
+\begin{lstlisting}[language=Rust]
+use std::cell::RefCell;
+
+fn audit_and_append(log: &RefCell<Vec<i64>>) {
+    {
+        let r1 = log.borrow(); // borrow state: 0 -> +1
+        let r2 = log.borrow(); // borrow state: +1 -> +2 (multiple readers OK!)
+        assert_eq!(r1.len(), r2.len());
+    } // `r2` and `r1` drop here -> borrow state returns to 0!
+
+    log.borrow_mut().push(750); // borrow state: 0 -> -1 -> push -> drops back to 0!
+}
+\end{lstlisting}
+
+\begin{trapbox}
+\textbf{Keep \texttt{Ref} and \texttt{RefMut} guards in tight scopes.} A classic beginner bug with \texttt{RefCell} is binding \texttt{let entries = log.borrow();} at the top of a 60-line function and then calling a helper method 40 lines later that internally calls \texttt{log.borrow\_mut()}, triggering a runtime \texttt{already borrowed: BorrowMutError} panic. Drop your \texttt{Ref} guard explicitly with \texttt{drop(entries);} or scope it inside \texttt{\{ ... \}} right before calling anything else that touches the same \texttt{RefCell}.
+\end{trapbox}
+
+\subsection{3. \texttt{Mutex<T>} and \texttt{RwLock<T>}: Putting the Data \emph{Inside} the Lock}
+
+Now step into multi-threaded server engineering --- where an Axum HTTP service handles thousands of concurrent requests across worker threads. Compare how Java~6 (and C++) attach a lock to shared state versus how Rust does it.
+
+In Java~6, a lock and the fields it protects are \textbf{two separate objects} connected only by a comment in the author's head:
+
+\begin{lstlisting}[language=Java]
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class SharedVault {
+  private final Lock lock = new ReentrantLock(); // Sits NEXT to the data
+  private long balanceCents = 100000L;
+
+  public void withdraw(long cents) {
+    lock.lock();
+    try {
+      balanceCents -= cents;
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  // Six months later, a hurried teammate adds a getter WITHOUT `lock.lock()`:
+  public long peekBalanceBuggy() {
+    return balanceCents; // SILENT DATA RACE! `javac` compiles with 0 warnings!
+  }
+}
+\end{lstlisting}
+
+Experienced Java and C++ engineers ship bugs like \texttt{peekBalanceBuggy()} regularly: forgetting to acquire the lock in a newly added method, forgetting \texttt{try/finally} so an early return leaks a held lock, or returning a reference to a mutable \texttt{HashMap} stored inside the class so the caller keeps reading and mutating the map \emph{after} \texttt{finally \{ lock.unlock(); \}} has already released the lock.
+
+Look at \texttt{std::sync::Mutex<T>} in Rust. In Rust, \textbf{a \texttt{Mutex} is a generic container that physically wraps and owns the \texttt{T} inside itself}:
+
+\begin{lstlisting}[language=Rust]
+use std::sync::{Arc, Mutex};
+
+pub fn concurrent_withdrawal_demo() {
+    let vault: Arc<Mutex<Account>> = Arc::new(Mutex::new(Account {
+        id: 99,
+        balance_cents: 100_000,
+        currency: *b"USD",
+    }));
+
+    let worker_vault = Arc::clone(&vault);
+    let handle = std::thread::spawn(move || {
+        // You CANNOT touch `balance_cents` on `worker_vault` directly!
+        // `.lock()` acquires the OS mutex and returns an RAII `MutexGuard<Account>`:
+        let mut guard = worker_vault.lock().unwrap();
+        guard.balance_cents -= 15_000;
+    }); // `guard` drops right here -> OS mutex unlocks deterministically!
+
+    handle.join().unwrap();
+    assert_eq!(vault.lock().unwrap().balance_cents, 85_000);
+}
+\end{lstlisting}
+
+Each of the three properties below is enforced by the type system:
+\begin{enumerate}
+  \item \textbf{Impossible to forget the lock:} \texttt{Mutex<Account>} has no \texttt{.balance\_cents} field. The \emph{only} API that yields \texttt{\&mut Account} is \texttt{.lock()}, which blocks until the OS mutex is acquired and returns \texttt{MutexGuard<'\_, Account>}.
+  \item \textbf{Impossible to forget to unlock:} \texttt{MutexGuard} implements \texttt{Drop}; whether the scope exits normally, hits an early \texttt{return} or \texttt{?}, or unwinds on a panic, the lock is released at the exact end of \texttt{guard}'s scope. (Even better: if a thread panics while holding \texttt{MutexGuard}, Rust marks the mutex \emph{poisoned} --- returning \texttt{Err(PoisonError)} on \texttt{.lock()} --- warning other threads that an invariant might have been left half-updated.)
+  \item \textbf{Impossible to leak a reference out past unlock:} Suppose someone writes \texttt{let leaked: \&mut i64 = \&mut vault.lock().unwrap().balance\_cents;} trying to use \texttt{leaked} after the lock releases. The borrow checker sees that \texttt{leaked} borrows from the temporary \texttt{MutexGuard}, which drops at the semicolon --- and \textbf{rejects the code at compile time}.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small, >=Stealth]
+  % Left: Java 6 Detached Lock
+  \begin{scope}[shift={(0,0)}]
+    \node[font=\bfseries\footnotesize, text=trapred!85!black] at (3.1, 3.95) {Java 6 / C++: Detached Lock};
+    \draw[rounded corners=4pt, draw=gray!55, fill=gray!4] (0.0, 0.0) rectangle (6.2, 3.65);
+
+    \draw[rounded corners=3pt, thick, draw=sourceblue!80, fill=sourceblue!10] (1.65, 2.35) rectangle (4.05, 3.25);
+    \node[font=\scriptsize, align=center] at (2.85, 2.80) {\texttt{ReentrantLock}\\(advisory sibling)};
+
+    \draw[rounded corners=3pt, thick, draw=quotientorange!85, fill=quotientorange!12] (3.45, 0.75) rectangle (5.85, 1.85);
+    \node[font=\scriptsize, align=center] at (4.65, 1.30) {\texttt{balanceCents}\\\texttt{100\_000L}};
+
+    \draw[->, thick, targetgreen!80!black] (0.25, 2.80) -- node[above=2pt, font=\tiny, text=targetgreen!80!black] {polite caller} (1.65, 2.80);
+    \draw[->, thick, targetgreen!80!black] (4.05, 2.80) to[out=0, in=90] (4.65, 1.85);
+
+    \draw[->, very thick, trapred!90] (0.3, 0.65) -- node[above=2pt, font=\tiny\bfseries, text=trapred!90!black] {bypasses lock!} (3.45, 0.95);
+  \end{scope}
+
+  % Right: Rust Mutex<Account> Wrapper
+  \begin{scope}[shift={(6.9,0)}]
+    \node[font=\bfseries\footnotesize, text=targetgreen!85!black] at (3.45, 3.95) {Rust: \texttt{Mutex<Account>} Owns the Data};
+    \draw[rounded corners=4pt, draw=gray!55, fill=gray!4] (0.0, 0.0) rectangle (6.9, 3.65);
+
+    % Outer Mutex wall
+    \draw[rounded corners=4pt, very thick, draw=sourceblue!85, fill=sourceblue!6] (1.45, 0.45) rectangle (6.55, 3.30);
+    \node[font=\scriptsize\bfseries, text=sourceblue!90!black] at (4.00, 3.00) {\texttt{Mutex<Account>} boundary};
+
+    % Gate: MutexGuard INSIDE the Mutex boundary
+    \draw[rounded corners=2pt, thick, draw=structurepurple!85, fill=structurepurple!14] (1.75, 1.20) rectangle (3.55, 2.10);
+    \node[font=\tiny\bfseries, align=center, text=structurepurple!95!black] at (2.65, 1.65) {\texttt{.lock()}\\\texttt{MutexGuard}};
+
+    % Inner Account data
+    \draw[rounded corners=3pt, thick, draw=targetgreen!85, fill=targetgreen!12] (4.05, 0.85) rectangle (6.25, 2.45);
+    \node[font=\scriptsize, align=center] at (5.15, 1.65) {\texttt{Account}\\\texttt{balance\_cents}\\\texttt{100\_000}};
+
+    \draw[->, thick, structurepurple!90] (0.25, 1.65) -- (1.75, 1.65);
+    \draw[->, thick, targetgreen!85!black] (3.55, 1.65) -- (4.05, 1.65);
+  \end{scope}
+\end{tikzpicture}
+\caption{Why data races vanish in safe Rust. In Java~6 and C++, locks sit \emph{beside} the fields they protect, so forgetting to lock compiles cleanly. In Rust, \texttt{Mutex<T>} (and \texttt{RwLock<T>}) wraps \texttt{T} inside its type boundary; \texttt{MutexGuard} is the sole physical doorway to \texttt{\&mut T}.}
+\label{ch03:fig-java-vs-rust-mutex}
+\end{figure}
+
+When reads heavily outnumber writes (such as our five-minute \texttt{FeeSchedule} refresh read by thousands of HTTP requests per second), swap \texttt{Mutex<T>} for \texttt{std::sync::RwLock<T>}: \texttt{.read()} hands out concurrent shared \texttt{RwLockReadGuard<'\_, T>} handles across all CPU cores simultaneously, while \texttt{.write()} waits for exclusive \texttt{RwLockWriteGuard<'\_, T>} access --- the exact runtime multi-threaded twin of Rust's compile-time \texttt{\&T} versus \texttt{\&mut T}.
+
+\subsection{Putting the Entire Pointer \& Ownership Toolkit Together}
+
+Table~\ref{ch03:tab-pointer-toolkit} summarizes every ownership, borrowing, and interior-mutability type we have built in this chapter, along with its exact 64-bit stack size (assuming a sized type \texttt{T}, such as our 24-byte \texttt{Account}) and when Aliasing XOR Mutability is checked.
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}llllp{4.3cm}@{}}
+\toprule
+\textbf{Type} & \textbf{Stack Size} & \textbf{Ownership} & \textbf{Threads} & \textbf{Aliasing XOR Mutability} \\
+\midrule
+\texttt{T} & \texttt{size\_of::<T>()} & Unique inline & \texttt{Send}/\texttt{Sync} if \texttt{T} & Compile time (0 cost) \\
+\texttt{\&T} / \texttt{\&[U]} & 8B / 16B & Shared borrow & Cross-thread & Compile time ($N$ readers) \\
+\texttt{\&mut T} / \texttt{\&mut [U]} & 8B / 16B & Unique borrow & Exclusive & Compile time ($1$ writer) \\
+\texttt{Box<T>} & 8B & Unique heap & \texttt{Send}/\texttt{Sync} if \texttt{T} & Compile time (0 header) \\
+\texttt{Rc<T>} & 8B & Shared heap & Single (\texttt{!Send}) & Compile time (\texttt{\&T} only) \\
+\texttt{Arc<T>} & 8B & Shared heap & Atomic (\texttt{Send+Sync}) & Compile time (\texttt{\&T} only) \\
+\texttt{Cell<T>} & \texttt{size\_of::<T>()} & Inline wrapper & Single (\texttt{!Sync}) & Compile time (value swap) \\
+\texttt{RefCell<T>} & $+8\text{B}$ tag & Inline wrapper & Single (\texttt{!Sync}) & Runtime \texttt{isize} (panics) \\
+\texttt{Mutex<T>} & Lock $+$ \texttt{T} & Inline wrapper & \texttt{Send+Sync} & Runtime OS \texttt{MutexGuard} \\
+\texttt{RwLock<T>} & RwLock $+$ \texttt{T} & Inline wrapper & \texttt{Send+Sync} & Runtime OS read/write guards \\
+\bottomrule
+\end{tabular}
+\caption{The complete Rust ownership, borrowing, and interior-mutability map on a 64-bit target.}
+\label{ch03:tab-pointer-toolkit}
+\end{table}
+
+\begin{applicationbox}
+In Chapters~12 through~14, when we wire up our production Axum financial service backed by PostgreSQL, almost every shared service handle in \texttt{AppState} will be a cheap-to-clone \texttt{Arc<...>} wrapping immutable config and a thread-safe \texttt{PgPool}, while per-request ledger mutations happen either on uniquely owned local values or inside PostgreSQL row locks (\texttt{SELECT ... FOR UPDATE}) rather than global process-wide mutexes. Knowing every row of Table~\ref{ch03:tab-pointer-toolkit} tells you immediately why that architecture scales across 64 cores without contention.
+\end{applicationbox}
+
+In the next chapter, we look directly at the lifetime tick marks (\texttt{'a}) we glimpsed on borrowed references and guards --- stripping away every trace of mysticism around how the compiler tracks regions, when lifetimes can be elided, why \texttt{String: 'static} is true, and how six lines of carefully audited \texttt{unsafe} code power \texttt{Vec<T>} and \texttt{split\_at\_mut}.
+
+\section{Exercises}
+\label{ch03:exercises}
+
+\begin{exercise}[Spot the hidden Aliasing $+$ Mutation triangle]
+Consider the following single-threaded C++ function operating on a \texttt{std::unordered\_map<std::string, int64\_t> balances}:
+\begin{lstlisting}[language=C++]
+void match_default_balance(std::unordered_map<std::string, int64_t>& balances,
+                           const std::string& new_user) {
+  const int64_t& template_bal = balances["DEFAULT_TIER"];
+  balances[new_user] = template_bal;
+}
+\end{lstlisting}
+(a) Trace step-by-step how line~4 can trigger undefined behavior (reading freed memory) even when \texttt{"DEFAULT\_TIER"} is already present in \texttt{balances}. Which internal resize event inside \texttt{operator[]} invalidates \texttt{template\_bal}?\\
+(b) Translate those two lines into Rust using \texttt{HashMap<String, i64>} from \texttt{std::collections}, explain why \texttt{rustc} rejects the naive version, and write the one-line safe fix.
+\end{exercise}
+
+\begin{exercise}[Exact 64-bit byte accounting]
+On a 64-bit Linux x86-64 machine, compute the exact stack byte size \emph{and} total heap byte allocation (excluding internal \texttt{malloc} bin metadata) right after all three bindings below execute:
+\begin{lstlisting}[language=Rust]
+let mut codes: Vec<String> = Vec::with_capacity(4);
+codes.push(String::from("USD"));
+codes.push(String::from("CHF"));
+let view: &[String] = &codes[0..2];
+\end{lstlisting}
+(a) How many bytes sit on the stack frame for \texttt{codes} and \texttt{view} combined?\\
+(b) How many distinct heap allocations exist, and what are their exact sizes and byte contents?\\
+(c) Compare your answer to storing two three-letter currency codes in \texttt{Vec<[u8; 3]>} with capacity $4$: how many heap allocations and total heap bytes does \texttt{Vec<[u8; 3]>} use, and why?
+\end{exercise}
+
+\begin{exercise}[Destructive move versus C++ \texttt{std::move}]
+Suppose \texttt{Buffer} owns a 4,096-byte heap array. Trace what happens in machine instructions and destructor calls for:
+\begin{lstlisting}[language=Rust]
+fn relay(b1: Buffer) -> Buffer {
+    let b2 = b1;
+    b2
+}
+\end{lstlisting}
+versus the C++11 equivalent \texttt{Buffer relay(Buffer b1) \{ Buffer b2 = std::move(b1); return b2; \}} (assuming NRVO does not elide \texttt{b1} into \texttt{b2}). Specifically, how many times does \texttt{\~{}Buffer()} execute in C++ versus \texttt{Drop::drop} in Rust, and what prevents Rust from ever needing a ``moved-from empty state'' inside \texttt{Buffer}?
+\end{exercise}
+
+\begin{exercise}[Why \texttt{\&T} is \texttt{Copy} while \texttt{\&mut T} is not]
+Suppose Rust mistakenly implemented \texttt{Copy} for \texttt{\&mut T}. Construct a 6-line safe Rust program (using zero \texttt{unsafe} blocks and zero threads) that exploits \texttt{\&mut T: Copy} to cause a genuine memory-corruption use-after-free crash on \texttt{Vec<String>}.
+\end{exercise}
+
+\begin{exercise}[Reborrowing and generic functions]
+Explain why \texttt{call\_twice\_concrete} below compiles cleanly while \texttt{call\_twice\_generic} fails to compile on the second call, and show the 5-character edit at the call site inside \texttt{call\_twice\_generic} that makes it compile:
+\begin{lstlisting}[language=Rust]
+fn touch_concrete(x: &mut i64) { *x += 1; }
+fn touch_generic<T>(x: T) -> T { x }
+
+fn call_twice_concrete(r: &mut i64) {
+    touch_concrete(r);
+    touch_concrete(r);
+}
+
+fn call_twice_generic(r: &mut i64) {
+    let _ = touch_generic(r);
+    // let _ = touch_generic(r); // Why does this line fail without an explicit reborrow?
+}
+\end{lstlisting}
+\end{exercise}
+
+\begin{exercise}[Generalizing \texttt{split\_at\_mut} to three accounts]
+In \S\ref{ch03:borrowing-reborrowing-slices} we wrote \texttt{transfer\_in\_slice} to obtain two disjoint \texttt{\&mut Account} references from \texttt{accounts: \&mut [Account]}. Now suppose every transfer also credits a fee directly to a house fee account at index \texttt{fee\_idx} inside the \emph{same} \texttt{\&mut [Account]} slice, requiring \textbf{three} simultaneous mutable references \texttt{(\&mut Account, \&mut Account, \&mut Account)} for \texttt{(from\_idx, to\_idx, fee\_idx)}.\\
+(a) What precondition on \texttt{(from\_idx, to\_idx, fee\_idx)} must hold for three simultaneous mutable borrows to be sound?\\
+(b) Write a safe Rust helper \texttt{borrow\_three\_mut<T>(slice: \&mut [T], i: usize, j: usize, k: usize)} returning \texttt{Option<(\&mut T, \&mut T, \&mut T)>} using two calls to \texttt{split\_at\_mut} (Hint: sort the three indices along with their original positions first).
+\end{exercise}
+
+\begin{exercise}[Tracing \texttt{RefCell<T>} borrow states]
+For the snippet below, write the exact integer value stored in \texttt{cell}'s internal \texttt{borrow: isize} counter at the end of each numbered comment line, or state which line panics at runtime and why:
+\begin{lstlisting}[language=Rust]
+let cell = std::cell::RefCell::new(vec![10, 20]); // (1)
+let a = cell.borrow();                            // (2)
+let b = cell.borrow();                            // (3)
+drop(a);                                          // (4)
+let ok = cell.try_borrow_mut().is_ok();           // (5) What is `ok`, and what is `borrow`?
+drop(b);                                          // (6)
+let mut w = cell.borrow_mut();                    // (7)
+w.push(30);
+drop(w);                                          // (8)
+\end{lstlisting}
+\end{exercise}
+
+\begin{exercise}[Choosing the sharpest smart-pointer combination]
+For each engineering requirement below, pick the simplest, lowest-overhead Rust type from Table~\ref{ch03:tab-pointer-toolkit} (e.g., \texttt{T}, \texttt{Box<T>}, \texttt{Rc<T>}, \texttt{Arc<T>}, \texttt{Rc<RefCell<T>>}, \texttt{Arc<RwLock<T>>}, \texttt{Arc<Mutex<T>>}) and justify in two sentences why both weaker and heavier choices are worse:
+\begin{enumerate}
+  \item[(a)] A read-only TLS certificate chain loaded at startup and inspected on every incoming HTTPS connection across 32 Tokio worker threads.
+  \item[(b)] A single-threaded compiler pass where AST expression nodes share references to symbol-table entries whose inferred type slot starts \texttt{None} and gets filled in during type checking.
+  \item[(c)] An in-memory FX rate map read $50{,}000$ times per second across 16 threads and replaced once every $2$~seconds by a background market-data feed thread. (Bonus: compare wrapping the map in \texttt{Arc<RwLock<RateMap>>} versus storing \texttt{Mutex<Arc<RateMap>>} so readers clone an immutable \texttt{Arc<RateMap>})
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Why \texttt{MutexGuard} cannot leak an unprotected reference]
+A Java~6 developer accustomed to \texttt{synchronized} writes the following Rust function intending to ``grab a mutable reference quickly under the lock and mutate it afterward without holding the lock'':
+\begin{lstlisting}[language=Rust]
+use std::sync::Mutex;
+
+fn unlocked_ref_attempt(m: &Mutex<Vec<i64>>) {
+    // let r: &mut Vec<i64> = &mut *m.lock().unwrap();
+    // r.push(42);
+}
+\end{lstlisting}
+Wait: uncomment those two lines and test them mentally (or in \texttt{rustc}). Does \texttt{let r: \&mut Vec<i64> = \&mut *m.lock().unwrap();} compile when \texttt{r} is used on the next line? Explain carefully what happens to the temporary \texttt{MutexGuard}'s lifetime versus when someone tries \texttt{let r = \{ let mut g = m.lock().unwrap(); \&mut *g \};}, and why \emph{neither} form allows \texttt{r.push(42)} to execute while the mutex is unlocked.
+\end{exercise}

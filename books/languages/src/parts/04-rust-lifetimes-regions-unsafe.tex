@@ -1,0 +1,897 @@
+\chapter{Lifetimes Without Mysticism: Regions, Elision, and the Unsafe Boundary}
+
+Chapter~3 established the physical rules of Rust memory: every heap buffer or stack slot has a single owner, moving copies a small stack header to transfer ownership, and dropping runs deterministically at scope exit. Borrowing lets code read (\texttt{\&T}) or mutate (\texttt{\&mut T}) memory without taking ownership, under one aliasing rule --- at any point in execution, you may hold either any number of shared readers or one exclusive writer, never both at once.
+
+Sooner or later you write a function that accepts two string slices and returns one of them, or you define a parser struct holding slices into a network buffer, and the compiler asks for a \emph{lifetime annotation} written with a tick mark: \texttt{'a}. Engineers arriving from Java~6 or C++ often guess at first that \texttt{'a} tells the allocator how long to keep an object alive in memory.
+
+At the hardware level, nothing of the sort happens. A lifetime parameter \texttt{'a} generates \textbf{zero machine instructions} and \textbf{never extends or shortens when any value is created, moved, or freed}. Every local variable still drops at the exact point Chapter~3 described. Instead, \texttt{'a} is a compile-time region variable in a constraint solver: it states in a function or type signature which owner's memory a reference may point into, proving before code generation that no pointer ever outlives its referent.
+
+Seeing lifetimes as region constraints over stack frames and control-flow graphs connects every topic in this chapter into one picture: why modern Rust ends borrows at their last read rather than at a closing brace, how the three elision rules fill in everyday signatures automatically, when zero-copy structs holding \texttt{\&'a str} beat heap allocation (and when owned types beat both), why \texttt{\&'static str} and \texttt{T:\ 'static} mean completely different things, why \texttt{\&'a mut T} refuses to shrink lifetimes inside \texttt{T}, and how six lines of audited \texttt{unsafe} code wrap raw pointer arithmetic behind a safe signature.
+
+\chapterline
+
+\section{Demystifying \texttt{'a} From the Machine Up}
+\label{ch04:machine-regions}
+
+Suppose a payment gateway receives raw ASCII tags such as \texttt{"USD:12500"} and needs a helper that strips an optional \texttt{"USD:"} prefix without copying bytes or touching the heap. Writing the lifetime parameter out in full gives:
+
+\begin{lstlisting}[language=Rust]
+pub fn strip_usd_prefix<'a>(tag: &'a [u8]) -> &'a [u8] {
+    if tag.len() >= 4 && &tag[..4] == b"USD:" {
+        &tag[4..]
+    } else {
+        tag
+    }
+}
+\end{lstlisting}
+
+What happens to \texttt{<'a>} when \texttt{rustc} compiles this function with \texttt{-C opt-level=3} on 64-bit x86 Linux? Under the System~V AMD64 ABI, an input byte slice \texttt{\&[u8]} arrives in two 64-bit registers (\texttt{rdi} = address, \texttt{rsi} = length) and returns in \texttt{rax} (address) and \texttt{rdx} (length). Here is the exact assembly emitted by \texttt{rustc}:
+
+\begin{lstlisting}[language=Plain]
+strip_usd_prefix:
+    mov  rdx, rsi                  ; default return len = input len
+    mov  rax, rdi                  ; default return ptr = input ptr
+    cmp  rsi, 4                    ; if len < 4, return unchanged
+    jb   .Ldone
+    cmp  dword ptr [rax], 977556309 ; 0x3a445355 = little-endian "USD:"
+    jne  .Ldone
+    add  rdx, -4                   ; return len = len - 4
+    add  rax, 4                    ; return ptr = ptr + 4
+.Ldone:
+    ret
+\end{lstlisting}
+
+Nine instructions do the entire job. There is no heap allocation, no reference-count update, no garbage-collector write barrier, and no runtime lifetime metadata alongside the pointer. Even the four-byte check \texttt{\&tag[..4] == b"USD:"} folded into one 32-bit compare against \texttt{0x3a445355}. Once the compiler front end verifies region constraints, every \texttt{'a} is erased before LLVM emits machine code.
+
+\begin{focusbox}
+\textbf{The physical law of Rust lifetimes.} A lifetime annotation \texttt{'a} describes memory validity; it never alters runtime execution. No lifetime annotation can keep a stack frame alive past \texttt{ret} or delay a \texttt{Drop} destructor by a single cycle. Owners govern when bytes are freed; \texttt{'a} proves that every borrow stops being used beforehand.
+\end{focusbox}
+
+Compare how C++, Java~6, and Rust treat a classic hazard: formatting an account label inside a helper and returning a view of the text.
+
+\begin{lstlisting}[language=C++]
+// C++17: compiles cleanly under default flags; instant Undefined Behavior!
+#include <string>
+#include <string_view>
+
+std::string_view format_account_bad(uint64_t id) {
+    std::string local = "ACCT-" + std::to_string(id);
+    return std::string_view(local); // `local` frees its buffer right here!
+}
+\end{lstlisting}
+
+In C++, \texttt{std::string\_view} has the exact same 16-byte \texttt{(ptr, len)} register layout as Rust's \texttt{\&str}. On return, \texttt{std::string\_view(local)} copies the pointer and length into \texttt{rax} and \texttt{rdx}, and \texttt{local}'s destructor immediately frees the backing characters. The caller receives a dangling pointer into dead memory --- often printing \texttt{"ACCT-42"} in isolated unit tests and corrupting wire messages under production load.
+
+Java~6 avoids dangling pointers by outlawing stack buffers and interior slices altogether:
+
+\begin{lstlisting}[language=Java]
+// Java 6: memory-safe, paid for by mandatory heap allocation and GC sweeps.
+public static String formatAccount(long id) {
+    return "ACCT-" + id; // allocates StringBuilder, char[], and String on heap
+}
+\end{lstlisting}
+
+Java~6 buys safety by extending \emph{runtime} liveness on the heap until objects become unreachable. Rust keeps C++'s exact stack frames, deterministic destructors, and 16-byte register slices, and proves statically for every borrow in the program that
+\[
+  \mathrm{region}(\text{borrow}) \;\subseteq\; \mathrm{liveness}(\text{referent}).
+\]
+
+\subsection{Lexical Scopes vs.\ Non-Lexical Lifetimes (NLL)}
+\label{ch04:nll}
+
+Before Rust's 2018 edition, borrow regions were strictly \emph{lexical}: every reference stayed active from its \texttt{let} binding down to the closing brace \texttt{\}} of its block, forcing programmers to wrap short reads inside artificial \texttt{\{ ... \}} scopes. Modern Rust computes borrow regions on the \textbf{control-flow graph (CFG)} via \textbf{Non-Lexical Lifetimes (NLL)}: a borrow spans only the CFG points from creation along paths reaching its \emph{last actual use}.
+
+Trace NLL on a ledger helper that reads the first and last posting in a vector to pick a fee, then pushes the fee onto that same vector:
+
+\begin{lstlisting}[language=Rust]
+pub fn append_settlement_fee(postings: &mut Vec<i64>) {
+    if postings.is_empty() { return; }
+    let first: &i64 = &postings[0];                  // L1: shared borrow 'r1 starts
+    let last: &i64 = &postings[postings.len() - 1];  // L2: shared borrow 'r2 starts
+    let fee = if *first > 10_000 || *last < 0 {      // L3: last read of `first` & `last`
+        250
+    } else {
+        50
+    };
+    // Both 'r1 and 'r2 end right after L3!
+    postings.push(-fee);                             // L4: exclusive borrow 'w (&mut Vec)
+}                                                    // L5: lexical brace closes
+\end{lstlisting}
+
+If \texttt{first} remained live across \texttt{L4}, \texttt{postings.push(-fee)} could reallocate the vector's heap buffer and leave \texttt{first} dangling. Because neither \texttt{first} nor \texttt{last} is read after \texttt{L3}, NLL ends \texttt{'r1} and \texttt{'r2} at \texttt{L3}, leaving \texttt{postings} unborrowed when \texttt{L4} takes \texttt{\&mut Vec<i64>}. Figure~\ref{ch04:fig-nll-timeline} contrasts the owner's full scope with these flow-sensitive spans.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex]
+  % Statement labels
+  \node[anchor=east,font=\ttfamily\scriptsize] at (0, 3.5) {L0: entries owned};
+  \node[anchor=east,font=\ttfamily\scriptsize] at (0, 2.8) {L1: first = \&v[0]};
+  \node[anchor=east,font=\ttfamily\scriptsize] at (0, 2.1) {L2: last = \&v[n-1]};
+  \node[anchor=east,font=\ttfamily\scriptsize] at (0, 1.4) {L3: read *first, *last};
+  \node[anchor=east,font=\ttfamily\scriptsize] at (0, 0.7) {L4: v.push(-fee)};
+  \node[anchor=east,font=\ttfamily\scriptsize] at (0, 0.0) {L5: \} (scope exit)};
+
+  % Horizontal guides (stop L4 short of clash label so zero lines cross text)
+  \foreach \y in {3.5,2.8,2.1,1.4,0.0} {
+    \draw[gray!22] (0.2, \y) -- (9.8, \y);
+  }
+  \draw[gray!22] (0.2, 0.7) -- (7.5, 0.7);
+
+  % Column headers (two crisp lines each)
+  \node[font=\bfseries\scriptsize,structurepurple,align=center] at (1.2, 4.25) {Owner\\liveness};
+  \node[font=\bfseries\scriptsize,sourceblue,align=center] at (3.7, 4.25) {NLL shared\\(\texttt{'r1}, \texttt{'r2})};
+  \node[font=\bfseries\scriptsize,targetgreen,align=center] at (6.2, 4.25) {Exclusive\\(\texttt{'w})};
+  \node[font=\bfseries\scriptsize,trapred,align=center] at (8.7, 4.25) {If \texttt{first} read\\after L4};
+
+  % Owner bar
+  \draw[line width=3.8pt,structurepurple] (1.2, 3.5) -- (1.2, 0.0);
+  \fill[structurepurple] (1.2, 3.5) circle (2.8pt);
+  \fill[structurepurple] (1.2, 0.0) circle (2.8pt);
+
+  % r1 and r2 bars with labels cleanly above grid lines
+  \draw[line width=3.4pt,sourceblue] (3.25, 2.8) -- (3.25, 1.4);
+  \fill[sourceblue] (3.25, 2.8) circle (2.7pt);
+  \fill[sourceblue] (3.25, 1.4) circle (2.7pt);
+  \node[font=\scriptsize,sourceblue] at (3.25, 3.12) {\texttt{'r1}};
+
+  \draw[line width=3.4pt,sourceblue!75] (4.15, 2.1) -- (4.15, 1.4);
+  \fill[sourceblue!75] (4.15, 2.1) circle (2.7pt);
+  \fill[sourceblue!75] (4.15, 1.4) circle (2.7pt);
+  \node[font=\scriptsize,sourceblue!85!black] at (4.15, 2.42) {\texttt{'r2}};
+
+  \node[font=\scriptsize,sourceblue!90!black] at (3.7, 1.05) {last read at L3};
+
+  % w bar (disjoint!)
+  \draw[line width=3.8pt,targetgreen] (6.2, 0.82) -- (6.2, 0.58);
+  \fill[targetgreen] (6.2, 0.7) circle (3.0pt);
+  \node[font=\scriptsize,targetgreen!85!black] at (6.2, 0.32) {disjoint from \texttt{'r1}};
+
+  % Illegal extension bar split cleanly around E0502 pill
+  \draw[line width=2.8pt,trapred,dashed] (8.7, 2.8) -- (8.7, 1.02);
+  \draw[line width=2.8pt,trapred,dashed] (8.7, 0.38) -- (8.7, 0.12);
+  \fill[trapred] (8.7, 2.8) circle (2.7pt);
+  \fill[trapred] (8.7, 0.12) circle (2.7pt);
+  \draw[thick,trapred,fill=trapred!8,rounded corners=2pt] (7.8, 0.48) rectangle (9.6, 0.92);
+  \node[font=\scriptsize\bfseries,trapred] at (8.7, 0.7) {E0502 clash};
+\end{tikzpicture}
+\caption{Non-Lexical Lifetimes (NLL) on a control-flow graph. Shared borrows \texttt{'r1} and \texttt{'r2} end at their last read (\texttt{L3}) rather than the closing brace (\texttt{L5}), allowing \texttt{v.push(-fee)} at \texttt{L4}. Reading \texttt{first} after \texttt{L4} stretches \texttt{'r1} across \texttt{L4} and triggers compile error \texttt{E0502}.}
+\label{ch04:fig-nll-timeline}
+\end{figure}
+
+Adding \texttt{println!("\{\}", first);} below \texttt{L4} stretches \texttt{'r1} across the mutation, and \texttt{rustc} pinpoints all three lines: where the shared borrow started, where the mutable borrow clashed, and where the shared borrow was later read.
+
+\begin{intuitionbox}
+\textbf{Struct field splitting vs.\ methods.} Borrowing distinct struct fields directly --- say \texttt{let c = \&acct.currency;} followed by \texttt{acct.balance\_cents -= 500;} --- lets \texttt{c} remain live across the mutation because \texttt{rustc} sees two disjoint byte offsets inside \texttt{acct}. Calling a method \texttt{acct.debit(500)} takes \texttt{\&mut self}, borrowing the whole struct at once because callers check methods solely by signature.
+\end{intuitionbox}
+
+\section{Functions, Borrow Signatures, and the Three Elision Rules}
+\label{ch04:elision-signatures}
+
+Inside one function body, NLL solves every region constraint without annotations. Lifetime parameters appear at \textbf{function and type boundaries} because Rust checks functions modularly.
+
+Consider a C++ header declaration in a large trading system:
+
+\begin{lstlisting}[language=C++]
+const char* longer_id(const char* a, const char* b);
+\end{lstlisting}
+
+If you pass a long-lived session ID as \texttt{a} and a short-lived stack buffer as \texttt{b}, then free \texttt{b} while keeping the returned pointer, is that safe? From the header alone, nobody can tell whether the return pointer aliases \texttt{a}, aliases \texttt{b}, points to a static buffer, or came from \texttt{malloc}. Worse, changing the \texttt{.cpp} body later can silently break callers across the tree without a single compiler warning.
+
+Rust enforces \textbf{signature-level modularity}: callers are verified solely against the callee's signature, and the callee's body is verified solely against its own signature. Whenever a function returns a reference, the signature must declare which input borrow(s) the output may alias:
+
+\begin{lstlisting}[language=Rust]
+pub fn longer_id<'a>(x: &'a str, y: &'a str) -> &'a str {
+    if x.len() >= y.len() { x } else { y }
+}
+\end{lstlisting}
+
+\begin{formalbox}
+\textbf{Contract of a shared lifetime variable.} In \texttt{fn longer\_id<'a>(x:\ \&'a str, y:\ \&'a str) -> \&'a str}, for \emph{any} region \texttt{'a} where both arguments stay live ($\mathrm{liveness}(x) \supseteq \text{\texttt{'a}}$ and $\mathrm{liveness}(y) \supseteq \text{\texttt{'a}}$), the returned slice stays valid throughout \texttt{'a}. At any call site, the largest valid region satisfies
+\[
+  \text{\texttt{'a}} \;\subseteq\; \mathrm{liveness}(x) \;\cap\; \mathrm{liveness}(y).
+\]
+\end{formalbox}
+
+When two arguments have different stack scopes, \texttt{rustc} solves for their intersection:
+
+\begin{lstlisting}[language=Rust]
+fn check_ids() {
+    let session_id = String::from("SESS-998877"); // lives until end of check_ids
+    let chosen: &str;
+    {
+        let req_id = String::from("REQ-1");       // lives only until inner `}`
+        chosen = longer_id(&session_id, &req_id);
+        println!("inside inner block: {}", chosen); // OK: both live here
+    } // `req_id` drops here
+    // println!("after: {}", chosen); // Error E0597: `req_id` does not live long enough
+}
+\end{lstlisting}
+
+Even though \texttt{"SESS-998877"} is longer than \texttt{"REQ-1"} at runtime, \texttt{check\_ids} inspects only \texttt{longer\_id}'s signature --- never its body --- so \texttt{chosen} cannot outlive the shorter-lived input \texttt{req\_id}.
+
+\subsection{Distinct Lifetimes, Outlives Bounds, and Callee Stack Frames}
+\label{ch04:distinct-lifetimes}
+
+When a function reads a second slice for validation or logging yet always returns data from the first slice, giving each input its own lifetime parameter avoids tying them together:
+
+\begin{lstlisting}[language=Rust]
+pub fn select_primary<'a, 'b>(primary: &'a str, audit_tag: &'b str) -> &'a str {
+    if audit_tag.is_empty() { primary.trim() } else { primary }
+}
+\end{lstlisting}
+
+Because \texttt{'b} does not appear in \texttt{\&'a str}, calling \texttt{select\_primary(\&session\_id, \&req\_id)} lets the returned slice live as long as \texttt{session\_id} after \texttt{req\_id} drops. When a second borrow \emph{can} be returned as \texttt{\&'a str} provided it lasts at least as long as \texttt{'a}, write the outlives bound \texttt{'b:\ 'a} ($\text{\texttt{'b}} \supseteq \text{\texttt{'a}}$):
+
+\begin{lstlisting}[language=Rust]
+pub fn pick_bounded<'a, 'b: 'a>(first: &'a str, second: &'b str) -> &'a str {
+    if first.len() >= second.len() { first } else { second }
+}
+\end{lstlisting}
+
+\begin{trapbox}
+\textbf{Why \texttt{fn broken\_label<'a>(cents:\ i64) -> \&'a str} can never return a local \texttt{String}.} Trying to format a local \texttt{let s = format!("USD \{\}", cents);} and return \texttt{\&s} fails with \texttt{E0515} no matter what lifetime parameter you write:
+\begin{lstlisting}[language=Rust]
+pub fn broken_label<'a>(cents: i64) -> &'a str {
+    let s = format!("USD {}", cents);
+    &s // Error E0515: cannot return reference to local variable `s`
+}
+\end{lstlisting}
+The caller chooses \texttt{'a} in its own stack frame \emph{after} \texttt{broken\_label} executes \texttt{ret}, whereas \texttt{s} drops its heap buffer right \emph{before} \texttt{ret} pops \texttt{rsp}. Return an owned \texttt{String} instead (\texttt{-> String}): Rust moves the 24-byte \texttt{(ptr, len, cap)} header to the caller with zero extra heap copies.
+\end{trapbox}
+
+\subsection{Deriving the Three Lifetime Elision Rules}
+\label{ch04:three-elision-rules}
+
+In pre-1.0 Rust, even one-input functions like \texttt{fn trim<'a>(s:\ \&'a str) -> \&'a str} required explicit ticks. Because nearly 90\% of borrow signatures follow three mechanical patterns, Rust expands unannotated (\emph{elided}) references deterministically before borrow checking. Parameter lifetimes are called \emph{input lifetimes}; return-type lifetimes are \emph{output lifetimes}.
+
+\begin{definition}[The Three Lifetime Elision Rules]
+\label{ch04:def-elision}
+Given a function or method signature containing elided references:
+\begin{enumerate}
+  \item \textbf{Distinct inputs.} Each elided input reference gets its own lifetime parameter (\texttt{'a}, \texttt{'b}, \dots).
+  \item \textbf{Single input.} If there is \emph{exactly one} input lifetime parameter, assign it to all elided output lifetimes.
+  \item \textbf{Method receiver.} If multiple input lifetimes exist and one is \texttt{\&self} or \texttt{\&mut self}, assign \texttt{self}'s lifetime to all elided output lifetimes.
+\end{enumerate}
+If any output lifetime remains unassigned after Rules 1--3, \texttt{rustc} stops and asks for an explicit annotation.
+\end{definition}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Written signature} & \textbf{Expanded by Rules 1--3} & \textbf{Rules} \\
+\midrule
+\texttt{fn trim(s:\ \&str) -> \&str} & \texttt{fn trim<'a>(s:\ \&'a str) -> \&'a str} & 1, 2 \\
+\texttt{fn kv(s:\ \&str) -> (\&str, \&str)} & \texttt{fn kv<'a>(s:\ \&'a str) -> (\&'a str, \&'a str)} & 1, 2 \\
+\texttt{fn id(\&self, fmt:\ \&str) -> \&str} & \texttt{fn id<'a,'b>(\&'a self, fmt:\ \&'b str) -> \&'a str} & 1, 3 \\
+\texttt{fn max(x:\ \&str, y:\ \&str) -> \&str} & \emph{Compile error: ambiguous output} & 1 only \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Rule~3 deserves special attention when writing parsers. On \texttt{fn strip\_from(\&self, wire:\ \&str) -> Option<\&str>}, Rule~3 ties the returned \texttt{\&str} to \texttt{\&self}. When the returned slice actually points into \texttt{wire} rather than \texttt{self}, spelling out \texttt{'s} and \texttt{'buf} overrides Rule~3 so callers can drop \texttt{PrefixMatcher} while keeping the slice of \texttt{wire}:
+
+\begin{lstlisting}[language=Rust]
+pub struct PrefixMatcher { prefix: String }
+
+impl PrefixMatcher {
+    pub fn strip_from<'s, 'buf>(&'s self, wire: &'buf str) -> Option<&'buf str> {
+        wire.strip_prefix(self.prefix.as_str())
+    }
+}
+\end{lstlisting}
+
+\section{Structs Holding References: Zero-Copy Views vs.\ Owned Data}
+\label{ch04:structs-zero-copy}
+
+What happens when a \texttt{struct} stores a reference inside its fields? Consider an order gateway ingesting 500,000 pipe-delimited wire lines such as \texttt{"ORD-9042|\allowbreak{}AAPL|\allowbreak{}BUY|\allowbreak{}250|\allowbreak{}18945"} every second off a TCP socket.
+
+In Java~6, decoding bytes and calling \texttt{split} allocates seven to ten heap objects per message:
+
+\begin{lstlisting}[language=Java]
+// Java 6: allocates decoded String + char[], ArrayList, String[], and 5 Strings!
+String line = new String(rxBuf, 0, bytesRead, "US-ASCII").trim();
+String[] parts = line.split("\\|");
+Order ord = new Order(parts[0], parts[1], parts[2],
+    Long.parseLong(parts[3]), Long.parseLong(parts[4]));
+\end{lstlisting}
+
+\begin{historybox}
+\textbf{Why Java~7 ripped zero-copy \texttt{substring} out of Java~6.} Java~6's \texttt{String} stored \texttt{(char[] value, int offset, int count)}, so \texttt{line.substring(0, 8)} shared the backing \texttt{char[]} without copying. Oracle removed that sharing in Java~7u6 (2012) and forced \texttt{substring} to copy \texttt{char[]} eagerly because Java lacked lifetime parameters: caching a 10-byte substring parsed from a 2~MB HTTP body quietly pinned the entire 2~MB \texttt{char[]} on the GC heap forever. With \texttt{'a}, Rust gives you zero-copy views while statically forbidding accidental long-lived retention.
+\end{historybox}
+
+In Rust, \texttt{WireOrder<'a>} slices straight into \texttt{raw:\ \&'a [u8]}. Any \texttt{struct} or \texttt{enum} holding a borrow declares that lifetime on its type header:
+
+\begin{lstlisting}[language=Rust]
+use std::mem::size_of;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct WireOrder<'a> {
+    pub cl_ord_id: &'a str,
+    pub symbol: &'a str,
+    pub side: &'a str,
+    pub qty: u64,
+    pub price_ticks: i64,
+}
+
+const _: () = assert!(size_of::<WireOrder<'static>>() == 64); // 1 CPU cache line!
+
+pub fn parse_wire_order<'a>(raw: &'a [u8]) -> Option<WireOrder<'a>> {
+    let line = std::str::from_utf8(raw).ok()?.trim_ascii();
+    let mut parts = line.split('|');
+    let (cl_ord_id, symbol, side) = (parts.next()?, parts.next()?, parts.next()?);
+    let qty = parts.next()?.parse::<u64>().ok()?;
+    let price_ticks = parts.next()?.parse::<i64>().ok()?;
+    if parts.next().is_some() || cl_ord_id.is_empty() || symbol.is_empty() {
+        return None;
+    }
+    Some(WireOrder { cl_ord_id, symbol, side, qty, price_ticks })
+}
+\end{lstlisting}
+
+Read \texttt{WireOrder<'a>} as a proof bound: \emph{no \texttt{WireOrder<'a>} instance may outlive the buffer borrow \texttt{'a} backing its string slices.} Calling \texttt{parse\_wire\_order} performs \textbf{zero heap allocations}, returning a 64-byte stack value whose three \texttt{(ptr, len)} pairs point straight into \texttt{rx\_buf} (Figure~\ref{ch04:fig-wireorder-layout}).
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex]
+  % Top receive buffer
+  \node[anchor=west,font=\bfseries\footnotesize,structurepurple] at (0, 3.55)
+    {Socket buffer \texttt{rx\_buf:\ [u8; 64]} on stack (region \texttt{'buf})};
+
+  \draw[thick,sourceblue,fill=sourceblue!10] (0, 2.45) rectangle (2.6, 3.2);
+  \node[font=\ttfamily\footnotesize] at (1.3, 2.93) {"ORD-9042"};
+  \node[font=\scriptsize,sourceblue!90!black] at (1.3, 2.62) {bytes 0..8};
+
+  \draw[thick,gray!60,fill=gray!12] (2.6, 2.45) rectangle (3.0, 3.2);
+  \node[font=\ttfamily\footnotesize,gray!80!black] at (2.8, 2.82) {|};
+
+  \draw[thick,targetgreen,fill=targetgreen!10] (3.0, 2.45) rectangle (4.7, 3.2);
+  \node[font=\ttfamily\footnotesize] at (3.85, 2.93) {"AAPL"};
+  \node[font=\scriptsize,targetgreen!85!black] at (3.85, 2.62) {bytes 9..13};
+
+  \draw[thick,gray!60,fill=gray!12] (4.7, 2.45) rectangle (5.1, 3.2);
+  \node[font=\ttfamily\footnotesize,gray!80!black] at (4.9, 2.82) {|};
+
+  \draw[thick,quotientorange,fill=quotientorange!12] (5.1, 2.45) rectangle (6.6, 3.2);
+  \node[font=\ttfamily\footnotesize] at (5.85, 2.93) {"BUY"};
+  \node[font=\scriptsize,quotientorange!90!black] at (5.85, 2.62) {bytes 14..17};
+
+  \draw[thick,gray!60,fill=gray!12] (6.6, 2.45) rectangle (7.0, 3.2);
+  \node[font=\ttfamily\footnotesize,gray!80!black] at (6.8, 2.82) {|};
+
+  \draw[thick,gray!65,fill=gray!6] (7.0, 2.45) rectangle (8.5, 3.2);
+  \node[font=\ttfamily\footnotesize] at (7.75, 2.93) {"250"};
+  \node[font=\scriptsize,gray!80!black] at (7.75, 2.62) {18..21};
+
+  \draw[thick,gray!60,fill=gray!12] (8.5, 2.45) rectangle (8.9, 3.2);
+  \node[font=\ttfamily\footnotesize,gray!80!black] at (8.7, 2.82) {|};
+
+  \draw[thick,gray!65,fill=gray!6] (8.9, 2.45) rectangle (10.9, 3.2);
+  \node[font=\ttfamily\footnotesize] at (9.9, 2.93) {"18945"};
+  \node[font=\scriptsize,gray!80!black] at (9.9, 2.62) {22..27};
+
+  \draw[thick,gray!45,dashed,fill=gray!4] (10.9, 2.45) rectangle (12.6, 3.2);
+  \node[font=\scriptsize,gray!70!black] at (11.75, 2.82) {unused};
+
+  % Bottom WireOrder<'buf> struct (64 bytes) with label cleanly BELOW
+  \draw[thick,sourceblue,fill=sourceblue!8] (0, 0.35) rectangle (2.6, 1.25);
+  \node[font=\ttfamily\scriptsize\bfseries,sourceblue!90!black] at (1.3, 1.0) {cl\_ord\_id};
+  \node[font=\ttfamily\scriptsize] at (1.3, 0.6) {ptr:+0, len:8};
+
+  \draw[thick,targetgreen,fill=targetgreen!8] (2.6, 0.35) rectangle (5.2, 1.25);
+  \node[font=\ttfamily\scriptsize\bfseries,targetgreen!85!black] at (3.9, 1.0) {symbol};
+  \node[font=\ttfamily\scriptsize] at (3.9, 0.6) {ptr:+9, len:4};
+
+  \draw[thick,quotientorange,fill=quotientorange!10] (5.2, 0.35) rectangle (7.8, 1.25);
+  \node[font=\ttfamily\scriptsize\bfseries,quotientorange!90!black] at (6.5, 1.0) {side};
+  \node[font=\ttfamily\scriptsize] at (6.5, 0.6) {ptr:+14, len:3};
+
+  \draw[thick,structurepurple,fill=structurepurple!8] (7.8, 0.35) rectangle (10.1, 1.25);
+  \node[font=\ttfamily\scriptsize\bfseries,structurepurple] at (8.95, 1.0) {qty:\ u64};
+  \node[font=\ttfamily\scriptsize] at (8.95, 0.6) {250 (8 B)};
+
+  \draw[thick,structurepurple,fill=structurepurple!8] (10.1, 0.35) rectangle (12.6, 1.25);
+  \node[font=\ttfamily\scriptsize\bfseries,structurepurple] at (11.35, 1.0) {price\_ticks:\ i64};
+  \node[font=\ttfamily\scriptsize] at (11.35, 0.6) {18945 (8 B)};
+
+  \node[anchor=west,font=\bfseries\footnotesize,structurepurple] at (0, 0.0)
+    {\texttt{WireOrder<'buf>} on stack (64 bytes total, 0 heap allocations)};
+
+  % Pointers up into rx_buf across clear white space
+  \draw[->,thick,sourceblue] (1.3, 1.25) -- (1.3, 2.42);
+  \draw[->,thick,targetgreen] (3.9, 1.25) -- (3.85, 2.42);
+  \draw[->,thick,quotientorange] (6.5, 1.25) -- (5.85, 2.42);
+\end{tikzpicture}
+\caption{Zero-copy layout of \texttt{WireOrder<'buf>}. Three 16-byte \texttt{(ptr, len)} slices point straight into \texttt{rx\_buf}, while \texttt{qty} and \texttt{price\_ticks} sit inline as 64-bit integers.}
+\label{ch04:fig-wireorder-layout}
+\end{figure}
+
+That region parameter catches a notorious C/C++ ring-buffer bug at compile time. If a loop reuses one stack buffer \texttt{rx\_buf} across \texttt{sock.read(\&mut rx\_buf)} calls while pushing parsed \texttt{WireOrder} views into an outer \texttt{Vec}, C++ \texttt{std::string\_view} silently corrupts every earlier order with bytes from the latest packet, whereas Rust rejects the loop immediately:
+
+\begin{lstlisting}[language=Rust]
+fn broken_batch_reader(sock: &mut impl std::io::Read) {
+    let mut rx_buf = [0_u8; 64];
+    let mut batch: Vec<WireOrder<'_>> = Vec::new();
+    while let Ok(n) = sock.read(&mut rx_buf) { // Error E0502 on next iteration!
+        if n == 0 { break; }
+        if let Some(ord) = parse_wire_order(&rx_buf[..n]) {
+            batch.push(ord); // extends shared borrow of `rx_buf` to `batch`
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection{Architectural Guidance: Avoiding ``Lifetime Infection'' and Self-References}
+\label{ch04:lifetime-infection}
+
+Putting \texttt{\&'a str} into long-lived domain models, caches, and order books forces every outer container and service to carry \texttt{<'a>}, an anti-pattern known as \textbf{lifetime infection}.
+
+\begin{applicationbox}
+\textbf{When to borrow in structs vs.\ when to own.}
+\begin{itemize}
+  \item \textbf{Borrow (\texttt{Struct<'a>}) for short-lived synchronous views:} wire parsers, serializers, iterators (\texttt{Iter<'a, T>}), and SQL query parameter tuples scoped to one buffer.
+  \item \textbf{Own at state and concurrency boundaries:} once validated orders enter an order book, cache, thread channel, or async task, convert text to fixed ASCII arrays (\texttt{[u8; 8]} for tickers --- \texttt{Copy} and heap-free), \texttt{Box<str>} (16 bytes, omitting \texttt{String}'s 8-byte capacity), \texttt{Arc<str>} for shared immutable identifiers, or \texttt{String} when mutating.
+\end{itemize}
+\end{applicationbox}
+
+What if you try to bundle both the owned buffer and the borrowed view inside a single struct \texttt{struct Bundle<'a> \{ raw:\ String, parsed:\ WireOrder<'a> \}}? Safe Rust forbids naive self-referential structs: borrowing \texttt{raw} prevents moving \texttt{raw} into \texttt{Bundle}, and because Rust can relocate any struct between stack frames via bitwise \texttt{memcpy}, any pointer into an inline field would dangle after a move. Instead, either parse on demand via a method \texttt{fn view(\&self) -> Option<WireOrder<'\_>>}, or store integer byte ranges \texttt{(usize, usize)} that stay valid across arbitrary moves:
+
+\begin{lstlisting}[language=Rust]
+pub struct OwnedPacketOrder {
+    raw: Box<[u8]>,
+    id_range: (usize, usize),
+    sym_range: (usize, usize),
+    pub qty: u64,
+    pub price_ticks: i64,
+}
+
+impl OwnedPacketOrder {
+    pub fn cl_ord_id(&self) -> &str {
+        let (start, end) = self.id_range;
+        std::str::from_utf8(&self.raw[start..end]).expect("validated at construction")
+    }
+}
+\end{lstlisting}
+
+(Chapter~12 examines the one case where compiler-generated structs genuinely hold internal pointers --- \texttt{async}/\texttt{await} state machines --- and how \texttt{Pin<P>} prevents moving them once polled.)
+
+\section{Busting the \#1 Beginner Trap: \texttt{\&'static str} vs.\ \texttt{T:\ 'static}}
+\label{ch04:static-vs-bound}
+
+Spawning threads or registering Axum handlers often produces an error mentioning \texttt{'static}, leading newcomers to think Rust wants them to leak memory or stick data into global variables. That confusion disappears once you separate two distinct constructs: the \textbf{reference type \texttt{\&'static str}} versus the \textbf{trait bound \texttt{T:\ 'static}}.
+
+A \texttt{\&'static str} is a concrete 16-byte reference whose target bytes remain at a valid address until process exit --- typically string literals like \texttt{"NASDAQ"} baked into the binary's read-only \texttt{.rodata} segment, or startup configuration intentionally leaked once via \texttt{Box::leak}.
+
+The bound \texttt{T:\ 'static} asks something completely different:
+
+\begin{definition}[The \texttt{T:\ 'static} Lifetime Bound]
+\label{ch04:def-t-static}
+A type $T$ satisfies \texttt{T:\ 'static} if and only if $T$ contains \textbf{no non-\texttt{'static} borrows}. Any value of type $T$ is self-contained: its current owner may drop it immediately or hold it until program exit without depending on any caller stack frame.
+\end{definition}
+
+Under Definition~\ref{ch04:def-t-static}, an owned \texttt{String} allocated inside a loop and dropped microseconds later satisfies \texttt{T:\ 'static} completely:
+
+\begin{lstlisting}[language=Rust]
+pub fn assert_static_bound<T: 'static>(_value: T) {}
+
+pub fn test_ephemeral_owned() {
+    for i in 0..3 {
+        let temp: String = format!("BATCH-{}", i);
+        assert_static_bound(temp); // Compiles! `String: 'static` is TRUE!
+    }
+}
+\end{lstlisting}
+
+Why? Because \texttt{T:\ 'static} is a property of the \emph{type} \texttt{String}: \texttt{temp} owns its heap buffer outright and borrows zero local stack frames.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Type \texttt{T}} & \textbf{\texttt{T:\ 'static}?} & \textbf{Reason} \\
+\midrule
+\texttt{u64}, \texttt{[u8; 8]} & Yes & Inline value bytes; zero borrows \\
+\texttt{String}, \texttt{Vec<u8>}, \texttt{Arc<str>} & Yes & Owns heap allocation; zero stack borrows \\
+\texttt{\&'static str} & Yes & Targets \texttt{.rodata}; valid until exit \\
+\texttt{\&'a str}, \texttt{WireOrder<'a>} & \textbf{No} & Tied to non-\texttt{'static} borrow \texttt{'a} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+That explains why \texttt{std::\allowbreak{}thread::\allowbreak{}spawn} requires \texttt{F: FnOnce() -> T + Send + 'static}: an OS thread may keep running after the parent stack frame returns. In C++, detaching a \texttt{std::thread} whose lambda captures \texttt{[\&local]} causes a use-after-return crash; in Rust, you either \texttt{move} owned \texttt{'static} data into \texttt{thread::spawn}, or use \texttt{std::\allowbreak{}thread::\allowbreak{}scope} to join workers before the stack frame exits:
+
+\begin{lstlisting}[language=Rust]
+use std::thread;
+
+pub fn concurrent_wire_notional() {
+    // 1. Background thread (`'static` closure): move owned `String`
+    let owned_msg = String::from("ORD-1001|MSFT|BUY|100|41250");
+    let bg = thread::spawn(move || {
+        let ord = parse_wire_order(owned_msg.as_bytes()).unwrap();
+        ord.qty * (ord.price_ticks as u64)
+    });
+    assert_eq!(bg.join().unwrap(), 4_125_000);
+
+    // 2. Scoped thread: guaranteed join before scope exit permits `&stack_msg`!
+    let stack_msg = String::from("ORD-1002|GOOG|SELL|50|17500");
+    let notional = thread::scope(|s| {
+        s.spawn(|| {
+            let ord = parse_wire_order(stack_msg.as_bytes()).unwrap();
+            ord.qty * (ord.price_ticks as u64)
+        }).join().unwrap()
+    });
+    assert_eq!(notional, 875_000);
+}
+\end{lstlisting}
+
+\section{Subtyping and Variance: Why \texttt{\&'a mut T} Is Invariant in \texttt{T}}
+\label{ch04:subtyping-variance}
+
+Java~6 defines subtyping over class hierarchies ($\texttt{Integer} <: \texttt{Number}$). Rust has no struct inheritance; subtyping in Rust is purely about \textbf{region containment}. Wherever code expects a reference valid over a short span \texttt{'short}, passing a reference valid over an enclosing span \texttt{'long} (such as \texttt{'static}) is always safe:
+\[
+  \text{\texttt{'long:\ 'short}} \quad\Longleftrightarrow\quad \text{\texttt{'long}} \;<:\; \text{\texttt{'short}}.
+\]
+
+How compound types propagate subtyping from their parameters is called \textbf{variance}:
+
+\begin{definition}[Covariance, Invariance, and Contravariance]
+\label{ch04:def-variance}
+For a type constructor $F\langle X \rangle$ and $A <: B$:
+\begin{itemize}
+  \item $F$ is \textbf{covariant} in $X$ if $A <: B \implies F\langle A \rangle <: F\langle B \rangle$ (lifetimes inside $F$ may shrink).
+  \item $F$ is \textbf{invariant} in $X$ if neither $F\langle A \rangle <: F\langle B \rangle$ nor $F\langle B \rangle <: F\langle A \rangle$ holds for $A \neq B$.
+  \item $F$ is \textbf{contravariant} in $X$ if $A <: B \implies F\langle B \rangle <: F\langle A \rangle$ (as in \texttt{fn(\&'short str)} $<:$ \texttt{fn(\&'long str)}).
+\end{itemize}
+\end{definition}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Reference type} & \textbf{In outer lifetime \texttt{'a}} & \textbf{In referent type \texttt{T}} \\
+\midrule
+Shared reference \texttt{\&'a T} & Covariant & Covariant \\
+Exclusive reference \texttt{\&'a mut T} & Covariant & \textbf{Invariant} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Shrinking \texttt{'a} on either reference is safe, and shrinking a lifetime inside \texttt{T} behind read-only \texttt{\&'a T} is safe because the holder only reads \texttt{T}. Why must \texttt{\&'a mut T} be strictly \textbf{invariant} in \texttt{T}? Watch what seven lines of \texttt{unsafe}-free code would do if \texttt{\&mut \&'static str} could coerce to \texttt{\&mut \&'short str}:
+
+\begin{lstlisting}[language=Rust]
+fn overwrite<'s>(slot: &mut &'s str, replacement: &'s str) {
+    *slot = replacement;
+}
+
+fn exploit_if_covariant() {
+    let mut ticker: &'static str = "MSFT"; // promises `'static` target
+    {
+        let local = String::from("BAD");   // lives only for `'short`
+        overwrite(&mut ticker, &local);    // Error E0597: blocked by invariance!
+    } // `local` drops and frees "BAD"
+    println!("ticker = {}", ticker);       // WOULD READ FREED HEAP MEMORY!
+}
+\end{lstlisting}
+
+Figure~\ref{ch04:fig-mut-invariance} traces the prevented exploit. Because \texttt{slot} can be \emph{written to}, letting \texttt{\&mut \&'static str} pose as \texttt{\&mut \&'short str} would allow \texttt{overwrite} to write \texttt{\&local} into the outer \texttt{ticker} slot, leaving \texttt{ticker} dangling as soon as \texttt{local} drops. Invariance locks \texttt{'s = 'static}, so \texttt{rustc} reports \texttt{type annotation requires that local is borrowed for 'static} (\texttt{E0597}).
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex]
+  % Outer stack frame (top left)
+  \draw[thick,sourceblue,fill=sourceblue!6,rounded corners=4pt] (0, 1.95) rectangle (4.0, 3.85);
+  \node[font=\bfseries\footnotesize,sourceblue!90!black] at (2.0, 3.55) {Outer stack frame};
+  \draw[thick,sourceblue,fill=white] (0.28, 2.2) rectangle (3.72, 3.22);
+  \node[font=\ttfamily\scriptsize\bfseries] at (2.0, 2.92) {ticker:\ \&'static str};
+  \node[font=\scriptsize,gray!85!black] at (2.0, 2.48) {must hold \texttt{'static} ptr};
+
+  % Blocked badge (bottom left, clear gap below outer stack)
+  \draw[thick,trapred,fill=trapred!7,rounded corners=3pt] (0, 0.25) rectangle (3.65, 1.15);
+  \node[font=\scriptsize\bfseries,trapred,align=center] at (1.825, 0.7)
+    {Blocked by invariance:\\\texttt{'s = 'static} (\texttt{E0597})};
+
+  % .rodata box (top right)
+  \draw[thick,targetgreen,fill=targetgreen!10,rounded corners=4pt] (6.1, 2.65) rectangle (10.5, 3.85);
+  \node[font=\bfseries\scriptsize,targetgreen!85!black] at (8.3, 3.5) {\texttt{.rodata} (\texttt{'static})};
+  \node[font=\ttfamily\footnotesize] at (8.3, 3.0) {"MSFT" (valid forever)};
+
+  % Initial safe arrow
+  \draw[->,thick,targetgreen] (3.72, 3.05) --
+    node[above,font=\scriptsize,targetgreen!85!black] {1. initial} (6.1, 3.05);
+
+  % Inner block (bottom right): put "BAD" on LEFT so red arrow never crosses `local`!
+  \draw[thick,quotientorange,fill=quotientorange!8,rounded corners=4pt] (6.1, 0.15) rectangle (12.4, 2.1);
+  \node[font=\bfseries\footnotesize,quotientorange!90!black] at (9.25, 1.8)
+    {Inner block (\texttt{'short}) --- freed at \texttt{\}}};
+
+  \draw[thick,trapred,fill=trapred!10] (6.4, 0.38) rectangle (8.8, 1.42);
+  \node[font=\ttfamily\footnotesize\bfseries,trapred] at (7.6, 1.08) {"BAD"};
+  \node[font=\scriptsize,trapred] at (7.6, 0.65) {freed at inner \texttt{\}}!};
+
+  \draw[thick,quotientorange,fill=white] (9.5, 0.38) rectangle (12.1, 1.42);
+  \node[font=\ttfamily\scriptsize\bfseries] at (10.8, 1.08) {local:\ String};
+  \node[font=\scriptsize] at (10.8, 0.65) {owns heap buf};
+
+  \draw[->,thick,quotientorange!90!black] (9.5, 0.9) -- (8.8, 0.9);
+
+  % Illegal write-back arrow across open channel x = 3.72 .. 6.4
+  \draw[->,line width=1.3pt,trapred,dashed] (3.72, 2.45) -- (6.4, 1.15);
+  \node[font=\scriptsize\bfseries,trapred,align=center] at (4.88, 0.85)
+    {2. write-back\\if covariant};
+\end{tikzpicture}
+\caption{Why \texttt{\&'a mut T} is invariant in \texttt{T}. Coercing \texttt{\&mut \&'static str} to \texttt{\&mut \&'short str} would let \texttt{overwrite} aim \texttt{ticker} at \texttt{"BAD"} on the heap, which is freed when the inner block exits.}
+\label{ch04:fig-mut-invariance}
+\end{figure}
+
+\begin{connectionbox}
+\textbf{Java~6's broken array covariance and \texttt{ArrayStoreException}.} Java~1.0 made mutable arrays covariant (\texttt{Object[] slots = new String[]\{"MSFT"\};}), allowing \texttt{slots[0] = Integer.valueOf(42);} to compile and crash at runtime with \texttt{ArrayStoreException}. Java~6 catches that write only by storing a runtime class tag in every array header and checking types on \emph{every reference array store}. Because Rust erases lifetimes at compile time, no runtime tag exists to throw a \texttt{LifetimeStoreException}; invariance of \texttt{\&'a mut T} in \texttt{T} keeps zero-cost lifetime erasure sound.
+\end{connectionbox}
+
+\section{The Unsafe Boundary: Raw Pointers, \texttt{UnsafeCell}, and Sound Abstractions}
+\label{ch04:unsafe-boundary}
+
+Any decidable static borrow checker is conservative: it must reject some memory-safe programs whose safety hinges on array index arithmetic, and at the lowest layer --- inside \texttt{Vec<T>}, \texttt{Arc<T>}, \texttt{Mutex<T>}, and OS syscalls --- code has to manipulate raw addresses directly. Rust isolates those obligations inside \texttt{unsafe} blocks.
+
+Writing \texttt{unsafe \{ ... \}} does \textbf{not} disable the borrow checker: safe references (\texttt{\&T}, \texttt{\&mut T}), moves, lifetimes, and \texttt{Drop} remain enforced inside \texttt{unsafe} blocks. Instead, \texttt{unsafe} permits \textbf{five specific operations}:
+\begin{enumerate}
+  \item \textbf{Dereferencing raw pointers} (\texttt{*const T} and \texttt{*mut T}). Creating and copying raw pointers is safe (\texttt{\&x as *const i32}, \texttt{slice.as\_mut\_ptr()}), and so is \texttt{wrapping\_add}; dereferencing \texttt{*p} requires \texttt{unsafe}, and so does \texttt{ptr.add}, which is an \texttt{unsafe fn} (see item~2).
+  \item \textbf{Calling an \texttt{unsafe fn}} (including C \texttt{extern "C"} functions), asserting you have met its documented preconditions.
+  \item \textbf{Implementing an \texttt{unsafe trait}} (such as \texttt{Send} or \texttt{Sync}), asserting your type upholds its contract.
+  \item \textbf{Accessing or mutating a \texttt{static mut}} global variable.
+  \item \textbf{Accessing fields of a C-style \texttt{union}}, where the active variant is untagged.
+\end{enumerate}
+
+\subsection{Case Study: Implementing \texttt{split\_two\_mut} Behind a Safe Signature}
+\label{ch04:split-at-mut}
+
+Suppose two worker threads want mutable slices of the morning and afternoon halves of an intraday price array \texttt{\&mut [T]}. Writing \texttt{(\&mut values[..mid], \&mut values[mid..])} fails with \texttt{E0499} because the borrow checker treats both sub-slices as overlapping mutable borrows of \texttt{values} rather than proving $[0, \text{mid}) \cap [\text{mid}, \text{len}) = \emptyset$.
+
+Checking \texttt{assert!(mid <= len)} in safe code and forming the two non-overlapping slices via raw pointers wraps that arithmetic proof behind a 100\% safe signature (Figure~\ref{ch04:fig-split-at-mut}):
+
+\begin{lstlisting}[language=Rust]
+use std::slice;
+
+pub fn split_two_mut<T>(values: &mut [T], mid: usize) -> (&mut [T], &mut [T]) {
+    let len = values.len();
+    assert!(mid <= len, "mid index out of bounds");
+    let ptr: *mut T = values.as_mut_ptr();
+    // SAFETY:
+    // 1. `mid <= len` holds by `assert!`, so `[0, mid)` and `[mid, len)` lie within
+    //    the single allocated, aligned, initialized slice `values`.
+    // 2. `[0, mid)` and `[mid, len)` are disjoint, so the two `&mut [T]` slices never alias.
+    // 3. Elision Rule 2 ties both outputs to `values`'s input borrow lifetime.
+    unsafe {
+        (
+            slice::from_raw_parts_mut(ptr, mid),
+            slice::from_raw_parts_mut(ptr.add(mid), len - mid),
+        )
+    }
+}
+\end{lstlisting}
+
+In production Rust, every \texttt{unsafe} block carries a \texttt{// SAFETY:} comment discharging the exact preconditions of each operation inside it (\texttt{ptr.add} staying within the allocated object; \texttt{from\_raw\_parts\_mut} receiving a valid, aligned, initialized, unaliased range).
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex]
+  % Backing array at top
+  \node[anchor=west,font=\bfseries\footnotesize,structurepurple] at (0, 3.85)
+    {Input \texttt{values:\ \&'a mut [i64]} (\texttt{ptr}, \texttt{len = 6}, \texttt{mid = 3})};
+
+  \foreach \i/\v in {0/100, 1/102, 2/105} {
+    \draw[thick,sourceblue,fill=sourceblue!10] (\i*1.65, 2.85) rectangle (\i*1.65+1.65, 3.55);
+    \node[font=\ttfamily\footnotesize] at (\i*1.65+0.825, 3.2) {[\i]: \v};
+  }
+  \foreach \i/\v in {3/101, 4/99, 5/104} {
+    \draw[thick,targetgreen,fill=targetgreen!10] (\i*1.65, 2.85) rectangle (\i*1.65+1.65, 3.55);
+    \node[font=\ttfamily\footnotesize] at (\i*1.65+0.825, 3.2) {[\i]: \v};
+  }
+  \draw[line width=1.6pt,trapred,dashed] (4.95, 2.65) -- (4.95, 3.72);
+
+  % Middle safety gate + unsafe box
+  \draw[thick,quotientorange,fill=quotientorange!10,rounded corners=3pt] (0.2, 1.55) rectangle (4.2, 2.35);
+  \node[font=\scriptsize\bfseries,quotientorange!90!black,align=center] at (2.2, 1.95)
+    {Safe precondition gate:\\\texttt{assert!(mid <= len)}};
+
+  \draw[thick,trapred,fill=trapred!7,rounded corners=3pt] (4.8, 1.55) rectangle (9.7, 2.35);
+  \node[font=\scriptsize\bfseries,trapred,align=center] at (7.25, 1.95)
+    {\texttt{unsafe}: \texttt{from\_raw\_parts\_mut}\\\texttt{(ptr, 3)} and \texttt{(ptr.add(3), 3)}};
+
+  \draw[->,thick,quotientorange!90!black] (4.2, 1.95) -- (4.8, 1.95);
+
+  % Bottom disjoint outputs
+  \draw[thick,sourceblue,fill=sourceblue!8,rounded corners=3pt] (0.2, 0.2) rectangle (4.5, 1.05);
+  \node[font=\ttfamily\scriptsize\bfseries,sourceblue!90!black] at (2.35, 0.8)
+    {left:\ \&'a mut [i64]};
+  \node[font=\scriptsize] at (2.35, 0.43) {\texttt{ptr = base + 0}, \texttt{len = 3}};
+
+  \draw[thick,targetgreen,fill=targetgreen!8,rounded corners=3pt] (5.4, 0.2) rectangle (9.7, 1.05);
+  \node[font=\ttfamily\scriptsize\bfseries,targetgreen!85!black] at (7.55, 0.8)
+    {right:\ \&'a mut [i64]};
+  \node[font=\scriptsize] at (7.55, 0.43) {\texttt{ptr = base + 3}, \texttt{len = 3}};
+
+  % Arrows from unsafe to outputs and up to backing array cleanly outside boxes
+  \draw[->,thick,sourceblue] (5.8, 1.55) -- (3.1, 1.05);
+  \draw[->,thick,targetgreen] (7.55, 1.55) -- (7.55, 1.05);
+  \draw[->,thick,sourceblue,dashed] (0.2, 0.65) to[out=160,in=-145] (0.2, 2.85);
+  \draw[->,thick,targetgreen,dashed] (9.7, 0.65) to[out=20,in=-35] (9.7, 2.85);
+\end{tikzpicture}
+\caption{Inside \texttt{split\_two\_mut}. Once \texttt{assert!(mid <= len)} validates $0 \le 3 \le 6$ in safe code, raw pointer offsets construct two disjoint \texttt{\&'a mut [i64]} slices tied to input borrow \texttt{'a}.}
+\label{ch04:fig-split-at-mut}
+\end{figure}
+
+\begin{definition}[Soundness and the Module Trust Boundary]
+\label{ch04:def-soundness}
+A public Rust API is \textbf{sound} if no sequence of calls written in \emph{safe} Rust --- for any caller inputs --- can ever trigger Undefined Behavior.
+\end{definition}
+
+Definition~\ref{ch04:def-soundness} carries an architectural lesson shown in Figure~\ref{ch04:fig-abstraction-capsule}: \textbf{the soundness boundary is the module privacy boundary (\texttt{mod}), not merely the \texttt{unsafe \{ ... \}} braces.} Deleting the safe line \texttt{assert!(mid <= len)} outside \texttt{unsafe} makes \texttt{split\_two\_mut} unsound immediately, just as a safe bug modifying private \texttt{Vec::len} inside \texttt{Vec}'s module breaks \texttt{Vec}'s \texttt{unsafe} invariants.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex]
+  % Outer safe callers
+  \draw[thick,targetgreen,fill=targetgreen!8,rounded corners=4pt] (0, 1.0) rectangle (2.5, 2.5);
+  \node[font=\bfseries\footnotesize,targetgreen!85!black,align=center] at (1.25, 2.02)
+    {Safe callers};
+  \node[font=\scriptsize,align=center] at (1.25, 1.42)
+    {arbitrary inputs,\\0 \texttt{unsafe} needed};
+
+  % Module privacy capsule (wider margins so header sits comfortably inside)
+  \draw[line width=1.4pt,structurepurple,fill=structurepurple!5,rounded corners=6pt] (3.6, 0.15) rectangle (12.6, 3.35);
+  \node[font=\bfseries\footnotesize,structurepurple] at (8.1, 3.03)
+    {Module Soundness Boundary (\texttt{mod}: private \texttt{ptr}, \texttt{len}, \texttt{cap})};
+
+  % Safe invariant checks inside module
+  \draw[thick,sourceblue,fill=white,rounded corners=3pt] (4.0, 0.52) rectangle (7.75, 2.58);
+  \node[font=\bfseries\scriptsize,sourceblue!90!black,align=center] at (5.875, 2.26)
+    {Safe module code};
+  \node[font=\scriptsize,align=center] at (5.875, 1.4)
+    {bounds assertions,\\capacity math,\\updating \texttt{self.len},\\\texttt{UnsafeCell<T>} wrapper};
+
+  % Small unsafe kernel inside module
+  \draw[thick,trapred,fill=trapred!9,rounded corners=3pt] (8.45, 0.52) rectangle (12.2, 2.58);
+  \node[font=\bfseries\scriptsize,trapred,align=center] at (10.325, 2.26)
+    {\texttt{unsafe \{ ... \}} kernel};
+  \node[font=\scriptsize,align=center] at (10.325, 1.4)
+    {raw \texttt{*mut T} derefs,\\\texttt{ptr.add}, \texttt{MaybeUninit},\\backed by \texttt{// SAFETY:}};
+
+  \draw[->,thick,targetgreen!85!black] (2.5, 1.75) -- node[above,font=\scriptsize] {\texttt{pub fn}} (3.6, 1.75);
+  \draw[<->,thick,structurepurple] (7.75, 1.55) -- (8.45, 1.55);
+\end{tikzpicture}
+\caption{The safe abstraction capsule. Module privacy shields representation invariants (\texttt{len <= cap}, disjoint ranges) from external callers while safe checks and the small \texttt{unsafe} kernel maintain soundness together.}
+\label{ch04:fig-abstraction-capsule}
+\end{figure}
+
+\subsection{\texttt{UnsafeCell<T>}, Aliasing UB, \texttt{MaybeUninit<T>}, and Miri}
+\label{ch04:unsafecell-ub}
+
+Three habits from C and C++ cause \textbf{instant Undefined Behavior in Rust}, even inside \texttt{unsafe}, because Rust hands LLVM far stronger aliasing guarantees than C or C++:
+
+\textbf{1. Mutating behind \texttt{\&T} without \texttt{UnsafeCell<T>} is always UB.} Every \texttt{\&T} carries an LLVM \texttt{readonly}/\texttt{noalias} contract unless \texttt{T} wraps its mutable bytes inside \texttt{std::cell::UnsafeCell<U>} (the sole primitive underlying \texttt{Cell}, \texttt{RefCell}, \texttt{Mutex}, and \texttt{AtomicU64}). Casting \texttt{\&u64} to \texttt{*mut u64} and writing to it without \texttt{UnsafeCell} miscompiles under optimization:
+
+\begin{lstlisting}[language=Rust]
+use std::cell::UnsafeCell;
+
+pub struct CounterCell { value: UnsafeCell<u64> } // `!Sync`; opts out of `&T` readonly
+
+impl CounterCell {
+    pub const fn new(initial: u64) -> Self { Self { value: UnsafeCell::new(initial) } }
+    pub fn increment(&self) -> u64 {
+        // SAFETY: `!Sync` guarantees single-threaded access; no `&u64` lives across `*p`.
+        unsafe {
+            let p: *mut u64 = self.value.get();
+            *p += 1;
+            *p
+        }
+    }
+}
+\end{lstlisting}
+
+\textbf{2. Two aliasing \texttt{\&mut T} references are instant UB --- even without writes.} Every \texttt{\&mut T} is emitted as an LLVM \texttt{noalias} pointer. Forming \texttt{let r1 = \&mut *p; let r2 = \&mut *p;} while \texttt{r1} remains live violates Rust's Stacked/Tree Borrows model immediately. Inside doubly linked lists or intrusive queues where pointers alias, keep raw \texttt{*mut Node} pointers until the exact instant of an unaliased access.
+
+\textbf{3. Every \texttt{\&T} and \texttt{\&mut T} must be non-null, aligned, and initialized.} Taking a reference to an unaligned packed network field is UB (use \texttt{std::ptr::\allowbreak{}addr\_of!(hdr.field).\allowbreak{}read\_unaligned()} instead), and materializing a \texttt{T} or \texttt{\&mut [u8]} over uninitialized memory is immediate UB. Use \texttt{std::mem::MaybeUninit<T>} to populate buffers safely before calling \texttt{assume\_init()}:
+
+\begin{lstlisting}[language=Rust]
+use std::mem::MaybeUninit;
+
+pub fn fill_ascii_digits(count: usize) -> Option<[u8; 16]> {
+    if count > 16 { return None; }
+    let mut buf: MaybeUninit<[u8; 16]> = MaybeUninit::uninit();
+    let base: *mut u8 = buf.as_mut_ptr() as *mut u8;
+    // SAFETY: `base` points to 16 stack bytes; all 16 are written before `assume_init`.
+    unsafe {
+        for i in 0..16 {
+            base.add(i).write(if i < count { b'0' + (i as u8 % 10) } else { b'_' });
+        }
+        Some(buf.assume_init())
+    }
+}
+\end{lstlisting}
+
+\begin{labbox}
+\textbf{Auditing \texttt{unsafe} with Miri.} Passing unit tests on x86-64 never proves \texttt{unsafe} code free of UB. Run \texttt{cargo +nightly miri test}: \textbf{Miri} interprets Rust's Mid-level IR on an instrumented abstract machine that tracks per-byte initialization, alignment, bounds, and pointer provenance, catching aliasing UB, use-after-free, and data races on the exact offending line.
+\end{labbox}
+
+With ownership (Chapter~3), region lifetimes, and safe abstraction capsules in place, you hold Rust's complete memory model. Chapter~5 moves from \emph{how long bytes live} to \emph{what shapes values take}: algebraic data types, niche layout optimizations that pack \texttt{Option<\&'a str>} into the exact same 16 bytes as \texttt{\&'a str}, and exhaustive pattern matching for domain state machines.
+
+\section{Exercises}
+\label{ch04:exercises}
+
+\begin{exercise}[Zero runtime cost of \texttt{'a}]
+Write a helper \texttt{pub fn head\_four<'a>(buf: \&'a [u8]) -> Option<\&'a [u8]>} (returning \texttt{Some(\&buf[..4])} when \texttt{buf.len() >= 4}) alongside an elided version omitting \texttt{<'a>}.
+(a) Compile with \texttt{rustc -C opt-level=3 --emit=asm} and verify that both emit identical assembly.
+(b) Explain in terms of stack frames and registers why changing \texttt{<'a>} to \texttt{<'static>} cannot extend how long a caller's \texttt{Vec<u8>} stays allocated at runtime.
+\end{exercise}
+
+\begin{exercise}[Tracing Non-Lexical Lifetimes by hand]
+Given \texttt{let mut ledger = vec![100\_i64, -40, 250];}, predict whether each snippet below compiles under NLL; if it fails, identify the overlapping regions and fix it in two lines without cloning:
+\begin{enumerate}[label=(\alph*)]
+  \item \texttt{let r = \&ledger[0]; let x = *r; ledger.push(x); println!("\{\}", x);}
+  \item \texttt{let r = \&ledger[0]; ledger.push(50); println!("\{\}", *r);}
+  \item \texttt{let r = \&ledger[0]; if *r > 0 \{ ledger.push(10); \} else \{ println!("\{\}", *r); \}}
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Applying and overriding the Three Elision Rules]
+Apply Definition~\ref{ch04:def-elision} to expand each signature, or explain why \texttt{rustc} rejects it:
+\begin{enumerate}[label=(\alph*)]
+  \item \texttt{fn parse\_ticker(line: \&str) -> Result<\&str, u32>}
+  \item \texttt{fn first\_non\_empty(primary: \&str, backup: \&str) -> \&str}
+  \item \texttt{impl HeaderConfig \{ fn extract\_host(\&self, raw\_http: \&str) -> Option<\&str> \}}
+\end{enumerate}
+In~(c), rewrite the signature with explicit lifetimes when the returned host slice borrows \texttt{raw\_http} rather than \texttt{self}, allowing \texttt{HeaderConfig} to drop early.
+\end{exercise}
+
+\begin{exercise}[Zero-copy HTTP header line parser]
+Define a struct \texttt{HttpHeader<'a>} with public fields \texttt{name: \&'a str} and \texttt{value: \&'a str}, and implement a function \texttt{parse\_header<'a>} that takes \texttt{line: \&'a [u8]}, returns \texttt{Option<HttpHeader<'a>>}, splits an ASCII header line like \texttt{b"Content-Length: 1024"} on the first \texttt{':'}, trims ASCII whitespace, rejects empty names, and performs zero heap allocations. Verify at compile time that \texttt{size\_of::<HttpHeader<'static>>() == 32}.
+\end{exercise}
+
+\begin{exercise}[Diagnosing \texttt{\&'static str} vs.\ \texttt{T:\ 'static}]
+State whether each type satisfies \texttt{T:\ 'static} and justify in one sentence:
+(a) \texttt{Vec<String>} created and dropped inside a three-line block;
+(b) \texttt{Result<u64, \&'static str>};
+(c) \texttt{Option<WireOrder<'a>>} for an arbitrary \texttt{'a};
+(d) \texttt{std::sync::Arc<[u8]>}.
+Then show how to run \texttt{parse\_wire\_order} on a \texttt{stack\_buf: [u8; 64]} on a worker thread first using \texttt{std::thread::scope} and second using \texttt{std::thread::spawn}.
+\end{exercise}
+
+\begin{exercise}[Constructing a variance counterexample for \texttt{Cell<T>}]
+In the standard library, \texttt{std::\allowbreak{}cell::\allowbreak{}Cell<T>} mutates its inner \texttt{T} through a shared reference \texttt{\&Cell<T>} via \texttt{Cell::set(\&self, val: T)}, built atop \texttt{UnsafeCell<T>}. Write a 10-line counterexample modeled on \texttt{exploit\_\allowbreak{}if\_\allowbreak{}covariant} proving that \texttt{\&'a Cell<T>} must be invariant in \texttt{T} to prevent a dangling \texttt{\&'static str}.
+\end{exercise}
+
+\begin{exercise}[Auditing module-level soundness]
+Consider this miniature buffer module whose \texttt{set\_len} contains zero \texttt{unsafe} keywords:
+\begin{lstlisting}[language=Rust]
+pub mod mini_buf {
+    pub struct MiniBuf { data: [u8; 8], len: usize }
+    impl MiniBuf {
+        pub fn new() -> Self { Self { data: [0; 8], len: 0 } }
+        pub fn set_len(&mut self, new_len: usize) { self.len = new_len; }
+        pub fn as_slice(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.data.as_ptr(), self.len) }
+        }
+    }
+}
+\end{lstlisting}
+(a) Write a 3-line \emph{safe} caller outside \texttt{mini\_buf} that triggers an out-of-bounds memory read.
+(b) Explain why \texttt{MiniBuf} violates Definition~\ref{ch04:def-soundness}, and give two distinct fixes (one checking bounds in safe \texttt{set\_len}, and one marking \texttt{pub unsafe fn set\_len}).
+\end{exercise}
+
+\begin{exercise}[Safe abstraction: \texttt{first\_and\_last\_mut}]
+Implement a generic helper \texttt{first\_\allowbreak{}and\_\allowbreak{}last\_\allowbreak{}mut<T>} taking \texttt{slice: \&mut [T]} and returning \texttt{Option<(\&mut T, \&mut T)>} for the first and last elements when \texttt{slice.len() >= 2}, or \texttt{None} otherwise.
+(a) Implement it first \emph{without} \texttt{unsafe} using \texttt{split\_\allowbreak{}first\_\allowbreak{}mut()} and \texttt{split\_\allowbreak{}last\_\allowbreak{}mut()}.
+(b) Implement it with raw pointers and a \texttt{// SAFETY:} proof, and explain what UB occurs on a 1-element slice if you guard with \texttt{!slice.is\_empty()} instead of \texttt{slice.len() >= 2}.
+\end{exercise}
+
+\begin{exercise}[Eliminating uninitialized-memory UB with \texttt{MaybeUninit}]
+A C programmer writes:
+\begin{lstlisting}[language=Rust]
+pub unsafe fn bad_read_header(fill_bytes: fn(*mut u8, usize)) -> [u8; 32] {
+    let mut hdr: [u8; 32] = std::mem::MaybeUninit::uninit().assume_init();
+    fill_bytes(hdr.as_mut_ptr(), 32);
+    hdr
+}
+\end{lstlisting}
+Explain why calling \texttt{assume\_init()} before \texttt{fill\_bytes} writes all 32 bytes is immediate Undefined Behavior in Rust, and rewrite the function so \texttt{assume\_init()} runs only after initialization completes.
+\end{exercise}

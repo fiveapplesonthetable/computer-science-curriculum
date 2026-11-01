@@ -1,0 +1,1086 @@
+\chapter{TypeScript From the Ground Up: Structural Subtyping, Set Theory, and Erase-to-JS}
+\label{ch:typescript-structural-sets}
+
+In Parts~II and~III we lived inside compilers where types govern physical memory. When you write \texttt{struct Posting \{ account\_id: u64, cents: i64 \}} in Rust or C++, that declaration decides exact byte offsets, register assignments, stack-frame sizes, and machine instructions. Even in Java~6, where generics lose their type arguments at compile time, every object on the heap still carries a 16-byte header whose \texttt{klass} pointer names the exact class that allocated it; try an invalid cast at runtime and the JVM halts the instruction with a \texttt{ClassCastException}.
+
+Welcome to Part~IV, where we step outside Rust to study three modern languages---TypeScript, Kotlin, and Go---that made different engineering bets about types, memory, and concurrency. We begin with TypeScript because no mainstream language looks more familiar on the surface to a Java programmer while operating on more different mathematical foundations underneath.
+
+Start with the keywords in a TypeScript file: \texttt{interface}, \texttt{class}, \texttt{implements}, \texttt{extends}, \texttt{private}, \texttt{readonly}, \texttt{<T>}. Every single one looks like Java. If you sit down to write TypeScript carrying your Java~6 mental model, everything feels fine for about twenty minutes---right until two unrelated types become interchangeable without an \texttt{implements} clause, \texttt{instanceof} refuses to compile against an \texttt{interface}, \texttt{keyof (A | B)} evaluates to an intersection instead of a union, a mutable \texttt{Dog[]} slips silently into an \texttt{Animal[]}, and a malformed JSON payload passes straight through \texttt{as Account} into production without throwing a cast exception.
+
+None of these behaviors are quirks to memorize one by one. Every one of them follows from two foundational design choices:
+\begin{enumerate}
+  \item \textbf{Structural subtyping (types as mathematical sets of shapes):} TypeScript checks whether a value has the required \emph{shape}, not which named declaration created it. A type is simply a mathematical set of runtime JavaScript values, and subtyping ($S <: T$) is ordinary set inclusion ($S \subseteq T$).
+  \item \textbf{Total type erasure to JavaScript:} the TypeScript compiler (\texttt{tsc}) emits plain JavaScript with \emph{zero} runtime type descriptors. Every \texttt{interface}, \texttt{type} alias, union, generic parameter, and \texttt{private} modifier vanishes before V8 or Node.js sees a single byte of code.
+\end{enumerate}
+
+With both principles in hand, TypeScript is best understood as a set-theoretic static analyzer layered over a dynamic runtime. The rest of the chapter builds up each half.
+
+\chapterline
+
+\section{Two Mental Shifts from Java 6: Shape Typing and Total Erasure}
+\label{ch09:two-mental-shifts}
+
+Suppose we are building the browser dashboard and Node.js API gateway that sit in front of a double-entry financial ledger. Consider two class declarations in Java~6:
+
+\begin{lstlisting}[language=Java]
+// Java 6: nominal typing -- names and explicit hierarchy decide compatibility
+public final class InvoiceTotal {
+    private final long cents;
+    public InvoiceTotal(long cents) { this.cents = cents; }
+    public long getCents() { return cents; }
+}
+
+public final class LedgerBalance {
+    private final long cents;
+    public LedgerBalance(long cents) { this.cents = cents; }
+    public long getCents() { return cents; }
+}
+\end{lstlisting}
+
+In Java~6, \texttt{InvoiceTotal} and \texttt{LedgerBalance} have identical memory layouts (a 16-byte JVM object header plus an 8-byte \texttt{long}) and identical method signatures. Yet you cannot pass an \texttt{InvoiceTotal} to a method expecting a \texttt{LedgerBalance}. Even if you later introduce an interface \texttt{HasCents \{ long getCents(); \}}, existing classes in third-party JARs cannot satisfy \texttt{HasCents} unless their original authors wrote \texttt{implements HasCents} on the class header. Compatibility is \emph{nominal}: it lives in declared names and explicit lineage. Rust \texttt{struct}s and \texttt{trait}s are nominal in the same sense---two structs with identical fields are distinct types, and a type satisfies a trait only when an explicit \texttt{impl Trait for Type} block says so (though Rust, unlike Java~6, lets you write that \texttt{impl} block outside the struct declaration).
+
+Now write the analogous declarations in TypeScript:
+
+\begin{lstlisting}[language=TypeScript]
+// TypeScript: structural typing -- the set of properties decides compatibility
+interface InvoiceTotal {
+  readonly cents: bigint;
+}
+
+interface LedgerBalance {
+  readonly cents: bigint;
+}
+
+function formatUsd(amount: InvoiceTotal): string {
+  const sign = amount.cents < 0n ? '-' : '';
+  const abs = amount.cents < 0n ? -amount.cents : amount.cents;
+  const dollars = abs / 100n;
+  const rem = (abs - dollars * 100n).toString().padStart(2, '0');
+  return `${sign}$${dollars}.${rem}`;
+}
+
+const bal: LedgerBalance = { cents: 12500n };
+console.log(formatUsd(bal));              // Compiles! "$125.00"
+console.log(formatUsd({ cents: -450n })); // Plain object literal compiles! "-$4.50"
+\end{lstlisting}
+
+Consider \texttt{formatUsd(bal)}. Nobody declared that \texttt{LedgerBalance} extends \texttt{InvoiceTotal}, and the anonymous literal \texttt{\{ cents: -450n \}} has no class name at all. TypeScript accepts both calls because \texttt{formatUsd} asks only one question: \emph{is the argument guaranteed to be an object possessing a \texttt{cents} property whose value is a \texttt{bigint}?} Both \texttt{LedgerBalance} and \texttt{\{ cents: -450n \}} answer yes, so both belong to the set of values accepted by \texttt{InvoiceTotal}.
+
+\begin{definition}[Nominal vs.\ Structural Subtyping]
+\label{ch09:def-nominal-vs-structural}
+In a \emph{nominally typed} language (Java~6 classes and interfaces, C++ class inheritance, Rust structs and traits, Kotlin classes), type $S$ is a subtype of $T$ if and only if the program explicitly declares that named relationship ($S$ \texttt{extends} or \texttt{implements} $T$).
+
+In a \emph{structurally typed} language (TypeScript types and interfaces, OCaml object types, Go interfaces on method sets), type $S$ is a subtype of $T$ ($S <: T$) whenever every member required by the structure of $T$ is present with a compatible type in $S$, regardless of what $S$ and $T$ are named or where they were declared.
+\end{definition}
+
+\begin{intuitionbox}
+\textbf{Why did TypeScript choose structural typing?} Because TypeScript did not invent its own runtime; it was designed by Anders Hejlsberg and his team at Microsoft (first released in 2012) to type-check idiomatic JavaScript as JavaScript programmers actually write it. In JavaScript, functions routinely build and return ad-hoc object literals \texttt{\{ ok: true, txId: 'tx\_91' \}}, compose configuration bags across libraries that have never heard of each other, and pass callbacks without ceremony. Forcing every object literal to instantiate a nominal class hierarchy would have turned JavaScript into Java. Structural subtyping lets TypeScript assign exact static types to plain data shapes without changing a single runtime allocation.
+\end{intuitionbox}
+
+\subsection{Mental Shift 2: Total Erasure and What V8 Actually Sees}
+
+Now let us follow \texttt{formatUsd} across the compiler boundary. When you run \texttt{tsc --target es2022}, here is the exact JavaScript that emerges:
+
+\begin{lstlisting}[language=JavaScript]
+// Emitted JavaScript: interfaces, type annotations, and readonly are gone
+function formatUsd(amount) {
+  const sign = amount.cents < 0n ? '-' : '';
+  const abs = amount.cents < 0n ? -amount.cents : amount.cents;
+  const dollars = abs / 100n;
+  const rem = (abs - dollars * 100n).toString().padStart(2, '0');
+  return `${sign}$${dollars}.${rem}`;
+}
+
+const bal = { cents: 12500n };
+console.log(formatUsd(bal));
+console.log(formatUsd({ cents: -450n }));
+\end{lstlisting}
+
+Compare the two listings line by line. Both \texttt{interface InvoiceTotal} and \texttt{interface LedgerBalance} evaporated into zero bytes. The parameter annotation \texttt{: InvoiceTotal}, the return type \texttt{: string}, and the variable annotation \texttt{: LedgerBalance} vanished too. Even \texttt{readonly} disappeared: at runtime, nothing stops untyped JavaScript code from mutating \texttt{bal.cents = 0n} unless you explicitly call \texttt{Object.freeze(bal)} at the value level.
+
+Figure~\ref{ch09:fig-erasure-boundary} compares what survives compilation in Java~6, Rust, and TypeScript.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,
+  stage/.style={draw,rounded corners=3pt,thick,align=center,minimum height=1.15cm},
+  arrow/.style={->,thick,gray!75!black}]
+
+  % Column headers
+  \node[font=\bfseries\footnotesize,text=gray!70!black] at (1.8, 3.6) {SOURCE CODE};
+  \node[font=\bfseries\footnotesize,text=gray!70!black] at (6.0, 3.6) {COMPILER STEP};
+  \node[font=\bfseries\footnotesize,text=gray!70!black] at (11.2, 3.6) {RUNTIME MEMORY \& CHECKS};
+
+  % Row 1: Java 6
+  \node[stage,draw=sourceblue!80,fill=sourceblue!8,minimum width=3.4cm] (jsrc) at (1.8, 2.4)
+    {\textbf{Java 6}\\ {\scriptsize \texttt{List<Account> xs}}\\ {\scriptsize \texttt{(Account) obj}}};
+  \node[stage,draw=gray!70,fill=gray!8,minimum width=2.7cm] (jcmp) at (6.0, 2.4)
+    {\texttt{javac}\\ {\scriptsize erases \texttt{<Account>}}\\ {\scriptsize keeps \texttt{checkcast}}};
+  \node[stage,draw=sourceblue!80,fill=sourceblue!8,minimum width=5.1cm] (jrun) at (11.2, 2.4)
+    {\textbf{JVM Heap Object}\\ {\scriptsize 16B header (\texttt{mark} + \texttt{klass*}) + fields}\\ {\scriptsize Bad cast throws \texttt{ClassCastException}}};
+  \draw[arrow] (jsrc) -- (jcmp);
+  \draw[arrow] (jcmp) -- (jrun);
+
+  % Row 2: Rust
+  \node[stage,draw=targetgreen!80,fill=targetgreen!8,minimum width=3.4cm] (rsrc) at (1.8, 0.7)
+    {\textbf{Rust}\\ {\scriptsize \texttt{Vec<Account>}}\\ {\scriptsize \texttt{\&mut Account}}};
+  \node[stage,draw=gray!70,fill=gray!8,minimum width=2.7cm] (rcmp) at (6.0, 0.7)
+    {\texttt{rustc + LLVM}\\ {\scriptsize monomorphizes \texttt{<T>}}\\ {\scriptsize erases lifetimes \texttt{'a}}};
+  \node[stage,draw=targetgreen!80,fill=targetgreen!8,minimum width=5.1cm] (rrun) at (11.2, 0.7)
+    {\textbf{Native Machine Words}\\ {\scriptsize 0B object header; raw \texttt{[ptr,len,cap]}}\\ {\scriptsize Field offsets baked into CPU instructions}};
+  \draw[arrow] (rsrc) -- (rcmp);
+  \draw[arrow] (rcmp) -- (rrun);
+
+  % Row 3: TypeScript
+  \node[stage,draw=quotientorange!85,fill=quotientorange!10,minimum width=3.4cm] (tsrc) at (1.8, -1.0)
+    {\textbf{TypeScript}\\ {\scriptsize \texttt{interface Account}}\\ {\scriptsize \texttt{raw as Account}}};
+  \node[stage,draw=trapred!80,fill=trapred!8,minimum width=2.7cm] (tcmp) at (6.0, -1.0)
+    {\texttt{tsc} / \texttt{esbuild}\\ {\scriptsize \textbf{100\% type erasure}}\\ {\scriptsize emits plain \texttt{.js}}};
+  \node[stage,draw=quotientorange!85,fill=quotientorange!10,minimum width=5.1cm] (trun) at (11.2, -1.0)
+    {\textbf{V8 Heap JS Object}\\ {\scriptsize V8 Hidden Class (\texttt{Map}) + property slots}\\ {\scriptsize \textbf{Zero TS types}; \texttt{as Account} is a no-op.}};
+  \draw[arrow] (tsrc) -- (tcmp);
+  \draw[arrow] (tcmp) -- (trun);
+\end{tikzpicture}
+\caption{What survives compilation in Java~6, Rust, and TypeScript. Java~6 erases generic type arguments but keeps every object's runtime \texttt{klass} pointer and emits \texttt{checkcast} bytecode. Rust bakes exact field offsets into machine code and needs no object header. TypeScript erases \emph{all} static type constructs, leaving plain JavaScript values managed by V8 hidden classes.}
+\label{ch09:fig-erasure-boundary}
+\end{figure}
+
+ Java~6 developers often hear ``TypeScript uses type erasure'' and assume it means the same thing as Java~6 generics erasure. It goes much deeper than that:
+
+\begin{itemize}
+  \item \textbf{In Java~6, casts are runtime-checked operations.} Writing \texttt{(LedgerBalance) obj} compiles to the JVM bytecode instruction \texttt{checkcast \#LedgerBalance}, which inspects \texttt{obj}'s runtime \texttt{klass} word and throws \texttt{ClassCastException} immediately if \texttt{obj} is actually a \texttt{String} or \texttt{HashMap}.
+  \item \textbf{In TypeScript, \texttt{x as LedgerBalance} emits zero instructions.} It is not a conversion and it is not a checked cast. It is a compile-time note telling \texttt{tsc}: ``stop checking \texttt{x} and pretend it belongs to \texttt{LedgerBalance}.'' If \texttt{x} at runtime is \texttt{\{ cents: "not-a-bigint" \}}, \texttt{x as LedgerBalance} succeeds silently and your program fails later when arithmetic hits a string.
+  \item \textbf{You cannot use \texttt{instanceof} against an \texttt{interface} or \texttt{type}.} Writing \texttt{if (x instanceof LedgerBalance)} fails at compile time because JavaScript's \texttt{instanceof} walks an object's prototype chain (\texttt{Object.\allowbreak{}getPrototypeOf(x)}) looking for a runtime constructor's \texttt{.prototype} object. Since \texttt{interface LedgerBalance} was erased before runtime, no \texttt{LedgerBalance} value exists in JavaScript for \texttt{instanceof} to inspect.
+\end{itemize}
+
+\begin{happeningbox}
+\textbf{What does V8 actually store in memory for \texttt{\{ cents: 12500n \}}?} Even though TypeScript types vanish, V8 does not represent every JavaScript object as a slow \texttt{HashMap<String, Object>}. Internally, V8 attaches a pointer to a hidden descriptor called a \emph{Map} (often called a \emph{shape} or \emph{hidden class}) at word~0 of every JS heap object. When V8 executes \texttt{\{ cents: 12500n \}}, it assigns the Hidden Class ``object with property \texttt{cents} at in-object slot~0.'' When \texttt{formatUsd} reads \texttt{amount.cents}, V8 uses an \emph{inline cache}: if the Hidden Class pointer at \texttt{amount} matches the Hidden Class seen on previous calls, V8 loads slot~0 at a fixed byte offset in a couple of instructions---almost like a Java field load. However, if callers pass objects whose properties were added in six different orders (\texttt{\{ a, b \}} vs.\ \texttt{\{ b, a \}}), V8 sees distinct Hidden Classes, the inline cache turns \emph{megamorphic}, and property access falls back to a slower dictionary lookup. Writing consistent TypeScript interfaces naturally nudges authors to construct objects with consistent property shapes, accidentally helping V8's JIT optimizer even though V8 never reads a single line of TypeScript.
+\end{happeningbox}
+
+\begin{trapbox}
+\textbf{Three TypeScript constructs that look erased, and aren't.} Almost everything in TypeScript's type syntax erases cleanly, with three legacy exceptions inherited from TypeScript's pre-ES6 days: \texttt{enum}, parameter properties (\texttt{constructor(public readonly id: string)}), and legacy \texttt{namespace} blocks. A non-\texttt{const} TypeScript \texttt{enum Status \{ Open, Closed \}} compiles into an IIFE that allocates a real JavaScript lookup object at runtime---and numeric enums even create reverse number-to-string mappings so \texttt{Status[0] === 'Open'}. Modern TypeScript codebases (and Node.js's built-in \texttt{--experimental-strip-types} loader, which strips types directly without code generation) strongly prefer union string literals \texttt{type Status = 'open' | 'closed'} over TypeScript \texttt{enum}. Every union, interface, and type alias erases cleanly by simple whitespace stripping.
+\end{trapbox}
+
+\section{Types as Mathematical Sets: From \texttt{never} to \texttt{unknown}}
+\label{ch09:types-as-sets}
+
+In Java~6 or C++, we usually picture types as blueprints for constructing instances, arranged in a family tree of superclasses and subclasses. In TypeScript, a cleaner picture makes every rule predictable:
+
+\begin{focusbox}
+\textbf{The Set-Theory Mental Model.} Every static type $T$ in TypeScript denotes a \textbf{set $[\![ T ]\!]$ of runtime JavaScript values}. Saying ``expression $e$ has type $T$'' ($e : T$) means that whatever value $v$ expression $e$ evaluates to at runtime (assuming termination), $v \in [\![ T ]\!]$. Saying ``$S$ is a subtype of $T$''---written \texttt{S extends T} in TypeScript and $S <: T$ in type theory---means nothing more and nothing less than \textbf{set inclusion}:
+\[
+  S <: T \quad\Longleftrightarrow\quad [\![ S ]\!] \subseteq [\![ T ]\!].
+\]
+Whenever $S <: T$, any value in $[\![ S ]\!]$ is already an element of $[\![ T ]\!]$, so assigning a variable of type $S$ to a variable of type $T$ requires zero runtime conversion.
+\end{focusbox}
+
+Let us climb the entire TypeScript type lattice from the smallest possible set to the largest, checking every rung against set algebra.
+
+\subsection{Cardinality 0: \texttt{never} Is the Empty Set $\emptyset$}
+
+In set theory, there is a unique set with zero elements: the empty set $\emptyset$. What type denotes $\emptyset$---the set of runtime values that has \emph{no inhabitants at all}? TypeScript calls it \texttt{never} (the exact counterpart of Rust's \texttt{!} never type and Kotlin's \texttt{Nothing}).
+
+Two consequences follow from $[\![ \texttt{never} ]\!] = \emptyset$:
+\begin{enumerate}
+  \item \textbf{Is \texttt{never} assignable to every type $T$?} Yes. In set theory, $\emptyset \subseteq A$ holds vacuously for \emph{every} set $A$ (every element of $\emptyset$ is in $A$, because there are no elements in $\emptyset$ to violate the condition). Thus $\texttt{never} <: T$ for all $T$: \texttt{never} sits at the very bottom of the subtype lattice, which is why type theorists call it the \emph{bottom type} ($\bot$).
+  \item \textbf{Can any non-empty type $T$ be assigned to \texttt{never}?} Never. For any set $A$, $A \subseteq \emptyset$ holds if and only if $A = \emptyset$. If a variable $x$ still has even one possible runtime value (say $x : \texttt{'chargeback'}$), assigning \texttt{const check: never = x} is a compile-time type error because $\{\texttt{'chargeback'}\} \not\subseteq \emptyset$.
+\end{enumerate}
+
+When does a real expression have type \texttt{never}? In two everyday situations: first, as the return type of a function that never returns normally (because it unconditionally throws an exception or runs an infinite event loop); second, as the narrowed type of a variable after you have eliminated every possible case in a \texttt{switch} or \texttt{if}/\texttt{else} chain.
+
+\begin{lstlisting}[language=TypeScript]
+function failInvariant(msg: string): never {
+  throw new Error(`Ledger invariant violated: ${msg}`);
+}
+
+// Because never <: bigint, failInvariant() can stand inside a bigint expression!
+function requirePositive(cents: bigint): bigint {
+  return cents > 0n ? cents : failInvariant(`expected > 0, got ${cents}`);
+}
+\end{lstlisting}
+
+Consider why \texttt{cents > 0n ? cents : failInvariant(...)} has type \texttt{bigint} rather than \texttt{bigint | void}. The true branch produces a value in $[\![ \texttt{bigint} ]\!]$; the false branch produces a value in $[\![ \texttt{never} ]\!] = \emptyset$. The conditional expression's type is the union of both branches:
+\[
+  [\![ \texttt{bigint} ]\!] \cup [\![ \texttt{never} ]\!] \;=\; [\![ \texttt{bigint} ]\!] \cup \emptyset \;=\; [\![ \texttt{bigint} ]\!].
+\]
+In Java~6, \texttt{failInvariant} would have to return \texttt{void} or take a dummy generic \texttt{<T> T} return type, and you could never place a \texttt{void} call inside a ternary expression. Set algebra makes \texttt{bigint | never = bigint} automatic.
+
+\subsection{Cardinality 1 and Finite Sets: Literal Types and Unions ($A \cup B$)}
+
+Above $\emptyset$ sit the \emph{singleton sets}---types containing exactly one runtime value:
+\begin{align*}
+  [\![ \texttt{undefined} ]\!] &= \{\texttt{undefined}\}, &
+  [\![ \texttt{null} ]\!] &= \{\texttt{null}\}, \\
+  [\![ \texttt{'credit'} ]\!] &= \{\texttt{'credit'}\}, &
+  [\![ \texttt{200} ]\!] &= \{200\}, \qquad
+  [\![ \texttt{true} ]\!] = \{\texttt{true}\}.
+\end{align*}
+In Java~6 or C++, \texttt{"credit"} and \texttt{200} are strictly \emph{values}, never \emph{types}. The smallest type containing \texttt{"credit"} in Java~6 is \texttt{java.lang.String}, an infinite set containing every possible Unicode string (plus \texttt{null}). Because TypeScript treats types as sets, nothing stops a type from being the 1-element set $\{\texttt{'credit'}\}$. Since $\{\texttt{'credit'}\} \subsetneq [\![ \texttt{string} ]\!]$, \texttt{'credit'} is automatically a subtype of \texttt{string}: every function expecting a \texttt{string} accepts a \texttt{'credit'}, while a function expecting \texttt{'credit' | 'debit'} rejects \texttt{'refund'} at compile time.
+
+Combining sets with the union operator \texttt{|} corresponds directly to mathematical set union:
+\[
+  [\![ A \mid B ]\!] \;=\; [\![ A ]\!] \cup [\![ B ]\!].
+\]
+In fact, TypeScript's primitive \texttt{boolean} type is not an indivisible atom at all---inside the compiler, \texttt{boolean} is the 2-element union \texttt{true | false}. Similarly:
+\begin{lstlisting}[language=TypeScript]
+type EntrySide = 'debit' | 'credit';               // Cardinality 2
+type HttpSuccess = 200 | 201 | 204;                // Cardinality 3
+type NullableOwner = string | null;                // Infinite set union { null }
+
+let mutableSide = 'credit';    // Widened to `string` because `let` can be reassigned!
+const fixedSide = 'credit';    // Narrowed to singleton literal type `'credit'`!
+
+const routeConfig = {
+  method: 'POST',
+  retries: 3,
+} as const;
+// Type of routeConfig is `{ readonly method: 'POST'; readonly retries: 3 }`
+\end{lstlisting}
+
+Notice the difference between \texttt{let} and \texttt{const}. When you write \texttt{let mutableSide = 'credit'}, TypeScript knows you will likely reassign \texttt{mutableSide = 'debit'} two lines later, so it widens the inferred type from $\{\texttt{'credit'}\}$ to $[\![ \texttt{string} ]\!]$. When you write \texttt{const fixedSide = 'credit'}, the binding can never point to a different string, so TypeScript infers the exact 1-element set \texttt{'credit'}. Appending \texttt{as const} to an object or array literal applies that same non-widening rule recursively to every nested property and marks every slot \texttt{readonly}.
+
+\begin{trapbox}
+\textbf{Never compile TypeScript without \texttt{"strict": true} (especially \texttt{strictNullChecks}).} In early TypeScript (before TypeScript~2.0 in 2016), \texttt{null} and \texttt{undefined} behaved like Java~6's \texttt{null}: they were silent inhabitants of \emph{every} type, so $[\![ \texttt{string} ]\!]$ implicitly included \texttt{null} and \texttt{undefined}---reproducing Tony Hoare's ``billion-dollar mistake.'' Turning on \texttt{"strict": true} in \texttt{tsconfig.json} enables \texttt{strictNullChecks}, which evicts \texttt{null} and \texttt{undefined} into their own disjoint singleton sets. Under \texttt{strictNullChecks}, \texttt{string} contains \emph{only} strings; if a value might be absent, you must write the union \texttt{string | null} or \texttt{string | undefined} explicitly.
+\end{trapbox}
+
+\subsection{Open Object Sets: Why More Properties Mean a \emph{Smaller} Set}
+
+Here is the first place where Java~6 intuition conflicts with set theory. Consider two TypeScript object types:
+
+\begin{lstlisting}[language=TypeScript]
+interface Identifiable {
+  id: string;
+}
+
+interface AccountSummary {
+  id: string;
+  owner: string;
+  balanceCents: bigint;
+}
+\end{lstlisting}
+
+Ask a room of programmers: ``Which type is \emph{larger}---\texttt{Identifiable} or \texttt{AccountSummary}?'' A C or Java programmer instinctively pictures memory size on the heap and answers ``\texttt{AccountSummary} is larger; it has three fields instead of one.''
+
+Now ask the set-theory question: \textbf{which set of runtime values has more elements?}
+\begin{itemize}
+  \item $[\![ \texttt{Identifiable} ]\!]$ is the set of \emph{all} non-null objects that possess at least a property \texttt{id} whose value is a \texttt{string}. That set includes \texttt{\{ id: 'acc\_1' \}}, \texttt{\{ id: 'acc\_1', active: true \}}, and every \texttt{AccountSummary} ever created.
+  \item $[\![ \texttt{AccountSummary} ]\!]$ is the set of objects that possess \texttt{id: string} \emph{and} \texttt{owner: string} \emph{and} \texttt{balanceCents: bigint}. Every new required property adds another filter condition, \emph{shrinking} the set of qualifying values:
+  \[
+    [\![ \texttt{AccountSummary} ]\!] \;\subsetneq\; [\![ \texttt{Identifiable} ]\!],
+    \qquad\text{so}\qquad
+    \texttt{AccountSummary} <: \texttt{Identifiable}.
+  \]
+\end{itemize}
+
+Type theorists call this \textbf{width subtyping}: a wider record (more properties) is a \emph{subtype} (smaller set) of a narrower record (fewer properties). One consequence follows directly: \textbf{TypeScript object types are open, not sealed.} Knowing \texttt{x : Identifiable} tells you that \texttt{x.id} is a \texttt{string}; it does \emph{not} promise that \texttt{id} is the \emph{only} property on \texttt{x} at runtime.
+
+\begin{lstlisting}[language=TypeScript]
+function logId(entity: Identifiable): void {
+  // Why does Object.keys(entity) return `string[]` instead of `('id')[]`?
+  for (const key of Object.keys(entity)) {
+    console.log(key);
+  }
+}
+
+const acc: AccountSummary = { id: 'acc_7', owner: 'Linus', balanceCents: 9000n };
+logId(acc); // Legal because AccountSummary <: Identifiable!
+// Prints: "id", "owner", "balanceCents" -- NOT just "id"!
+\end{lstlisting}
+
+This explains why \texttt{Object.keys(entity)} in TypeScript's standard library returns \texttt{string[]} rather than \texttt{(keyof Identifiable)[]}. Because \texttt{AccountSummary <: Identifiable}, \texttt{acc} is a completely valid \texttt{Identifiable}, and at runtime \texttt{Object.keys(acc)} returns \texttt{['id', \allowbreak{}'owner', \allowbreak{}'balanceCents']}. If TypeScript claimed \texttt{Object.keys(entity)} contained only \texttt{'id'}, any code indexing a lookup table typed only for \texttt{'id'} would crash on \texttt{'owner'}.
+
+\begin{trapbox}
+\textbf{Excess Property Checking Is a Lint Rule on Fresh Literals, Not Sealed Types.} Wait---if \texttt{AccountSummary} has extra properties and assigns cleanly to \texttt{Identifiable}, why does TypeScript reject \texttt{const e: Identifiable = \{ id: 'acc\_7', owenr: 'Linus' \}} when you write an object literal directly? Because when you type a \emph{fresh object literal} straight into a typed slot, nobody else holds a reference to that literal; any extra property written right there (like a misspelled optional field \texttt{owenr} instead of \texttt{owner}) would be dead, unreachable data and is almost certainly a typo. So \texttt{tsc} runs a special \emph{excess property check} on fresh literals only. Assign that exact same literal to an intermediate variable first (\texttt{const tmp = \{ id: 'acc\_7', owenr: 'Linus' \}; const e: Identifiable = tmp;}), and it compiles without complaint because set inclusion $[\![ \texttt{typeof tmp} ]\!] \subseteq [\![ \texttt{Identifiable} ]\!]$ holds. Never confuse excess property checking with sealed objects: extra properties can \emph{always} enter through subtype variables.
+\end{trapbox}
+
+\subsection{Intersections ($A \cap B$) and the Dual Algebra of \texttt{keyof}}
+
+Just as \texttt{A | B} forms the set union $[\![ A ]\!] \cup [\![ B ]\!]$, the intersection operator \texttt{A \& B} forms the mathematical set intersection:
+\[
+  [\![ A \mathbin{\&} B ]\!] \;=\; [\![ A ]\!] \cap [\![ B ]\!].
+\]
+
+Let us test \texttt{\&} on both primitives and object shapes to make sure our intuition never slips:
+\begin{itemize}
+  \item \textbf{Intersecting disjoint primitives:} What is \texttt{string \& number}? Which JavaScript runtime value is simultaneously a primitive \texttt{string} and a primitive \texttt{number}? None. $[\![ \texttt{string} ]\!] \cap [\![ \texttt{number} ]\!] = \emptyset = [\![ \texttt{never} ]\!]$. Indeed, \texttt{tsc} simplifies \texttt{string \& number} directly to \texttt{never}.
+  \item \textbf{Intersecting overlapping unions:} What is \texttt{('a' | 'b') \& ('b' | 'c')}? $\{ \texttt{'a'}, \texttt{'b'} \} \cap \{ \texttt{'b'}, \texttt{'c'} \} = \{ \texttt{'b'} \}$, so \texttt{tsc} simplifies it to the literal type \texttt{'b'}.
+  \item \textbf{Intersecting two object types:} Let \texttt{HasId} be \texttt{\{ id: string \}} and let \texttt{Timestamped} be \texttt{\{ createdAt: Date \}}. What is \texttt{HasId \& Timestamped}? Beginners often trip here and say: ``Wait---\texttt{HasId \& Timestamped} has \emph{both} \texttt{id} and \texttt{createdAt}, so didn't it take the \emph{union} of their properties?'' Compare the sets of values. $[\![ \texttt{HasId} ]\!]$ is all objects with \texttt{id: string}; $[\![ \texttt{Timestamped} ]\!]$ is all objects with \texttt{createdAt: Date}. Which runtime objects belong to the intersection of those two sets? Precisely those objects that satisfy \emph{both} membership requirements---meaning they carry \emph{both} \texttt{id: string} and \texttt{createdAt: Date}. Intersecting the \emph{value sets} unions the \emph{required property sets}.
+\end{itemize}
+
+That exact inversion between value sets and property key sets gives a short theorem about \texttt{keyof}. Recall that for any type $T$, \texttt{keyof T} denotes the union of property keys known to exist on \emph{every} runtime value $v \in [\![ T ]\!]$.
+
+\begin{theorem}[Contravariant Key Duality of Unions and Intersections]
+\label{ch09:thm-keyof-duality}
+For any two object types $A$ and $B$ in TypeScript (assuming compatible property types so $A \mathbin{\&} B \neq \texttt{never}$), the \texttt{keyof} operator swaps unions and intersections, just like De~Morgan's laws:
+\begin{align}
+  \texttt{keyof }(A \mid B) &\;=\; (\texttt{keyof } A) \mathbin{\&} (\texttt{keyof } B), \label{eq:ch09-keyof-union}\\
+  \texttt{keyof }(A \mathbin{\&} B) &\;=\; (\texttt{keyof } A) \mid (\texttt{keyof } B). \label{eq:ch09-keyof-inter}
+\end{align}
+\end{theorem}
+
+\begin{proof}
+A key $k$ belongs to $\texttt{keyof } T$ if and only if accessing $v[k]$ is guaranteed to find a declared property on \emph{every} value $v \in [\![ T ]\!]$ ($\forall v \in [\![ T ]\!],\; k \in \mathrm{props}(v)$).
+
+For~\eqref{eq:ch09-keyof-union}, take $T = A \mid B$, so $[\![ A \mid B ]\!] = [\![ A ]\!] \cup [\![ B ]\!]$. Requiring $\forall v \in [\![ A ]\!] \cup [\![ B ]\!],\; k \in \mathrm{props}(v)$ holds if and only if $(\forall v \in [\![ A ]\!],\; k \in \mathrm{props}(v))$ \textbf{and} $(\forall v \in [\![ B ]\!],\; k \in \mathrm{props}(v))$---that is, $k \in \texttt{keyof } A$ and $k \in \texttt{keyof } B$, which is $(\texttt{keyof } A) \mathbin{\&} (\texttt{keyof } B)$.
+
+For~\eqref{eq:ch09-keyof-inter}, every value $v \in [\![ A \mathbin{\&} B ]\!] = [\![ A ]\!] \cap [\![ B ]\!]$ satisfies both $A$ and $B$, so $v$ possesses every guaranteed key of $A$ together with every guaranteed key of $B$: every key in $(\texttt{keyof } A) \cup (\texttt{keyof } B)$ is guaranteed on $v$. TypeScript \emph{defines} $\texttt{keyof }(A \mathbin{\&} B)$ syntactically as the union $(\texttt{keyof } A) \mid (\texttt{keyof } B)$; the argument above shows that this definition is sound, because every key it lists is present on every value of the intersection.
+\end{proof}
+
+Let us see Theorem~\ref{ch09:thm-keyof-duality} in code on two payment rails:
+
+\begin{lstlisting}[language=TypeScript]
+interface CardPayment {
+  amountCents: bigint;
+  currency: 'USD' | 'EUR';
+  cardLast4: string;
+}
+
+interface WirePayment {
+  amountCents: bigint;
+  currency: 'USD' | 'EUR';
+  swiftBic: string;
+}
+
+// Keys guaranteed on EITHER payment rail = intersection of key sets:
+// ('amountCents' | 'currency' | 'cardLast4') & ('amountCents' | 'currency' | 'swiftBic')
+type SharedPaymentKeys = keyof (CardPayment | WirePayment);
+// Evaluates to: 'amountCents' | 'currency'
+
+// Keys present on an object satisfying BOTH interfaces = union of key sets:
+type MergedPaymentKeys = keyof (CardPayment & WirePayment);
+// Evaluates to: 'amountCents' | 'currency' | 'cardLast4' | 'swiftBic'
+\end{lstlisting}
+
+Concretely: if a function accepts \texttt{p: CardPayment | WirePayment} and has not yet checked which rail \texttt{p} came from, the only fields safe to read on \texttt{p} are \texttt{p.amountCents} and \texttt{p.currency}---precisely \texttt{keyof (CardPayment | WirePayment)}.
+
+\subsection{Top of the Lattice: \texttt{unknown} ($\mathcal{U}$) vs.\ the Escape Hatch \texttt{any}}
+
+At the very bottom of the lattice sits \texttt{never} ($\emptyset$). What sits at the very top---the universal set $\mathcal{U}$ containing \emph{every} possible JavaScript runtime value (\texttt{42}, \texttt{'hi'}, \texttt{null}, \texttt{undefined}, \texttt{\{\}}, functions, symbols)?
+
+TypeScript has \emph{two} types that accept any value, and confusing them is the single biggest source of preventable production crashes in TypeScript services:
+
+\begin{itemize}
+  \item \textbf{\texttt{unknown} is the true mathematical top type $\mathcal{U}$ (added in TypeScript~3.0).} Because $[\![ T ]\!] \subseteq \mathcal{U}$ for every type $T$, \emph{every} value is assignable to \texttt{unknown}. Conversely, because $\mathcal{U} \not\subseteq [\![ T ]\!]$ for any proper subset $T \subsetneq \mathcal{U}$, \textbf{you cannot assign an \texttt{unknown} to anything else, call it, or read properties off it} until you narrow it down with a runtime check. In Java~6 terms, \texttt{unknown} behaves like \texttt{Object} (plus primitives and \texttt{null}), except you don't even get \texttt{.toString()} until you check for \texttt{null}/\texttt{undefined}.
+  \item \textbf{\texttt{any} is NOT a set---it disables the type checker.} Assigning \texttt{const x: any = ...} tells \texttt{tsc} to allow \emph{both} directions: any type $T$ assigns into \texttt{any}, \emph{and} \texttt{any} silently assigns into any type $T$ (except \texttt{never}), lets you access \texttt{x.nonExistent.deep.field()}, and infects downstream return types with \texttt{any} without a single warning.
+\end{itemize}
+
+\begin{lstlisting}[language=TypeScript]
+function handleWebhookUnsafe(payload: any): bigint {
+  // Compiles with ZERO warnings -- crashes at runtime if payload or data is undefined!
+  return BigInt(payload.data.amountCents);
+}
+
+function handleWebhookSafe(payload: unknown): bigint {
+  // payload.data; // COMPILER ERROR: 'payload' is of type 'unknown'.
+  if (
+    typeof payload === 'object' &&
+    payload !== null &&
+    'amountCents' in payload &&
+    typeof payload.amountCents === 'string'
+  ) {
+    return BigInt(payload.amountCents); // Narrowed cleanly!
+  }
+  throw new Error('Malformed webhook payload');
+}
+\end{lstlisting}
+
+Figure~\ref{ch09:fig-type-lattice} puts the entire set-inclusion hierarchy together in one picture, contrasting the sound lattice from \texttt{never} ($\emptyset$) to \texttt{unknown} ($\mathcal{U}$) against the side-channel short-circuit of \texttt{any}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,
+  ty/.style={draw=sourceblue!80,fill=sourceblue!7,rounded corners=3pt,thick,align=center,inner sep=4pt,minimum height=0.72cm},
+  lit/.style={draw=targetgreen!80,fill=targetgreen!8,rounded corners=3pt,thick,align=center,inner sep=3.5pt,minimum height=0.66cm},
+  bot/.style={draw=structurepurple!85,fill=structurepurple!10,rounded corners=3pt,thick,align=center,inner sep=4pt,minimum height=0.75cm},
+  topn/.style={draw=sourceblue!90!black,fill=sourceblue!14,rounded corners=3pt,very thick,align=center,inner sep=4.5pt,minimum height=0.8cm},
+  bad/.style={draw=trapred!85,fill=trapred!10,rounded corners=3pt,very thick,dashed,align=center,inner sep=5pt},
+  sub/.style={->,thick,gray!70!black}]
+
+  % Top: unknown
+  \node[topn,minimum width=4.6cm] (unk) at (5.2, 5.4) {\textbf{\texttt{unknown}} \quad ($\mathcal{U}$, all JS values)};
+
+  % Upper-mid: unions & broad primitives/objects
+  \node[ty] (strnum) at (1.5, 3.85) {\texttt{string | bigint}};
+  \node[ty] (hasid)  at (5.3, 3.85) {\texttt{\{ id: string \}}};
+  \node[ty] (hasbal) at (8.7, 3.85) {\texttt{\{ cents: bigint \}}};
+  \node[ty] (nullt)  at (11.4, 3.85) {\texttt{null}};
+
+  % Mid: primitives & intersections
+  \node[ty] (str)    at (0.4, 2.2) {\texttt{string}};
+  \node[ty] (big)    at (2.7, 2.2) {\texttt{bigint}};
+  \node[ty] (acct)   at (7.0, 2.2) {\texttt{\{ id: string \} \& \{ cents: bigint \}}};
+
+  % Lower: literal types
+  \node[lit] (cred)  at (-0.3, 0.65) {\texttt{"credit"}};
+  \node[lit] (deb)   at (1.25, 0.65) {\texttt{"debit"}};
+  \node[lit] (zero)  at (2.85, 0.65) {\texttt{0n}};
+
+  % Bottom: never
+  \node[bot,minimum width=4.4cm] (nev) at (5.2, -0.85) {\textbf{\texttt{never}} \quad ($\emptyset$, zero values)};
+
+  % Escape hatch: any on the right
+  \node[bad,minimum width=3.1cm] (anyn) at (12.1, 1.35) {\textbf{\texttt{any}}\\ {\scriptsize disables checker}\\ {\scriptsize ($T \leftrightarrow \texttt{any}$)}};
+
+  % Subtype arrows (S -> T means S <: T, i.e., S subseteq T)
+  \draw[sub] (nev) -- (cred);
+  \draw[sub] (nev) -- (deb);
+  \draw[sub] (nev) -- (zero);
+  \draw[sub] (nev) -- (acct);
+  \draw[sub] (nev.east) .. controls (9.5,-0.6) and (11.1,1.8) .. (nullt.south);
+
+  \draw[sub] (cred) -- (str);
+  \draw[sub] (deb)  -- (str);
+  \draw[sub] (zero) -- (big);
+
+  \draw[sub] (str)  -- (strnum);
+  \draw[sub] (big)  -- (strnum);
+  \draw[sub] (acct) -- (hasid);
+  \draw[sub] (acct) -- (hasbal);
+
+  \draw[sub] (strnum) -- (unk);
+  \draw[sub] (hasid)  -- (unk);
+  \draw[sub] (hasbal) -- (unk);
+  \draw[sub] (nullt)  -- (unk);
+
+  % Infectious dashed arrows for any
+  \draw[<->,thick,dashed,trapred] (anyn.north west) -- node[sloped,above,font=\scriptsize,text=trapred]{bypasses} (hasbal.south east);
+  \draw[<->,thick,dashed,trapred] (anyn.west) -- (acct.east);
+\end{tikzpicture}
+\caption{The TypeScript subtype lattice ordered by set inclusion ($S \to T$ means $[\![ S ]\!] \subseteq [\![ T ]\!]$). Every type sits between $\texttt{never}$ ($\emptyset$) at the bottom and $\texttt{unknown}$ ($\mathcal{U}$) at the top; object intersections sit \emph{below} their constituent object sets because requiring more properties shrinks the set of inhabitants. Off to the right, \texttt{any} steps outside the lattice by permitting unchecked two-way assignment.}
+\label{ch09:fig-type-lattice}
+\end{figure}
+
+\section{Discriminated Unions and Control-Flow Narrowing}
+\label{ch09:discriminated-unions}
+
+In Chapter~5 we saw why Rust's algebraic \texttt{enum} sum types eliminate entire classes of invalid-state bugs that plague Java~6 classes full of nullable fields and boolean flags. Let us recall that lesson briefly. In Java~6, a newcomer modeling a ledger event often writes one ``god object'' with nullable columns for every possible event type:
+
+\begin{lstlisting}[language=Java]
+// Java 6 anti-pattern: 3^3 combinations of nulls, most of them nonsensical!
+public final class LedgerEvent {
+    public enum Kind { DEPOSIT, REVERSAL, FEE_WAIVER }
+    public final Kind kind;
+    public final Long amountCents;     // non-null only for DEPOSIT and FEE_WAIVER?
+    public final String originalTxId;  // non-null only for REVERSAL!
+    public final String reasonCode;    // non-null for REVERSAL and FEE_WAIVER?
+    // ... constructor and getters ...
+}
+\end{lstlisting}
+
+To make illegal states unrepresentable in Java~6 without Java~17+ \texttt{sealed} classes, you had to write a 60-line \emph{Visitor pattern}: an abstract base class \texttt{LedgerEvent}, three final subclasses, an interface \texttt{LedgerEventVisitor<R>} with \texttt{visitDeposit}, \texttt{visitReversal}, and \texttt{visitFeeWaiver}, and an \texttt{accept(LedgerEventVisitor<R>)} method on each subclass.
+
+In Rust, you wrote a 6-line \texttt{enum}, and the compiler laid it out on the stack as a 1-byte integer tag followed by a union of the largest variant's payload. How do we get that exact same algebraic precision in TypeScript when everything compiles down to untagged V8 objects?
+
+\subsection{Tagged Shapes: TypeScript's Counterpart to Rust's \texttt{enum}}
+
+Recall how a Rust \texttt{enum} is laid out in memory: memory bytes alone cannot tell a \texttt{Deposit} apart from a \texttt{Reversal}, so \texttt{rustc} prefixes every instance with a discriminant tag byte ($0, 1, 2$). In TypeScript, we put that discriminant tag right into the JavaScript object as a \textbf{singleton literal property}---traditionally named \texttt{kind}, \texttt{type}, or \texttt{status}---and form the union of the variant interfaces:
+
+\begin{lstlisting}[language=TypeScript]
+// Direct TypeScript counterpart to Rust's `enum LedgerEvent`
+type LedgerEvent =
+  | { readonly kind: 'deposit'; readonly amountCents: bigint; readonly sourceIban: string }
+  | { readonly kind: 'reversal'; readonly originalTxId: string; readonly reason: string }
+  | { readonly kind: 'fee_waiver'; readonly waivedCents: bigint; readonly approvedBy: string };
+
+function netBalanceDelta(event: LedgerEvent): bigint {
+  switch (event.kind) {
+    case 'deposit':
+      // Here tsc narrows `event` to the 'deposit' variant ONLY!
+      return event.amountCents;
+    case 'reversal':
+      // Reading `event.amountCents` here would be a compile-time error!
+      return 0n; // Actual delta looked up by event.originalTxId
+    case 'fee_waiver':
+      return event.waivedCents;
+    default: {
+      // Exhaustiveness proof: if all 3 variants were handled, `event` is `never`!
+      const _exhaustive: never = event;
+      return _exhaustive;
+    }
+  }
+}
+\end{lstlisting}
+
+Trace the set algebra inside \texttt{netBalanceDelta} step by step.
+At the top of the function, \texttt{event} belongs to $D \cup R \cup W$, where $D$, $R$, and $W$ are the three disjoint object sets whose \texttt{kind} property equals \texttt{'deposit'}, \texttt{'reversal'}, and \texttt{'fee\_waiver'} respectively. Notice why those three sets are guaranteed \emph{pairwise disjoint} ($D \cap R = \emptyset$): no JavaScript object can have \texttt{event.kind} simultaneously equal to \texttt{'deposit'} and \texttt{'reversal'}.
+\begin{enumerate}
+  \item Inside \texttt{case 'deposit':}, the runtime test \texttt{event.kind === 'deposit'} succeeded. TypeScript intersects the current type $D \cup R \cup W$ with the constraint $\{\, v \mid v.\texttt{kind} = \texttt{'deposit'} \,\}$:
+  \[
+    (D \cup R \cup W) \cap \{\, v \mid v.\texttt{kind} = \texttt{'deposit'} \,\} \;=\; D \cup \emptyset \cup \emptyset \;=\; D.
+  \]
+  Inside that branch, \texttt{event.amountCents} and \texttt{event.sourceIban} are known to exist without any cast. And because \texttt{return} exits the branch, $D$ is subtracted from the flow state that continues past \texttt{case 'deposit'}.
+  \item After \texttt{case 'reversal':} returns, $R$ is subtracted, leaving only $W$.
+  \item After \texttt{case 'fee\_waiver':} returns, $W$ is subtracted, leaving $W \setminus W = \emptyset = \texttt{never}$ reaching \texttt{default:}.
+  \item Now imagine six months later a colleague adds a fourth variant to \texttt{LedgerEvent}:
+  \begin{center}
+    \small\texttt{| \{ readonly kind: 'chargeback'; readonly disputeId: string; readonly clawbackCents: bigint \}}.
+  \end{center}
+  Every \texttt{switch} in the entire codebase that forgot \texttt{case 'chargeback':} now arrives at \texttt{default:} with residual type \texttt{\{ readonly kind: 'chargeback'; ... \}}. The line \texttt{const \_exhaustive: never = event} immediately fails to compile with:
+  \begin{center}
+  \texttt{Type '\{ readonly kind: "chargeback"; ... \}' is not assignable to type 'never'.}
+  \end{center}
+  Just like an unhandled \texttt{match} arm in Rust or OCaml, the compiler refuses to build until every call site handles chargebacks.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,
+  flow/.style={draw=sourceblue!80,fill=sourceblue!7,rounded corners=3pt,thick,align=center,inner sep=4.5pt},
+  branch/.style={draw=targetgreen!80,fill=targetgreen!9,rounded corners=3pt,thick,align=center,inner sep=4.5pt},
+  exhaust/.style={draw=structurepurple!85,fill=structurepurple!10,rounded corners=3pt,very thick,align=center,inner sep=5pt},
+  arr/.style={->,thick,gray!75!black}]
+
+  % Vertical fallthrough spine on the left
+  \node[flow,minimum width=4.5cm] (s0) at (0, 3.6)
+    {\textbf{Entry: \texttt{event}}\\ {\scriptsize $D \cup R \cup W$}};
+
+  \node[flow,minimum width=4.5cm] (s1) at (0, 1.8)
+    {\textbf{Past \texttt{deposit} arm}\\ {\scriptsize $(D \cup R \cup W) \setminus D = R \cup W$}};
+
+  \node[flow,minimum width=4.5cm] (s2) at (0, 0.0)
+    {\textbf{Past \texttt{reversal} arm}\\ {\scriptsize $(R \cup W) \setminus R = W$}};
+
+  \node[exhaust,minimum width=4.5cm] (s3) at (0, -1.8)
+    {\textbf{\texttt{default:} arm}\\ {\scriptsize $W \setminus W = \emptyset = \texttt{never}$}};
+
+  % Matched branches on the right
+  \node[branch,minimum width=4.2cm] (b0) at (7.5, 3.6)
+    {\textbf{Matched \texttt{deposit}}\\ {\scriptsize narrowed to $D$; reads \texttt{amountCents}}};
+
+  \node[branch,minimum width=4.2cm] (b1) at (7.5, 1.8)
+    {\textbf{Matched \texttt{reversal}}\\ {\scriptsize narrowed to $R$; reads \texttt{originalTxId}}};
+
+  \node[branch,minimum width=4.2cm] (b2) at (7.5, 0.0)
+    {\textbf{Matched \texttt{fee\_waiver}}\\ {\scriptsize narrowed to $W$; reads \texttt{waivedCents}}};
+
+  \draw[arr] (s0) -- node[left=3pt,font=\scriptsize]{not \texttt{"deposit"}} (s1);
+  \draw[arr] (s1) -- node[left=3pt,font=\scriptsize]{not \texttt{"reversal"}} (s2);
+  \draw[arr] (s2) -- node[left=3pt,font=\scriptsize]{not \texttt{"fee\_waiver"}} (s3);
+
+  \draw[arr,targetgreen!75!black] (s0) -- node[above=1pt,font=\scriptsize]{\texttt{kind === "deposit"}} (b0);
+  \draw[arr,targetgreen!75!black] (s1) -- node[above=1pt,font=\scriptsize]{\texttt{kind === "reversal"}} (b1);
+  \draw[arr,targetgreen!75!black] (s2) -- node[above=1pt,font=\scriptsize]{\texttt{kind === "fee\_waiver"}} (b2);
+\end{tikzpicture}
+\caption{Control-flow type narrowing across a discriminated union \texttt{switch}. Each returning \texttt{case} arm intersects the union with one literal discriminant on the rightward branch and subtracts that variant along the downward fallthrough spine, reducing the residual set at \texttt{default:} to $\emptyset = \texttt{never}$.}
+\label{ch09:fig-cfa-narrowing}
+\end{figure}
+
+\subsection{How Control-Flow Narrowing Works---and Three Classic JavaScript Traps}
+
+TypeScript's control-flow analyzer recognizes all of JavaScript's built-in runtime inspection idioms:
+\begin{itemize}
+  \item \textbf{\texttt{typeof x === '...'}} for primitives (\texttt{'string'}, \texttt{'number'}, \texttt{'bigint'}, \texttt{'boolean'}, \texttt{'symbol'}, \texttt{'undefined'}, \texttt{'function'}, \texttt{'object'});
+  \item \textbf{\texttt{x instanceof SomeClass}} when \texttt{SomeClass} is an actual runtime \texttt{class} or constructor (\texttt{Date}, \texttt{Error}, \texttt{Uint8Array});
+  \item \textbf{\texttt{'propName' in x}} to check property presence on objects;
+  \item \textbf{\texttt{Array.isArray(x)}} to narrow \texttt{unknown} or unions down to array types;
+  \item \textbf{Strict equality} (\texttt{===}, \texttt{!==}) and \textbf{nullish coalescing} (\texttt{x ?? fallback}, which checks \texttt{x !== null \&\& x !== undefined}).
+\end{itemize}
+
+Because TypeScript faithfully models JavaScript's actual runtime semantics, three JavaScript quirks show up directly during narrowing:
+
+\begin{trapbox}
+\textbf{Three Narrowing Traps Every Java/C++ Engineer Hits Once:}
+\begin{enumerate}
+  \item \textbf{\texttt{typeof null === 'object'}.} Due to a type-tag bug in the original 1995 Mocha implementation of JavaScript, \texttt{typeof null} returns the string \texttt{'object'}. TypeScript knows this. If \texttt{x : Account | null}, checking \texttt{if (typeof x === 'object')} narrows \texttt{x} to \texttt{Account | null}---it does \emph{not} eliminate \texttt{null}. Always write \texttt{if (typeof x === 'object' \&\& x !== null)}.
+  \item \textbf{Truthiness narrowing drops \texttt{0}, \texttt{0n}, and \texttt{""}.} In Java~6, \texttt{if (amount)} does not even compile unless \texttt{amount} is a \texttt{boolean}. In JavaScript, \texttt{if (amount)} coerces \texttt{amount} to boolean, where \texttt{0}, \texttt{0n}, \texttt{""} (empty string), \texttt{NaN}, \texttt{null}, and \texttt{undefined} are \emph{all} falsy. If \texttt{feeCents: bigint | undefined} happens to be \texttt{0n} (a zero-fee transfer), writing \texttt{if (feeCents)} takes the \texttt{else} branch and treats \texttt{0n} as missing. Write \texttt{if (feeCents !== undefined)} or use \texttt{feeCents ?? defaultFee} instead of \texttt{feeCents || defaultFee}.
+  \item \textbf{Narrowing does not cross non-inlined callbacks.} Suppose \texttt{let acct: Account | null = findAccount(id); if (acct !== null) \{ items.forEach(item => use(acct.id)); \}}. Inside the callback, \texttt{tsc} flags \texttt{acct} as possibly \texttt{null}. Why? Because \texttt{acct} is a mutable \texttt{let} variable, and \texttt{tsc} cannot prove when \texttt{forEach} (or an async \texttt{setTimeout}) invokes the closure---outer code could reassign \texttt{acct = null} before the callback runs. Fix: bind a \texttt{const verifiedAcct = acct;} right inside the \texttt{if} block; a \texttt{const} binding can never be reassigned, so its narrowed type stays narrowed inside every nested closure.
+\end{enumerate}
+\end{trapbox}
+
+\subsection{User-Defined Type Guards (\texttt{x is T}) and Assertion Functions (\texttt{asserts x is T})}
+
+Built-in checks work inside a single function, but what happens when you extract a validation helper into its own function? If a helper returns plain \texttt{boolean}, TypeScript sees only ``this function returned \texttt{true} or \texttt{false}''---it forgets \emph{why} it returned \texttt{true}. To carry narrowing across function boundaries, TypeScript provides \textbf{type predicates} (\texttt{param is Type}) and \textbf{assertion signatures} (\texttt{asserts param is Type}):
+
+\begin{lstlisting}[language=TypeScript]
+type DepositEvent = Extract<LedgerEvent, { kind: 'deposit' }>;
+
+// 1. User-defined type guard: returns boolean AND tells tsc what `true` proves
+function isDeposit(event: LedgerEvent): event is DepositEvent {
+  return event.kind === 'deposit';
+}
+
+// 2. Assertion function: returns normally ONLY if condition holds (throws otherwise)
+function assertNonEmptyString(val: unknown, name: string): asserts val is string {
+  if (typeof val !== 'string' || val.trim().length === 0) {
+    throw new Error(`Expected non-empty string for ${name}`);
+  }
+}
+
+function summarizeDeposits(events: readonly LedgerEvent[]): bigint {
+  // Without `event is DepositEvent`, .filter() would return LedgerEvent[], NOT DepositEvent[]!
+  const deposits: DepositEvent[] = events.filter(isDeposit);
+  return deposits.reduce((sum, d) => sum + d.amountCents, 0n);
+}
+\end{lstlisting}
+
+Look at \texttt{events.filter(isDeposit)}. Because \texttt{Array.prototype.filter} has a TypeScript overload accepting \texttt{(value: T) => value is S} and returning \texttt{S[]}, passing \texttt{isDeposit} narrows the entire filtered array from \texttt{LedgerEvent[]} down to \texttt{DepositEvent[]} in one step. Just remember the contract you sign when writing \texttt{x is T}: \texttt{tsc} trusts the boolean your predicate returns. If you accidentally write \texttt{return event.kind !== 'deposit'} inside \texttt{isDeposit}, \texttt{tsc} will narrow \texttt{true} branches to \texttt{DepositEvent} anyway, creating a soundness bug that you authored yourself. Keep custom type guards tiny and thoroughly unit-tested.
+
+\section{Type-Level Programming: Transforming Types Like Data}
+\label{ch09:type-level-programming}
+
+So far we have this picture: types are sets, unions and intersections are set operations, and object shapes map keys to sets. Now take the next step. In Java~6, generics let you parameterize a container by a type (\texttt{List<T>}, \texttt{Map<K, V>}), and nothing more: you cannot loop over the fields of \texttt{T} at compile time to generate a read-only version of \texttt{T}, or inspect a function type \texttt{F} to extract its return type, or compute a union of valid event topic strings from currency codes. To do any of that in Java~6, teams turned to runtime reflection (\texttt{java.lang.reflect}), bytecode weaving, or external code generators.
+
+TypeScript takes a completely different route: \textbf{every TypeScript file actually contains two languages}.
+\begin{itemize}
+  \item At the \emph{value level}, you have JavaScript: variables, loops, objects, and functions that run inside V8 at runtime.
+  \item At the \emph{type level}, you have a \textbf{purely functional compile-time language over sets}: generic type aliases are functions from types to types, \texttt{keyof} and \texttt{T[K]} inspect record structures, mapped types iterate over finite unions of keys, conditional types (\texttt{T extends U ? X : Y}) act as \texttt{if}/\texttt{else} expressions, and \texttt{infer} performs pattern matching.
+\end{itemize}
+Every computation in this type-level language finishes inside \texttt{tsc} and erases to zero runtime bytes. Let us build each operator from simple, concrete ledger examples.
+
+\subsection{\texttt{typeof}, \texttt{keyof}, and Indexed Access \texttt{T[K]}}
+
+Often a constant configuration object or table schema already exists at the value level, and writing a separate \texttt{interface} by hand would force you to keep two copies in sync. TypeScript's type-level \texttt{typeof} operator lifts any value expression's inferred type straight into the type language, while \texttt{keyof} extracts its union of property keys, and \textbf{indexed access} \texttt{T[K]} looks up the value set stored at key (or key union) \texttt{K}:
+
+\begin{lstlisting}[language=TypeScript]
+const CURRENCY_DECIMALS = {
+  USD: 2,
+  EUR: 2,
+  JPY: 0,
+  BHD: 3, // Bahraini Dinar uses fils (1/1000)
+} as const;
+
+// 1. Lift the runtime constant's shape into the type language:
+type CurrencyMap = typeof CURRENCY_DECIMALS;
+// { readonly USD: 2; readonly EUR: 2; readonly JPY: 0; readonly BHD: 3 }
+
+// 2. Extract the union of keys:
+type SupportedCurrency = keyof CurrencyMap;
+// 'USD' | 'EUR' | 'JPY' | 'BHD'
+
+// 3. Indexed access with a UNION of keys distributes across every key!
+type AllowedScale = CurrencyMap[SupportedCurrency];
+// CurrencyMap['USD'] | CurrencyMap['EUR'] | CurrencyMap['JPY'] | CurrencyMap['BHD']
+// Simplifies by set union to: 2 | 0 | 3
+\end{lstlisting}
+
+Look at step~3: \texttt{CurrencyMap[SupportedCurrency]} is not an array lookup at runtime---it is a \emph{type-level} lookup. Passing a union of keys \texttt{'USD' | 'EUR' | 'JPY' | 'BHD'} into \texttt{T[K]} evaluates \texttt{T[k]} for each key $k$ in the union and takes the union of all resulting types, simplifying $\{2\} \cup \{2\} \cup \{0\} \cup \{3\} = \{0, 2, 3\}$. Add \texttt{BTC: 8} to \texttt{CURRENCY\_DECIMALS} tomorrow, and both \texttt{SupportedCurrency} and \texttt{AllowedScale} update across your entire project automatically.
+
+Indexed access also works on arrays and tuples using the index type \texttt{number}: if \texttt{const ROLES = ['viewer', 'auditor', 'approver'] as const}, then \texttt{(typeof ROLES)[number]} evaluates directly to \texttt{'viewer' | 'auditor' | 'approver'}. Better still, combining \texttt{K extends keyof T} with \texttt{T[K]} gives us compile-time type-safe property lookup---something Java~6 reflection (\texttt{Field.get(obj)} returning raw \texttt{Object}) could never check statically:
+
+\begin{lstlisting}[language=TypeScript]
+interface LedgerAccount {
+  id: string;
+  currency: SupportedCurrency;
+  balanceCents: bigint;
+  frozen: boolean;
+}
+
+function getField<T, K extends keyof T>(record: T, key: K): T[K] {
+  return record[key];
+}
+
+declare const acc: LedgerAccount;
+const bal = getField(acc, 'balanceCents'); // Inferred type: bigint!
+const cur = getField(acc, 'currency');     // Inferred type: 'USD' | 'EUR' | 'JPY' | 'BHD'!
+// getField(acc, 'balance');               // COMPILER ERROR: '"balance"' is not in keyof LedgerAccount
+\end{lstlisting}
+
+\subsection{Mapped Types: Looping Over Keys at Compile Time}
+
+Suppose we are building an HTTP \texttt{PATCH /accounts/:id} endpoint where a client can update a subset of fields on a \texttt{LedgerAccount}, or an audit snapshot where every field of \texttt{LedgerAccount} must be frozen \texttt{readonly}. Writing \texttt{LedgerAccountPatch} and \texttt{ReadonlyLedgerAccount} by hand duplicates every field name and drifts out of date whenever a column is added.
+
+Instead, TypeScript's \textbf{mapped types} let you iterate \texttt{[K in Union]} right inside an object type, transforming each property's value type and toggling two orthogonal property modifiers---\texttt{readonly} (vs.\ mutable \texttt{-readonly}) and optional \texttt{?} (vs.\ required \texttt{-?}):
+
+\begin{lstlisting}[language=TypeScript]
+// Built right into TypeScript's standard lib.es5.d.ts -- zero compiler special-casing!
+type MyReadonly<T> = {
+  readonly [K in keyof T]: T[K];
+};
+
+type MyPartial<T> = {
+  [K in keyof T]?: T[K];
+};
+
+type MyRequired<T> = {
+  [K in keyof T]-?: T[K]; // `-?` strips optionality from every property!
+};
+
+type MyPick<T, Keys extends keyof T> = {
+  [K in Keys]: T[K];
+};
+
+// Domain example: only allow patching `frozen` and `currency`, never `id` or `balanceCents`!
+type AccountPatchRequest = Partial<Pick<LedgerAccount, 'frozen' | 'currency'>>;
+// Evaluates to: { frozen?: boolean | undefined; currency?: SupportedCurrency | undefined }
+\end{lstlisting}
+
+Look at \texttt{MyReadonly}, \texttt{MyPartial}, \texttt{MyRequired}, and \texttt{MyPick}. When programmers coming from Java~6 first see \texttt{Partial<LedgerAccount>} or \texttt{Pick<LedgerAccount, 'id' | 'balanceCents'>}, they often assume \texttt{Partial} and \texttt{Pick} are special keywords hard-wired inside the TypeScript compiler. They aren't. Open \texttt{lib.es5.d.ts} in any TypeScript installation and you will find the exact three-line mapped types shown above. You can even remap property names on the fly using an \texttt{as} clause inside the bracket:
+
+\begin{lstlisting}[language=TypeScript]
+// Generate getter method signatures for every property of T!
+type Getters<T> = {
+  [K in keyof T as `get${Capitalize<string & K>}`]: () => T[K];
+};
+
+type AccountGetters = Getters<Pick<LedgerAccount, 'id' | 'balanceCents'>>;
+// { getId: () => string; getBalanceCents: () => bigint }
+\end{lstlisting}
+
+\subsection{Conditional Types, Union Distributivity, and Pattern Matching with \texttt{infer}}
+
+Mapped types give us compile-time \texttt{for} loops. To make the type language genuinely expressive, we also need compile-time \texttt{if}/\texttt{else} branching and pattern matching. TypeScript provides both via \textbf{conditional types}:
+\[
+  \texttt{T extends U ? TrueBranch : FalseBranch}.
+\]
+Remember our set-theory translation: \texttt{T extends U} asks ``is $[\![ T ]\!] \subseteq [\![ U ]\!]$?'' If yes, the type expression evaluates to \texttt{TrueBranch}; otherwise, to \texttt{FalseBranch}.
+
+The following rule explains most of TypeScript's standard utility types, and is easiest to follow in terms of sets:
+
+\begin{definition}[Distributive Conditional Types]
+\label{ch09:def-distributive-conditional}
+When \texttt{T} is a \emph{naked type parameter} (meaning \texttt{T} appears bare on the left side of \texttt{extends}, not wrapped inside \texttt{[T]} or \texttt{Box<T>}), applying a conditional type $\Phi(\texttt{T}) = (\texttt{T extends U ? X : Y})$ to a union $A \mid B \mid C$ \textbf{distributes over the union element by element}:
+\[
+  \Phi(A \mid B \mid C) \;=\; \Phi(A) \;\mid\; \Phi(B) \;\mid\; \Phi(C).
+\]
+In particular, $\Phi(\texttt{never}) = \texttt{never}$ because \texttt{never} is the 0-element union.
+\end{definition}
+
+Union distributivity, together with $\emptyset = \texttt{never}$, turns \texttt{Exclude} and \texttt{Extract} into one-liners:
+
+\begin{lstlisting}[language=TypeScript]
+// Built-in Exclude<T, U>: drop every union member assignable to U!
+type MyExclude<T, U> = T extends U ? never : T;
+
+// Trace MyExclude<'deposit' | 'reversal' | 'fee_waiver', 'fee_waiver'>:
+//   ('deposit'    extends 'fee_waiver' ? never : 'deposit')
+// | ('reversal'   extends 'fee_waiver' ? never : 'reversal')
+// | ('fee_waiver' extends 'fee_waiver' ? never : 'fee_waiver')
+// = 'deposit' | 'reversal' | never
+// = 'deposit' | 'reversal'   (since A U empty_set = A!)
+
+// Built-in NonNullable<T>: strip null and undefined from any union
+type MyNonNullable<T> = T extends null | undefined ? never : T;
+\end{lstlisting}
+
+\begin{trapbox}
+\textbf{When distributivity surprises you---and how \texttt{[T] extends [U]} turns it off.} Suppose you write \texttt{type ToArray<T> = T extends unknown ? T[] : never} and evaluate \texttt{ToArray<string | number>}. Because \texttt{T} is a naked type parameter, it distributes: \texttt{ToArray<string> | ToArray<number>} = \texttt{string[] | number[]} (an array of all strings \emph{or} an array of all numbers---NOT a mixed \texttt{(string | number)[]}). Even wilder: if someone writes \texttt{type IsNever<T> = T extends never ? true : false}, what is \texttt{IsNever<never>}? Because \texttt{never} is the empty union, distributing over zero elements produces the empty union \texttt{never} instead of \texttt{true}. Whenever you want to test a type $T$ \emph{as a single whole set} without distributing across unions, wrap both sides in a 1-tuple:
+\begin{center}
+\texttt{type IsNever<T> = [T] extends [never] ? true : false;} \quad (\texttt{IsNever<never>} is \texttt{true}.)
+\end{center}
+\end{trapbox}
+
+Now pair conditional types with the \textbf{\texttt{infer}} keyword. Inside the \texttt{extends} clause of a conditional type, writing \texttt{infer R} tells TypeScript: ``if \texttt{T} matches this structural pattern, bind the unknown piece at this slot to a fresh type variable \texttt{R} so I can use \texttt{R} in the true branch.'' If you wrote OCaml or Rust pattern matching in Parts~II and~III, \texttt{infer} is structural pattern matching at the type level:
+
+\begin{lstlisting}[language=TypeScript]
+// 1. Extract the return type of any function type F
+type MyReturnType<F> = F extends (...args: never[]) => infer R ? R : never;
+
+// 2. Recursively unwrap nested Promises (just like TypeScript's built-in Awaited<T>)
+type UnwrapPromise<T> =
+  T extends Promise<infer Inner> ? UnwrapPromise<Inner> : T;
+
+type Resolved = UnwrapPromise<Promise<Promise<{ txId: string }>>>;
+// Evaluates to: { txId: string }
+
+// 3. Extract the payload shape for a specific discriminated-union kind!
+type EventPayload<E, K extends string> =
+  E extends { kind: K } ? Omit<E, 'kind'> : never;
+
+type ReversalFields = EventPayload<LedgerEvent, 'reversal'>;
+// Evaluates to: { readonly originalTxId: string; readonly reason: string }
+\end{lstlisting}
+
+\subsection{Template Literal Types: Compile-Time String Algebra}
+
+TypeScript~4.1 extended literal sets with \textbf{template literal types}, allowing backtick string interpolation \emph{inside type expressions}. When you interpolate unions into a template literal type, \texttt{tsc} computes the Cartesian product across all combinations, and when you combine template literals with \texttt{infer}, you can parse route paths and event names at compile time.
+
+\begin{lstlisting}[language=TypeScript]
+type EventStage = 'initiated' | 'settled' | 'failed';
+// Cartesian product: 4 currencies * 3 stages = 12 exact string literal types!
+type LedgerTopic = `ledger.${Lowercase<SupportedCurrency>}.${EventStage}`;
+// 'ledger.usd.initiated' | 'ledger.usd.settled' | ... | 'ledger.bhd.failed'
+
+// Parse `:param` segments out of an Express / Fastify HTTP route string at compile time!
+type RouteParams<Path extends string> =
+  Path extends `${string}:${infer Param}/${infer Rest}`
+    ? { [K in Param | keyof RouteParams<`/${Rest}`>]: string }
+    : Path extends `${string}:${infer Param}`
+      ? { [K in Param]: string }
+      : Record<never, never>;
+
+type TransferRouteParams = RouteParams<'/ledgers/:ledgerId/accounts/:accountId'>;
+// Evaluates to: { ledgerId: string; accountId: string }
+\end{lstlisting}
+
+Compare this with Java~6. In a Java~6 servlet or Spring~2.5 controller, calling \texttt{getParameter} with the misspelled name \texttt{"acountId"} compiled cleanly and failed with a \texttt{NullPointerException} only when an HTTP request hit that route. Here, \texttt{tsc} parses the route string literal during compilation, synthesizes the object type \texttt{\{ ledgerId: string; accountId: string \}}, gives you instant IDE autocomplete on \texttt{req.params.accountId}, and flags \texttt{req.params.acountId} before a single server process boots---and emits no runtime parsing code.
+
+\begin{labbox}
+\textbf{Don't confuse \texttt{as T} with \texttt{satisfies T} (TypeScript 4.9+).} Suppose you have a dictionary of route handlers or ledger accounts and want \emph{both} compile-time checking against a schema \emph{and} narrow literal inference on the keys/values:
+\begin{itemize}
+  \item Writing \texttt{const cfg: Record<string, number | string> = \{ port: 8080, host: '0.0.0.0' \}} checks the object, \emph{but widens} \texttt{cfg.port} to \texttt{string | number} (forgetting it is a \texttt{number}).
+  \item Writing \texttt{const cfg = \{ ... \} as Record<...>} suppresses real type errors.
+  \item Writing \texttt{const cfg = \{ port: 8080, host: '0.0.0.0' \} satisfies Record<string, number | string>} validates that \texttt{cfg} belongs to $[\![ \texttt{Record<...>} ]\!]$ \textbf{without widening} \texttt{cfg}'s inferred type: \texttt{cfg.port} stays \texttt{number} and \texttt{cfg.host} stays \texttt{string}. Reach for \texttt{satisfies} whenever you want schema validation at compile time without throwing away exact literal/field information.
+\end{itemize}
+\end{labbox}
+
+\section{Variance, Unsoundness Holes, Branding, and Runtime Boundaries}
+\label{ch09:variance-branding-boundaries}
+
+Every industrial type system makes deliberate trade-offs between strict mathematical soundness and practical ergonomics. TypeScript's design goals explicitly state that it does \emph{not} aim for 100\% provable soundness at every corner if doing so would make everyday JavaScript patterns unusable; instead, it aims for high productivity while catching bugs early. As an engineer building financial software, however, \emph{you} need to know exactly where the ice is thin. Let us walk through variance, the mutable-array soundness hole, nominal branding, and the untrusted JSON boundary.
+
+\subsection{Variance From Set Inclusion---and the Mutable Array Trap}
+
+Suppose $\texttt{CorporateAccount} <: \texttt{Account}$ ($[\![ \texttt{CorporateAccount} ]\!] \subseteq [\![ \texttt{Account} ]\!]$). How do compound types built out of $T$---arrays, promises, callbacks, comparators---preserve or reverse that subtype order?
+\begin{enumerate}
+  \item \textbf{Covariant (same direction, producers/readers):} \texttt{ReadonlyArray<CorporateAccount>} $<:$ \texttt{ReadonlyArray<Account>}, and \texttt{() => CorporateAccount} $<:$ \texttt{() => Account}. If a caller expects a function that produces an \texttt{Account}, handing them a function that always produces a \texttt{CorporateAccount} is 100\% safe, because every \texttt{CorporateAccount} \emph{is} an \texttt{Account}.
+  \item \textbf{Contravariant (reversed direction, consumers and writers):} Consider callback types of the form \texttt{Handler<T>} $=$ \texttt{(item: T) => void}. Which way does subtyping go between \texttt{Handler<Account>} and \texttt{Handler<CorporateAccount>}? Think about who calls the callback. A function expecting a \texttt{Handler<\allowbreak{}CorporateAccount>} will pass a \texttt{CorporateAccount} into it. If you supply a \texttt{Handler<Account>} (which knows how to handle \emph{any} \texttt{Account}, using only base \texttt{Account} properties), passing a \texttt{CorporateAccount} into it works every time. Conversely, supplying a \texttt{Handler<\allowbreak{}CorporateAccount>} (which reads \texttt{item.taxEin}, a field present \emph{only} on corporate accounts) where a general \texttt{Handler<Account>} is expected would crash the moment someone passed a personal account. Thus function parameter types invert the inclusion arrow:
+  \begin{gather*}
+    \texttt{CorporateAccount} <: \texttt{Account} \\
+    \Longrightarrow\quad
+    \texttt{(x: Account) => void} \;<:\; \texttt{(x: CorporateAccount) => void}.
+  \end{gather*}
+  TypeScript enforces function-parameter contravariance whenever \texttt{strictFunctionTypes} (included in \texttt{"strict": true}) is enabled, for arrow-type signatures \texttt{prop: (x: T) => void}.
+  \item \textbf{Invariant (neither direction, mutable read-write cells):} What if a container \emph{both} produces $T$ (covariant read) and consumes $T$ (contravariant write), like a mutable array \texttt{T[]} or \texttt{\{ value: T \}}? Mathematically, both $S <: T$ and $T <: S$ must hold simultaneously, forcing $S = T$ (\emph{invariance})---which is why Rust's \texttt{\&'a mut T} and Java~6's \texttt{ArrayList<T>} are strictly invariant.
+\end{enumerate}
+
+Here is what happens in TypeScript (and compare it directly to Java~6 arrays):
+
+\begin{lstlisting}[language=TypeScript]
+interface Account {
+  id: string;
+}
+interface CorporateAccount extends Account {
+  taxEin: string; // Required string on every CorporateAccount!
+}
+
+const corpAccounts: CorporateAccount[] = [
+  { id: 'corp_1', taxEin: '12-3456789' },
+];
+
+// UNSOUND COVARIANCE: TypeScript allows CorporateAccount[] -> Account[]!
+const generalAccounts: Account[] = corpAccounts;
+
+// Mutating through the wider alias inserts an Account with NO `taxEin`:
+generalAccounts.push({ id: 'personal_9' });
+
+// Compiles cleanly -- crashes at runtime with TypeError: Cannot read properties of undefined!
+console.log(corpAccounts[1].taxEin.toUpperCase());
+\end{lstlisting}
+
+Compare this line for line against Java~6's notorious covariant \texttt{CorporateAccount[]} $\to$ \texttt{Account[]} bug.
+\begin{itemize}
+  \item In \textbf{Java~6}, \texttt{Account[] general = corpAccounts;} also compiles, \emph{but} the JVM heap array object stores its reified element class \texttt{[LCorporateAccount;} in its header. On the line \texttt{general[1] = new PersonalAccount("personal\_9")}, the JVM executes \texttt{aastore}, sees the runtime element mismatch, and immediately throws \texttt{java.lang.ArrayStoreException} right at the bad write.
+  \item In \textbf{TypeScript}, because of Mental Shift~2 (total type erasure), the V8 array at runtime is just a plain JS \texttt{Array} with zero knowledge that it was born as a \texttt{CorporateAccount[]}. So \texttt{generalAccounts.push(\{ id: 'personal\_9' \})} succeeds silently, corrupting the invariant of \texttt{corpAccounts}, and the crash happens much later (possibly in a completely different module) when a reader dereferences \texttt{.taxEin}.
+\end{itemize}
+
+\begin{trapbox}
+\textbf{Two Defensive Habits That Close TypeScript's Array Holes:}
+\begin{enumerate}
+  \item \textbf{Default to \texttt{readonly T[]} (or \texttt{ReadonlyArray<T>}) on function parameters.} Because \texttt{readonly T[]} strips \texttt{.push()}, \texttt{.pop()}, \texttt{.splice()}, and index assignment, it is a pure producer---so its covariance is 100\% mathematically sound. Better still, mutable \texttt{T[]} is a subtype of \texttt{readonly T[]}, so callers can pass mutable arrays in without copying.
+  \item \textbf{Enable \texttt{"noUncheckedIndexedAccess": true} in \texttt{tsconfig.json}.} Even \texttt{"strict": true} leaves \texttt{arr[i]} and \texttt{dict[key]} typed as \texttt{T} rather than \texttt{T | undefined}, pretending out-of-bounds reads never happen. Turning on \texttt{noUncheckedIndexedAccess} changes \texttt{arr[i]} to \texttt{T | undefined}, forcing you to handle empty/out-of-bounds indices explicitly just like Rust's \texttt{slice.get(i) -> Option<\&T>}. (Also prefer arrow property syntax \texttt{validate: (x: T) => boolean} over method syntax \texttt{validate(x: T): boolean} in interfaces; TypeScript leaves method syntax bivariant so \texttt{Array<T>} stays covariant.)
+\end{enumerate}
+\end{trapbox}
+
+\subsection{Nominal Branding: Teaching a Structural Type Checker About Units and IDs}
+
+Structural typing works well for composing shapes, and is dangerous when two domain concepts share the same primitive representation. In our financial ledger:
+\begin{itemize}
+  \item \texttt{UsdCents} and \texttt{EurCents} are both \texttt{bigint} at runtime.
+  \item \texttt{AccountId} and \texttt{TransactionId} are both \texttt{string} at runtime.
+\end{itemize}
+In Rust (Chapter~5), we wrote zero-cost tuple structs such as \texttt{UsdCents(i64)} and \texttt{EurCents(i64)}; because Rust is nominal, mixing dollars and euros is a hard compile error with zero heap wrapper overhead. In TypeScript, writing \texttt{type UsdCents = bigint} and \texttt{type EurCents = bigint} creates two aliases for the \emph{exact same set} $[\![ \texttt{bigint} ]\!]$---passing \texttt{EurCents} into \texttt{settleUsdWire(amount: \allowbreak{}UsdCents)} compiles without a peep.
+
+How do we carve disjoint nominal subsets out of \texttt{bigint} \emph{without} wrapping every number in a heap-allocated box object \texttt{\{ kind: 'USD', cents: 500n \}} (which would mirror Java~6's costly \texttt{Long} boxing)? We use \textbf{branded types} (also called \emph{opaque} or \emph{phantom} types):
+
+\begin{lstlisting}[language=TypeScript]
+// Declare phantom unique symbols -- erased completely at runtime!
+declare const UsdBrand: unique symbol;
+declare const EurBrand: unique symbol;
+
+export type UsdCents = bigint & { readonly [UsdBrand]: never };
+export type EurCents = bigint & { readonly [EurBrand]: never };
+
+// Zero-allocation smart constructors: validate invariants once, return bare bigint!
+export function usdCents(raw: bigint): UsdCents {
+  return raw as UsdCents;
+}
+
+export function eurCents(raw: bigint): EurCents {
+  return raw as EurCents;
+}
+
+export function addUsd(a: UsdCents, b: UsdCents): UsdCents {
+  return (a + b) as UsdCents; // UsdCents <: bigint, so `+` works directly!
+}
+
+const price = usdCents(2500n);
+const taxEu = eurCents(475n);
+
+const totalUsd = addUsd(price, usdCents(500n)); // Compiles! Runtime value is bare `3000n`
+// addUsd(price, taxEu);
+// COMPILER ERROR: Argument of type 'EurCents' is not assignable to parameter of type 'UsdCents'.
+\end{lstlisting}
+
+Here is what happens at compile time and at runtime:
+\begin{enumerate}
+  \item At \textbf{compile time}, \texttt{UsdCents} is the intersection $\texttt{bigint} \mathbin{\&} \{\, \texttt{readonly [UsdBrand]: never} \,\}$. Because $\texttt{UsdCents} <: \texttt{bigint}$, you can still pass a \texttt{UsdCents} to \texttt{>}, \texttt{===}, or string formatting expecting a \texttt{bigint}. Yet a plain \texttt{bigint} is \emph{not} assignable to \texttt{UsdCents}, and \texttt{EurCents} is \emph{not} assignable to \texttt{UsdCents}, because neither carries the unique phantom symbol \texttt{UsdBrand}.
+  \item At \textbf{runtime}, \texttt{declare const UsdBrand}, \texttt{type UsdCents}, and \texttt{as UsdCents} all erase to zero bytes. Calling \texttt{usdCents(2500n)} executes \texttt{return raw;}, keeping raw unboxed V8 \texttt{BigInt} primitives in memory---giving us the exact zero-wrapper discipline of Rust's newtypes and Kotlin's \texttt{@JvmInline value class} (which we will meet in Chapter~10).
+\end{enumerate}
+
+\subsection{The Runtime Trust Boundary: Parse, Don't Cast}
+
+We close Chapter~9 with the single architectural lesson that ties structural set theory and total erasure together in real production services.
+
+Inside your compiled TypeScript modules, \texttt{tsc} verifies every function call, union branch, and branded unit. Now ask: \textbf{where do values enter your process from the outside world?} HTTP request bodies (\texttt{req.body}), PostgreSQL JSONB columns, Kafka messages, environment variables, \texttt{fetch()} responses, and browser \texttt{localStorage}.
+
+In TypeScript's standard library, \texttt{JSON.parse(text: string): any} historically returned \texttt{any}. Here is what happens when a developer writes the tempting one-liner at an API boundary:
+
+\begin{lstlisting}[language=TypeScript]
+interface WireTransferPayload {
+  fromAccount: string;
+  toAccount: string;
+  amountCents: number;
+}
+
+// BROKEN IN PRODUCTION: `as WireTransferPayload` performs ZERO runtime checks!
+function handleTransferBroken(rawJson: string): number {
+  const req = JSON.parse(rawJson) as WireTransferPayload;
+  const flatFeeCents = 150;
+  // Suppose attacker sends: {"fromAccount":"a","toAccount":"b","amountCents":"900000"}
+  // In JavaScript, `"900000" + 150` performs STRING CONCATENATION -> `"900000150"`!
+  return req.amountCents + flatFeeCents;
+}
+\end{lstlisting}
+
+Trace what goes wrong in \texttt{handleTransferBroken}. In Java~6 with Jackson or Gson, deserializing \texttt{"amountCents": "900000"} into a \texttt{long} field either parses the integer into a real 64-bit \texttt{long} or throws a deserialization exception, because the target Java class exists at runtime and its field types are inspected by reflection. In TypeScript, \texttt{interface WireTransferPayload} vanished at compile time, and \texttt{as WireTransferPayload} vanished at compile time. At runtime, \texttt{req.amountCents} is the string \texttt{"900000"}, and JavaScript's overloaded \texttt{+} operator concatenates \texttt{"900000" + 150} into \texttt{"900000150"}.
+
+The architectural cure is the principle \textbf{Parse, Don't Validate} (and never \texttt{as}-cast untrusted data): treat every external byte stream as \texttt{unknown} ($\mathcal{U}$), pass it through a \textbf{runtime schema parser} (such as \texttt{Zod}, \texttt{Valibot}, or \texttt{ArkType}) right at the edge of your process, and derive your static TypeScript type \emph{from the runtime schema itself} so the runtime check and compile-time type can never drift apart.
+
+\begin{lstlisting}[language=TypeScript]
+import { z } from 'zod';
+
+// 1. Define the RUNTIME parser value once at the boundary:
+const LedgerEventSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('deposit'),
+    amountCents: z.string().regex(/^[1-9]\d*$/).transform((s) => usdCents(BigInt(s))),
+    sourceIban: z.string().min(15).max(34),
+  }),
+  z.object({
+    kind: z.literal('reversal'),
+    originalTxId: z.string().uuid(),
+    reason: z.string().min(1),
+  }),
+]);
+
+// 2. Derive the STATIC TypeScript type automatically via type-level typeof + infer!
+type VerifiedLedgerEvent = z.infer<typeof LedgerEventSchema>;
+// { kind: 'deposit'; amountCents: UsdCents; sourceIban: string }
+// | { kind: 'reversal'; originalTxId: string; reason: string }
+
+export function ingestHttpPayload(rawJson: string): VerifiedLedgerEvent {
+  const untrusted: unknown = JSON.parse(rawJson); // Immediately lock down `any` to `unknown`!
+  const parsed = LedgerEventSchema.safeParse(untrusted);
+  if (!parsed.success) {
+    throw new Error(`Invalid ledger payload: ${parsed.error.message}`);
+  }
+  // Inside our domain core, `parsed.data` is guaranteed at BOTH runtime and compile time!
+  return parsed.data;
+}
+\end{lstlisting}
+
+Each idea from this chapter appears in those twenty lines (Figure~\ref{ch09:fig-boundary-architecture}):
+\begin{enumerate}
+  \item Assigning \texttt{JSON.parse(rawJson)} directly to \texttt{untrusted: unknown} immediately closes the \texttt{any} escape hatch and places the untrusted payload at the top of our mathematical lattice ($\mathcal{U}$).
+  \item \texttt{LedgerEventSchema} is a real JavaScript object that executes actual V8 property, regex, and discriminant checks at runtime, transforming decimal integer strings safely into branded \texttt{UsdCents} \texttt{bigint}s (avoiding IEEE-754 \texttt{number} precision loss above $2^{53} - 1 = 9{,}007{,}199{,}254{,}740{,}991$).
+  \item \texttt{z.infer<typeof LedgerEventSchema>} uses the exact type-level programming tools from Section~\ref{ch09:type-level-programming} (\texttt{typeof}, conditional types, and \texttt{infer}) to compute the static discriminated union \texttt{VerifiedLedgerEvent} directly from the runtime validator.
+  \item Once \texttt{parsed.data} crosses the boundary into your core domain logic, zero redundant runtime \texttt{typeof} checks are needed: static set inclusion carries the guarantee from there on.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,
+  zone/.style={draw,rounded corners=4pt,thick,align=center,inner sep=5pt},
+  arr/.style={->,very thick}]
+
+  % Untrusted wire
+  \node[zone,draw=gray!75!black,fill=gray!10,minimum width=2.4cm,minimum height=1.55cm] (wire) at (0, 0)
+    {\textbf{Wire Bytes}\\ {\scriptsize HTTP / Kafka}\\ {\scriptsize \texttt{string}}};
+
+  % JSON.parse -> unknown
+  \node[zone,draw=quotientorange!85,fill=quotientorange!10,minimum width=2.7cm,minimum height=1.55cm] (unk) at (3.25, 0)
+    {\textbf{Untrusted JS}\\ {\scriptsize \texttt{JSON.parse()}}\\ {\scriptsize \textbf{\texttt{unknown}} ($\mathcal{U}$)}};
+
+  % Runtime schema parser
+  \node[zone,draw=structurepurple!85,fill=structurepurple!10,minimum width=3.1cm,minimum height=1.75cm] (zod) at (6.95, 0)
+    {\textbf{Schema Parser}\\ {\scriptsize \texttt{Zod} / Type Guard}\\ {\scriptsize checks \& converts}\\ {\scriptsize \texttt{string} $\to$ \texttt{UsdCents}}};
+
+  % Verified interior
+  \node[zone,draw=targetgreen!85!black,fill=targetgreen!10,minimum width=3.4cm,minimum height=1.65cm] (core) at (11.55, 0.85)
+    {\textbf{Verified Domain Core}\\ {\scriptsize \texttt{VerifiedLedgerEvent}}\\ {\scriptsize \textbf{0 runtime check cost}}};
+
+  % Rejected error path
+  \node[zone,draw=trapred!85,fill=trapred!10,minimum width=3.4cm,minimum height=1.0cm] (err) at (11.55, -1.15)
+    {\textbf{400 Bad Request}\\ {\scriptsize structured field errors}};
+
+  \draw[arr,gray!75!black] (wire) -- (unk);
+  \draw[arr,quotientorange!85!black] (unk) -- (zod);
+  \draw[arr,targetgreen!75!black] ([yshift=8pt]zod.east) -- node[above=2pt,sloped,font=\scriptsize\bfseries,text=targetgreen!70!black]{valid} ([yshift=-4pt]core.west);
+  \draw[arr,trapred!80!black] ([yshift=-10pt]zod.east) -- node[below=2pt,sloped,font=\scriptsize\bfseries,text=trapred!80!black]{invalid} (err.west);
+
+  % Dashed boundary line
+  \draw[dashed,thick,structurepurple!70] (5.05, -1.9) -- (5.05, 1.9);
+  \node[above,font=\scriptsize\bfseries,text=structurepurple!85!black] at (5.05, 1.9) {Process Trust Boundary};
+\end{tikzpicture}
+\caption{The ``Parse, Don't Validate'' architecture required by total type erasure. External bytes enter as \texttt{unknown} ($\mathcal{U}$) and cross a runtime schema parser (\texttt{Zod}) once at the trust boundary; invalid payloads are rejected immediately, while valid payloads enter the statically verified core with branded types and discriminated unions.}
+\label{ch09:fig-boundary-architecture}
+\end{figure}
+
+\begin{connectionbox}
+\textbf{Looking Ahead to Chapter 10 (Kotlin on the JVM).} TypeScript showed us what happens when you layer a rich, structural, set-theoretic type checker over a completely dynamic runtime where all static types erase. What if instead you want modern null-safety, algebraic sum types, zero-overhead domain wrappers, and lightweight concurrency \emph{without} giving up JVM bytecode verification, nominal runtime class descriptors, and direct calls to twenty years of existing Java~6 libraries? That is the exact design space of \textbf{Kotlin}, where we head next.
+\end{connectionbox}
+
+\section{Exercises}
+\label{ch09:exercises}
+
+\begin{exercise}[Set Algebra of Unions, Intersections, and \texttt{keyof}]
+\label{ex:ch09-set-algebra}
+Consider two object types: \texttt{A} with fields \texttt{id: string}, \texttt{status: \allowbreak{}'open' | 'frozen'}, and \texttt{limit: bigint}; and \texttt{B} with fields \texttt{id: string}, \texttt{status: \allowbreak{}'frozen' | 'closed'}, and \texttt{closedAt: Date}.
+\begin{enumerate}
+  \item Compute the exact simplified TypeScript types for \texttt{keyof (A | B)} and \texttt{keyof (A \& B)}.
+  \item What is the type of \texttt{(A \& B)['status']}? Prove your answer using $[\![ A \mathbin{\&} B ]\!] = [\![ A ]\!] \cap [\![ B ]\!]$.
+  \item What would happen to $[\![ A \mathbin{\&} B ]\!]$ if \texttt{A} had \texttt{status: 'open'} and \texttt{B} had \texttt{status: 'closed'}? Verify what \texttt{tsc} infers for \texttt{A \& B} in that disjoint case.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Exhaustiveness Checking and Refactoring Safety]
+\label{ex:ch09-exhaustiveness}
+Model a payment settlement state machine as a discriminated union \texttt{SettlementState} with four variants:
+\texttt{Pending} (\texttt{submittedAt: Date}),
+\texttt{Authorized} (\texttt{authCode: string} and \texttt{holdCents: \allowbreak{}bigint}),
+\texttt{Captured} (\texttt{settledCents: \allowbreak{}bigint} and \texttt{receiptId: string}), and
+\texttt{Declined} (a \texttt{declineReason} that is one of \texttt{'insufficient\_\allowbreak{}funds'}, \texttt{'fraud\_\allowbreak{}suspected'}, or \texttt{'network\_\allowbreak{}timeout'}).
+\begin{enumerate}
+  \item Explain why storing these four states in a single Java~6 class with nullable fields allows at least $2^6 - 4$ nonsensical combinations of null and non-null fields, whereas the TypeScript union allows only valid states.
+  \item Write \texttt{canRetry(state: \allowbreak{}SettlementState): boolean} using a \texttt{switch} and a \texttt{never} exhaustiveness check so that only \texttt{Declined} states with reason \texttt{'network\_timeout'} return \texttt{true}, and adding any fifth variant forces a compile error.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Mutable Covariance vs.\ \texttt{readonly}]
+\label{ex:ch09-variance-trap}
+Consider \texttt{interface Box<T> \{ value: T \}} alongside \texttt{interface ReadonlyBox<T> \{ readonly value: T \}} and \texttt{interface Sink<T> \{ put: (item: T) => void \}}.
+\begin{enumerate}
+  \item Given \texttt{CorporateAccount <: Account}, determine whether \texttt{ReadonlyBox}, \texttt{Sink}, and \texttt{Box} should be covariant, contravariant, or invariant in \texttt{T} to preserve runtime type soundness.
+  \item In TypeScript, even in strict mode, test whether a box of corporate accounts is assignable to a box of plain accounts. Construct a 6-line snippet showing how writing through the wider box's \texttt{value} field causes a runtime \texttt{TypeError} without any \texttt{any} or \texttt{as} casts. Then explain why Java~6's generic \texttt{AtomicReference} rejects the analogous assignment at compile time.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Writing \texttt{DeepReadonly<T>} at the Type Level]
+\label{ex:ch09-deep-readonly}
+TypeScript's built-in \texttt{Readonly<T>} is \emph{shallow}: on an \texttt{Order} interface with \texttt{id: string} and nested \texttt{customer: \{ name: string \}}, \texttt{Readonly<Order>} blocks reassigning the \texttt{customer} field, yet still lets you overwrite the customer's \texttt{name} with \texttt{'Mallory'}.
+Write a recursive conditional and mapped type \texttt{DeepReadonly<T>} that leaves function types and primitives untouched, converts \texttt{Array<infer U>} into \texttt{ReadonlyArray<\allowbreak{}DeepReadonly<U>>}, and recursively marks every property of object types \texttt{readonly}. Test it on nested arrays and objects.
+\end{exercise}
+
+\begin{exercise}[Compile-Time SQL Column Projection with Template Literals and \texttt{infer}]
+\label{ex:ch09-template-infer}
+Using template literal types, conditional types, and \texttt{infer}, write a generic type \texttt{ParseColumns<Query extends string>} that extracts a union of trimmed column names from simple strings such as \texttt{'SELECT id, owner, \allowbreak{}balanceCents FROM accounts'}, so that applying \texttt{Pick<LedgerAccount, \allowbreak{}ParseColumns<...>>} to \texttt{'SELECT id, \allowbreak{}balanceCents FROM accounts'} evaluates at compile time to \texttt{\{ id: string; balanceCents: bigint \}} and flags a misspelled column name \texttt{'SELECT id, balence FROM accounts'} as a compile error.
+\end{exercise}
+
+\begin{exercise}[Closing an IEEE-754 Precision and Brand Bug at an HTTP Boundary]
+\label{ex:ch09-ieee754-boundary}
+A teammate wrote an HTTP handler accepting a JSON body whose \texttt{amountCents} field is the bare number \texttt{9007199254740993}, parsed via \texttt{JSON.parse(body)} and then cast with \texttt{as} to an object type with \texttt{accountId: string} and \texttt{amountCents: number}.
+\begin{enumerate}
+  \item Explain two independent bugs in this handler: first, what \texttt{JSON.parse} actually produces in V8 for the integer $9{,}007{,}199{,}254{,}740{,}993 = 2^{53} + 1$ when parsed into an IEEE-754 double-precision \texttt{number}; second, what happens if a client sends \texttt{"amountCents": null}.
+  \item Redesign the wire format and write a boundary parser (either using \texttt{Zod} or a zero-dependency type-guard/parser function taking \texttt{unknown}) that accepts exact base-10 integer strings, rejects negative or malformed strings, and returns an object carrying branded \texttt{AccountId} and \texttt{UsdCents} types.
+\end{enumerate}
+\end{exercise}

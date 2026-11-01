@@ -1,0 +1,211 @@
+\chapter*{Preface}
+\addcontentsline{toc}{chapter}{Preface}
+
+Every backend engineer eventually meets the day when the database stops pretending to be an infinite hash map in the sky.
+
+Perhaps a query that ran in four milliseconds on Friday suddenly takes nineteen seconds on Monday morning, even though nobody deployed code over the weekend. Perhaps two concurrent requests check that a customer has \$100 available, both pass the check inside separate \texttt{BEGIN ... COMMIT} blocks, both deduct \$80, and the account settles at $-\$60$. Or perhaps someone adds a harmless-looking \texttt{WHERE id NOT IN (SELECT blocked\_id FROM blocks)} filter, a single row in \texttt{blocks} happens to have \texttt{blocked\_id = NULL}, and the entire query returns zero rows without raising a warning.
+
+When those moments arrive, guessing at index combinations or copying configuration snippets from blog posts feels terrible. Underneath every surprise sits a deterministic machine built out of concrete data structures: 8,192-byte slotted pages, line-pointer arrays, B-link trees with right-sibling pointers, append-only Write-Ahead Log segments, and 32-bit transaction IDs compared on a modular circle. Once you can picture those bytes and trace the invariants that govern them, PostgreSQL stops feeling mysterious. Every behavior has a physical cause you can inspect, predict, and measure.
+
+I wrote this book because most treatments of databases give you only half the picture. Academic textbooks teach relational algebra, functional dependencies, and serializability graphs cleanly, yet rarely show how a tuple header is padded to an 8-byte boundary or why a 4~KB operating-system write tearing an 8~KB database page forces full-page logging after a checkpoint. Operational manuals list parameters like \texttt{shared\_buffers}, \texttt{work\_mem}, and \texttt{autovacuum\_vacuum\_scale\_factor}, yet seldom derive from first principles what breaks when you set them wrong. Here we keep the mathematical model, the byte-level PostgreSQL implementation, and production engineering on the very same page.
+
+\section*{What this book is, and who it is for}
+
+You know Java~6 (classes, \texttt{null}, \texttt{synchronized}, \texttt{ArrayList}, \texttt{HashMap}, the garbage collector) and basic C (structs, pointers, \texttt{malloc}, \texttt{write} and \texttt{fsync}). You may have written SQL through JDBC or Hibernate, or you may be meeting SQL seriously for the first time. We assume no prior knowledge of database internals. Each new mechanism is first tied to the Java or C construct it resembles --- an object graph, a \texttt{TreeMap}, a C struct with padding, a \texttt{FileOutputStream} that has not been synced --- and then we show exactly where PostgreSQL differs and why.
+
+By the end of these eight chapters, you will be able to reason like a systems engineer who genuinely understands PostgreSQL from the query parser down to NVMe flash:
+
+\begin{itemize}
+  \item read a complex SQL query in the order the engine logically evaluates it (\texttt{FROM} $\to$ \texttt{JOIN} $\to$ \texttt{WHERE} $\to$ \texttt{GROUP BY} $\to$ \texttt{HAVING} $\to$ \texttt{WINDOW} $\to$ \texttt{SELECT} $\to$ \texttt{DISTINCT} $\to$ \texttt{ORDER BY} $\to$ \texttt{LIMIT}), and spot three-valued \texttt{NULL} traps before they ship;
+  \item inspect a raw 8~KB PostgreSQL heap file in your head or with \texttt{pageinspect}, read \texttt{PageHeaderData}, trace the \texttt{ItemIdData} array growing downward and heap tuples growing upward, and compute exact row sizes including \texttt{MAXALIGN} padding;
+  \item design composite, covering (\texttt{INCLUDE}), partial, GIN, GiST, and BRIN indexes from their physical tree geometry rather than superstition, and explain how Lehman--Yao high keys let readers traverse splitting B-tree pages without holding parent locks;
+  \item trace a \texttt{COMMIT} through \texttt{shared\_buffers}, \texttt{pg\_wal}, and \texttt{fsync}, state the Write-Ahead Logging rule precisely, and replay crash recovery by hand from a checkpoint's redo point;
+  \item determine exactly which tuple versions a transaction snapshot $(x_{\min}, x_{\max}, \text{xip})$ can see, why \texttt{UPDATE} creates dead tuples, when Heap-Only Tuple (HOT) chains avoid index bloat, and why 32-bit transaction ID wraparound requires freezing;
+  \item construct two-transaction timelines for lost updates and write skew, choose deliberately between \texttt{SELECT ... FOR UPDATE}, \texttt{REPEATABLE READ}, and \texttt{SERIALIZABLE} (SSI), and read every counter in an \texttt{EXPLAIN (ANALYZE, BUFFERS)} plan;
+  \item design schemas for high-integrity financial ledgers --- pairing naturally with Rust, \texttt{Axum}, and \texttt{SQLx} --- backed by streaming replication and transaction-mode connection pooling.
+\end{itemize}
+
+\section*{How to read this book}
+
+Every major mechanism in this book follows the same four-step rhythm: a concrete problem, a small paper-and-pencil trace, the exact PostgreSQL data structure, and a hands-on inspection query.
+
+We always start with \emph{the failure or bottleneck that forced the design}. Why not store pointers from a customer record directly to their order records on disk? Why not overwrite an updated integer in place inside its 8~KB page? Why not flush dirty table pages straight to disk at \texttt{COMMIT}? When you feel the constraint first, the invention that resolves it reads like common sense rather than arbitrary complexity.
+
+Next we work through \emph{tiny numbers by hand}. Before stating general formulas, we pack three rows into a miniature slotted page and watch byte offsets move when the middle row is deleted and compacted. We split a B-tree leaf node holding four keys while a concurrent reader is halfway down the tree. We trace crash recovery across six Log Sequence Numbers (\texttt{0/1000} through \texttt{0/1260}) and check every page header's \texttt{pd\_lsn}. Doing the arithmetic on six items gives you complete command over sixty million.
+
+Then we look directly at \emph{PostgreSQL's real C structures and extensions}. PostgreSQL is open-source C written with unusual clarity, and its built-in extensions (\texttt{pageinspect}, \texttt{pg\_walinspect}, \texttt{pg\_buffercache}, \texttt{pg\_stat\_statements}) let you inspect live pages, line pointers, hint bits, and WAL records from an ordinary \texttt{psql} prompt. Whenever we introduce an internal structure, we name the real fields (\texttt{pd\_lower}, \texttt{pd\_upper}, \texttt{t\_xmin}, \texttt{t\_xmax}, \texttt{t\_infomask}) so that PostgreSQL's source tree and documentation feel immediately familiar.
+
+\subsection*{What the recurring callouts mean}
+
+Throughout each chapter, shaded callout blocks signal shifts in perspective so you always know what kind of thinking a passage asks of you:
+
+\begin{intuitionbox}
+The geometric or physical mental picture --- the one clear visual model that makes all the details snap into place. If you revisit a chapter months later, reading these boxes will reconstruct the whole story in minutes.
+\end{intuitionbox}
+
+\begin{formalbox}
+Exact definitions, invariants, and correctness rules --- relational algebra operators, the Write-Ahead Logging invariant, or the MVCC snapshot visibility predicate --- stated without hand-waving.
+\end{formalbox}
+
+\begin{whybox}
+The engineering and mathematical proof for \emph{why} a mechanism preserves correctness under concurrency or power loss, or why an alternative design fails.
+\end{whybox}
+
+\begin{trapbox}
+Subtle mistakes that bite production systems every week: \texttt{NOT IN} against a nullable column, leading range columns in composite B-trees, \texttt{TIMESTAMP WITHOUT TIME ZONE}, or \texttt{REPEATABLE READ} silently permitting write skew.
+\end{trapbox}
+
+\begin{implementbox}
+Direct looks inside PostgreSQL's C structs (\texttt{PageHeaderData}, \texttt{HeapTupleHeaderData}, \texttt{BufferDesc}) or compact reference code in Rust, C, and Python showing how the mechanism operates at the byte level.
+\end{implementbox}
+
+\begin{labbox}
+Self-contained SQL sessions you can paste straight into a local PostgreSQL 16+ container to watch raw pages, indexes, locks, and execution plans with your own eyes:
+\begin{lstlisting}[language=SQL]
+-- Start an ephemeral container with:
+-- docker run --rm -it -e POSTGRES_PASSWORD=postgres postgres:17 psql -U postgres
+SELECT version();
+\end{lstlisting}
+\end{labbox}
+
+\section*{One end-to-end trace, so you see how the layers connect}
+
+Before we begin Chapter~1, let us trace one tiny SQL statement all the way from text to silicon. Watching all the layers cooperate on a single row gives you a map of the entire book.
+
+Suppose a ledger table \texttt{accounts} holds rows with \texttt{(id BIGINT, balance\_cents BIGINT)}, and account \texttt{7} currently sits on heap block \texttt{0} at slot \texttt{1} with a balance of \texttt{25000} cents (\$250.00). A backend session executes:
+
+\begin{lstlisting}[language=SQL]
+BEGIN;
+UPDATE accounts
+   SET balance_cents = balance_cents - 5000
+ WHERE id = 7;
+COMMIT;
+\end{lstlisting}
+
+A naive mental model imagines PostgreSQL seeking to byte offset $8160$ of the table file, overwriting \texttt{25000} with \texttt{20000}, and returning \texttt{UPDATE 1}. PostgreSQL does \emph{none} of that. Overwriting those eight bytes in place would violate two foundational requirements at once:
+
+\begin{enumerate}
+  \item \textbf{Concurrent readers without read locks:} Another session running an analytical report that started ten milliseconds ago must still see \texttt{25000}, without blocking your \texttt{UPDATE} and without being blocked by it.
+  \item \textbf{Atomic rollback and crash safety:} If your transaction aborts on the next statement --- or the server loses power mid-flight --- \texttt{25000} must still be intact.
+\end{enumerate}
+
+Instead, suppose your transaction has been assigned Transaction ID (\texttt{xid}) \texttt{502}, while the original row was inserted earlier by committed transaction \texttt{480}. Here is what PostgreSQL actually does inside RAM and on disk:
+
+\begin{enumerate}
+  \item \textbf{Index lookup and buffer pin (Chapters~2--3):} Using the primary-key B-tree on \texttt{id}, the executor walks from the root page down to a leaf entry mapping \texttt{id = 7} $\to$ \texttt{ctid = (0, 1)} (block \texttt{0}, line pointer \texttt{1}). It looks up block \texttt{0} in \texttt{shared\_buffers}, pins the 8~KB frame in RAM so clock-sweep eviction cannot steal it, and locates tuple \texttt{(0, 1)} via line pointer \texttt{1} at byte offset \texttt{8152}.
+  \item \textbf{Multi-version tuple creation in RAM (Chapter~5):} Rather than overwriting \texttt{25000}, PostgreSQL stamps the existing tuple's \texttt{t\_xmax} field with \texttt{502} (marking it deleted by transaction \texttt{502}) and allocates a brand-new tuple in the free space at the top of the tuple area (say, byte offset \texttt{8104}, pointed to by new line pointer \texttt{2}). The new tuple gets \texttt{t\_xmin = 502}, \texttt{t\_xmax = 0}, and \texttt{balance\_cents = 20000}. The old tuple's \texttt{t\_ctid} pointer is updated from \texttt{(0, 1)} to \texttt{(0, 2)}, linking the version chain forward.
+  \item \textbf{Write-Ahead Logging before dirty page flush (Chapter~4):} Modifying the 8~KB buffer in RAM marks the buffer dirty, but PostgreSQL does \emph{not} rush to write that 8~KB heap page to disk. Instead, it appends a compact sequential record describing the heap update to the Write-Ahead Log buffer, say at Log Sequence Number (LSN) \texttt{0/16B3748}, and stamps \texttt{pd\_lsn = 0/16B3748} at byte offset \texttt{0} of the 8~KB heap page. When \texttt{COMMIT} runs, PostgreSQL appends a tiny commit record at \texttt{0/16B3780} and calls \texttt{fdatasync} on the sequential WAL file \emph{only}. Once those few dozen sequential bytes hit non-volatile flash, your transaction is durable --- even while the dirty 8~KB heap page sits lazily in RAM for minutes until a background writer or checkpoint flushes it.
+\end{enumerate}
+
+\begin{center}
+\begin{tikzpicture}[
+  >=Stealth,
+  font=\small,
+  slot/.style={draw=sourceblue!80!black, fill=sourceblue!12, minimum height=0.62cm, font=\scriptsize\ttfamily, inner sep=3pt},
+  tup/.style={draw=#1!80!black, fill=#1!12, rounded corners=1.5pt, minimum height=0.78cm, font=\scriptsize\ttfamily, inner sep=4pt, align=left}
+]
+  % Outer 8 KB page frame
+  \draw[thick, draw=gray!75!black, fill=gray!3, rounded corners=3pt] (0, 0) rectangle (13.2, 4.9);
+  \node[anchor=north west, font=\footnotesize\bfseries, text=gray!80!black] at (0.2, 4.78)
+    {8,192-Byte Heap Page (Block 0 in \texttt{shared\_buffers}, \texttt{BM\_DIRTY})};
+
+  % PageHeaderData + ItemIdData row at top
+  \node[slot, fill=structurepurple!15, draw=structurepurple!80!black, anchor=west, minimum width=4.2cm] (hdr) at (0.25, 3.95)
+    {Header: pd\_lsn = 0/16B3748};
+  \node[slot, anchor=west, minimum width=2.5cm] (lp1) at (4.6, 3.95)
+    {lp[1] -> off 8152};
+  \node[slot, fill=targetgreen!16, draw=targetgreen!80!black, anchor=west, minimum width=2.5cm] (lp2) at (7.25, 3.95)
+    {lp[2] -> off 8104};
+  \node[font=\scriptsize\itshape, text=gray!70!black, anchor=west] at (9.9, 3.95)
+    {pd\_lower $\to$ grows right};
+
+  % Free space middle band
+  \draw[dashed, gray!55] (0.25, 3.35) -- (12.95, 3.35);
+  \node[font=\scriptsize, text=gray!65!black] at (6.6, 2.92)
+    {Unallocated free space (\texttt{pd\_lower .. pd\_upper}) --- tuples grow upward from byte 8,192};
+  \draw[dashed, gray!55] (0.25, 2.50) -- (12.95, 2.50);
+
+  % New tuple v2 (at 8104)
+  \node[tup=targetgreen, minimum width=12.5cm, anchor=west] (t2) at (0.35, 1.82)
+    {\textbf{Tuple (0,2)} [offset 8104]: \texttt{xmin=502} | \texttt{xmax=0} | \texttt{ctid=(0,2)} | \texttt{id=7, balance\_cents=20000}};
+
+  % Old tuple v1 (at 8152)
+  \node[tup=quotientorange, minimum width=12.5cm, anchor=west] (t1) at (0.35, 0.72)
+    {\textbf{Tuple (0,1)} [offset 8152]: \texttt{xmin=480} | \texttt{xmax=502} | \texttt{ctid=(0,2)} | \texttt{id=7, balance\_cents=25000}};
+
+  % Pointer arrows
+  \draw[->, thick, sourceblue!80!black] (lp1.south) -- ++(0,-0.25) -| (0.15, 0.72) -- (t1.west);
+  \draw[->, thick, targetgreen!80!black] (lp2.south) -- ++(0,-0.15) -| (2.6, 2.22);
+  \draw[->, thick, trapred!85!black] (12.6, 0.72) .. controls (13.05, 1.1) and (13.05, 1.45) ..
+    node[left=3pt, font=\scriptsize\ttfamily, text=trapred!85!black] {t\_ctid} (12.6, 1.82);
+\end{tikzpicture}
+\end{center}
+
+Every piece of that story raises the exact engineering questions the rest of this book answers. What happens when old dead tuples like \texttt{(0, 1)} fill up the page? (Page pruning, HOT updates, and \texttt{VACUUM} in Chapter~5.) Did every secondary index on \texttt{accounts} have to add a new entry pointing to \texttt{(0, 2)}? (Not if no indexed column changed and \texttt{(0, 2)} fit on the same 8~KB page.) What if power failed after \texttt{COMMIT} flushed WAL record \texttt{0/16B3780}, before block \texttt{0} ever left RAM? (Crash recovery replays the WAL stream forward from the redo point in Chapter~4.)
+
+\section*{How the book is organized}
+
+The eight chapters divide into three parts that climb from logical meaning down to storage bytes and back up to distributed production architecture:
+
+\textbf{Part~I --- Relations, Storage Pages, and Access Methods (Chapters~1--3).} Chapter~1 starts with Codd's relational model, translating relational algebra ($\sigma, \pi, \bowtie, \gamma$) into SQL's true logical evaluation pipeline, unpacking three-valued \texttt{NULL} logic, window frames, and recursive fixpoint queries. Chapter~2 opens \texttt{\$PGDATA/base} on disk, dissects the 8,192-byte slotted heap page, aligns tuple columns to hardware boundaries, explains TOAST chunking for large attributes, and traces clock-sweep eviction in \texttt{shared\_buffers}. Chapter~3 builds indexes from B+tree fanout math up to PostgreSQL's Lehman--Yao high-concurrency B-link trees, composite index geometry, covering \texttt{INCLUDE} indexes with the Visibility Map, partial/expression indexes, and Hash, GIN, GiST, and BRIN access methods.
+
+\textbf{Part~II --- Durability, Concurrency, and MVCC Internals (Chapters~4--6).} Chapter~4 confronts hardware failure: volatile caches, torn 4~KB writes inside 8~KB pages, Write-Ahead Logging, Log Sequence Numbers, \texttt{full\_page\_writes}, group commit, checkpoints, and step-by-step crash recovery. Chapter~5 builds Multi-Version Concurrency Control from \texttt{t\_xmin}/\texttt{t\_xmax}, the \texttt{pg\_xact} commit log, and tuple hint bits up to snapshots, HOT chains, \texttt{VACUUM}, and 32-bit transaction wraparound. Chapter~6 maps every concurrency anomaly --- dirty reads, non-repeatable reads, phantoms, lost updates (including \texttt{EvalPlanQual}), and write skew --- onto concrete two-transaction timelines, contrasting row locks (\texttt{FOR UPDATE}, \texttt{SKIP LOCKED}) with Serializable Snapshot Isolation's \texttt{rw}-antidependency detection.
+
+\textbf{Part~III --- Query Execution and Production PostgreSQL (Chapters~7--8).} Chapter~7 steps inside the cost-based query planner: \texttt{pg\_stats} histograms and correlation, sequential vs.\ bitmap vs.\ index scans, nested-loop vs.\ Grace hash vs.\ merge joins, and reading \texttt{EXPLAIN (ANALYZE, BUFFERS)} plans without guesswork. Chapter~8 brings every piece together into production engineering for financial-grade systems: integer minor units, \texttt{TIMESTAMPTZ}, time-ordered \texttt{UUIDv7} keys, exclusion and deferred balance constraints, declarative partitioning, physical/logical WAL replication, and transaction-mode connection pooling with \texttt{PgBouncer} and Rust's \texttt{SQLx}.
+
+\begin{center}
+\begin{tikzpicture}[
+  >=Stealth,
+  font=\small,
+  partbox/.style={draw=#1!80!black, fill=#1!10, rounded corners=2.5pt, line width=0.75pt, text width=12.0cm, inner sep=6pt, align=left},
+  arr/.style={->, thick, gray!75!black}
+]
+  \node[partbox=sourceblue] (p1) at (0, 4.0) {
+    \textbf{\color{sourceblue!90!black}Part~I: Relations, Storage Pages, and Access Methods}\\[2pt]
+    {\footnotesize \textbf{Ch~1:} Relational Algebra \& SQL Semantics \quad|\quad \textbf{Ch~2:} 8~KB Slotted Heap Pages \& Buffer Pool \quad|\quad \textbf{Ch~3:} B-Link Trees, GIN, GiST \& BRIN}
+  };
+
+  \node[partbox=quotientorange] (p2) at (0, 2.0) {
+    \textbf{\color{quotientorange!90!black}Part~II: Durability, Concurrency, and MVCC Internals}\\[2pt]
+    {\footnotesize \textbf{Ch~4:} \texttt{fsync}, Torn Pages, WAL \& Recovery \quad|\quad \textbf{Ch~5:} MVCC Snapshots, HOT \& \texttt{VACUUM} \quad|\quad \textbf{Ch~6:} Anomalies, Locks \& SSI}
+  };
+
+  \node[partbox=targetgreen] (p3) at (0, 0.0) {
+    \textbf{\color{targetgreen!90!black}Part~III: Query Execution and Production PostgreSQL}\\[2pt]
+    {\footnotesize \textbf{Ch~7:} Optimizer Statistics, Joins \& \texttt{EXPLAIN (ANALYZE, BUFFERS)} \quad|\quad \textbf{Ch~8:} Financial Schemas, Replication \& Pooling}
+  };
+
+  \draw[arr] (p1.south) -- (p2.north);
+  \draw[arr] (p2.south) -- (p3.north);
+\end{tikzpicture}
+\end{center}
+
+\begin{connectionbox}
+This book pairs directly with two companions in the curriculum. \emph{Algorithms From the Ground Up} develops asymptotic cost analysis, hashing, dynamic programming, and textbook B-trees, which we extend in Chapters~3 and~7 into concurrent B-link trees and relational join planning. \emph{Programming Languages From the Ground Up} builds an asynchronous financial ledger service in Rust with \texttt{Axum}, \texttt{Tokio}, and \texttt{SQLx}; Chapter~8 of this book designs the exact PostgreSQL storage, isolation, replication, and pooling layer that backs that service.
+\end{connectionbox}
+
+\section*{Exercises}
+
+Every chapter closes with concrete exercises --- calculations, trace tables, and failure scenarios. Work them with a pen before moving on; calculating one page layout or race condition yourself teaches more than skimming ten pages of prose. These five require nothing beyond what we just traced.
+
+\begin{exercise}[Counting rows per 8~KB page]
+An empty PostgreSQL heap page is $8{,}192$ bytes long and begins with a $24$-byte \texttt{PageHeaderData}. Each row added to the page consumes one $4$-byte \texttt{ItemIdData} line pointer at the front of the page plus the padded tuple bytes at the back. Suppose each tuple in a narrow ledger table occupies exactly $40$ bytes (a $24$-byte tuple header plus two $8$-byte \texttt{BIGINT} columns). What is the maximum number of live tuples that can fit on a single $8{,}192$-byte page, and how many bytes of free space remain unused?
+\end{exercise}
+
+\begin{exercise}[Why in-place overwrite breaks crash atomicity]
+Suppose a naive storage engine has no Write-Ahead Log and updates rows by overwriting bytes directly inside heap pages on disk. A transaction transfers \$50 from Account~A (stored on block~$12$) to Account~B (stored on block~$904$). Describe the exact disk state after power fails halfway between flushing block~$12$ and flushing block~$904$, and explain why restarting the server cannot tell whether to undo block~$12$ or finish block~$904$.
+\end{exercise}
+
+\begin{exercise}[Log Sequence Number byte arithmetic]
+PostgreSQL writes a 64-bit Log Sequence Number as \texttt{X/YYYYYYYY}, where \texttt{X} is the upper 32 bits in hexadecimal and \texttt{YYYYYYYY} is the lower 32 bits in hexadecimal. In our trace above, the heap update record began at \texttt{0/16B3748} and the commit record began at \texttt{0/16B3780}. How many bytes long was the heap update WAL record?
+\end{exercise}
+
+\begin{exercise}[Reading through a version chain]
+Look back at the 8~KB heap-page diagram in this preface, where tuple \texttt{(0, 1)} has \texttt{xmin = 480, xmax = 502} and tuple \texttt{(0, 2)} has \texttt{xmin = 502, xmax = 0}. Suppose Transaction~\texttt{501} started \emph{before} Transaction~\texttt{502} committed, while Transaction~\texttt{505} started \emph{after} Transaction~\texttt{502} committed. Which tuple should Transaction~\texttt{501} read, which tuple should Transaction~\texttt{505} read, and why can neither transaction safely delete \texttt{(0, 1)} while Transaction~\texttt{501} is still running?
+\end{exercise}
+
+\begin{exercise}[Sequential WAL versus random heap I/O]
+A busy payment checkout inserts one row into an \texttt{orders} table that has four secondary B-tree indexes (on \texttt{customer\_id}, \texttt{merchant\_id}, \texttt{created\_at}, and \texttt{status}). How many distinct 8~KB pages in \texttt{shared\_buffers} may be dirtied by this single \texttt{INSERT}? Compare the I/O cost of calling \texttt{fdatasync} on five scattered files across a 2~TB table space at \texttt{COMMIT} versus appending ~300 bytes to one sequential \texttt{pg\_wal} file.
+\end{exercise}
+
+\chapterline

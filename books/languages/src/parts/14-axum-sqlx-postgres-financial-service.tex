@@ -1,0 +1,1336 @@
+\chapter{Building the Financial Service End-to-End: Axum, Tower, SQLx, and PostgreSQL}
+
+We now have both halves of the system in hand. Chapter~12 showed how a Rust process waits: each request becomes a compact \texttt{Future} state machine, Tokio polls thousands of them on a few threads, and dropping a future cancels it at its current \texttt{.await}. Chapter~13 showed what the process computes: money as checked integers tagged with a currency, double-entry journal entries, and a \texttt{BalancedEntry} type that can only exist if debits equal credits.
+
+This chapter wires those halves into a running service. A client sends
+\begin{lstlisting}[language=Plain]
+POST /v1/transfers
+Idempotency-Key: 7f3c9a2e-checkout-4411
+Content-Type: application/json
+
+{"from": "0190f1c2-...", "to": "0190f1c3-...", "amount_minor": 8000,
+ "currency": "USD", "fee_bps": 250}
+\end{lstlisting}
+and we follow those bytes all the way down: through Tower middleware, Axum extractors, our domain types, a SQLx transaction, PostgreSQL row locks and constraints, a transactional outbox, and back out as an HTTP response. Along the way we answer the questions that separate a demo from a ledger you can trust with other people's money:
+\begin{itemize}
+  \item What does the database itself refuse to store, even if application code has a bug?
+  \item How can a SQL query be type-checked by \texttt{cargo build}?
+  \item What happens when two withdrawals of $\$80$ hit a $\$100$ balance in the same millisecond?
+  \item What happens when the client times out, retries, and the first attempt actually succeeded?
+  \item What happens to in-flight transfers when Kubernetes sends \texttt{SIGTERM}?
+\end{itemize}
+
+\chapterline
+
+\section{The PostgreSQL Schema: Constraints as a Second Line of Defense}
+\label{ch14:schema}
+
+Chapter~13 made illegal states unrepresentable inside Rust. But a database outlives any single binary. Over the years, other services, migration scripts, and an engineer in a \texttt{psql} session at 2 a.m.\ will all write to these tables. So we repeat the most important invariants in the schema itself, where no caller can skip them. The type system is the first line of defense; constraints are the second.
+
+Figure~\ref{ch14:fig-schema} shows the five tables and how they reference each other. Read it before the DDL: \texttt{accounts} holds one row per ledger account; each \texttt{journal\_entries} row is one atomic business event; \texttt{postings} holds the individual debit and credit legs of each entry; \texttt{idempotency\_keys} remembers which client requests we already answered; and \texttt{outbox\_events} queues notifications for other systems.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\scriptsize,
+  tbl/.style={draw, rounded corners=2pt, align=left, inner sep=4pt, text width=3.8cm},
+  hdr/.style={font=\footnotesize\bfseries}
+]
+\node[tbl, draw=sourceblue!85, fill=sourceblue!8] (acc) at (0, 0) {
+  {\footnotesize\bfseries accounts}\\[2pt]
+  \texttt{id} UUID PK\\
+  \texttt{kind} account\_kind\\
+  \texttt{currency} CHAR(3)\\
+  \texttt{allow\_negative} BOOLEAN\\
+  \texttt{balance\_minor} BIGINT\\
+  \texttt{version} BIGINT
+};
+\node[tbl, draw=structurepurple!85, fill=structurepurple!8] (je) at (10.3, 0) {
+  {\footnotesize\bfseries journal\_entries}\\[2pt]
+  \texttt{id} UUID PK\\
+  \texttt{tenant\_id} UUID\\
+  \texttt{currency} CHAR(3)\\
+  \texttt{description} TEXT\\
+  \texttt{reverses\_entry\_id} UUID FK
+};
+\node[tbl, draw=targetgreen!85, fill=targetgreen!8] (po) at (5.15, 0) {
+  {\footnotesize\bfseries postings}\\[2pt]
+  \texttt{id} BIGINT PK\\
+  \texttt{entry\_id} UUID FK\\
+  \texttt{account\_id} UUID FK\\
+  \texttt{side} CHAR(1) D or C\\
+  \texttt{amount\_minor} BIGINT $> 0$\\
+  \texttt{currency} CHAR(3)
+};
+\node[tbl, draw=quotientorange!90, fill=quotientorange!8] (ik) at (10.3, -3.6) {
+  {\footnotesize\bfseries idempotency\_keys}\\[2pt]
+  PK (\texttt{tenant\_id}, \texttt{key})\\
+  \texttt{request\_hash} BYTEA\\
+  \texttt{status} TEXT\\
+  \texttt{response\_body} JSONB\\
+  \texttt{entry\_id} UUID FK
+};
+\node[tbl, draw=trapred!80, fill=trapred!6] (ob) at (5.15, -3.6) {
+  {\footnotesize\bfseries outbox\_events}\\[2pt]
+  \texttt{id} BIGINT PK\\
+  \texttt{aggregate\_id} UUID\\
+  \texttt{event\_type} TEXT\\
+  \texttt{payload} JSONB\\
+  \texttt{published\_at} TIMESTAMPTZ
+};
+\draw[-{Stealth[length=2.2mm]}, thick, targetgreen!80!black] (po.west) -- node[above=1pt, fill=white, inner sep=1pt]{N:1} (acc.east);
+\draw[-{Stealth[length=2.2mm]}, thick, targetgreen!80!black] (po.east) -- node[above=1pt, fill=white, inner sep=1pt]{N:1} (je.west);
+\draw[-{Stealth[length=2.2mm]}, thick, quotientorange!90!black] (ik.north) -- node[right, fill=white, inner sep=1pt]{0 or 1} (je.south);
+\draw[-{Stealth[length=2.2mm]}, thick, dashed, trapred!80] (ob.north) -- node[right, fill=white, inner sep=1pt]{same tx} (po.south);
+\end{tikzpicture}
+\caption{The ledger schema. Every posting belongs to exactly one journal entry and one account. An idempotency record points at the entry it produced. Outbox rows are not linked by a foreign key, but they are always inserted in the same transaction as the postings they describe.}
+\label{ch14:fig-schema}
+\end{figure}
+
+Here is the migration, \texttt{migrations/0001\_ledger.sql}. Read each constraint as a sentence the database will enforce for every writer, forever.
+
+\begin{lstlisting}[language=SQL, caption={The core ledger schema with constraints that mirror the Rust domain invariants.}]
+CREATE TYPE account_kind AS ENUM
+    ('asset', 'liability', 'equity', 'revenue', 'expense');
+
+CREATE TABLE accounts (
+    id             UUID PRIMARY KEY,           -- UUIDv7, generated in Rust
+    tenant_id      UUID NOT NULL,
+    kind           account_kind NOT NULL,
+    currency       CHAR(3) NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+    allow_negative BOOLEAN NOT NULL DEFAULT FALSE,
+    balance_minor  BIGINT NOT NULL DEFAULT 0,  -- projection of postings
+    version        BIGINT NOT NULL DEFAULT 0,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT balance_floor CHECK (allow_negative OR balance_minor >= 0)
+);
+
+CREATE TABLE journal_entries (
+    id                UUID PRIMARY KEY,
+    tenant_id         UUID NOT NULL,
+    currency          CHAR(3) NOT NULL,
+    description       TEXT NOT NULL,
+    reverses_entry_id UUID REFERENCES journal_entries (id),
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE postings (
+    id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    entry_id     UUID NOT NULL REFERENCES journal_entries (id),
+    account_id   UUID NOT NULL REFERENCES accounts (id),
+    side         CHAR(1) NOT NULL CHECK (side IN ('D', 'C')),
+    amount_minor BIGINT NOT NULL CHECK (amount_minor > 0),
+    currency     CHAR(3) NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX postings_by_account ON postings (account_id, created_at, id);
+CREATE INDEX postings_by_entry   ON postings (entry_id);
+
+CREATE TABLE idempotency_keys (
+    tenant_id       UUID NOT NULL,
+    key             TEXT NOT NULL CHECK (length(key) BETWEEN 1 AND 128),
+    request_hash    BYTEA NOT NULL,            -- SHA-256 of canonical request
+    status          TEXT NOT NULL CHECK (status IN ('in_progress', 'completed')),
+    response_status SMALLINT,                  -- NULL until completed
+    response_body   JSONB,                     -- NULL until completed
+    entry_id        UUID REFERENCES journal_entries (id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, key)
+);
+
+CREATE TABLE outbox_events (
+    id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    aggregate_id UUID NOT NULL,
+    event_type   TEXT NOT NULL,
+    payload      JSONB NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at TIMESTAMPTZ
+);
+CREATE INDEX outbox_pending ON outbox_events (id) WHERE published_at IS NULL;
+
+CREATE TABLE fx_rates (
+    base_currency  CHAR(3) NOT NULL,
+    quote_currency CHAR(3) NOT NULL,
+    rate           NUMERIC(20, 8) NOT NULL CHECK (rate > 0),
+    valid_from     TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (base_currency, quote_currency, valid_from)
+);
+\end{lstlisting}
+
+A few of these lines deserve a closer look, because each one corresponds to a decision from earlier chapters.
+\begin{itemize}
+  \item \textbf{\texttt{BIGINT} for every amount.} PostgreSQL's \texttt{BIGINT} is an 8-byte signed integer, the exact twin of Rust's \texttt{i64}. Arithmetic on it is exact, and \texttt{SUM} never depends on row order. \texttt{NUMERIC} appears only in \texttt{fx\_rates}, where the value is a ratio with many decimal places; it maps to \texttt{rust\_decimal::Decimal}.
+  \item \textbf{\texttt{CHECK (amount\_minor > 0)}.} This is \texttt{PositiveMoney} from Chapter~13, restated in SQL. Direction lives in \texttt{side}, never in the sign of the amount.
+  \item \textbf{\texttt{balance\_floor}.} Customer wallets may not go negative; some internal accounts (a settlement clearing account, for instance) legitimately can. Rather than trusting application code to check, the constraint makes an overdraft impossible to commit.
+  \item \textbf{\texttt{balance\_minor} is a projection.} The source of truth is the immutable \texttt{postings} table. The balance column is a cached sum we update in the same transaction, so we can check and lock a balance with one indexed row read instead of summing millions of postings. A nightly job recomputes every balance from postings and pages someone if any projection disagrees.
+  \item \textbf{Indexes follow the queries.} \texttt{postings\_by\_account} serves statement pages (``all postings on account $X$ in October, in order''). The partial index \texttt{outbox\_pending} contains only unpublished rows, so it stays tiny no matter how many billions of events have been delivered.
+\end{itemize}
+
+\subsection{A Database-Level Balance Check}
+
+Our Rust \texttt{BalancedEntry} guarantees that every entry \emph{we} write balances. To protect against every other writer, we add a constraint trigger that re-checks the conservation law inside PostgreSQL. It is declared \texttt{DEFERRABLE INITIALLY DEFERRED}, which means it does not fire after each individual row insert (when the first posting of an entry is necessarily unbalanced) but once at \texttt{COMMIT}, when all legs are present.
+
+\begin{lstlisting}[language=SQL, caption={A deferred constraint trigger that rejects unbalanced journal entries at commit time.}]
+CREATE FUNCTION assert_entry_balanced() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    net BIGINT;
+BEGIN
+    SELECT COALESCE(SUM(CASE side WHEN 'D' THEN amount_minor
+                                  ELSE -amount_minor END), 0)
+      INTO net
+      FROM postings
+     WHERE entry_id = NEW.entry_id;
+    IF net <> 0 THEN
+        RAISE EXCEPTION 'journal entry % is unbalanced by %',
+            NEW.entry_id, net USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NULL;
+END $$;
+
+CREATE CONSTRAINT TRIGGER postings_must_balance
+    AFTER INSERT ON postings
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION assert_entry_balanced();
+\end{lstlisting}
+
+The trigger costs one indexed aggregate per posting at commit. For most ledgers that is a fair price for a guarantee that holds even when someone bypasses the Rust service entirely. Systems pushing tens of thousands of entries per second sometimes drop it and rely on the application type plus the nightly reconciliation; that is an explicit trade, and it should be written down as one.
+
+\section{SQLx: SQL Checked at Compile Time}
+\label{ch14:sqlx}
+
+If you wrote JDBC in Java~6, you remember the routine: build a SQL string, call \texttt{prepareStatement}, bind parameters by position with \texttt{setLong(2, ...)}, then pull columns out of a \texttt{ResultSet} with \texttt{getLong("balance\_minor")}. Every one of those steps is checked only at runtime. A typo in a column name, a parameter bound at the wrong index, or a nullable column read into a primitive \texttt{long} (which silently becomes \texttt{0}) all compile cleanly and fail in production.
+
+SQLx takes a different approach. Its \texttt{query!} and \texttt{query\_as!} macros run \emph{inside the compiler} and ask a real PostgreSQL server to check your SQL while \texttt{cargo build} runs.
+
+\subsection{What \texttt{query!} Does During \texttt{cargo build}}
+
+Take this query, which loads one account:
+
+\begin{lstlisting}[language=Rust, caption={A compile-time checked query with SQLx.}]
+let row = sqlx::query!(
+    r#"SELECT id, kind AS "kind: AccountKind", currency,
+              allow_negative, balance_minor
+         FROM accounts
+        WHERE id = $1"#,
+    account_id.as_uuid()
+)
+.fetch_one(&pool)
+.await?;
+
+let balance: i64 = row.balance_minor; // a plain i64, not Option<i64>
+\end{lstlisting}
+
+When \texttt{rustc} expands the \texttt{query!} macro, the macro code does the following:
+\begin{enumerate}
+  \item Reads \texttt{DATABASE\_URL} from the environment (or from \texttt{.env}) and opens a connection to a development database that has your migrations applied.
+  \item Sends the SQL text in a PostgreSQL \texttt{Parse} message followed by \texttt{Describe}. This is the same extended-protocol handshake used for prepared statements. PostgreSQL parses and plans the statement without running it. If the SQL has a syntax error or names a column that does not exist, the server replies with an error and the macro turns it into a \emph{compile error} pointing at your source line.
+  \item Reads the reply: a \texttt{ParameterDescription} listing the type OID of each \texttt{\$n} placeholder, and a \texttt{RowDescription} listing each output column's name and type OID.
+  \item Works out nullability. For a column read directly from a table, it looks up \texttt{attnotnull} in \texttt{pg\_attribute}. For expressions and joins, it inspects the query plan (via \texttt{EXPLAIN}) to see whether an outer join could produce \texttt{NULL}s.
+  \item Generates an anonymous struct with one field per column, typed by a fixed mapping: \texttt{BIGINT} becomes \texttt{i64}, \texttt{UUID} becomes \texttt{uuid::Uuid}, \texttt{BOOLEAN} becomes \texttt{bool}, \texttt{TIMESTAMPTZ} becomes a \texttt{time} or \texttt{chrono} timestamp, \texttt{NUMERIC} becomes \texttt{Decimal}, \texttt{JSONB} becomes \texttt{serde\_json::Value}. A \texttt{NOT NULL} column becomes \texttt{T}; a nullable one becomes \texttt{Option<T>}.
+  \item Checks that each Rust argument you passed can be encoded as the type PostgreSQL expects for its placeholder. Passing a \texttt{String} where \texttt{\$1} is a \texttt{UUID} is a compile error.
+\end{enumerate}
+
+The nullability rule is where SQLx earns the most trust in a ledger. The \texttt{response\_body} column of \texttt{idempotency\_keys} is nullable (it stays \texttt{NULL} until the request completes), so SQLx types it as an \texttt{Option} wrapping a JSON value. You cannot forget the \texttt{NULL} case, because the compiler will not let you treat an \texttt{Option} as a value. Compare JDBC, where \texttt{getLong} on a \texttt{NULL} column quietly returns \texttt{0} and you must remember to call \texttt{wasNull()} afterwards.
+
+\begin{trapbox}
+\textbf{\texttt{SUM} of a \texttt{BIGINT} column is not a \texttt{BIGINT}.} PostgreSQL widens \texttt{SUM(bigint)} to \texttt{NUMERIC} so the total cannot overflow, and it returns \texttt{NULL} when there are no rows. So
+\begin{lstlisting}[language=SQL]
+SELECT SUM(amount_minor) AS total FROM postings WHERE account_id = $1
+\end{lstlisting}
+gives you \texttt{Option<Decimal>}, not \texttt{i64}. SQLx is reporting the truth here, and the fix is to say what you mean: \texttt{COALESCE(SUM(amount\_minor), 0)::BIGINT AS "total!"}. The cast restores \texttt{BIGINT} (and will raise an error rather than wrap if the sum ever exceeds the \texttt{i64} range), and the \texttt{!} suffix in the alias tells SQLx to treat the column as non-null. The opposite override, \texttt{"name?"}, forces a column to \texttt{Option<T>}; and \texttt{"kind: AccountKind"} tells SQLx to decode into your own type, here a Rust enum declared with \texttt{\#[derive(sqlx::Type)]} that matches the PostgreSQL \texttt{account\_kind} enum.
+\end{trapbox}
+
+\subsection{Offline Mode: Building Without a Database}
+
+Requiring a live database for every build would make CI painful. SQLx solves this with offline metadata. Running \texttt{cargo sqlx prepare} against your development database writes one JSON file per query into a \texttt{.sqlx/} directory, keyed by a hash of the query text. Each file records the parameter types, column types, and nullability the server reported. You commit \texttt{.sqlx/} to version control. In CI, setting \texttt{SQLX\_OFFLINE=true} makes the macros read those files instead of connecting anywhere. If someone edits a query without re-running \texttt{prepare}, the hash no longer matches, and the build fails with a message telling them exactly that. A CI step running \texttt{cargo sqlx prepare --check} catches a stale \texttt{.sqlx/} directory before merge.
+
+\subsection{Connection Pools and the Settings That Protect You}
+
+A PostgreSQL connection is not a lightweight handle. Each one is a separate operating-system process on the database server with its own memory (several megabytes once it has run a few queries), and opening one costs a TCP handshake, TLS negotiation, and authentication. So we open a fixed set once and share them through a \texttt{PgPool}.
+
+\begin{lstlisting}[language=Rust, caption={Configuring a PgPool with explicit limits and per-session safety timeouts.}]
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::Executor;
+use std::time::Duration;
+
+pub async fn build_pool(opts: PgConnectOptions) -> Result<PgPool, sqlx::Error> {
+    PgPoolOptions::new()
+        .max_connections(32)
+        .min_connections(4)
+        .acquire_timeout(Duration::from_millis(500))
+        .idle_timeout(Duration::from_secs(300))
+        .max_lifetime(Duration::from_secs(30 * 60))
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                conn.execute(
+                    "SET statement_timeout = '5s';
+                     SET lock_timeout = '2s';
+                     SET idle_in_transaction_session_timeout = '10s';",
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .connect_with(opts)
+        .await
+}
+\end{lstlisting}
+
+Each setting answers a specific failure:
+\begin{itemize}
+  \item \textbf{\texttt{max\_connections(32)}.} More connections do not mean more throughput. PostgreSQL does real work on CPU cores and disks; past a few connections per core, extra connections just contend for locks and caches. Recall Little's Law from Chapter~12: with transactions holding a connection for $4\text{ ms}$, $32$ connections sustain about $8{,}000$ transactions per second. If you run $10$ service replicas, the database sees $320$ connections, which is why large deployments put PgBouncer in front.
+  \item \textbf{\texttt{acquire\_timeout(500 ms)}.} When all $32$ connections are busy, a new request waits in the pool's queue. Without a timeout, a slow database turns into an unbounded pile of waiting futures. With one, the request fails fast and the handler can return \texttt{503} with \texttt{Retry-After}.
+  \item \textbf{\texttt{max\_lifetime}.} Recycling connections every 30 minutes lets the pool follow DNS changes after a failover and releases memory that long-lived server processes accumulate.
+  \item \textbf{\texttt{statement\_timeout}, \texttt{lock\_timeout}.} The database will cancel any statement running longer than 5 seconds and any lock wait longer than 2 seconds. A bad query plan or a stuck lock becomes an error you can see instead of a hung request.
+  \item \textbf{\texttt{idle\_in\_transaction\_session\_timeout}.} If a transaction is open but idle for 10 seconds (for instance, because application code is waiting on something it should not be), PostgreSQL terminates the session and rolls the transaction back, releasing every row lock it held.
+\end{itemize}
+
+\subsection{\texttt{Transaction} as an RAII Guard}
+
+In Chapter~12 we saw that a dropped future runs the destructors of everything it holds. SQLx's \texttt{Transaction} type is built for exactly that situation.
+
+\begin{lstlisting}[language=Rust, caption={The lifecycle of an SQLx transaction: commit consumes it, every other exit rolls it back.}]
+let mut tx: sqlx::Transaction<'_, Postgres> = pool.begin().await?; // BEGIN
+
+sqlx::query!("UPDATE accounts SET version = version + 1 WHERE id = $1", id)
+    .execute(&mut *tx)     // runs on the transaction's own connection
+    .await?;               // an Err here returns early: tx is dropped
+
+tx.commit().await?;        // COMMIT; takes `tx` by value
+\end{lstlisting}
+
+Three paths lead out of this code, and only one of them commits:
+\begin{enumerate}
+  \item \textbf{\texttt{tx.commit()}.} It takes \texttt{self} by value, so after a successful commit the variable \texttt{tx} no longer exists. You cannot accidentally run another statement on a finished transaction; the compiler reports ``use of moved value''.
+  \item \textbf{An early return through \texttt{?}, or a panic.} \texttt{tx} goes out of scope without being committed, and its \texttt{Drop} implementation runs.
+  \item \textbf{The handler future is dropped} because the client disconnected or a timeout fired. Every live local, including \texttt{tx}, is dropped where it stands.
+\end{enumerate}
+In cases 2 and 3, \texttt{Drop} cannot \texttt{.await} --- destructors in Rust are synchronous --- so it cannot send \texttt{ROLLBACK} and wait for the reply. Instead SQLx marks the connection as having an open transaction and returns it to the pool; the pool sends \texttt{ROLLBACK} before handing that connection to anyone else. If the process dies outright, the TCP connection closes and PostgreSQL rolls back the transaction itself. In every case the outcome is the same: none of the transaction's writes become visible. That is the property we needed at the end of Chapter~12.
+
+\section{Two Withdrawals, One Balance: Concurrency Done Right}
+\label{ch14:concurrency}
+
+Alice's wallet holds $\$100.00$ (\texttt{10\_000} cents). She taps ``Pay $\$80$'' on her phone and, because the screen seemed frozen, taps it again on her laptop. Two requests with different idempotency keys arrive at two different service replicas within the same millisecond. Exactly one should succeed.
+
+\subsection{The Naive Version and Its Race}
+
+Here is the code most people write first. It reads the balance, checks it in Rust, and writes the result back.
+
+\begin{lstlisting}[language=Rust, caption={BROKEN: read, check in application code, then write.}]
+let mut tx = pool.begin().await?;              // READ COMMITTED by default
+
+let bal = sqlx::query_scalar!(
+    "SELECT balance_minor FROM accounts WHERE id = $1", alice
+).fetch_one(&mut *tx).await?;
+
+if bal < amount {
+    return Err(LedgerError::InsufficientFunds);
+}
+
+sqlx::query!(
+    "UPDATE accounts SET balance_minor = $1 WHERE id = $2",
+    bal - amount, alice                         // writes a value computed in Rust
+).execute(&mut *tx).await?;
+// ... insert postings ...
+tx.commit().await?;
+\end{lstlisting}
+
+Follow the two transactions step by step (the left half of Figure~\ref{ch14:fig-race}):
+\begin{enumerate}
+  \item $T_1$ reads \texttt{balance\_minor = 10000}.
+  \item $T_2$ reads \texttt{balance\_minor = 10000}. Plain \texttt{SELECT} takes no row lock, and under \texttt{READ COMMITTED} each statement sees all data committed before it began. $T_1$ has not committed, so $T_2$ sees the old value.
+  \item $T_1$ checks $10{,}000 \ge 8{,}000$ in Rust: OK. It writes \texttt{balance\_minor = 2000} and inserts its postings.
+  \item $T_2$ checks $10{,}000 \ge 8{,}000$ in Rust: OK, based on a value that is about to become stale. It tries to write \texttt{balance\_minor = 2000} and blocks, because $T_1$ holds the row lock taken by its \texttt{UPDATE}.
+  \item $T_1$ commits. $T_2$'s \texttt{UPDATE} proceeds and writes \texttt{2000} again. $T_2$ commits.
+\end{enumerate}
+The postings table now shows $\$160$ leaving a $\$100$ wallet, but the balance column says $\$20$. This is a \emph{lost update}: $T_2$ overwrote $T_1$'s write with a value computed from a stale read. The projection and the postings disagree, and Alice has spent money she did not have.
+
+What if we write \texttt{SET balance\_minor = balance\_minor - \$1} instead of a precomputed value? Then step~5 changes. When $T_2$'s \texttt{UPDATE} unblocks, PostgreSQL notices that the row it was waiting for has been updated, and re-evaluates the statement against the newest committed version of the row (this is called EvalPlanQual re-checking). $T_2$ computes $2{,}000 - 8{,}000 = -6{,}000$. Our \texttt{balance\_floor} constraint rejects it, so $T_2$ fails with a \texttt{check\_violation}. The constraint saved us, but the Rust-side check \texttt{bal < amount} was useless: it looked at a number that was already out of date by the time it mattered. This is what $T_2$ receives:
+\begin{lstlisting}[language=Plain]
+ERROR:  new row for relation "accounts" violates check constraint "balance_floor"
+DETAIL: Failing row contains (0190f1c2-..., ..., liability, USD, f, -6000, ...).
+SQLSTATE: 23514
+\end{lstlisting}
+In SQLx it arrives as \texttt{sqlx::Error::Database}, and calling \texttt{.code()} on the inner error returns \texttt{"23514"}. In our finished service this path should never fire, because \texttt{commit\_entry} (below) checks the floor itself while holding the row lock. If it ever does fire, the error falls through to a \texttt{500} and an alert, because it means the application and the schema disagree about the rules.
+
+\subsection{Fix 1: A Single Conditional Statement}
+
+For a single-account debit, the cleanest fix moves the check into the same statement as the write:
+
+\begin{lstlisting}[language=SQL]
+UPDATE accounts
+   SET balance_minor = balance_minor - $1, version = version + 1
+ WHERE id = $2
+   AND (allow_negative OR balance_minor >= $1)
+RETURNING balance_minor;
+\end{lstlisting}
+
+If $T_2$ blocks behind $T_1$, PostgreSQL re-checks the whole \texttt{WHERE} clause against the row $T_1$ committed. The condition $2{,}000 \ge 8{,}000$ is false, so the statement updates zero rows and returns nothing. The Rust code sees an empty result and returns \texttt{InsufficientFunds}. No stale read exists anywhere, because there is no separate read.
+
+\subsection{Fix 2: Lock Every Touched Account, in Sorted Order}
+
+A real journal entry touches several accounts: Alice's wallet, the merchant's wallet, and the platform fee account. We need to read all their kinds, currencies, and balances, apply every posting with checked arithmetic, and write the results back, without any other transaction changing those rows underneath us. \texttt{SELECT ... FOR UPDATE} does this: it reads the rows and takes an exclusive row lock on each one, held until commit or rollback. Any other transaction that tries to lock or update those rows waits.
+
+That raises a new hazard. Suppose $T_1$ transfers from account $A$ to account $B$, and $T_2$ transfers from $B$ to $A$, and each locks the accounts in the order it mentions them:
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Time} & $T_1$ ($A \to B$) & $T_2$ ($B \to A$) \\
+\midrule
+$t_1$ & locks $A$ & locks $B$ \\
+$t_2$ & waits for $B$ (held by $T_2$) & waits for $A$ (held by $T_1$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+Each waits for the other forever. This is a deadlock. PostgreSQL detects it after \texttt{deadlock\_timeout} (one second by default), picks one transaction, and aborts it with error code \texttt{40P01}. Nothing is corrupted, but one customer waited a full second for an error that looks like this:
+\begin{lstlisting}[language=Plain]
+ERROR:  deadlock detected
+DETAIL: Process 41207 waits for ShareLock on transaction 918344; blocked by process 41211.
+        Process 41211 waits for ShareLock on transaction 918343; blocked by process 41207.
+HINT:   See server log for query details.
+SQLSTATE: 40P01
+\end{lstlisting}
+
+The standard fix is simple: \textbf{every transaction acquires locks in the same global order.} If both $T_1$ and $T_2$ lock the lower account ID first, a cycle is impossible. Whichever transaction gets the first lock also gets the second, and the other waits in line. Our \texttt{AccountId} derives \texttt{Ord} (Chapter~13) for this reason, and the SQL makes the order explicit:
+
+\begin{lstlisting}[language=SQL]
+SELECT id, kind, currency, allow_negative, balance_minor
+  FROM accounts
+ WHERE id = ANY($1)
+ ORDER BY id
+   FOR UPDATE;
+\end{lstlisting}
+
+In the query plan, the row-locking step sits above the sort, so PostgreSQL locks rows in the order they come out of \texttt{ORDER BY id}. We also sort and de-duplicate the IDs in Rust before sending them, so the code states the rule as well.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\scriptsize,
+  ev/.style={draw, rounded corners=1.5pt, minimum width=2.9cm, minimum height=0.55cm, align=center, inner sep=2pt},
+  t1/.style={ev, draw=sourceblue!85, fill=sourceblue!10},
+  t2/.style={ev, draw=quotientorange!90, fill=quotientorange!12},
+  bad/.style={ev, draw=trapred!85, fill=trapred!14},
+  good/.style={ev, draw=targetgreen!85, fill=targetgreen!14}
+]
+% Left panel: naive
+\node[font=\footnotesize\bfseries, text=trapred!90!black] at (-3.6, 4.15) {Naive read, check, write};
+\node[font=\footnotesize\bfseries] at (-5.25, 3.6) {$T_1$};
+\node[font=\footnotesize\bfseries] at (-1.95, 3.6) {$T_2$};
+\node[t1] at (-5.25, 3.0) {read bal = 10000};
+\node[t2] at (-1.95, 2.35) {read bal = 10000};
+\node[t1] at (-5.25, 1.7) {check OK; write 2000};
+\node[t2] at (-1.95, 1.05) {check OK; write blocks};
+\node[t1] at (-5.25, 0.4) {COMMIT};
+\node[bad] at (-1.95, -0.25) {writes 2000; COMMIT};
+\node[bad, minimum width=6.2cm] at (-3.6, -1.05) {16000 debited; balance says 2000};
+
+% Right panel: FOR UPDATE
+\node[font=\footnotesize\bfseries, text=targetgreen!75!black] at (3.6, 4.15) {Sorted \texttt{SELECT ... FOR UPDATE}};
+\node[font=\footnotesize\bfseries] at (1.95, 3.6) {$T_1$};
+\node[font=\footnotesize\bfseries] at (5.25, 3.6) {$T_2$};
+\node[t1] at (1.95, 3.0) {lock + read 10000};
+\node[t2] at (5.25, 2.35) {lock request waits};
+\node[t1] at (1.95, 1.7) {check OK; write 2000};
+\node[t1] at (1.95, 1.05) {COMMIT; unlock};
+\node[t2] at (5.25, 0.4) {lock + read 2000};
+\node[good] at (5.25, -0.25) {check fails; ROLLBACK};
+\node[good, minimum width=6.2cm] at (3.6, -1.05) {one $\$80$ payment; balance 2000};
+
+% time arrows
+\draw[-{Stealth[length=2mm]}, gray!70] (-7.05, 3.3) -- node[left, rotate=90, anchor=south]{time} (-7.05, -0.5);
+\draw[gray!50, dashed] (0, 4.0) -- (0, -1.4);
+\draw[-{Stealth[length=2mm]}, thick, quotientorange!90!black, dashed] (5.25, 2.08) -- (5.25, 0.68);
+\end{tikzpicture}
+\caption{Two concurrent \$80 debits against a \$100 balance. On the left, both transactions read the same balance before either writes, so both checks pass and the second write erases the first. On the right, $T_2$'s lock request waits until $T_1$ commits, then reads the true balance of \$20 and is rejected.}
+\label{ch14:fig-race}
+\end{figure}
+
+\subsection{The Repository Function: \texttt{commit\_entry}}
+
+Now we can write the function that turns a \texttt{BalancedEntry} into rows. Its signature is the payoff of Chapter~13: it accepts only a sealed entry, so it cannot be handed an unbalanced one.
+
+\begin{lstlisting}[language=Rust, caption={Persisting a BalancedEntry: canonical locking, checked balance math, batch inserts, and an outbox event in one transaction.}]
+#[derive(Debug, thiserror::Error)]
+pub enum LedgerError {
+    #[error("unknown account {0}")]
+    UnknownAccount(Uuid),
+    #[error("account {0} currency does not match entry")]
+    CurrencyMismatch(Uuid),
+    #[error("insufficient funds in account {0}")]
+    InsufficientFunds(Uuid),
+    #[error("balance arithmetic overflow")]
+    Overflow,
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
+struct LockedAccount {
+    id: Uuid,
+    kind: AccountKind,
+    currency: String,
+    allow_negative: bool,
+    balance_minor: i64,
+}
+
+pub async fn commit_entry(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    tenant: TenantId,
+    entry: &BalancedEntry,
+) -> Result<(), LedgerError> {
+    // 1. Canonical lock order: sorted, de-duplicated account ids.
+    let mut ids: Vec<Uuid> = entry
+        .postings()
+        .iter()
+        .map(|p| p.account_id().as_uuid())
+        .collect();
+    ids.sort();
+    ids.dedup();
+
+    let rows = sqlx::query_as!(
+        LockedAccount,
+        r#"SELECT id, kind AS "kind: AccountKind", currency,
+                  allow_negative, balance_minor
+             FROM accounts
+            WHERE id = ANY($1) AND tenant_id = $2
+            ORDER BY id
+              FOR UPDATE"#,
+        &ids[..],
+        tenant.as_uuid()
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut accounts: HashMap<Uuid, LockedAccount> =
+        rows.into_iter().map(|r| (r.id, r)).collect();
+
+    // 2. Apply every posting in memory with checked arithmetic.
+    for p in entry.postings() {
+        let id = p.account_id().as_uuid();
+        let acct = accounts
+            .get_mut(&id)
+            .ok_or(LedgerError::UnknownAccount(id))?;
+        if acct.currency != entry.currency().as_str() {
+            return Err(LedgerError::CurrencyMismatch(id));
+        }
+        let delta = p.side().signed_delta(acct.kind, p.amount().minor());
+        acct.balance_minor = acct
+            .balance_minor
+            .checked_add(delta)
+            .ok_or(LedgerError::Overflow)?;
+    }
+    for acct in accounts.values() {
+        if !acct.allow_negative && acct.balance_minor < 0 {
+            return Err(LedgerError::InsufficientFunds(acct.id));
+        }
+    }
+
+    // 3. Append the immutable journal rows.
+    sqlx::query!(
+        "INSERT INTO journal_entries (id, tenant_id, currency, description)
+         VALUES ($1, $2, $3, $4)",
+        entry.id().as_uuid(),
+        tenant.as_uuid(),
+        entry.currency().as_str(),
+        entry.description()
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    let acct_ids: Vec<Uuid> =
+        entry.postings().iter().map(|p| p.account_id().as_uuid()).collect();
+    let sides: Vec<String> = entry
+        .postings()
+        .iter()
+        .map(|p| match p.side() {
+            EntrySide::Debit => "D".to_owned(),
+            EntrySide::Credit => "C".to_owned(),
+        })
+        .collect();
+    let amounts: Vec<i64> =
+        entry.postings().iter().map(|p| p.amount().minor()).collect();
+
+    sqlx::query!(
+        "INSERT INTO postings (entry_id, account_id, side, amount_minor, currency)
+         SELECT $1, t.account_id, t.side, t.amount, $5
+           FROM UNNEST($2::uuid[], $3::text[], $4::int8[])
+                AS t(account_id, side, amount)",
+        entry.id().as_uuid(),
+        &acct_ids[..],
+        &sides[..],
+        &amounts[..],
+        entry.currency().as_str()
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    // 4. Write back the balance projections in one statement.
+    let (upd_ids, upd_bals): (Vec<Uuid>, Vec<i64>) =
+        accounts.values().map(|a| (a.id, a.balance_minor)).unzip();
+    sqlx::query!(
+        "UPDATE accounts AS a
+            SET balance_minor = v.bal, version = a.version + 1
+           FROM UNNEST($1::uuid[], $2::int8[]) AS v(id, bal)
+          WHERE a.id = v.id",
+        &upd_ids[..],
+        &upd_bals[..]
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    // 5. Record the event for other systems, in the same transaction.
+    sqlx::query!(
+        "INSERT INTO outbox_events (aggregate_id, event_type, payload)
+         VALUES ($1, 'ledger.entry_committed', $2)",
+        entry.id().as_uuid(),
+        serde_json::json!({ "entry_id": entry.id().as_uuid() })
+    )
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("NOTIFY outbox").execute(&mut **tx).await?;
+
+    Ok(())
+}
+\end{lstlisting}
+
+A few details are worth slowing down for.
+\begin{itemize}
+  \item \textbf{\texttt{\&mut **tx}.} The parameter \texttt{tx} is a \texttt{\&mut Transaction}. One \texttt{*} reaches the \texttt{Transaction}; the second goes through its \texttt{DerefMut} to the underlying \texttt{PgConnection}, which is what SQLx accepts as an executor. Every statement runs on the same connection, inside the same transaction.
+  \item \textbf{Locks are held, not just taken.} Between step~1 and \texttt{COMMIT}, no other transaction can change any of these balances. Steps 2 through 5 therefore work with numbers that stay true until commit.
+  \item \textbf{\texttt{UNNEST}} turns parallel arrays into a set of rows, so inserting a three-leg entry costs one round trip rather than three.
+  \item \textbf{\texttt{NOTIFY}} is transactional: PostgreSQL holds the notification and delivers it only if the transaction commits. A rolled-back transfer never wakes the outbox worker.
+  \item \textbf{The fee account is a hot row.} Every transfer that charges a fee locks the platform's single fee-revenue account. At high volume, that one row serializes all transfers. A common remedy is to split it into $N$ shard accounts (\texttt{fee\_revenue\_00} through \texttt{fee\_revenue\_15}) and pick one by hashing the entry ID; reports sum the shards.
+\end{itemize}
+
+\subsection{Fix 3: \texttt{SERIALIZABLE} and the Retry Loop}
+
+PostgreSQL also offers the strongest isolation level, \texttt{SERIALIZABLE}. Under it, you write plain reads and writes with no \texttt{FOR UPDATE}, and PostgreSQL guarantees that the result equals \emph{some} one-at-a-time ordering of the committed transactions. It does this with Serializable Snapshot Isolation: it tracks which transactions read data that others later wrote, and when it finds a pattern that could not occur in any serial order, it aborts one of the transactions with error code \texttt{40001} (\texttt{serialization\_failure}).
+
+That shifts work onto the application: \textbf{every serializable transaction must be retryable}. You re-run the whole transaction from \texttt{BEGIN}, because its earlier reads are no longer valid. In Rust, the cleanest shape is a loop around a function that performs one complete attempt:
+
+\begin{lstlisting}[language=Rust, caption={Retrying a whole transaction on serialization failures and deadlocks with jittered backoff.}]
+pub trait Retryable {
+    fn is_retryable(&self) -> bool;
+}
+
+/// 40001 = serialization_failure, 40P01 = deadlock_detected.
+pub fn sqlstate_is_retryable(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db) => {
+            matches!(db.code().as_deref(), Some("40001") | Some("40P01"))
+        }
+        _ => false,
+    }
+}
+
+impl Retryable for LedgerError {
+    fn is_retryable(&self) -> bool {
+        matches!(self, LedgerError::Db(e) if sqlstate_is_retryable(e))
+    }
+}
+
+pub async fn with_retries<T, E, F, Fut>(mut attempt: F) -> Result<T, E>
+where
+    E: Retryable,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut delay_ms = 5u64;
+    for n in 1..=5 {
+        match attempt().await {
+            Err(e) if e.is_retryable() && n < 5 => {
+                let jitter = rand::random::<u64>() % delay_ms;
+                tokio::time::sleep(Duration::from_millis(delay_ms + jitter)).await;
+                delay_ms *= 2;
+            }
+            other => return other,
+        }
+    }
+    unreachable!("the final attempt always returns")
+}
+\end{lstlisting}
+
+Each call to \texttt{attempt()} opens a fresh transaction (for example with \texttt{pool.begin()} followed by \texttt{SET TRANSACTION ISOLATION LEVEL SERIALIZABLE}), so a retry never reuses a doomed one. The helper is generic over the error type: any error that implements the small \texttt{Retryable} trait can use it, which is how the HTTP handler later reuses it with its own error type. Note that \texttt{40P01} is in the list too: even with sorted locking, a deadlock can arise from other code paths, and retrying is the correct response.
+
+Which approach should a ledger use? Both are correct; they fail differently under load.
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.2cm}p{5.5cm}p{5.5cm}@{}}
+\toprule
+ & \textbf{Sorted \texttt{FOR UPDATE}} & \textbf{\texttt{SERIALIZABLE} + retry} \\
+\midrule
+Under contention & Transactions queue and wait; latency rises smoothly & Transactions abort and retry; wasted work rises \\
+Code burden & Must lock every row you rely on, in order & Must make every transaction safely re-runnable \\
+Protects against & Exactly the rows you locked & Any anomaly, including ones you did not foresee \\
+Typical use & Hot-path money movement & Complex reads and rules across many tables \\
+\bottomrule
+\end{tabular}
+\end{center}
+Our transfer path uses sorted \texttt{FOR UPDATE} under \texttt{READ COMMITTED}, because the set of rows it depends on is known exactly, and we still wrap it in \texttt{with\_retries} to absorb the occasional \texttt{40P01}.
+
+\section{Idempotency Keys: Safe Retries Over an Unreliable Network}
+\label{ch14:idempotency}
+
+Locks stop two \emph{different} payments from overdrawing an account. They do nothing about the \emph{same} payment arriving twice. And over a real network, the same payment arrives twice all the time. Picture this sequence:
+\begin{enumerate}
+  \item The client sends ``transfer \$80.''
+  \item Our service commits the entry and starts writing the \texttt{201 Created} response.
+  \item A mobile network handover drops the TCP connection. The client never sees the response.
+  \item From the client's side, the outcome is unknown. It does the reasonable thing and retries.
+\end{enumerate}
+Without protection, step~4 moves another \$80. The client cannot avoid this: it simply has no way to tell ``the request never arrived'' apart from ``the response never arrived.''
+
+The fix, popularized by Stripe's API, is the \emph{idempotency key}. The client generates a unique key per logical operation (a UUID is fine) and sends it in a header on the first attempt and on every retry. The server promises: \textbf{for a given key, the operation happens at most once, and every retry receives the same response as the first successful attempt.}
+
+\subsection{The Protocol, Step by Step}
+
+We store each key in \texttt{idempotency\_keys} together with a SHA-256 hash of the request, the response we sent, and the entry we created. All of it happens \emph{inside the same database transaction} as the ledger write. That single decision is what makes the scheme correct: the stored response and the money movement commit together or not at all. There is no window in which the money moved but the key was not recorded, or the key was recorded but the money did not move.
+
+\begin{lstlisting}[language=Rust, caption={Executing a transfer exactly once per idempotency key, inside one transaction.}]
+pub enum TransferOutcome {
+    Fresh(StoredResponse),    // we executed it just now
+    Replayed(StoredResponse), // we executed it earlier; same answer
+}
+
+pub async fn execute_once(
+    pool: &PgPool,
+    tenant: TenantId,
+    key: &IdempotencyKey,
+    request_hash: [u8; 32],
+    entry: &BalancedEntry,
+) -> Result<TransferOutcome, ApiError> {
+    let mut tx = pool.begin().await?;
+
+    // 1. Claim the key. If another transaction holds an uncommitted claim
+    //    on the same key, this INSERT waits until that transaction ends.
+    let claimed = sqlx::query_scalar!(
+        "INSERT INTO idempotency_keys (tenant_id, key, request_hash, status)
+         VALUES ($1, $2, $3, 'in_progress')
+         ON CONFLICT (tenant_id, key) DO NOTHING
+         RETURNING true AS \"claimed!\"",
+        tenant.as_uuid(),
+        key.as_str(),
+        &request_hash[..]
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .is_some();
+
+    if !claimed {
+        // 2. The key already exists and is committed. Replay or reject.
+        let prior = sqlx::query!(
+            "SELECT request_hash, status, response_status, response_body
+               FROM idempotency_keys
+              WHERE tenant_id = $1 AND key = $2",
+            tenant.as_uuid(),
+            key.as_str()
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if prior.request_hash != request_hash {
+            return Err(ApiError::IdempotencyKeyReused);
+        }
+        return match (prior.status.as_str(), prior.response_status, prior.response_body) {
+            ("completed", Some(status), Some(body)) => {
+                Ok(TransferOutcome::Replayed(StoredResponse { status, body }))
+            }
+            _ => Err(ApiError::RequestInProgress),
+        };
+    }
+
+    // 3. First time we see this key: move the money.
+    ledger::commit_entry(&mut tx, tenant, entry).await?;
+
+    let response = StoredResponse::created(entry);
+    sqlx::query!(
+        "UPDATE idempotency_keys
+            SET status = 'completed', response_status = $3,
+                response_body = $4, entry_id = $5
+          WHERE tenant_id = $1 AND key = $2",
+        tenant.as_uuid(),
+        key.as_str(),
+        response.status,
+        &response.body,
+        entry.id().as_uuid()
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    // 4. One COMMIT makes the postings, balances, outbox row,
+    //    and stored response durable together.
+    tx.commit().await?;
+    Ok(TransferOutcome::Fresh(response))
+}
+\end{lstlisting}
+
+Walk through the cases this handles.
+\begin{itemize}
+  \item \textbf{First request.} The \texttt{INSERT} claims the key, the transfer runs, the response is stored, and everything commits together.
+  \item \textbf{Retry after a lost response.} The key exists with status \texttt{completed}. The hash matches, so we return the stored body and status. The client sees exactly what the first attempt would have shown it, and no money moves.
+  \item \textbf{Two copies racing.} Both try to insert the same primary key. PostgreSQL makes the second \texttt{INSERT} wait on the first transaction's uncommitted row. If the first commits, the second sees a conflict and replays the stored response. If the first rolls back (for example, insufficient funds), the second's insert succeeds and it runs the transfer itself, which is correct because the first one left no trace. This relies on \texttt{READ COMMITTED}: the follow-up \texttt{SELECT} is a new statement with a fresh snapshot, so it sees the row the other transaction just committed.
+  \item \textbf{Same key, different request.} A client bug reuses a key for a different amount. The hashes differ, and we return \texttt{422 Unprocessable Entity} rather than replaying an answer to a question the client did not ask.
+  \item \textbf{Failure mid-transfer.} If \texttt{commit\_entry} returns an error, or the handler future is dropped, the transaction rolls back and the key claim disappears with it. A later retry starts clean.
+\end{itemize}
+
+\begin{intuitionbox}
+\textbf{Why have an \texttt{in\_progress} status at all?} In the code above, an \texttt{in\_progress} row is never visible to anyone else, because it only exists inside an uncommitted transaction. The status earns its place when a request includes a side effect \emph{outside} the database, such as calling a card network. You cannot hold a database transaction open across a two-second HTTP call to a third party (it would hold row locks and trip \texttt{idle\_in\_transaction\_session\_timeout}). So you commit the \texttt{in\_progress} claim first, make the external call, and then complete the record in a second transaction. A retry that arrives in between sees \texttt{in\_progress} and gets \texttt{409 Conflict}, telling the client to wait and try again. Stripe describes this as splitting a request into atomic phases separated by recovery points.
+\end{intuitionbox}
+
+The request hash must be computed over a \emph{canonical} form of the request: the method, the path, and the parsed DTO serialized with a fixed field order. Hashing the raw body bytes would make two semantically identical requests (differing only in whitespace or key order) look different. Keys are scoped by tenant, so two customers can never collide, and a periodic job deletes keys older than 24 hours, which is the replay window we promise in the API documentation.
+
+\section{Axum and Tower: From Bytes to a Typed Handler}
+\label{ch14:axum}
+
+We now have a function that moves money exactly once. The last layer turns HTTP requests into calls to it and turns its results back into HTTP responses. Axum does this with ordinary Rust traits, and once you see those traits, its behavior stops being surprising.
+
+\subsection{Tower Middleware: Services Wrapping Services}
+
+Tower is a small library built around one trait:
+
+\begin{lstlisting}[language=Rust]
+pub trait Service<Request> {
+    type Response;
+    type Error;
+    type Future: Future<Output = Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+    fn call(&mut self, req: Request) -> Self::Future;
+}
+\end{lstlisting}
+
+A \texttt{Service} is an asynchronous function from a request to a response. \texttt{poll\_ready} lets a service say ``not now'' (for example, because a concurrency limit is reached), which is how Tower expresses backpressure. A \emph{layer} is a function that takes one service and returns another service wrapping it. Timeouts, request IDs, tracing, body-size limits, and load shedding are all layers. The innermost service is your Axum router. Figure~\ref{ch14:fig-request-path} shows a request passing inward through the layers to the handler, and the response passing back out.
+
+If you know Java servlet filters, this is the same idea with one difference: each layer's type is known at compile time, so the whole stack is monomorphized into direct calls (Chapter~6) with no virtual dispatch between layers.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\scriptsize,
+  layer/.style={draw, rounded corners=3pt, align=center},
+  stp/.style={draw=sourceblue!80, fill=sourceblue!8, rounded corners=2pt, minimum height=0.62cm, align=center, inner sep=3pt}
+]
+% Nested Tower layers
+\draw[layer, draw=gray!70, fill=gray!5] (-6.9, -1.95) rectangle (3.2, 2.25);
+\node[anchor=north west, font=\scriptsize\bfseries] at (-6.8, 2.2) {\texttt{TraceLayer}: span with \texttt{request\_id}};
+\draw[layer, draw=gray!70, fill=gray!10] (-6.6, -1.65) rectangle (2.9, 1.75);
+\node[anchor=north west, font=\scriptsize\bfseries] at (-6.5, 1.7) {\texttt{TimeoutLayer} (5 s): drops the inner future};
+\draw[layer, draw=gray!70, fill=gray!16] (-6.3, -1.35) rectangle (2.6, 1.25);
+\node[anchor=north west, font=\scriptsize\bfseries] at (-6.2, 1.2) {\texttt{RequestBodyLimitLayer} (64 KiB)};
+
+% Inside: extractors and handler
+\node[stp] (e1) at (-4.95, 0.2) {\texttt{State<AppState>}\\from parts};
+\node[stp] (e2) at (-2.25, 0.2) {\texttt{IdempotencyHeader}\\from parts};
+\node[stp] (e3) at (0.85, 0.2) {\texttt{Json<CreateTransferReq>}\\consumes body};
+\node[stp, draw=targetgreen!85, fill=targetgreen!12] (h) at (-0.45, -0.85) {\texttt{create\_transfer(...)} returns \texttt{Result<\_, ApiError>}};
+\draw[-{Stealth[length=1.8mm]}, thick, sourceblue] (e1) -- (e2);
+\draw[-{Stealth[length=1.8mm]}, thick, sourceblue] (e2) -- (e3);
+\draw[-{Stealth[length=1.8mm]}, thick, sourceblue] (e3.south) -- (e3.south |- h.north);
+
+% Postgres on the right
+\node[draw=structurepurple!85, fill=structurepurple!10, rounded corners=3pt, align=center, inner sep=4pt] (pg) at (5.0, -0.85) {\textbf{PostgreSQL}\\one transaction:\\locks, postings,\\idempotency, outbox};
+\draw[-{Stealth[length=2mm]}, thick, structurepurple] (h.east) -- (pg.west);
+
+% Request and response arrows
+\node[font=\scriptsize\bfseries, text=sourceblue!90!black, align=center] at (-7.6, 1.15) {HTTP\\request};
+\draw[-{Stealth[length=2mm]}, very thick, sourceblue] (-7.6, 0.7) -- (e1.west);
+\draw[-{Stealth[length=2mm]}, very thick, targetgreen!80!black] (h.west) -- (-7.6, -0.85);
+\node[font=\scriptsize, text=targetgreen!80!black, fill=gray!16, inner sep=1pt, above=1pt] at (-4.8, -0.85) {\texttt{IntoResponse}};
+\node[font=\scriptsize\bfseries, text=targetgreen!80!black, align=center] at (-7.6, -1.3) {HTTP\\response};
+\end{tikzpicture}
+\caption{The path of one request. Tower layers wrap the router from the outside in. Inside, Axum runs each extractor in argument order; only the last may consume the body. The handler's \texttt{Result} becomes an HTTP response through \texttt{IntoResponse}. If the timeout layer fires, it drops the inner future, and with it any open transaction.}
+\label{ch14:fig-request-path}
+\end{figure}
+
+\subsection{How Axum Calls a Plain \texttt{async fn}}
+
+Here is our handler. It is an ordinary \texttt{async fn}: no annotations, no base class, no reflection.
+
+\begin{lstlisting}[language=Rust, caption={The transfer handler. Each argument is an extractor; the return type implements IntoResponse.}]
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: PgPool,
+    pub fee_accounts: Arc<FeeAccountShards>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateTransferReq {
+    pub from: Uuid,
+    pub to: Uuid,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub fee_bps: u32,
+}
+
+#[tracing::instrument(
+    skip_all,
+    fields(tenant = %auth.tenant, idempotency_key = %key.0.as_str())
+)]
+pub async fn create_transfer(
+    State(state): State<AppState>,
+    auth: Authenticated,
+    key: IdempotencyHeader,
+    Json(req): Json<CreateTransferReq>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // Parse, don't validate: untrusted DTO -> domain types (Chapter 13).
+    let currency = Currency::parse(&req.currency) // Option<Currency>
+        .ok_or(ApiError::UnsupportedCurrency)?;
+    let gross = PositiveMoney::try_new(req.amount_minor, currency)
+        .map_err(LedgerDomainError::from)?;
+    let entry = build_peer_transfer_entry(
+        key.0.clone(),
+        AccountId::from_uuid(req.from),
+        AccountId::from_uuid(req.to),
+        state.fee_accounts.pick(currency),
+        gross,
+        req.fee_bps,
+    )?;
+
+    let hash = canonical_request_hash("POST", "/v1/transfers", &req);
+    let outcome = with_retries(|| {
+        execute_once(&state.pool, auth.tenant, &key.0, hash, &entry)
+    })
+    .await?;
+
+    let stored = match outcome {
+        TransferOutcome::Fresh(s) | TransferOutcome::Replayed(s) => s,
+    };
+    let status = StatusCode::from_u16(stored.status as u16)
+        .unwrap_or(StatusCode::OK);
+    Ok((status, Json(stored.body)))
+}
+\end{lstlisting}
+
+How can a router accept functions with any number of differently typed arguments? Through a trait that Axum implements, by macro, for every function shape from zero to sixteen arguments. The three-argument version looks roughly like this:
+
+\begin{lstlisting}[language=Rust, caption={A simplified view of Axum's Handler implementation for three-argument functions.}]
+impl<F, Fut, S, Res, M, T1, T2, T3> Handler<(M, T1, T2, T3), S> for F
+where
+    F: FnOnce(T1, T2, T3) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Res> + Send,
+    S: Send + Sync + 'static,
+    Res: IntoResponse,
+    T1: FromRequestParts<S> + Send,   // may read headers, URI, state
+    T2: FromRequestParts<S> + Send,   // may read headers, URI, state
+    T3: FromRequest<S, M> + Send,     // may consume the body
+{
+    // call(): split the request into parts and body, run T1 and T2
+    // against the parts, run T3 against parts + body, await F, then
+    // convert the output with IntoResponse.
+}
+\end{lstlisting}
+
+Read the bounds as the rules of the game:
+\begin{itemize}
+  \item \textbf{Every argument except the last implements \texttt{FromRequestParts}.} These extractors see only the request line, headers, and extensions. They cannot touch the body.
+  \item \textbf{Only the last argument may implement \texttt{FromRequest}}, which receives the body. A request body is a stream that can be read once, so only one extractor may consume it, and it must come last. If you put \texttt{Json<T>} first, the bounds are not satisfied and you get a compile error, usually phrased as ``the trait \texttt{Handler<\_, \_>} is not implemented.'' Adding \texttt{\#[axum::debug\_handler]} to the function makes the error point at the offending argument.
+  \item \textbf{\texttt{Fut: Send}.} Tokio may move the handler's future between worker threads at any \texttt{.await}, so the future must be \texttt{Send}. This is where the \texttt{MutexGuard} error from Chapter~12 shows up in practice.
+  \item \textbf{\texttt{Res: IntoResponse}.} Anything that can turn itself into an HTTP response can be returned. Tuples like \texttt{(StatusCode, Json<T>)} implement it, and so does \texttt{Result<T, E>} when both \texttt{T} and \texttt{E} do.
+\end{itemize}
+If any extractor fails, Axum does not call your function at all; it converts the extractor's \emph{rejection} into a response. A malformed JSON body produces \texttt{400} or \texttt{422} before a single line of your handler runs.
+
+\subsection{Writing Our Own Extractor}
+
+The idempotency key arrives in a header. We want handlers to receive the validated key type from Chapter~13, never a raw string. A custom extractor does that parsing once, for every handler that asks for it:
+
+\begin{lstlisting}[language=Rust, caption={A custom FromRequestParts extractor that parses and validates the Idempotency-Key header.}]
+pub struct IdempotencyHeader(pub IdempotencyKey);
+
+impl<S: Send + Sync> FromRequestParts<S> for IdempotencyHeader {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let raw = parts
+            .headers
+            .get("idempotency-key")
+            .ok_or(ApiError::MissingIdempotencyKey)?
+            .to_str()
+            .map_err(|_| ApiError::InvalidIdempotencyKey)?;
+        IdempotencyKey::parse(raw)
+            .map(IdempotencyHeader)
+            .map_err(|_| ApiError::InvalidIdempotencyKey)
+    }
+}
+\end{lstlisting}
+
+Now ``this endpoint requires a valid idempotency key'' is expressed in the handler's signature. A handler that lists \texttt{IdempotencyHeader} as an argument cannot run without one. \texttt{Authenticated}, which verifies the caller's token and yields a \texttt{TenantId}, follows the same pattern.
+
+\subsection{One Error Type, Mapped Once}
+
+Every failure in the request path converts into \texttt{ApiError}, and \texttt{ApiError} converts into an HTTP response in exactly one place.
+
+\begin{lstlisting}[language=Rust, caption={Centralized error mapping. Clients see stable codes; internal details go only to logs.}]
+#[derive(Debug, thiserror::Error)]
+pub enum ApiError {
+    #[error("missing Idempotency-Key header")]
+    MissingIdempotencyKey,
+    #[error("invalid Idempotency-Key header")]
+    InvalidIdempotencyKey,
+    #[error("idempotency key was used with a different request")]
+    IdempotencyKeyReused,
+    #[error("a request with this key is still in progress")]
+    RequestInProgress,
+    #[error("unsupported currency")]
+    UnsupportedCurrency,
+    #[error(transparent)]
+    Domain(#[from] LedgerDomainError),
+    #[error(transparent)]
+    Ledger(#[from] LedgerError),
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
+impl Retryable for ApiError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Db(e) => sqlstate_is_retryable(e),
+            Self::Ledger(e) => e.is_retryable(),
+            _ => false,
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, code) = match &self {
+            Self::MissingIdempotencyKey | Self::InvalidIdempotencyKey => {
+                (StatusCode::BAD_REQUEST, "invalid_idempotency_key")
+            }
+            Self::IdempotencyKeyReused => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "idempotency_key_reused")
+            }
+            Self::RequestInProgress => (StatusCode::CONFLICT, "request_in_progress"),
+            Self::Domain(_) | Self::UnsupportedCurrency => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "invalid_transfer")
+            }
+            Self::Ledger(LedgerError::InsufficientFunds(_)) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "insufficient_funds")
+            }
+            Self::Ledger(LedgerError::UnknownAccount(_)) => {
+                (StatusCode::NOT_FOUND, "account_not_found")
+            }
+            Self::Db(sqlx::Error::PoolTimedOut) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "overloaded")
+            }
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+        };
+        if status.is_server_error() {
+            tracing::error!(error = ?self, "request failed");
+        }
+        (status, Json(serde_json::json!({ "error": code }))).into_response()
+    }
+}
+\end{lstlisting}
+
+The \texttt{\#[from]} attributes generate \texttt{From} implementations, which is what lets the handler use \texttt{?} on calls returning \texttt{sqlx::Error}, \texttt{LedgerError}, or \texttt{LedgerDomainError}. The client sees a stable machine-readable code. The full error, which may contain SQL text or account IDs, goes only to the logs.
+
+\subsection{Tracing Across Threads}
+
+In a Java~6 servlet, you might put the request ID in log4j's \texttt{MDC}, which is backed by a \texttt{ThreadLocal}. That works because one thread runs one request from start to finish. In Tokio it breaks: a task can start on worker~0, suspend at an \texttt{.await}, and resume on worker~3, and meanwhile worker~0 runs other requests. A thread-local would attach the wrong request ID to half your log lines.
+
+The \texttt{tracing} crate attaches context to the \emph{future} instead of the thread. \texttt{\#[tracing::instrument]} wraps the handler's future in an \texttt{Instrumented} adapter whose \texttt{poll} method enters the span, polls the inner future, and exits the span. Whichever thread polls the task, the span is active for exactly as long as the task runs. Every log line emitted inside \texttt{create\_transfer} or anything it calls carries \texttt{request\_id}, \texttt{tenant}, and \texttt{idempotency\_key}, and a JSON log formatter makes them searchable fields.
+
+\subsection{Assembling the Application and Shutting Down Gracefully}
+
+\begin{lstlisting}[language=Rust, caption={main: router, middleware, outbox worker, and graceful shutdown on SIGTERM.}]
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().json().init();
+
+    let pool = build_pool(PgConnectOptions::from_str(&env::var("DATABASE_URL")?)?)
+        .await?;
+    sqlx::migrate!("./migrations").run(&pool).await?;
+
+    let state = AppState {
+        pool: pool.clone(),
+        fee_accounts: Arc::new(FeeAccountShards::load(&pool).await?),
+    };
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let outbox = tokio::spawn(run_outbox_worker(pool.clone(), shutdown_rx));
+
+    let app = Router::new()
+        .route("/v1/transfers", post(create_transfer))
+        .route("/healthz", get(|| async { "ok" }))
+        .with_state(state)
+        .layer(
+            ServiceBuilder::new()
+                .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+                .layer(TraceLayer::new_for_http().make_span_with(request_span))
+                .layer(TimeoutLayer::new(Duration::from_secs(5)))
+                .layer(RequestBodyLimitLayer::new(64 * 1024))
+                .layer(PropagateRequestIdLayer::x_request_id()),
+        );
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // HTTP side has drained. Stop the outbox worker, then close the pool.
+    let _ = shutdown_tx.send(true);
+    outbox.await??;
+    pool.close().await;
+    Ok(())
+}
+
+fn request_span(req: &axum::http::Request<axum::body::Body>) -> tracing::Span {
+    let id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    tracing::info_span!("http", method = %req.method(),
+                        path = %req.uri().path(), request_id = %id)
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async { tokio::signal::ctrl_c().await.expect("install Ctrl-C") };
+    let term = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM")
+            .recv()
+            .await;
+    };
+    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
+    tracing::info!("shutdown signal received; draining in-flight requests");
+}
+\end{lstlisting}
+
+When Kubernetes wants to replace a pod, it sends \texttt{SIGTERM} and waits for a grace period (30 seconds by default) before sending \texttt{SIGKILL}. Here is what happens in our service during that window:
+\begin{enumerate}
+  \item \texttt{shutdown\_signal()} completes. \texttt{axum::serve} stops accepting new connections.
+  \item Requests already in progress keep running. Their futures are still polled to completion: a transfer halfway through \texttt{commit\_entry} finishes its statements, commits, stores its idempotent response, and writes its HTTP reply.
+  \item Once the last in-flight request finishes, \texttt{serve} returns. We tell the outbox worker to stop, wait for it, and close the pool, which waits for connections to be returned and closes them cleanly.
+\end{enumerate}
+What if a request is still running when \texttt{SIGKILL} arrives? The process dies, its TCP connections to PostgreSQL close, and PostgreSQL rolls back the open transaction. The client sees a dropped connection, retries with the same idempotency key against another pod, and either gets the replayed response (if the commit happened) or a fresh execution (if it did not). Every path ends in a consistent state. That is the result of three separate designs fitting together: atomic transactions, RAII rollback, and idempotency keys.
+
+\section{The Transactional Outbox: Telling Other Systems, Reliably}
+\label{ch14:outbox}
+
+After a transfer commits, other systems need to hear about it: a notification service sends Alice a receipt, a fraud model scores the payment, a data warehouse records it. The obvious approach is to publish a message to Kafka or a webhook right after \texttt{tx.commit()} returns. It fails in two directions:
+\begin{itemize}
+  \item \textbf{Commit succeeds, publish fails.} The broker is briefly unreachable, or the process is killed between the two calls. The money moved and nobody downstream ever hears about it.
+  \item \textbf{Publish first, commit fails.} Downstream systems react to a payment that was rolled back.
+\end{itemize}
+The underlying problem is that the database and the broker are two separate systems, and no single operation can commit to both.
+
+The \emph{transactional outbox} pattern removes the second system from the critical moment. In step~5 of \texttt{commit\_entry}, we inserted a row into \texttt{outbox\_events} \emph{in the same transaction} as the postings. Either both exist or neither does. A separate background worker then reads unpublished outbox rows and delivers them to the broker, as shown in Figure~\ref{ch14:fig-outbox}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\scriptsize,
+  box/.style={draw, rounded corners=3pt, align=center, inner sep=4pt, minimum height=1.1cm},
+]
+\node[box, draw=sourceblue!85, fill=sourceblue!10, minimum width=3.1cm] (h) at (0, 0) {\textbf{Transfer handler}\\\texttt{commit\_entry}};
+\node[box, draw=structurepurple!85, fill=structurepurple!10, minimum width=3.6cm] (db) at (4.6, 0) {\textbf{One PG transaction}\\postings + balances\\+ \texttt{outbox\_events} row};
+\node[box, draw=quotientorange!90, fill=quotientorange!12, minimum width=3.1cm] (w) at (4.6, -2.6) {\textbf{Outbox worker}\\\texttt{FOR UPDATE}\\\texttt{SKIP LOCKED}};
+\node[box, draw=targetgreen!85, fill=targetgreen!12, minimum width=2.8cm] (k) at (9.4, -2.6) {\textbf{Broker}\\Kafka, webhooks};
+\node[box, draw=gray!70, fill=gray!8, minimum width=2.8cm] (c) at (9.4, 0) {\textbf{Consumers}\\dedupe by event id};
+
+\draw[-{Stealth[length=2mm]}, thick, sourceblue] (h) -- node[above, font=\scriptsize]{COMMIT} (db);
+\draw[-{Stealth[length=2mm]}, thick, dashed, structurepurple] ([xshift=-6mm]db.south) -- node[left, font=\scriptsize, align=right]{NOTIFY\\(on commit)} ([xshift=-6mm]w.north);
+\draw[-{Stealth[length=2mm]}, thick, quotientorange!90!black] ([xshift=6mm]w.north) -- node[right, font=\scriptsize, align=left]{claim\\batch} ([xshift=6mm]db.south);
+\draw[-{Stealth[length=2mm]}, thick, targetgreen!80!black] (w) -- node[above, font=\scriptsize]{publish} (k);
+\draw[-{Stealth[length=2mm]}, thick, gray!70] (k) -- (c);
+\end{tikzpicture}
+\caption{The transactional outbox. The ledger write and the outbox row commit atomically. \texttt{NOTIFY} wakes the worker promptly, but correctness does not depend on it: the worker also polls. Workers claim rows with \texttt{SKIP LOCKED}, publish, and mark them sent. Delivery is at least once, so consumers deduplicate by event ID.}
+\label{ch14:fig-outbox}
+\end{figure}
+
+\begin{lstlisting}[language=Rust, caption={An outbox worker using SKIP LOCKED for safe parallelism and LISTEN/NOTIFY for low latency.}]
+pub async fn run_outbox_worker(
+    pool: PgPool,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let publisher = Publisher::connect().await?;
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
+    listener.listen("outbox").await?;
+
+    loop {
+        // Drain everything currently pending, one batch at a time.
+        while publish_batch(&pool, &publisher).await? > 0 {}
+
+        // Sleep until a NOTIFY, a 5-second safety poll, or shutdown.
+        tokio::select! {
+            _ = listener.recv() => {}
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            _ = shutdown.changed() => break,
+        }
+    }
+    Ok(())
+}
+
+async fn publish_batch(pool: &PgPool, publisher: &Publisher) -> anyhow::Result<usize> {
+    let mut tx = pool.begin().await?;
+    let rows = sqlx::query!(
+        "SELECT id, event_type, payload
+           FROM outbox_events
+          WHERE published_at IS NULL
+          ORDER BY id
+          LIMIT 100
+            FOR UPDATE SKIP LOCKED"
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    for row in &rows {
+        publisher.send(row.id, &row.event_type, &row.payload).await?;
+    }
+
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    sqlx::query!(
+        "UPDATE outbox_events SET published_at = now() WHERE id = ANY($1)",
+        &ids[..]
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows.len())
+}
+\end{lstlisting}
+
+Three PostgreSQL features carry this design.
+\begin{itemize}
+  \item \textbf{\texttt{FOR UPDATE SKIP LOCKED}.} Each worker locks the rows it selects. If you run four worker replicas, a second worker running the same query \emph{skips} rows locked by the first and takes the next unlocked batch, instead of waiting. The table works as a concurrent job queue without any extra infrastructure, and the partial index \texttt{outbox\_pending} keeps the scan small.
+  \item \textbf{\texttt{LISTEN} and \texttt{NOTIFY}.} Without notifications, the worker would have to poll frequently to keep latency low. With them, \texttt{commit\_entry}'s \texttt{pg\_notify('outbox', '')} wakes the worker within milliseconds of the commit. The 5-second sleep branch is a safety net: if a notification is ever missed (the listener reconnected, say), the next poll finds the rows anyway. Correctness depends only on the table; notifications only affect latency.
+  \item \textbf{Transactions around the batch.} If the worker crashes after publishing but before \texttt{COMMIT}, the rows are still unpublished in the database and will be published again. Delivery is therefore \emph{at least once}, never \emph{at most once}. Consumers must deduplicate, typically by recording each processed event ID in their own database in the same transaction as their own side effects --- the mirror image of our idempotency keys.
+\end{itemize}
+
+Notice also how the worker uses \texttt{tokio::select!} with Chapter~12's cancellation rules in mind. The \texttt{select!} sits \emph{between} batches, never around \texttt{publish\_batch}. A shutdown signal can never drop a batch halfway through; it is noticed only after the current batch has committed.
+
+\section{Testing Against a Real Database With \texttt{\#[sqlx::test]}}
+\label{ch14:testing}
+
+Most of the guarantees in this chapter live in PostgreSQL: constraints, row locks, isolation, deferred triggers. Mocking the database would test none of them. SQLx provides a test attribute that gives each test its own real, empty database.
+
+\begin{lstlisting}[language=Rust, caption={Integration tests: concurrent overdraft attempts and idempotent replays against a fresh database per test.}]
+#[sqlx::test(migrations = "./migrations")]
+async fn concurrent_debits_cannot_overdraw(pool: PgPool) -> anyhow::Result<()> {
+    let f = Fixture::seed(&pool, /* alice balance */ 10_000).await?;
+
+    // `transfer` takes `self` by value so each spawned future is 'static.
+    let a = tokio::spawn(f.clone().transfer(pool.clone(), 8_000, "key-a"));
+    let b = tokio::spawn(f.clone().transfer(pool.clone(), 8_000, "key-b"));
+    let (ra, rb) = (a.await?, b.await?);
+
+    // Exactly one succeeds; the other is rejected for insufficient funds.
+    assert_eq!([ra.is_ok(), rb.is_ok()].iter().filter(|ok| **ok).count(), 1);
+
+    let alice = f.balance(&pool, f.alice).await?;
+    assert_eq!(alice, 2_000);
+
+    // The conservation law holds across the whole ledger.
+    let net = sqlx::query_scalar!(
+        r#"SELECT COALESCE(SUM(CASE side WHEN 'D' THEN amount_minor
+                                         ELSE -amount_minor END), 0)::BIGINT
+           AS "net!" FROM postings"#
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(net, 0);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn retry_with_same_key_replays_response(pool: PgPool) -> anyhow::Result<()> {
+    let f = Fixture::seed(&pool, 10_000).await?;
+
+    let first = f.clone().transfer(pool.clone(), 2_500, "same-key").await?;
+    let second = f.clone().transfer(pool.clone(), 2_500, "same-key").await?;
+
+    assert_eq!(first.body, second.body);
+    let entries = sqlx::query_scalar!(r#"SELECT count(*) AS "n!" FROM journal_entries"#)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(entries, 1);
+    assert_eq!(f.balance(&pool, f.alice).await?, 7_500);
+    Ok(())
+}
+\end{lstlisting}
+
+For each test, the attribute connects to the server named in \texttt{DATABASE\_URL}, creates a new database with a generated name, runs every migration in \texttt{./migrations}, passes your test a \texttt{PgPool} connected to it, and drops the database when the test passes. Tests therefore run in parallel without seeing each other's rows, and each one exercises the real schema, the real constraints, and the real lock manager.
+
+The first test is worth reading as a specification. It does not check \emph{how} we prevent overdrafts; it checks the outcome a customer and an auditor care about: one payment succeeds, the balance is exactly \$20, and debits equal credits across the entire ledger. You could replace sorted \texttt{FOR UPDATE} with \texttt{SERIALIZABLE} retries and the test would not change. Run it in a loop a few thousand times in CI with \texttt{tokio::spawn}ed pairs, and a regression in the locking code shows up as a red build rather than a reconciliation discrepancy weeks later.
+
+\begin{focusbox}
+\textbf{The whole request, in one paragraph.} Bytes arrive; Tower assigns a request ID, opens a tracing span, starts a 5-second timer, and caps the body size. Axum's extractors parse the tenant, the idempotency key, and the JSON body, each into a validated type, or reject the request before our code runs. The handler converts the DTO into \texttt{PositiveMoney} and a sealed \texttt{BalancedEntry}. \texttt{execute\_once} opens one transaction, claims the idempotency key, locks every touched account in ID order, applies checked arithmetic, appends postings, updates balances, writes an outbox row, stores the response, and commits once. A deferred trigger re-checks the balance at commit. Any failure or cancellation along the way rolls everything back. After commit, \texttt{NOTIFY} wakes the outbox worker, which publishes at least once. A client retry with the same key gets the same answer and moves no money.
+\end{focusbox}
+
+\section{Exercises}
+\label{ch14:exercises}
+
+\begin{exercise}[Reading the Schema as a Specification]
+For each of the following bugs in application code, name the exact constraint, trigger, or key in this chapter's schema that stops it from being committed, and the PostgreSQL error code the service would see:
+\begin{enumerate}
+  \item A refactor accidentally negates \texttt{amount\_minor} before inserting a posting.
+  \item A fee calculation bug credits the merchant \$97.00 and the fee account \$3.20 on a \$100.00 debit.
+  \item A race in a new code path lets a customer wallet reach \texttt{-500}.
+  \item A batch job inserts a posting for an account ID that was never created.
+\end{enumerate}
+Which of these would \emph{also} be caught at compile time by the Chapter~13 types, and which only by the database?
+\end{exercise}
+
+\begin{exercise}[SQLx Types and Nullability]
+For each query below, state the Rust type SQLx generates for every output column, and fix any query whose result type is not what a ledger developer would want:
+\begin{lstlisting}[language=SQL]
+-- (1)
+SELECT balance_minor, allow_negative FROM accounts WHERE id = $1;
+-- (2)
+SELECT response_body FROM idempotency_keys
+ WHERE tenant_id = $1 AND key = $2;
+-- (3)
+SELECT a.id, SUM(p.amount_minor) AS total
+  FROM accounts a LEFT JOIN postings p ON p.account_id = a.id
+ GROUP BY a.id;
+\end{lstlisting}
+For the third query, explain why \texttt{total} is nullable even though \texttt{amount\_minor} is \texttt{NOT NULL}, and why its type is not \texttt{i64}.
+\end{exercise}
+
+\begin{exercise}[Tracing a Deadlock]
+Two transactions run concurrently with \emph{unsorted} locking. $T_1$ transfers from $A$ to $B$ with a fee to $F$; $T_2$ transfers from $B$ to $C$ with a fee to $F$. Each locks accounts in the order debit, credit, fee.
+\begin{enumerate}
+  \item Find an interleaving that deadlocks and draw the wait-for graph.
+  \item Show that with \texttt{ORDER BY id} locking, no interleaving can deadlock, for any assignment of UUIDs to $A$, $B$, $C$, $F$. (Hint: argue that a cycle in the wait-for graph would require some transaction to wait for a lower-ordered lock while holding a higher-ordered one.)
+  \item Under sorted locking, $F$ is still locked by every transfer. Estimate the maximum transfer throughput if each transaction holds $F$'s lock for $1.5\text{ ms}$, and redesign with $16$ fee shards. What changes in the nightly reconciliation?
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Breaking and Fixing Idempotency]
+A teammate proposes a ``simpler'' idempotency scheme: check for the key with a \texttt{SELECT} at the start of the handler; if absent, run the transfer in its own transaction; after it commits, insert the key and response in a second transaction.
+\begin{enumerate}
+  \item Describe a sequence of two concurrent requests with the same key that moves money twice.
+  \item Describe a crash at a single point that moves money once but causes the client's retry to move it again.
+  \item Explain how the single-transaction design in \texttt{execute\_once} rules out both.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Cancellation Audit of the Request Path]
+The \texttt{TimeoutLayer} fires at 5 seconds and drops the handler future. For each of the following \texttt{.await} points, say what state the database is in if the future is dropped while suspended there, and what a retry with the same key will see:
+\begin{enumerate}
+  \item Waiting in \texttt{pool.begin()} for a free connection.
+  \item Waiting for the \texttt{INSERT INTO idempotency\_keys} to return, because another transaction with the same key is still open.
+  \item Waiting on \texttt{SELECT ... FOR UPDATE} for Alice's row lock.
+  \item Waiting for \texttt{tx.commit()} to return, after PostgreSQL has written the commit record to the WAL but before the reply reaches the service.
+\end{enumerate}
+Case~4 is the subtle one. Explain why it is the reason idempotency keys exist at all.
+\end{exercise}
+
+\begin{exercise}[Outbox Ordering and Delivery]
+\begin{enumerate}
+  \item With two outbox workers using \texttt{SKIP LOCKED}, can events for the same account be published out of order? Construct an example.
+  \item Propose a change that preserves per-account ordering while keeping parallelism across accounts. (Consider partitioning work by a hash of \texttt{aggregate\_id}, or using an advisory lock per partition.)
+  \item A consumer records processed event IDs in a \texttt{processed\_events} table. Write the SQL it should run so that handling an event and recording its ID are atomic.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[A Reversal Endpoint]
+Design \texttt{POST /v1/entries/\{id\}/reverse}. Your design should include:
+\begin{enumerate}
+  \item The domain function that turns a committed entry into a \texttt{BalancedEntry} with every side flipped and \texttt{reverses\_entry\_id} set.
+  \item A database constraint that prevents an entry from being reversed twice, even under concurrent requests with different idempotency keys.
+  \item What should happen if reversing would push a customer wallet below zero (the recipient has already spent the money), and how a real payment platform handles this case.
+\end{enumerate}
+\end{exercise}

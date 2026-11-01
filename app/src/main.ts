@@ -114,7 +114,7 @@ function showLibrary() {
   const main = document.createElement('div');
   main.innerHTML = `
     <h1 class="title">From the Ground Up</h1>
-    <p class="subtitle">Four readers in algorithms, graph algorithms, cryptography and signal processing, with figures you can move.</p>
+    <p class="subtitle">Six readers in algorithms, graph algorithms, cryptography, signal processing, programming languages and databases, with figures you can move.</p>
     ${lastBook && lastCh ? `<p class="continue"><a href="${chapterHref(lastBook.id, lastCh.key)}">Continue reading</a><span class="muted"> · ${esc(lastBook.title)}, ${lastCh.label}. ${lastCh.titleHtml}</span></p>` : ''}
     <ul class="books">${library
       .map((b) => `<li><a href="#/${b.id}"><span class="book-title">${esc(b.title)}</span><span class="book-sub">${esc(b.subtitle)}</span><span class="book-meta">${b.chapters.length} chapters</span></a></li>`)

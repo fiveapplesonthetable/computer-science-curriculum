@@ -12,7 +12,7 @@ We will meet Alice (you, at your laptop), the server she wants to reach, and Eve
 Before SSH there was \texttt{telnet}, \texttt{rlogin}, \texttt{rsh}, and \texttt{rcp}. All of them sent your password, and then your entire session, in cleartext. On a shared Ethernet segment or a compromised router, anyone running a packet sniffer harvested credentials for free. In 1995 Tatu Ylonen, a researcher at Helsinki University of Technology, watched exactly such a password-sniffing attack run against his network and wrote SSH-1 as a direct replacement. It spread quickly. SSH-1 had real cryptographic flaws (including a CRC-32 integrity check, an unkeyed polynomial checksum that enabled plaintext-insertion attacks), so the protocol was redesigned from scratch as SSH-2, standardized by the IETF in RFCs 4250--4254 (2006). Today ``SSH'' means SSH-2; SSH-1 is dead and should be refused. The dominant implementation, OpenSSH, grew out of the OpenBSD project and now ships on essentially every server on Earth. The primary open challenge today is migrating the installed base to post-quantum hybrid key exchange (combining X25519 with ML-KEM) before store-now-decrypt-later adversaries record traffic for future quantum decryption.
 \end{historybox}
 
-The threat model is worth stating precisely, because SSH's whole design follows from it.
+Every design choice in SSH follows from a single threat model: the network between your laptop and the remote machine is completely untrusted.
 
 \begin{focusbox}
 \textbf{Threat model.} The network between Alice and the server is fully controlled by Eve (a \emph{Dolev-Yao} attacker). She can:
@@ -86,7 +86,7 @@ The classic SSH key exchange is Diffie-Hellman; modern OpenSSH defaults to \emph
   signs it: $s = \Sign_{\textit{sk}_H}(H)$, and sends $(\textit{pk}_H,\, f,\, s)$.
   \item Client computes $K = f^{x} \bmod p$, reconstructs the \emph{same} $H$ from the values it already has, and verifies $\Vrfy_{\textit{pk}_H}(H, s)$. If the signature checks out, the server is authenticated.
 \end{enumerate}
-The shared secret is $K$ because $e^{y} = g^{xy} = f^{x} \pmod p$. The session key material is derived from $H$ and $K$ by hashing, described below. The exchange hash $H$ doubles as the \emph{session identifier} for the life of the connection.
+The shared secret is $K$ because $e^{y} = g^{xy} = f^{x} \pmod p$. (On the wire and inside $H$, SSH encodes $K$ as an \texttt{mpint} -- a 4-byte length-prefixed, big-endian signed two's-complement integer, which prepends a \texttt{0x00} byte whenever $K$'s top bit is $1$; forgetting that sign byte broke half of all handshakes in several early Curve25519 SSH implementations.) The session key material is derived from $H$ and $K$ by hashing, described below. The first exchange hash $H$ doubles as the permanent \emph{session identifier} for the life of the connection.
 \end{formalbox}
 
 \begin{whybox}
@@ -112,7 +112,7 @@ A session needs more than one key. Each direction (client-to-server and server-t
 \end{aligned}
 \]
 
-On the very first key exchange, $\textit{session\_id} = H$. If a key is longer than one hash output, SSH extends it by hashing $K \concat H$ concatenated with all key bytes produced so far -- a simple counter-free expansion. The distinct tags \texttt{A}--\texttt{F} guarantee the six outputs are independent even though they all derive from the same $(K,H)$: flipping one tag byte changes the hash input completely. Figure~\ref{ch28:fig-key-derivation} shows how the shared DH secret $K$ and the exchange hash $H$ fan out into the six directional keys and IVs.
+On the very first key exchange, $\textit{session\_id} = H$; on subsequent rekeys, $K$ and $H$ change, while $\textit{session\_id}$ stays frozen at that first $H$ to anchor the session. If a key is longer than one hash output, SSH extends it by hashing $K \concat H$ concatenated with all key bytes produced so far -- a simple counter-free expansion. The distinct tags \texttt{A}--\texttt{F} guarantee the six outputs are independent even though they all derive from the same $(K,H)$: flipping one tag byte changes the hash input completely. Figure~\ref{ch28:fig-key-derivation} shows how the shared DH secret $K$ and the exchange hash $H$ fan out into the six directional keys and IVs.
 
 \begin{figure}[H]
 \centering
@@ -158,7 +158,7 @@ On the very first key exchange, $\textit{session\_id} = H$. If a key is longer t
 Using \emph{different} keys per direction is a real requirement. If the client-to-server and server-to-client streams shared a key and IV, an attacker could reflect a packet back at its sender and, with some cipher modes, learn or forge content. Separate keys per direction also stop trivial replay of a captured packet into the opposite stream. This per-direction, per-purpose key separation is a pattern you will see in TLS, IPsec, and Signal -- never reuse a key for two jobs.
 \end{trapbox}
 
-Once both sides have the six keys, the client sends \texttt{SSH\_MSG\_NEWKEYS}, and from the next packet on, every SSH packet is encrypted and integrity-protected. SSH also \emph{rekeys} periodically (after roughly a gigabyte of traffic or an hour, by default) by re-running the key exchange inside the existing encrypted channel, which limits how much data ever rides on a single key and gives a measure of forward secrecy across the rekey boundary.
+Once both sides have the six keys, each side sends \texttt{SSH\_MSG\_NEWKEYS} to switch its outbound stream onto the new keys, and from the next packet on, every SSH packet is encrypted and integrity-protected. SSH also \emph{rekeys} periodically (after roughly a gigabyte of traffic or an hour, by default) by re-running the key exchange inside the existing encrypted channel, which limits how much data ever rides on a single key and gives a measure of forward secrecy across the rekey boundary.
 
 \subsection{The Binary Packet Protocol: encrypt and MAC}
 
@@ -320,7 +320,7 @@ This is the right way to use SSH. Alice generates a key pair once. The public ke
 \end{formalbox}
 
 \begin{whybox}
-Two design points make this secure and they are easy to miss. First, the signature covers $\textit{session\_id} = H$, which is unique to this connection (it contains both fresh DH shares). So $\sigma$ cannot be replayed onto a different connection -- a captured login signature is worthless against tomorrow's session, whose $H$ differs. This is \emph{channel binding}: the auth proof is welded to the exact encrypted tunnel it was made in. Second, the server only ever sees a \emph{signature}, never the private key, so even a fully malicious server learns nothing it can reuse to impersonate Alice elsewhere. Compare password auth, where a malicious server harvests the reusable secret directly. Channel binding plus a non-reusable proof is precisely why public-key auth resists the malicious-server and the man-in-the-middle cases that password auth does not.
+Two design points make this secure and they are easy to miss. First, the signature covers $\textit{session\_id} = H$, which is unique to this connection (it contains both fresh DH shares). So $\sigma$ cannot be replayed onto a different connection -- a captured login signature is worthless against tomorrow's session, whose $H$ differs. This is \emph{channel binding}: the auth proof is welded to the exact encrypted tunnel it was made in. Second, the server only ever sees a \emph{signature}, never the private key, so even a fully malicious server learns nothing it can reuse to impersonate Alice elsewhere. (Notice also the literal boolean $\textit{true}$ inside $M$: to avoid prompting for a passphrase or YubiKey touch on five rejected keys in \texttt{\textasciitilde/.ssh/}, the client first probes each candidate key with that flag set to $\textit{false}$ and no signature, signing with $\textit{true}$ only after the server replies \texttt{PK\_OK}.) Compare password auth, where a malicious server harvests the reusable secret directly. Channel binding plus a non-reusable proof is precisely why public-key auth resists the malicious-server and the man-in-the-middle cases that password auth does not.
 \end{whybox}
 
 \begin{connectionbox}
@@ -423,7 +423,7 @@ Use safer mechanisms instead of blanket forwarding:
 
 \section{Port forwarding and the connection layer}
 
-After authentication, the connection protocol multiplexes \emph{channels} over the one encrypted pipe. Beyond the interactive shell, its most heavily used feature is \emph{port forwarding}, which tunnels arbitrary TCP through SSH.
+After authentication, the connection protocol multiplexes independent logical \emph{channels} over the one encrypted TCP pipe: each channel carries its own integer ID and per-channel flow-control window so a stalled file transfer cannot freeze an interactive shell sharing the socket. Beyond the shell, its most heavily used feature is \emph{port forwarding}, which tunnels arbitrary TCP through SSH.
 
 \begin{itemize}
   \item \textbf{Local forward} (\texttt{ssh -L 5432:db.internal:5432 bastion}): your laptop's port 5432 is tunneled, through the SSH connection to \texttt{bastion}, onward to \texttt{db.internal:5432}. You reach an internal database as if it were local, with all traffic encrypted to the bastion.

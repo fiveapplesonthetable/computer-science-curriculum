@@ -1,0 +1,1042 @@
+\chapter{Write-Ahead Logging, Checkpoints, and Crash Recovery}
+\label{ch:wal-recovery}
+
+In Chapters~2 and~3 we built fast, compact 8,192-byte slotted heap pages and B-link tree index blocks inside PostgreSQL's \texttt{shared\_buffers} pool. As long as electricity flows steadily into DRAM, that design flies: inserting a row stamps twenty-four bytes of tuple header, appends four bytes to the \texttt{ItemIdData} line-pointer array, updates a leaf page in each index, and flips a \texttt{BM\_DIRTY} bit in memory in a few microseconds. Now pull the server's power cord out of the wall. Every byte in \texttt{shared\_buffers} vanishes, every byte sitting in the Linux kernel page cache vanishes, and any 8~KB page caught halfway across the PCIe bus lands on the solid-state drive split into mismatched halves. How does a database engine report \texttt{COMMIT} in sub-millisecond time while guaranteeing that a sudden power outage neither loses a single committed row nor leaves a single B-tree pointer dangling?
+
+\begin{focusbox}
+This chapter opens Part~II by tracing how PostgreSQL turns fragile 8~KB memory pages into crash-proof durable storage through \texttt{xlog.c} and \texttt{xlogrecovery.c}:
+\begin{itemize}
+  \item \textbf{Hardware failure physics:} why \texttt{write(2)} is not durability, what \texttt{fdatasync(2)} asks of an NVMe controller, and how an 8~KB PostgreSQL page tears across two 4~KB hardware sectors.
+  \item \textbf{Write-ahead logging and LSNs:} the sequential 16~MB segments in \texttt{\$PGDATA/pg\_wal/}, 64-bit \texttt{pg\_lsn} byte offsets, \texttt{XLogRecord} internals, and the fundamental WAL Invariant binding \texttt{pd\_lsn} to \texttt{XLogFlush()}.
+  \item \textbf{Healing torn pages:} why physiological delta records fail on a fractured 8~KB page, how checkpoint-anchored \texttt{full\_page\_writes} fix the problem with hole-stripped Full Page Images, and why WAL volume spikes right after a checkpoint begins.
+  \item \textbf{Group commit and durability modes:} leader-follower batching on \texttt{WALWriteLock}, the exact failure windows of \texttt{synchronous\_commit}, and zero-WAL \texttt{UNLOGGED} tables.
+  \item \textbf{Fuzzy checkpoints and single-pass recovery:} why recovery rewinds from \texttt{pg\_control}'s checkpoint record back to its \emph{Redo point}, why PostgreSQL needs no ARIES Undo phase, and an LSN-by-LSN crash trace inspected live with \texttt{pg\_walinspect}.
+\end{itemize}
+\end{focusbox}
+
+\chapterline
+
+\section{The Physics of \texttt{write()}, \texttt{fsync()}, and Torn 8 KB Pages}
+\label{ch04:physics}
+
+Before looking at a single line of PostgreSQL recovery code, we need an accurate physical picture of what happens when a user-space process writes bytes to a file on Linux. Programmers casually say ``we wrote the buffer to disk'' when \texttt{write(fd, buf, 8192)} returns \texttt{8192}. Physically, nothing of the sort happened. Those 8,192 bytes merely crossed the CPU ring boundary from one region of volatile RAM into another region of volatile RAM.
+
+Follow a dirty 8~KB page from the moment a backend modifies it inside \texttt{shared\_buffers} until its bits sit safely inside non-volatile NAND flash charge traps:
+
+\begin{enumerate}
+  \item \textbf{PostgreSQL \texttt{shared\_buffers} (user-space shared memory):} When an \texttt{INSERT} or \texttt{UPDATE} modifies heap block~7, it mutates an 8,192-byte frame in POSIX/System~V shared memory and sets \texttt{BM\_DIRTY} in the buffer's \texttt{BufferDesc} header. If the \texttt{postgres} process crashes with \texttt{SIGSEGV} or \texttt{kill -9}, and the postmaster resets shared memory, every dirty frame here is wiped instantly.
+  \item \textbf{Linux kernel page cache (\texttt{pwrite(2)}):} When PostgreSQL calls \texttt{pwrite(fd, page, 8192, offset)}, the kernel copies those 8,192 bytes into two 4,096-byte kernel memory pages (\texttt{struct folio}) inside the operating system's page cache, marks those kernel pages dirty, and immediately returns \texttt{8192} to user space. Notice the difference between process death and machine death: if \texttt{postgres} dies via \texttt{kill -9} a microsecond after \texttt{pwrite()} returns, the Linux kernel is still alive and its background writeback threads will flush those dirty page-cache frames to the drive seconds later. If the kernel panics or building power fails, everything in the kernel page cache evaporates.
+  \item \textbf{NVMe controller volatile DRAM cache:} When kernel writeback (or an unforced block write) DMA-transfers 4~KB blocks across PCIe to an SSD, the drive does not immediately program slow NAND flash cells. Most SSDs contain 512~MB to 4~GB of onboard DDR4 DRAM sitting right on the drive PCB to absorb bursts and maintain Flash Translation Layer (FTL) mapping tables. Left in that onboard DRAM without backup power, the bytes still vanish if the power supply drops to zero volts.
+  \item \textbf{Non-volatile NAND flash cells (\texttt{fsync(2)} / \texttt{fdatasync(2)}):} Only when PostgreSQL invokes \texttt{fdatasync(fd)} (or opens a WAL file with \texttt{O\_DSYNC}) does the Linux filesystem push dirty page-cache blocks to the block layer \emph{and} emit an NVMe \texttt{Flush} command (or set the Force Unit Access, \texttt{FUA}, bit on the write command). A specification-compliant drive holds off completing \texttt{fdatasync()} until every buffered byte is either programmed into non-volatile NAND flash or protected by onboard hardware capacitors that guarantee NAND programming upon power loss.
+\end{enumerate}
+
+Java~6 hides the same tiers behind \texttt{FileOutputStream.write()}, which returns as soon as the bytes reach tier~2, the kernel page cache. A Java program that needs durability must call \texttt{fos.getFD().sync()} or \texttt{FileChannel.force(true)}, and both end in \texttt{fsync(2)}. In C the pair is explicit:
+\begin{lstlisting}[language=C]
+ssize_t n = pwrite(fd, page, 8192, off); /* returns once bytes sit in the page cache */
+if (n != 8192)
+    report_error();
+if (fdatasync(fd) != 0)                  /* returns once the device reports durable */
+    abort();                             /* PostgreSQL PANICs here instead           */
+\end{lstlisting}
+Why abort instead of retrying? In 2018 PostgreSQL developers found that after a failed \texttt{fsync}, Linux may mark the dirty pages clean and discard them, so a second \texttt{fsync} reports success even though the data never reached the device. A failed WAL flush has always stopped the server. Since the February 2019 minor releases (9.4.21 through 11.2), a failed \texttt{fsync} of a data file during a checkpoint stops it too, and restart replays from the WAL (the subject of this chapter) instead of trusting the page cache. The log line you see is:
+\begin{lstlisting}
+PANIC:  could not fsync file "base/16384/16391": Input/output error
+\end{lstlisting}
+
+\begin{attackbox}
+\textbf{Lying consumer drives vs.\ enterprise Power-Loss Protection (PLP).}
+Enterprise NVMe drives carry a visible row of polymer tantalum or supercapacitors on their circuit boards. When the 12~V power rail drops, voltage-drop circuitry uses the stored joules in those capacitors to flush onboard DRAM and FTL metadata into NAND flash within a few milliseconds, allowing the drive to honor \texttt{NVMe Flush} rapidly and truthfully. Cheap consumer laptops and desktop SSDs often omit those capacitors to save two dollars on the bill of materials---and worse, some consumer firmware acknowledges \texttt{Flush} before the NAND cells are actually programmed in order to inflate benchmark scores. Pull the plug on such a drive mid-load (as tools like \texttt{fio} with hardware power relays test) and bytes that \texttt{fdatasync()} swore were durable vanish, silently corrupting any database engine on Earth.
+\end{attackbox}
+
+\subsection{Why Direct Heap Flushing on \texttt{COMMIT} Fails Twice}
+
+Suppose we had never heard of a write-ahead log and tried to build transaction durability the naive way: whenever a client sends \texttt{COMMIT}, find every 8~KB heap and index page modified by that transaction in \texttt{shared\_buffers}, \texttt{pwrite()} each one to its table or index file, and call \texttt{fdatasync()} on every touched file before returning \texttt{COMMIT} to the client.
+
+That design fails twice: first on \emph{performance}, then on \emph{correctness}.
+
+First, count the random I/O cost. Inserting one row into an \texttt{orders} table with four B-tree indexes (\texttt{orders\_pkey}, \texttt{idx\_customer}, \texttt{idx\_created\_at}, \texttt{idx\_status}) dirties five distinct 8~KB blocks scattered across five separate files in \texttt{\$PGDATA/base/16384/}. Worse, a B-tree leaf split in Chapter~3 dirties three blocks in a single index (left sibling, new right sibling, parent internal node). Flushing five to eight random 8~KB blocks plus issuing multiple filesystem sync barriers on every single one-row transaction turns sequential disk bandwidth into random-write thrashing, amplifies NAND flash erase-block wear by an order of magnitude, and prevents you from keeping hot pages buffered in RAM across consecutive updates.
+
+Second, and worse: even if you paid that 100$\times$ latency penalty and called \texttt{pwrite()} + \texttt{fdatasync()} on one 8,192-byte heap page, \textbf{a power cut during that flush destroys the page}. Look at the block sizes across the stack:
+\[
+  \text{PostgreSQL page} = 8{,}192\text{ bytes}
+  \qquad\text{vs.}\qquad
+  \text{Linux VM page / NVMe 4Kn sector} = 4{,}096\text{ bytes}.
+\]
+Standard POSIX filesystems (\texttt{ext4}, \texttt{XFS}) and standard NVMe block devices guarantee sector atomicity at 512~bytes or 4,096~bytes---never 8,192~bytes. An 8~KB PostgreSQL page occupies two consecutive 4~KB sectors on the drive: bytes \texttt{0..4095} in sector~$2k$ and bytes \texttt{4096..8191} in sector~$2k+1$. Recall the slotted-page geometry from Chapter~2: the 24-byte \texttt{PageHeaderData} (\texttt{pd\_lsn}, \texttt{pd\_checksum}, \texttt{pd\_lower}, \texttt{pd\_upper}) and the \texttt{ItemIdData} line-pointer array grow \emph{downward} from offset~\texttt{0} inside the first 4~KB sector, while the actual heap tuples grow \emph{upward} from offset~\texttt{8192} inside the second 4~KB sector.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small]
+  % ---- Upper Panel: 4-Stage Storage Write Stack ----
+  \node[font=\bfseries\small, anchor=west, text=black!85] at (0.0, 5.55)
+    {(a) The Volatile-to-Durable Path of a Dirty 8 KB Page};
+
+  \node[draw=sourceblue!85!black, fill=sourceblue!10, rounded corners=3pt, thick,
+        minimum width=2.75cm, minimum height=1.25cm, align=center] (sb) at (1.38, 4.45)
+    {\textbf{\texttt{shared\_buffers}}\\[-1pt]{\scriptsize 8,192 B frame}\\[-2pt]{\scriptsize (user-space RAM)}};
+
+  \node[draw=quotientorange!85!black, fill=quotientorange!10, rounded corners=3pt, thick,
+        minimum width=2.85cm, minimum height=1.25cm, align=center] (pc) at (5.42, 4.45)
+    {\textbf{OS Page Cache}\\[-1pt]{\scriptsize $2 \times 4{,}096$ B pages}\\[-2pt]{\scriptsize (Linux kernel RAM)}};
+
+  \node[draw=trapred!85!black, fill=trapred!10, rounded corners=3pt, thick,
+        minimum width=2.85cm, minimum height=1.25cm, align=center] (dram) at (9.48, 4.45)
+    {\textbf{NVMe DRAM}\\[-1pt]{\scriptsize controller cache}\\[-2pt]{\scriptsize (volatile w/o PLP)}};
+
+  \node[draw=targetgreen!85!black, fill=targetgreen!12, rounded corners=3pt, very thick,
+        minimum width=2.75cm, minimum height=1.25cm, align=center] (nand) at (13.62, 4.45)
+    {\textbf{NAND Flash}\\[-1pt]{\scriptsize 4,096 B sectors}\\[-2pt]{\scriptsize (non-volatile)}};
+
+  \draw[->, thick, black!75] (sb.east) -- node[above, font=\scriptsize\ttfamily]{pwrite()} (pc.west);
+  \draw[->, thick, black!75] (pc.east) -- node[above, font=\scriptsize]{DMA} (dram.west);
+  \draw[->, very thick, targetgreen!75!black] (dram.east) --
+    node[above=2pt, font=\scriptsize\ttfamily]{fdatasync()}
+    node[below=2pt, font=\tiny, text=targetgreen!75!black]{Flush / FUA} (nand.west);
+
+  % Volatility boundary bar
+  \draw[dashed, thick, trapred!80!black] (12.05, 3.35) -- (12.05, 5.25);
+  \node[font=\scriptsize, text=trapred!80!black, align=center] at (5.9, 3.38)
+    {$\underbrace{\hspace{11.4cm}}_{\text{Volatile on building power loss (unless NVMe DRAM has PLP capacitors)}}$};
+  \node[font=\scriptsize\bfseries, text=targetgreen!75!black] at (13.62, 3.42) {Durable};
+
+  % ---- Lower Panel: Torn 8 KB Page ----
+  \node[font=\bfseries\small, anchor=west, text=black!85] at (0.0, 2.42)
+    {(b) A Torn 8 KB Slotted Page Across Two 4 KB Physical Sectors};
+
+  % Sector 2k (0..4095) - NEW
+  \draw[draw=targetgreen!80!black, fill=targetgreen!8, thick, rounded corners=2pt]
+    (0.0, 0.0) rectangle (7.05, 1.68);
+  \node[font=\tiny\bfseries, text=targetgreen!70!black, anchor=west] at (0.12, 1.44)
+    {Sector $2k$ (\texttt{0..4095}) --- WRITTEN (NEW)};
+
+  \draw[fill=targetgreen!22, draw=targetgreen!75!black] (0.14, 0.18) rectangle (2.22, 1.18);
+  \node[font=\tiny, align=center] at (1.18, 0.68)
+    {\texttt{pd\_lsn=0/1140}\\\texttt{pd\_upper=7912}\\ {(24 B header)}};
+
+  \draw[fill=targetgreen!16, draw=targetgreen!70!black] (2.28, 0.18) rectangle (3.66, 1.18);
+  \node[font=\tiny, align=center] at (2.97, 0.68)
+    {\texttt{ItemId[1..3]}\\existing\\slots};
+
+  \draw[fill=targetgreen!35, draw=targetgreen!85!black, thick] (3.72, 0.18) rectangle (5.60, 1.18);
+  \node[font=\tiny, align=center] at (4.66, 0.68)
+    {\textbf{\texttt{ItemId[4]}}\\\texttt{off=7912}\\\texttt{len=56} (NEW)};
+
+  \node[font=\tiny, text=black!60, align=center] at (6.32, 0.68) {free\\space};
+
+  % Power Loss Cut Line
+  \draw[very thick, dashed, trapred] (7.50, -0.32) -- (7.50, 1.85);
+  \node[fill=trapred, text=white, font=\tiny\bfseries, inner sep=2pt, rounded corners=1.5pt]
+    at (7.50, 1.96) {POWER CUT};
+
+  % Sector 2k+1 (4096..8191) - STALE
+  \draw[draw=trapred!85!black, fill=trapred!7, thick, rounded corners=2pt]
+    (7.95, 0.0) rectangle (15.0, 1.68);
+  \node[font=\tiny\bfseries, text=trapred!80!black, anchor=west] at (8.07, 1.44)
+    {Sector $2k{+}1$ (\texttt{4096..8191}) --- UNWRITTEN (STALE)};
+
+  \node[font=\tiny, text=black!60, align=center] at (8.78, 0.68) {free\\space};
+
+  \draw[fill=trapred!28, draw=trapred!85!black, thick, dashed] (9.55, 0.18) rectangle (12.15, 1.18);
+  \node[font=\tiny, align=center, text=trapred!85!black] at (10.85, 0.68)
+    {\textbf{\texttt{[7912..7967]}}\\\textbf{STALE BYTES}\\(Tuple 4 missing)};
+
+  \draw[fill=gray!20, draw=gray!65!black] (12.22, 0.18) rectangle (14.86, 1.18);
+  \node[font=\tiny, align=center] at (13.54, 0.68)
+    {\texttt{[7968..8191]}\\Tuples 3, 2, 1\\(older rows)};
+
+  % Dangling pointer arc across the tear
+  \draw[->, very thick, trapred!90!black] (4.66, 0.18) .. controls (6.4, -0.65) and (9.0, -0.65) ..
+    node[below, font=\scriptsize\bfseries, text=trapred!85!black]
+    {Line pointer 4 dereferences uninitialized bytes across the 4 KB boundary!}
+    (10.85, 0.18);
+\end{tikzpicture}
+\caption{Top: the four memory tiers between a PostgreSQL backend and non-volatile NAND flash. Bottom: because an 8,192-byte PostgreSQL page spans two 4,096-byte hardware sectors, power loss mid-write produces a \emph{torn page} whose updated header and line pointers in Sector~$2k$ point into stale bytes in Sector~$2k+1$.}
+\label{ch04:fig-write-stack}
+\end{figure}
+
+Figure~\ref{ch04:fig-write-stack}(b) shows the exact anatomy of this \emph{torn page} (also called a \emph{fractured write}). Before our insert, block~7 held three tuples occupying bytes \texttt{7968..8191} (\texttt{pd\_upper = 7968}). Inserting a 56-byte fourth tuple lowers \texttt{pd\_upper} to \texttt{7912}, writes the tuple into bytes \texttt{7912..7967} (inside Sector~$2k+1$), and writes \texttt{ItemIdData[4] = (off=7912, len=56)} at byte offset~\texttt{36} (inside Sector~$2k$). Now power fails right after Sector~$2k$ lands in NAND flash and right before Sector~$2k+1$ arrives. When electricity returns, block~7 on disk is neither the old page nor the new page: \texttt{ItemIdData[4]} claims a live tuple sits at offset~\texttt{7912}, while bytes \texttt{7912..7967} hold zeroes or leftover debris from a tuple vacuumed three weeks ago. If data checksums (\texttt{initdb --data-checksums}) are enabled, PostgreSQL's 16-bit FNV-1a \texttt{pd\_checksum} catches the mismatch on the next read and aborts the query with \texttt{ERROR: invalid page in block 7}---detecting the corruption but unable to repair it. Without checksums, PostgreSQL silently decodes garbage bytes as customer balances.
+
+Solving both problems at once---eliminating random multi-file \texttt{fdatasync()} calls at \texttt{COMMIT} \emph{and} making every 8~KB page immune to mid-write tearing---is the job of Write-Ahead Logging.
+
+\section{Write-Ahead Logging (\texttt{pg\_wal}), LSNs, and the Fundamental WAL Invariant}
+\label{ch04:wal-invariant}
+
+\begin{intuitionbox}
+Separate \emph{recording} a change from \emph{applying} it. Recording is one sequential append to a single file. Applying touches scattered 8~KB pages in many files. \texttt{COMMIT} waits only for the append to become durable; the scattered pages are written later, in batches. If power fails before they are written, restart reads the appended records and applies them again. One rule makes this safe: \textbf{a data page may not reach disk before the log records describing its changes are durable.}
+\end{intuitionbox}
+
+PostgreSQL's Write-Ahead Log (historically called \texttt{XLOG}, implemented inside \texttt{src/\allowbreak backend/\allowbreak access/\allowbreak transam/\allowbreak xlog.c}) realizes that dock ledger as a single logical, append-only stream of bytes starting at offset~\texttt{0} when \texttt{initdb} creates a cluster and growing monotonically for the lifetime of the database.
+
+\subsection{Segment Files in \texttt{\$PGDATA/pg\_wal/} and \texttt{pg\_lsn} Byte Arithmetic}
+
+Storing a multi-terabyte stream in a single filesystem file would make recycling old log entries painful, so PostgreSQL slices the logical byte stream into fixed-size \textbf{16~MB} (\texttt{0x01000000} $= 16{,}777{,}216$ byte) segment files inside \texttt{\$PGDATA/pg\_wal/} (configurable at \texttt{initdb --wal-segsize} in powers of two from 1~MB to 1,024~MB). Internally, each 16~MB segment is subdivided into 2,048 pages of 8,192 bytes each, headed by a compact \texttt{XLogPageHeaderData} struct so recovery can verify alignment every 8~KB.
+
+Every position in this infinite logical stream is addressed by a 64-bit unsigned integer called a \textbf{Log Sequence Number} (\texttt{XLogRecPtr} in C, exposed in SQL as the \texttt{pg\_lsn} type). By convention, PostgreSQL prints a 64-bit LSN as two hexadecimal numbers separated by a slash:
+\[
+  \texttt{X/YYYYYYYY} \quad\Longleftrightarrow\quad (\texttt{0xX} \ll 32) \;\mid\; \texttt{0xYYYYYYYY}.
+\]
+The left side~\texttt{X} is the upper 32 bits (counting how many 4~GB $= 2^{32}$-byte logical epochs have elapsed), and the right side~\texttt{YYYYYYYY} is the 32-bit byte offset within that 4~GB epoch (suppressing leading zeros on display, so \texttt{0/016B3748} prints as \texttt{0/16B3748}).
+
+\begin{definition}[Log Sequence Number and Segment Mapping]
+\label{ch04:def-lsn}
+A \emph{Log Sequence Number} $L \in [0, 2^{64})$ is a monotonically increasing byte offset into PostgreSQL's logical WAL stream. Given segment size $S = 2^{24} = 16{,}777{,}216$~bytes (\texttt{0x01000000}) and a 32-bit timeline identifier $T \ge 1$ (initially $T = 1$, incremented upon point-in-time recovery promotion to prevent branching histories from overwriting old archives), $L$ maps to:
+\begin{align*}
+  \mathrm{segno}(L) &= \floor{L / S} = L \gg 24, &
+  \mathrm{offset}(L) &= L \bmod S = L \mathbin{\&} \texttt{0x00FFFFFF}.
+\end{align*}
+Because each 4~GB epoch ($2^{32}$ bytes) contains $2^{32} / 2^{24} = 256 = \texttt{0x100}$ segments of 16~MB, PostgreSQL's \texttt{XLogFileName} macro formats the 24-character hexadecimal filename in \texttt{\$PGDATA/pg\_wal/} by concatenating three 8-hex-digit fields:
+\[
+  \underbrace{\texttt{TTTTTTTT}}_{\text{timeline } T}
+  \;\underbrace{\texttt{XXXXXXXX}}_{\floor{\mathrm{segno}/256} = (L \gg 32)}
+  \;\underbrace{\texttt{000000SS}}_{\mathrm{segno} \bmod 256}.
+\]
+\end{definition}
+
+The third 8-character group \texttt{000000SS} explains a common puzzle: people staring at \texttt{ls \$PGDATA/pg\_wal/} for the first time are always puzzled when segment \texttt{0000000100000000000000FF} wraps directly to \texttt{000000010000000100000000} instead of \texttt{...00000100}. Now you see why: the middle group counts 4~GB chunks, and $256 \times 16\text{ MB} = 4\text{ GB}$, so with default 16~MB segments the final eight hex digits only ever range from \texttt{00000000} through \texttt{000000FF}.
+
+\begin{example}[Concrete \texttt{pg\_lsn} Arithmetic by Hand]
+\label{ch04:ex-lsn-math}
+Suppose \texttt{pg\_current\_wal\_lsn()} returns $L_1 = \texttt{0/16B3748}$ before a batch insert and $L_2 = \texttt{0/16B3A90}$ right after, on timeline $T = 1$:
+\begin{enumerate}
+  \item \textbf{Which 16~MB file holds $L_1$, and at what byte offset?}
+    Pad the lower half to eight hex digits: $L_1 = \texttt{0x00000000\_016B3748}$. Shifting right by 24~bits (dropping the last six hex digits) gives $\mathrm{segno}(L_1) = \texttt{0x01} = 1$, and masking the low six hex digits gives $\mathrm{offset}(L_1) = \texttt{0x6B3748} = 7{,}026{,}504$ bytes ($\approx 6.70$~MB into file \texttt{000000010000000000000001}).
+  \item \textbf{How many WAL bytes did the batch generate?}
+    Subtract directly in base~16:
+    \[
+      L_2 - L_1 = \texttt{0x016B3A90} - \texttt{0x016B3748} = \texttt{0x348}
+      = 3 \times 256 + 4 \times 16 + 8 = 840\text{ bytes}.
+    \]
+  \item \textbf{Cross-epoch subtraction:} Suppose $L_3 = \texttt{0/FFFFFC00}$ and $L_4 = \texttt{1/400}$ (which means \texttt{1/00000400}, i.e., \texttt{0x00000001\_00000400}). Then
+    \[
+      L_4 - L_3 = \texttt{0x100000400} - \texttt{0x0FFFFFC00} = \texttt{0x800} = 2{,}048\text{ bytes},
+    \]
+    which matches \texttt{SELECT pg\_wal\_lsn\_diff('1/400', '0/FFFFFC00');} returning \texttt{2048}.
+\end{enumerate}
+\end{example}
+
+\subsection{Inside an \texttt{XLogRecord} and Resource Managers}
+
+What actually sits at byte offset \texttt{0/16B3748} inside that segment file? Every change logged in PostgreSQL---inserting a heap tuple, splitting a B-tree page, committing a transaction, writing an online checkpoint---is wrapped in a binary envelope defined in \texttt{src/\allowbreak include/\allowbreak access/\allowbreak xlogrecord.h}:
+
+\begin{lstlisting}[language=C]
+/* Fixed 24-byte header at the front of every WAL record (xlogrecord.h) */
+typedef struct XLogRecord
+{
+    uint32          xl_tot_len;   /* total byte length of entire record       */
+    TransactionId   xl_xid;       /* 32-bit XID that wrote record (or 0)      */
+    XLogRecPtr      xl_prev;      /* start LSN of previous record in WAL      */
+    uint8           xl_info;      /* opcode flags specific to resource mgr    */
+    RmgrId          xl_rmid;      /* resource manager ID (heap, btree, xact)  */
+    /* 2 bytes of struct alignment padding here -> 20 bytes so far            */
+    pg_crc32c       xl_crc;       /* CRC32C over payload + bytes 0..19        */
+} XLogRecord;                     /* sizeof(XLogRecord) == 24 bytes           */
+\end{lstlisting}
+
+Immediately after those 24 header bytes come zero or more \textbf{block reference headers} (\texttt{XLogRecord\allowbreak BlockHeader}), each naming a physical target page via its tablespace, database, and relfilenode triple (\texttt{RelFileLocator}), fork number (main, FSM, visibility map), and 32-bit \texttt{BlockNumber}, followed by per-block delta bytes (or an optional Full Page Image) and any non-block main payload.
+
+Three fields in \texttt{XLogRecord} deserve special attention:
+\begin{itemize}
+  \item \textbf{\texttt{xl\_rmid} and \texttt{xl\_info} (Modular Resource Managers):} Rather than writing one giant \texttt{switch} statement for recovery, PostgreSQL partitions WAL ownership across roughly two dozen subsystem \textbf{Resource Managers} (\texttt{RmgrTable} in \texttt{rmgr.c}), each providing an \texttt{rm\_redo} function and an \texttt{rm\_desc} human decoder:
+    \begin{itemize}
+      \item \texttt{RM\_XLOG\_ID} (\texttt{XLOG}): checkpoints, parameter changes, standalone full-page writes.
+      \item \texttt{RM\_XACT\_ID} (\texttt{Transaction}): \texttt{COMMIT}, \texttt{ABORT}, and prepared-transaction records.
+      \item \texttt{RM\_HEAP\_ID} / \texttt{RM\_HEAP2\_ID} (\texttt{Heap} / \texttt{Heap2}): \texttt{INSERT}, \texttt{UPDATE}, \texttt{HOT\_UPDATE}, \texttt{DELETE}, in-page pruning (\texttt{PRUNE}), and freeze maps.
+      \item \texttt{RM\_BTREE\_ID} (\texttt{Btree}): \texttt{INSERT\_LEAF}, \texttt{SPLIT\_L}, \texttt{SPLIT\_R}, page deletion.
+    \end{itemize}
+  \item \textbf{\texttt{xl\_prev} (Back-pointer verification):} Every record stores the starting LSN of the immediately preceding record in the WAL stream. Because PostgreSQL recycles old 16~MB WAL segment files by renaming them to future segment numbers instead of zeroing 16~MB on disk, the bytes sitting \emph{past} the crash point in a recycled file often look like plausible old \texttt{XLogRecord} structs from last Tuesday. Checking both the 8~KB WAL page header address and \texttt{xl\_prev} prevents recovery from accidentally replaying stale records left over from an earlier segment incarnation.
+  \item \textbf{\texttt{xl\_crc} (Hardware CRC32C):} Computed with dedicated SSE4.2 (\texttt{crc32q}) or ARMv8 instructions over the entire record body and header. If power fails halfway through flushing a 200-byte WAL record, \texttt{xl\_crc} fails to match, cleanly marking the exact end of valid WAL on restart.
+\end{itemize}
+
+\subsection{\texttt{pd\_lsn} and the Fundamental WAL Invariant}
+
+How does a physical 8~KB heap or index block on disk remember how much of the WAL stream has already been applied to it? Look back at the very first field of \texttt{PageHeaderData} from Chapter~2, sitting at byte offsets \texttt{0..7} of every single heap page, B-tree page, GIN page, and visibility map page in PostgreSQL:
+\begin{lstlisting}[language=C]
+typedef struct PageHeaderData
+{
+    PageXLogRecPtr pd_lsn;        /* bytes 0..7: LSN of last modifying record */
+    uint16         pd_checksum;   /* bytes 8..9: 16-bit FNV-1a page checksum  */
+    uint16         pd_flags;      /* bytes 10..11: header flag bits           */
+    LocationIndex  pd_lower;      /* bytes 12..13: start of free space        */
+    LocationIndex  pd_upper;      /* bytes 14..15: end of free space          */
+    /* ... */
+} PageHeaderData;
+\end{lstlisting}
+Whenever a backend modifies buffer~$P$ in \texttt{shared\_buffers}---inside an atomic critical section while holding an exclusive content lock on~$P$---it constructs the corresponding \texttt{XLogRecord}, appends that record into \texttt{wal\_buffers} receiving back the record's \emph{ending} LSN~$L$, stamps \texttt{PageSetLSN(P, L)} into bytes \texttt{0..7} of~$P$, and marks~$P$ dirty.
+
+Notice that \texttt{wal\_buffers} is still volatile shared memory. At that instant, neither the WAL record at~$L$ nor the dirty data page~$P$ has reached NAND flash. That brings us to the single invariant on which all crash recovery rests.
+
+\begin{theorem}[The Write-Ahead Logging Invariant]
+\label{ch04:thm-wal-rule}
+Let $P$ be any dirty buffer frame in \texttt{shared\_buffers} carrying header stamp $\texttt{pd\_lsn}(P) = L$, and let $\mathrm{FlushLSN}$ denote the highest WAL byte offset durably synced (\texttt{fdatasync}) to non-volatile storage inside \texttt{\$PGDATA/\allowbreak pg\_wal/}. PostgreSQL's buffer manager (\texttt{FlushBuffer} in \texttt{bufmgr.c}) enforces:
+\[
+  P \text{ may be written to the OS via \texttt{pwrite(2)}} \quad\Longrightarrow\quad \mathrm{FlushLSN} \ge \texttt{pd\_lsn}(P) = L.
+\]
+If $\mathrm{FlushLSN} < L$ when $P$ is chosen for eviction or background cleaning, \texttt{FlushBuffer} blocks and invokes \texttt{XLogFlush(L)} before issuing \texttt{pwrite(2)}. Under this rule (together with torn-page protection from Section~\ref{ch04:fpw} and commit-record flushing at \texttt{COMMIT}), every committed transaction is recoverable and no physical page can persist an unlogged state on disk.
+\end{theorem}
+
+\begin{proof}
+In Haerder and Reuter's classic buffer-management taxonomy, PostgreSQL is a \textbf{\textsc{Steal} / \textsc{No-Force}} engine:
+\begin{itemize}
+  \item \textbf{\textsc{No-Force}:} At \texttt{COMMIT} of transaction~$T_1$ with commit record at LSN $L_{\text{commit}}$, PostgreSQL forces only the sequential WAL stream up to $\mathrm{FlushLSN} \ge L_{\text{commit}}$; dirty 8~KB pages modified by~$T_1$ may remain only in volatile \texttt{shared\_buffers}. Because every prior modification by~$T_1$ occurred at some LSN $L_i < L_{\text{commit}} \le \mathrm{FlushLSN}$, every log record needed to reconstruct $T_1$'s heap and index edits is already durable in \texttt{pg\_wal} before the client sees \texttt{COMMIT}.
+  \item \textbf{\textsc{Steal}:} Conversely, if \texttt{shared\_buffers} runs low on clean frames (or \texttt{bgwriter} sweeps), PostgreSQL may \emph{steal} frame~$P$ modified by a still-uncommitted transaction~$T_2$ at LSN~$L$ and write~$P$ out to the heap file before~$T_2$ commits. Because \texttt{FlushBuffer} enforces $\mathrm{FlushLSN} \ge L$ prior to \texttt{pwrite(2)}, if power fails after~$P$ lands on disk, the WAL record at~$L$ (plus its full-page image if~$P$ tore) is guaranteed to exist on non-volatile storage, so recovery can reconstruct a structurally valid page~$P$ and rely on transaction status (or ARIES undo in overwrite-in-place engines) to govern visibility of~$T_2$'s changes. \qedhere
+\end{itemize}
+\end{proof}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small]
+  % Dirty Buffer in shared_buffers
+  \node[draw=sourceblue!85!black, fill=sourceblue!10, rounded corners=3pt, thick,
+        minimum width=3.55cm, minimum height=1.85cm, align=center] (buf) at (1.80, 4.15)
+    {\textbf{Dirty Buffer \#42}\\ {\scriptsize in \texttt{shared\_buffers}}\\[3pt]
+     \texttt{\scriptsize BM\_DIRTY | BM\_VALID}\\
+     \textcolor{sourceblue!85!black}{\textbf{\texttt{\scriptsize pd\_lsn = 0/1A40}}}};
+
+  % Gatekeeper FlushBuffer()
+  \node[draw=trapred!85!black, fill=trapred!8, rounded corners=3pt, very thick,
+        minimum width=4.15cm, minimum height=1.85cm, align=center] (gate) at (7.55, 4.15)
+    {\textbf{\texttt{FlushBuffer()} Gate}\\ {\scriptsize (\texttt{storage/buffer/bufmgr.c})}\\[3pt]
+     {\scriptsize \texttt{pd\_lsn <= LogwrtResult.Flush}?}\\
+     {\scriptsize \textcolor{trapred!85!black}{\textbf{0/1A40 $\le$ 0/1980: FALSE $\to$ WAIT}}}};
+
+  % Target Heap File on Disk
+  \node[draw=targetgreen!85!black, fill=targetgreen!10, rounded corners=3pt, thick,
+        minimum width=3.55cm, minimum height=1.85cm, align=center] (heap) at (13.30, 4.15)
+    {\textbf{Heap Relation File}\\ {\scriptsize \texttt{base/16384/16391}}\\[3pt]
+     {\scriptsize \texttt{pwrite(fd, buf, 8192)}}\\
+     {\scriptsize \textcolor{targetgreen!75!black}{\textbf{Permitted at Step 4}}}};
+
+  % Sequential WAL Stream at bottom
+  \node[font=\bfseries\scriptsize, anchor=west, text=black!80] at (0.05, 1.62)
+    {Logical WAL Stream (\texttt{wal\_buffers} $\longrightarrow$ \texttt{\$PGDATA/pg\_wal/}):};
+
+  \draw[fill=targetgreen!22, draw=targetgreen!80!black, thick] (0.05, 0.42) rectangle (5.05, 1.35);
+  \node[font=\scriptsize, align=center] at (2.55, 0.88)
+    {\textbf{Already \texttt{fdatasync}ed to NAND}\\\texttt{[ .. 0/1980 ]}};
+
+  \draw[fill=quotientorange!26, draw=quotientorange!85!black, very thick] (5.05, 0.42) rectangle (10.15, 1.35);
+  \node[font=\scriptsize, align=center] at (7.60, 0.88)
+    {\textbf{Flushed \& \texttt{fdatasync}ed at Step 2}\\\texttt{(0/1980 .. 0/1A40]}};
+
+  \draw[fill=gray!14, draw=gray!60!black, dashed, thick] (10.15, 0.42) rectangle (15.05, 1.35);
+  \node[font=\scriptsize, align=center, text=black!65] at (12.60, 0.88)
+    {Unflushed tail in \texttt{wal\_buffers}\\\texttt{(0/1A40 .. 0/1B10]}};
+
+  % Pointer ticks
+  \draw[thick, trapred!85!black] (5.05, 0.42) -- (5.05, 0.08);
+  \node[font=\tiny\bfseries, text=trapred!85!black] at (5.05, -0.10) {Old \texttt{Flush = 0/1980}};
+
+  \draw[very thick, targetgreen!80!black] (10.15, 0.42) -- (10.15, 0.08);
+  \node[font=\tiny\bfseries, text=targetgreen!80!black] at (10.15, -0.10) {New \texttt{Flush = 0/1A40}};
+
+  % Numbered workflow arrows
+  \draw[->, thick, sourceblue!85!black] (buf.east) --
+    node[above=3pt, font=\scriptsize\bfseries, align=center]{evict /\\ clean} (gate.west);
+
+  \draw[->, very thick, trapred!85!black] (6.95, 3.22) --
+    node[left=3pt, pos=0.42, font=\scriptsize\bfseries, align=right]{Step 1:\\\texttt{XLogFlush(0/1A40)}} (6.95, 1.40);
+
+  \draw[->, very thick, targetgreen!80!black] (8.25, 1.40) --
+    node[right=3pt, pos=0.58, font=\scriptsize\bfseries, align=left]{Step 3: \texttt{Flush = 0/1A40}\\unblocks gate} (8.25, 3.22);
+
+  \draw[->, very thick, targetgreen!80!black] (gate.east) --
+    node[above=3pt, font=\scriptsize\bfseries, align=center]{Step 4:\\ \texttt{pwrite()}} (heap.west);
+\end{tikzpicture}
+\caption{How \texttt{FlushBuffer()} enforces the WAL Invariant in shared memory. Dirty Buffer~\#42 carries \texttt{pd\_lsn = 0/1A40}, while durable WAL (\texttt{XLogCtl->LogwrtResult.Flush}) has only reached \texttt{0/1980}. The gate blocks \texttt{pwrite()}, forces \texttt{wal\_buffers} out through \texttt{fdatasync()} up to \texttt{0/1A40}, and only then lets the 8~KB heap page leave user-space RAM.}
+\label{ch04:fig-wal-rule}
+\end{figure}
+
+\begin{attackbox}
+\textbf{What breaks if \texttt{bgwriter} violates the WAL Invariant?}
+Walk through a concrete violation. Suppose B-tree leaf block~19 is split by transaction~$T_1$: a new right-sibling block~44 is allocated, half of block~19's keys move to block~44 (logged at LSN \texttt{0/1A40}), and~$T_1$ has not yet committed, so \texttt{0/1A40} sits only in volatile \texttt{wal\_buffers} (\texttt{FlushLSN = 0/1980}). Suppose a broken background writer writes block~19 (now missing half its keys, with a right-link pointer to block~44) to the OS without calling \texttt{XLogFlush(0/1A40)}, the OS flushes block~19 to NAND, and power fails before \texttt{0/1A40} or block~44 ever reaches NAND. Upon reboot, recovery stops at \texttt{0/1980}. Block~44 does not exist on disk at all, while block~19 on disk permanently lost half its index entries \emph{for previously committed rows} and holds a right-sibling pointer to a nonexistent page. Even in an MVCC database, pushing a data page ahead of its own WAL record destroys physical structural invariants across pages.
+\end{attackbox}
+
+\section{Torn Pages Solved: \texttt{full\_page\_writes} After a Checkpoint}
+\label{ch04:fpw}
+
+Test your understanding with one question before reading on.
+
+\begin{walkbox}
+Suppose PostgreSQL strictly obeys the WAL Invariant (Theorem~\ref{ch04:thm-wal-rule}): before dirty block~7 (\texttt{pd\_lsn = 0/1140}) starts writing to the heap file, its WAL record at \texttt{0/1140} is already safely \texttt{fdatasync}ed in \texttt{pg\_wal}. A millisecond later, \texttt{bgwriter} calls \texttt{pwrite()} on block~7, and building power dies halfway through, tearing block~7 across its two 4~KB sectors just like Figure~\ref{ch04:fig-write-stack}(b). Since the WAL record at \texttt{0/1140} is safely on disk, why can't crash recovery simply replay record \texttt{0/1140} onto block~7 and fix the tear?
+\end{walkbox}
+
+Work out what happens with actual byte offsets, and you will watch naive delta replay fall apart in \emph{two independent ways}.
+
+Normally, WAL records use \textbf{physiological logging}: \emph{physical} to a specific 8~KB block (``relation 16384, block 7''), \emph{logical} within that block's internal slotted structure (``decrement \texttt{pd\_upper} by 56, write these 56 tuple bytes at \texttt{pd\_upper}, and point \texttt{ItemId[4]} there''). Compact physiological deltas are tiny---often 55 to 80 bytes instead of 8,192 bytes---and replaying them requires knowing whether a given disk page already reflects the delta so we never insert the same tuple twice (idempotency). Standard recovery checks idempotency by comparing the page's \texttt{pd\_lsn} against the record's end LSN:
+\begin{align*}
+  \texttt{page.pd\_lsn} \ge \texttt{record.end\_lsn} &\implies \text{skip replay (\texttt{BLK\_DONE});}\\
+  \texttt{page.pd\_lsn} < \texttt{record.end\_lsn} &\implies \text{apply delta and set } \texttt{page.pd\_lsn} \gets \texttt{record.end\_lsn}.
+\end{align*}
+
+Now watch both halves of a torn 8~KB write defeat that rule:
+
+\begin{enumerate}
+  \item \textbf{Failure Case A (Sector~$2k$ lands, Sector~$2k+1$ is lost):}
+    Where does \texttt{pd\_lsn} live inside an 8,192-byte page? At bytes \texttt{0..7}---right at the front of Sector~$2k$! When Sector~$2k$ lands on NAND flash and power cuts before Sector~$2k+1$ arrives, the torn disk page carries the \emph{new} \texttt{pd\_lsn = 0/1140} in Sector~$2k$, while Sector~$2k+1$ still holds stale bytes missing the 56-byte tuple. When recovery restarts and reads block~7, it sees $\texttt{page.pd\_lsn} = \texttt{0/1140} \ge \texttt{0/1140}$, concludes ``block~7 was already completely written before the crash,'' \textbf{skips replaying record \texttt{0/1140}}, and leaves a page whose header and tuples disagree, permanently.
+  \item \textbf{Failure Case B (Sector~$2k+1$ lands first, Sector~$2k$ is lost):}
+    NVMe command queues freely reorder concurrent 4~KB sector writes when no barrier separates them. Suppose Sector~$2k+1$ (upper tuple bytes) hits NAND while Sector~$2k$ (header + line pointers) stays at the old \texttt{pd\_lsn = 0/1080}. Worse, suppose record \texttt{0/1140} performed an in-page defragmentation (\texttt{PageRepairFragmentation}) shifting twenty tuples upward in Sector~$2k+1$ and updating twenty \texttt{ItemIdData} offsets in Sector~$2k$, followed by another delta at \texttt{0/1190}. Replaying physiological instructions that read current slot offsets or tuple headers off a half-shifted, half-unshifted 8~KB buffer reads misaligned bytes and scrambles the page.
+\end{enumerate}
+
+\begin{whybox}
+Physiological delta replay is only idempotent and well-defined when the 8~KB page on disk is a \textbf{clean snapshot from some single real point in time}---either completely before a WAL record or completely after it. A torn 8~KB page never existed in RAM at any instant in history; no sequence of deltas can safely build on a base image whose two 4~KB halves come from different points in time.
+\end{whybox}
+
+\subsection{Hole-Stripped Full Page Images (FPIs) vs.\ Doublewrite Buffers}
+
+Database engineers have invented two main ways out of this trap. MySQL's InnoDB engine uses a \textbf{doublewrite buffer}: every time InnoDB flushes dirty 16~KB pages from its buffer pool, it first writes full 16~KB copies sequentially into a dedicated doublewrite region on disk, calls \texttt{fsync()}, and only then scatters the 16~KB pages to their real tablespace offsets---doubling every background data-page write.
+
+PostgreSQL takes a leaner path controlled by the GUC \texttt{full\_page\_writes = on} (enabled by default and essential on every standard filesystem). Instead of writing every evicted buffer twice, PostgreSQL piggybacks torn-page protection directly onto its checkpoint cycle inside \texttt{XLogInsert} (\texttt{xloginsert.c}):
+
+\begin{formalbox}
+\textbf{The \texttt{full\_page\_writes} Rule (\texttt{XLogCheckBufferNeedsBackup}).}
+Let $\mathrm{RedoRecPtr}$ be the WAL LSN at which the most recently \emph{started} checkpoint began. Whenever a backend modifies buffer~$P$ in \texttt{shared\_buffers} and registers~$P$ in a WAL record, it inspects $P$'s \emph{prior} \texttt{pd\_lsn} (before stamping the new LSN):
+\begin{itemize}
+  \item If $\texttt{pd\_lsn}_{\text{prior}}(P) \le \mathrm{RedoRecPtr}$, this is the \textbf{very first modification to page~$P$ since the checkpoint began}. Instead of (or alongside) a physiological delta, PostgreSQL embeds a complete \textbf{Full Page Image (FPI)} of the modified 8~KB page directly inside this WAL record (\texttt{BKPBLOCK\_HAS\_IMAGE | BKPIMAGE\_APPLY}).
+  \item If $\texttt{pd\_lsn}_{\text{prior}}(P) > \mathrm{RedoRecPtr}$, an earlier WAL record after $\mathrm{RedoRecPtr}$ already logged an FPI for page~$P$! Every subsequent 2nd, 3rd, $\dots$, $10{,}000$th edit to page~$P$ until the next checkpoint begins emits \textbf{only a compact 55--80 byte physiological delta}.
+\end{itemize}
+\end{formalbox}
+
+Trace why this cures both Case~A and Case~B in one stroke. Suppose a checkpoint begins at $\mathrm{RedoRecPtr} = \texttt{0/1000}$. Block~7 (previously at \texttt{pd\_lsn = 0/0E20}) is touched first at \texttt{0/1080} (which embeds an FPI), then updated by deltas at \texttt{0/1140} and \texttt{0/1190}, and then tears on disk during a background flush right before power dies.
+
+When PostgreSQL restarts, crash recovery always begins scanning forward from $\mathrm{RedoRecPtr} = \texttt{0/1000}$. What is the very first WAL record after \texttt{0/1000} that mentions block~7? Record \texttt{0/1080}---carrying a Full Page Image. And when PostgreSQL's \texttt{XLogReadBufferForRedoExtended} encounters an active FPI (\texttt{BKPIMAGE\_APPLY}), it \textbf{does not read or trust \texttt{pd\_lsn} on the torn disk page at all}: it zeroes an 8~KB frame in \texttt{shared\_buffers}, copies the intact FPI directly from WAL into that frame, stamps \texttt{pd\_lsn = 0/1080}, and returns \texttt{BLK\_RESTORED}. Even if Sector~$2k$ on disk falsely claimed \texttt{pd\_lsn = 0/1190}, the FPI unconditionally overwrites the entire 8~KB block in memory back to the clean, untorn state at \texttt{0/1080}. Next, recovery reaches \texttt{0/1140}, compares in-memory $\texttt{pd\_lsn} = \texttt{0/1080} < \texttt{0/1140}$, applies the 64-byte delta in memory, and then applies \texttt{0/1190}'s 58-byte delta on top.
+
+Better still, an ``8~KB'' Full Page Image rarely writes 8,192 bytes to WAL. Look at a slotted page again: between \texttt{pd\_lower} (end of the \texttt{ItemIdData} array) and \texttt{pd\_upper} (start of the tuple region) sits a contiguous \textbf{free-space hole} containing zero live information. PostgreSQL strips that hole completely (\texttt{BKPIMAGE\_HAS\_HOLE}), recording only \texttt{hole\_offset = pd\_lower} and \texttt{hole\_length = pd\_upper - pd\_lower} in a 4-byte image header:
+\[
+  \text{Raw FPI bytes} = 8{,}192 - (\texttt{pd\_upper} - \texttt{pd\_lower}).
+\]
+If block~7 holds ten tuples totaling 2,000 bytes (\texttt{pd\_lower = 64}, \texttt{pd\_upper = 6192}), the hole is $6{,}128$ bytes, so the raw FPI costs only $64 + 2{,}000 = 2{,}064$ bytes---and enabling \texttt{wal\_compression = lz4} (or \texttt{zstd} in PostgreSQL~15+) typically shrinks those 2,064 bytes down to \textbf{650--900 bytes} at negligible CPU cost.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small]
+  % ---- Top Timeline: Checkpoint Cycle & FPI vs Deltas ----
+  \node[font=\bfseries\small, anchor=west, text=black!85] at (0.0, 4.95)
+    {(a) WAL Stream Across One Checkpoint Cycle (\texttt{full\_page\_writes = on})};
+
+  \draw[thick, black!75] (0.2, 3.15) -- (12.75, 3.15);
+  \draw[->, thick, black!75] (14.55, 3.15) -- (14.85, 3.15) node[right, font=\scriptsize]{LSN};
+
+  % RedoRecPtr k
+  \draw[very thick, trapred!85!black] (0.85, 2.60) -- (0.85, 4.10);
+  \node[font=\scriptsize\bfseries, text=trapred!85!black, align=center] at (1.05, 4.38)
+    {CKPT $k$ starts\\\texttt{Redo = 0/1000}};
+
+  % 1st touch: FPI
+  \draw[fill=structurepurple!25, draw=structurepurple!85!black, very thick, rounded corners=1.5pt]
+    (1.95, 2.75) rectangle (5.75, 3.88);
+  \node[font=\scriptsize, align=center] at (3.85, 3.31)
+    {\textbf{1st Touch @ \texttt{0/1080}}\\\texttt{\tiny prior pd\_lsn (0/0E20) <= 0/1000}\\ {\tiny\textbf{Hole-Stripped FPI ($\sim$2.1 KB)}}};
+
+  % 2nd, 3rd, 4th touches: tiny deltas
+  \draw[fill=sourceblue!22, draw=sourceblue!85!black, thick, rounded corners=1pt]
+    (6.15, 2.82) rectangle (7.65, 3.78);
+  \node[font=\tiny, align=center] at (6.90, 3.30)
+    {\textbf{2nd Touch}\\\texttt{0/1140}\\64 B delta};
+
+  \draw[fill=sourceblue!22, draw=sourceblue!85!black, thick, rounded corners=1pt]
+    (8.00, 2.82) rectangle (9.50, 3.78);
+  \node[font=\tiny, align=center] at (8.75, 3.30)
+    {\textbf{3rd Touch}\\\texttt{0/1190}\\58 B delta};
+
+  \draw[fill=sourceblue!22, draw=sourceblue!85!black, thick, rounded corners=1pt]
+    (9.85, 2.82) rectangle (11.35, 3.78);
+  \node[font=\tiny, align=center] at (10.60, 3.30)
+    {\textbf{4th Touch}\\\texttt{0/1240}\\62 B delta};
+
+  \node[font=\scriptsize, text=sourceblue!85!black] at (8.75, 2.38)
+    {$\underbrace{\hspace{5.2cm}}_{\texttt{prior pd\_lsn > 0/1000} \;\Longrightarrow\; \text{no FPI needed}}$};
+
+  % Next Checkpoint k+1
+  \draw[very thick, trapred!85!black] (12.15, 2.60) -- (12.15, 4.10);
+  \node[font=\scriptsize\bfseries, text=trapred!85!black, align=center] at (12.25, 4.38)
+    {CKPT $k{+}1$\\\texttt{Redo = 0/9000}};
+
+  \draw[fill=structurepurple!25, draw=structurepurple!85!black, very thick, rounded corners=1.5pt]
+    (12.75, 2.75) rectangle (14.55, 3.88);
+  \node[font=\tiny, align=center] at (13.65, 3.31)
+    {\textbf{New FPI}\\after CKPT\\$k{+}1$};
+
+  % ---- Bottom Left: Hole-Stripping ----
+  \node[font=\bfseries\scriptsize, anchor=west, text=black!85] at (0.0, 1.72)
+    {(b) Hole-Stripping Inside an 8,192 B FPI:};
+
+  \draw[fill=structurepurple!22, draw=structurepurple!80!black, thick] (0.05, 0.75) rectangle (1.35, 1.42);
+  \node[font=\tiny, align=center] at (0.70, 1.08) {Hdr+Slots\\64 B};
+
+  \draw[pattern=north east lines, pattern color=gray!45, draw=gray!65, dashed] (1.35, 0.75) rectangle (4.50, 1.42);
+  \node[font=\tiny, fill=white, inner sep=1pt, align=center] at (2.92, 1.08)
+    {Free Hole: 6,128 B\\\textbf{STRIPPED}};
+
+  \draw[fill=structurepurple!22, draw=structurepurple!80!black, thick] (4.50, 0.75) rectangle (6.70, 1.42);
+  \node[font=\tiny, align=center] at (5.60, 1.08) {Live Tuples\\2,000 B};
+
+  \draw[->, thick, structurepurple!80!black] (3.38, 0.72) -- (3.38, 0.36);
+  \draw[fill=targetgreen!18, draw=targetgreen!80!black, thick, rounded corners=2pt]
+    (0.05, -0.32) rectangle (6.70, 0.32);
+  \node[font=\tiny\bfseries, align=center, text=targetgreen!75!black] at (3.38, 0.0)
+    {Stored in WAL: 2,064 B raw $\;\xrightarrow{\texttt{lz4}}\;$ $\sim$740 B compressed};
+
+  % ---- Bottom Right: Healing a Torn Page on Replay ----
+  \node[font=\bfseries\scriptsize, anchor=west, text=black!85] at (7.15, 1.72)
+    {(c) Crash Replay Heals Any Later Disk Tear:};
+
+  \node[draw=trapred!80!black, fill=trapred!10, rounded corners=2pt,
+        minimum width=2.25cm, minimum height=0.84cm, align=center, font=\tiny]
+    (torn) at (8.05, 0.95) {\textbf{Torn Disk Block 7}\\Sec 0 NEW $\mid$ Sec 1 OLD};
+
+  \node[draw=structurepurple!85!black, fill=structurepurple!16, rounded corners=2pt, thick,
+        minimum width=2.35cm, minimum height=0.84cm, align=center, font=\tiny]
+    (fpi) at (11.50, 0.95) {\textbf{Replay \texttt{0/1080} FPI}\\\texttt{BLK\_RESTORED}\\overwrites all 8 KB};
+
+  \node[draw=targetgreen!85!black, fill=targetgreen!16, rounded corners=2pt, very thick,
+        minimum width=2.20cm, minimum height=0.84cm, align=center, font=\tiny]
+    (clean) at (14.10, 0.95) {\textbf{Replay Deltas}\\\texttt{0/1140..0/1240}\\Exact clean 8 KB};
+
+  \draw[->, thick, trapred!80!black] (torn.east) -- node[above=2pt, font=\tiny]{bypass} (fpi.west);
+  \draw[->, thick, targetgreen!80!black] (fpi.east) -- (clean.west);
+
+  \node[font=\tiny, text=black!75, text width=7.8cm, align=center] at (11.20, -0.05)
+    {\texttt{XLogReadBufferForRedoExtended} zeroes the RAM frame and expands the FPI + zero hole directly, never trusting torn disk bytes.};
+\end{tikzpicture}
+\caption{How \texttt{full\_page\_writes} eliminates torn pages without a doublewrite buffer. Only the \emph{first} edit to Block~7 after each checkpoint writes a hole-stripped Full Page Image (\texttt{0/1080}); subsequent edits before the next checkpoint write tiny $\sim$60-byte deltas. On crash recovery, the FPI unconditionally overwrites the entire 8~KB block in memory (\texttt{BLK\_RESTORED}), healing any mid-write tear on disk before deltas replay.}
+\label{ch04:fig-fpw-cycle}
+\end{figure}
+
+\begin{applicationbox}
+\textbf{Diagnosing and taming the ``Checkpoint WAL Storm'' in production.}
+Because every checkpoint advances $\mathrm{RedoRecPtr}$, the instant a new checkpoint begins, \emph{every hot page in \texttt{shared\_buffers}} satisfies $\texttt{pd\_lsn} \le \mathrm{RedoRecPtr}$ again. Over the next 30 to 90 seconds, the first update to each active heap and B-tree page emits a Full Page Image, causing WAL throughput (\texttt{wal\_fpi} and \texttt{wal\_bytes} in \texttt{pg\_stat\_wal}), disk sync load, and replication network bandwidth to spike $3\times$ to $10\times$ in a sharp sawtooth wave. Two tuning knobs flatten that sawtooth immediately on busy OLTP clusters:
+\begin{enumerate}
+  \item Increase \texttt{checkpoint\_timeout} from the conservative \texttt{5min} default to \texttt{15min}--\texttt{30min} (raising \texttt{max\_wal\_size} to \texttt{16GB}--\texttt{64GB} to match), so hot buffers pay the FPI tax three to six times less often.
+  \item Set \texttt{wal\_compression = lz4} (or \texttt{zstd}), which typically cuts FPI byte volume by $60\%$--$75\%$ while actually \emph{increasing} commit throughput on NVMe and cloud network block volumes.
+\end{enumerate}
+Never set \texttt{full\_page\_writes = off} on \texttt{ext4} or \texttt{XFS}; it is only safe on Copy-on-Write filesystems such as ZFS configured with \texttt{recordsize=8k} where the filesystem itself never overwrites an 8~KB block in place.
+\end{applicationbox}
+
+\section{Commit Durability Tradeoffs, Group Commit, and \texttt{wal\_writer}}
+\label{ch04:commit-durability}
+
+Appending a 70-byte \texttt{XLogRecord} is sequential, which solves random heap seeks---yet a sharp systems engineer should immediately raise a hand and object: \emph{``Wait. Even sequential \texttt{fdatasync()} takes $80\;\mu\text{s}$ on a local enterprise NVMe drive and $600$--$1{,}200\;\mu\text{s}$ on a cloud network block volume. If one backend holds a lock for $800\;\mu\text{s}$ on every \texttt{COMMIT}, isn't our 64-core server capped at $1 / 0.0008\text{ s} = 1{,}250$ commits per second?''}
+
+If each committing backend serialized its own \texttt{fdatasync()} one at a time, that $1{,}250$~TPS ceiling would be brick-solid. Breaking right through it requires separating \emph{inserting bytes into shared WAL memory} from \emph{flushing shared WAL memory to NAND}, and batching concurrent committers through \textbf{leader-follower group commit}.
+
+\subsection{\texttt{wal\_buffers}, Parallel Insertion Slots, and Group Commit}
+
+Inside shared memory, PostgreSQL carves out a circular ring buffer of 8~KB WAL frames controlled by \texttt{wal\_buffers} (auto-tuned to $1/32$ of \texttt{shared\_buffers}, clamped between 64~KB and 16~MB---one full WAL segment). Two distinct synchronization layers govern this ring:
+
+\begin{enumerate}
+  \item \textbf{Concurrent insertion (\texttt{NUM\_XLOGINSERT\_LOCKS = 8}):} When forty backends execute \texttt{INSERT} and \texttt{UPDATE} statements simultaneously, each backend computes its \texttt{XLogRecord} CRC32C in private memory, claims one of eight \texttt{WALInsertLocks}, atomically reserves exact start/end byte offsets $[L_{\text{start}}, L_{\text{end}})$ via a tiny spinlock/atomic fetch-add on the global byte position, and copies its bytes into \texttt{wal\_buffers} in parallel with seven other cores.
+  \item \textbf{Leader-follower \texttt{XLogFlush()} on \texttt{WALWriteLock}:} When backend $B_1$ executes \texttt{COMMIT}, it appends a tiny \texttt{XACT\_COMMIT} record ending at $L_1 = \texttt{0/1500}$ and calls \texttt{XLogFlush(0/1500)}. Only one process at a time may hold \texttt{WALWriteLock} to issue \texttt{write()} and \texttt{fdatasync()} on the active segment file. Watch what happens over the next $800\;\mu\text{s}$ while $B_1$ is parked inside the kernel waiting for NVMe NAND programming to finish:
+    \begin{itemize}
+      \item Backends $B_2, B_3, \dots, B_{40}$ do \emph{not} stall on insertion. Using the eight \texttt{WALInsertLocks}, all thirty-nine append their own \texttt{XACT\_COMMIT} records into \texttt{wal\_buffers}, advancing the inserted tail all the way from \texttt{0/1500} to $L_{40} = \texttt{0/4B20}$, and then line up waiting on \texttt{WALWriteLock}.
+      \item As soon as $B_1$'s \texttt{fdatasync()} returns, $B_1$ updates shared memory (\texttt{LogwrtResult.\allowbreak Flush = 0/1500}) and releases \texttt{WALWriteLock}.
+      \item Backend $B_2$ wakes up as the new \textbf{group leader}. Before touching the kernel, $B_2$ checks how far \texttt{wal\_buffers} has filled---not merely up to its own commit LSN $L_2 = \texttt{0/1590}$, \textbf{all the way up to the latest completed insertion at $L_{40} = \texttt{0/4B20}$!} Backend $B_2$ writes the entire contiguous slice \texttt{(0/1500 .. 0/4B20]} in one sequential \texttt{write()} and issues \textbf{one single \texttt{fdatasync()}} for all thirty-nine transactions.
+      \item When $B_2$ updates \texttt{LogwrtResult.Flush = 0/4B20} and drops \texttt{WALWriteLock}, followers $B_3 \dots B_{40}$ check shared memory before even acquiring (or right upon acquiring) the lock, see $\texttt{Flush} = \texttt{0/4B20} \ge L_i$, and return \texttt{COMMIT} to their clients immediately with \textbf{zero} system calls.
+    \end{itemize}
+\end{enumerate}
+
+\begin{implementbox}
+Here is the core leader-follower double-check pattern distilled from \texttt{XLogFlush()} in \texttt{src/backend/access/transam/xlog.c}:
+\begin{lstlisting}[language=C]
+void XLogFlush(XLogRecPtr record_end_lsn)
+{
+    /* Fast path: did an earlier group leader already sync past our LSN? */
+    if (record_end_lsn <= LogwrtResult.Flush)
+        return;
+
+    /* Wait our turn (or wake up after the current leader finishes) */
+    LWLockAcquire(WALWriteLock, LW_EXCLUSIVE);
+
+    /* Refresh shared Flush pointer; if the previous leader swept our
+     * commit record into its fdatasync batch, exit with ZERO syscalls! */
+    RefreshLogwrtResult();
+    if (record_end_lsn <= LogwrtResult.Flush)
+    {
+        LWLockRelease(WALWriteLock);
+        return;
+    }
+
+    /* We are the new group leader: flush ALL ready WAL bytes in wal_buffers,
+     * sweeping in every follower that appended while we waited! */
+    XLogRecPtr insert_pos = WaitXLogInsertionsToFinish(GetXLogInsertRecPtr());
+    XLogWrite(insert_pos);   /* sequential write() + single fdatasync()  */
+    LWLockRelease(WALWriteLock);
+}
+\end{lstlisting}
+Notice why forty concurrent clients on a $0.8\;\text{ms}$ cloud disk are no longer stuck at $1{,}250$~TPS: amortizing thirty-nine commits per $0.8\;\text{ms}$ round-trip lifts sustained durable throughput above $45{,}000$~TPS on the exact same storage volume. PostgreSQL also exposes \texttt{commit\_delay} (microseconds a leader pauses before calling \texttt{XLogWrite} when at least \texttt{commit\_siblings} transactions are active), though under genuine concurrency natural queueing during the previous \texttt{fdatasync()} already forms full batches without artificial sleep.
+\end{implementbox}
+
+\subsection{The \texttt{synchronous\_commit} Spectrum and \texttt{wal\_writer}}
+
+What if a workload writes millions of telemetry events, IoT sensor readings, or HTTP audit rows per minute where losing the last half-second of acknowledged inserts during a once-a-decade power outage is completely acceptable, provided the database itself \textbf{never corrupts}?
+
+Most developers facing that tradeoff reach for the wrong knob---and occasionally blow up a company's database by setting \texttt{fsync = off}. The two settings differ in what they risk, so we separate them here.
+
+\begin{trapbox}
+\textbf{\texttt{synchronous\_commit = off} is safe engineering; \texttt{fsync = off} is Russian roulette.}
+\begin{itemize}
+  \item Setting \textbf{\texttt{fsync = off}} strips \texttt{fdatasync()} out of PostgreSQL everywhere---commits, checkpoints, \texttt{FlushBuffer}, catalog updates, control-file updates. If the OS crashes or loses power, heap pages, B-tree pages, \texttt{pg\_xact}, and \texttt{pg\_control} land on NAND in arbitrary out-of-order fragments, violating the WAL Invariant and leaving the entire cluster unrecoverable (\texttt{PANIC: could not locate a valid checkpoint record} or silent index corruption). Use \texttt{fsync = off} \emph{only} on throwaway CI test instances you intend to delete on failure.
+  \item Setting \textbf{\texttt{synchronous\_commit = off}} (even for a single transaction via \texttt{SET LOCAL synchronous\_commit = off;}) changes \emph{only one thing}: when a transaction commits, the backend appends \texttt{XACT\_COMMIT} into \texttt{wal\_buffers} and returns \texttt{COMMIT} to the client immediately without calling \texttt{XLogFlush()}. Better yet, \textbf{\texttt{full\_page\_writes} and the WAL Invariant inside \texttt{FlushBuffer()} remain $100\%$ active.} No dirty heap or index page can ever reach the OS until its WAL record has been \texttt{fdatasync}ed.
+\end{itemize}
+\end{trapbox}
+
+Who flushes \texttt{wal\_buffers} when backends commit asynchronously with \texttt{synchronous\_commit = off}? A dedicated background daemon called \textbf{\texttt{wal\_writer}} wakes up every \texttt{wal\_writer\_delay} (default \texttt{200ms}, or sooner once \texttt{wal\_writer\_flush\_after = 1MB} of unwritten WAL accumulates) and calls \texttt{XLogBackgroundFlush()}. To avoid repeatedly overwriting partial 8~KB WAL sectors on quiet servers, \texttt{XLogBackgroundFlush()} flushes completed 8~KB WAL pages on normal ticks and forces out any lingering partial tail page once a full cycle elapses---bounding the maximum window of acknowledged-yet-unsynced commits on sudden power loss to at most $3 \times \texttt{wal\_writer\_delay} \approx \mathbf{600\;\text{ms}}$. If power fails, PostgreSQL recovers cleanly to a $100\%$ transactionally and structurally consistent state from $\le 600\;\text{ms}$ ago, with zero torn pages and zero broken indexes.
+
+\texttt{synchronous\_commit} can also be changed per transaction. Within the exact same database connection pool, a payment transfer runs at the default \texttt{synchronous\_commit = on}, while an analytics click logger runs:
+\begin{lstlisting}[language=SQL]
+BEGIN;
+SET LOCAL synchronous_commit = off;
+INSERT INTO page_views (user_id, url, viewed_at) VALUES (4812, '/checkout', now());
+COMMIT;  -- returns in ~15 microseconds without waiting on NVMe fdatasync!
+\end{lstlisting}
+
+When you add streaming replication standbys (which we wire up end-to-end in Chapter~8), \texttt{synchronous\_commit} generalizes smoothly from two levels to five, letting each transaction choose exactly how many failure domains its \texttt{XACT\_COMMIT} record must cross before the client receives \texttt{COMMIT}:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{2.3cm}>{\raggedright\arraybackslash}p{2.1cm}>{\raggedright\arraybackslash}p{3.5cm}>{\raggedright\arraybackslash}p{3.3cm}>{\raggedright\arraybackslash}p{3.3cm}@{}}
+\toprule
+\textbf{Setting} &
+\textbf{Primary WAL \texttt{fdatasync}?} &
+\textbf{Sync standby guarantee before client ACK} &
+\textbf{Power loss on primary host} &
+\textbf{Primary disk destroyed} \\
+\midrule
+\texttt{off} &
+  Async ($\le 3d$) &
+  None &
+  Lose $\le 600\text{ ms}$; 0 corruption &
+  Lose unshipped WAL \\
+\texttt{local} &
+  \textbf{Yes} &
+  None (local only) &
+  \textbf{0 committed rows lost} &
+  Lose unshipped WAL \\
+\texttt{remote\_write} &
+  \textbf{Yes} &
+  Standby OS page cache (\texttt{write}) &
+  \textbf{0 committed rows lost} &
+  0 lost unless dual power cut \\
+\texttt{on} \emph{(default)} &
+  \textbf{Yes} &
+  Standby NAND (\texttt{fdatasync})* &
+  \textbf{0 committed rows lost} &
+  \textbf{0 committed rows lost} \\
+\texttt{remote\_apply} &
+  \textbf{Yes} &
+  Standby NAND + replayed in RAM &
+  \textbf{0 committed rows lost} &
+  \textbf{0 lost + read-your-writes} \\
+\bottomrule
+\end{tabular}
+\caption{Exact durability guarantees across all five \texttt{synchronous\_commit} modes ($d = \texttt{wal\_writer\_delay} = 200\text{ ms}$). *When \texttt{synchronous\_standby\_names} is empty, \texttt{on} behaves identically to \texttt{local}.}
+\label{ch04:tab-sync-commit}
+\end{table}
+
+\subsection{\texttt{UNLOGGED} Tables: Trading Crash Survival for Raw RAM-to-Disk Speed}
+
+Sometimes even compact WAL records are pure waste: think of an intermediate staging table in an idempotent nightly ETL job, a reconstructible materialized lookup cache, or ephemeral user-session state. Declaring a table \texttt{UNLOGGED}:
+\begin{lstlisting}[language=SQL]
+CREATE UNLOGGED TABLE etl_staging_events (
+    batch_id    bigint NOT NULL,
+    payload     jsonb  NOT NULL
+);
+\end{lstlisting}
+instructs PostgreSQL (\texttt{relpersistence = 'u'} in \texttt{pg\_class}) to \textbf{bypass WAL generation completely} on \texttt{INSERT}, \texttt{UPDATE}, \texttt{DELETE}, and index maintenance. Backends mutate 8~KB pages in \texttt{shared\_buffers} without acquiring \texttt{WALInsertLocks}, without writing Full Page Images after checkpoints, and without streaming bytes to standbys---often doubling or tripling bulk write throughput.
+
+How does PostgreSQL prevent torn or half-flushed \texttt{UNLOGGED} pages from corrupting queries after a crash? When \texttt{CREATE UNLOGGED TABLE} runs, PostgreSQL writes one tiny WAL-logged file on disk alongside the main relation file (say \texttt{base/16384/24580}): an empty initialization fork named \textbf{\texttt{24580\_init}} (and an initialized empty root page \texttt{\_init} fork for each index on that table).
+\begin{itemize}
+  \item On a \textbf{clean shutdown} (\texttt{pg\_ctl stop -m fast}), the shutdown checkpoint flushes every dirty \texttt{UNLOGGED} buffer to disk cleanly, so all rows in \texttt{etl\_staging\_events} survive normal restarts intact.
+  \item On \textbf{any unclean shutdown / crash recovery}, before opening the database for client connections, \texttt{ResetUnloggedRelations()} scans \texttt{\$PGDATA/base/} for every relation possessing an \texttt{\_init} fork, unlinks the potentially torn main data files, and copies \texttt{24580\_init} over \texttt{24580}---automatically \textbf{truncating every \texttt{UNLOGGED} table to zero rows} so broken pages can never be read.
+\end{itemize}
+
+\section{Checkpoints, Background Writer, and Step-by-Step Crash Recovery}
+\label{ch04:recovery}
+
+One question remains. If we append to \texttt{\$PGDATA/pg\_wal/} forever and never coordinate when dirty buffers reach their relation files, two bad things happen: \texttt{pg\_wal} fills the entire NVMe drive, and recovering from a crash after six months of uptime requires replaying six months of WAL from LSN \texttt{0/0}.
+
+A \textbf{checkpoint} draws a clean floor under history so PostgreSQL can recycle old 16~MB WAL segment files and bound crash-recovery time to seconds. Yet the way a production checkpoint actually runs contains a detail that surprises most people the first time they look inside \texttt{pg\_control}.
+
+\subsection{\texttt{global/pg\_control}, Fuzzy Checkpoints, and Why Recovery Rewinds to the Redo Point}
+
+When a crashed PostgreSQL server boots up, how does \texttt{StartupXLOG()} know where in a 50~GB sea of \texttt{pg\_wal} segments to begin reading? It reads an 8,192-byte metadata file at \texttt{\$PGDATA/global/pg\_control}, holding a single CRC32C-protected C struct called \texttt{ControlFileData} (smaller than one 512-byte hardware sector in active payload so its update is atomic at the sector level):
+
+\begin{lstlisting}[language=C]
+/* Simplified excerpt from src/include/catalog/pg_control.h */
+typedef struct CheckPoint
+{
+    XLogRecPtr      redo;           /* Redo start LSN when ckpt BEGAN!   */
+    TimeLineID      ThisTimeLineID; /* current WAL timeline              */
+    FullTransactionId nextXid;      /* next free 64-bit XID              */
+    /* ... oldestActiveXid, oldestMulti, timestamp ... */
+} CheckPoint;
+
+typedef struct ControlFileData
+{
+    uint64          system_identifier;
+    DBState         state;          /* DB_SHUTDOWNED vs DB_IN_PRODUCTION */
+    XLogRecPtr      checkPoint;     /* LSN of latest Checkpoint Record   */
+    CheckPoint      checkPointCopy; /* embedded copy including .redo!    */
+    uint32          data_checksum_version;
+    pg_crc32c       crc;
+} ControlFileData;
+\end{lstlisting}
+
+Look at those two distinct LSN fields inside \texttt{ControlFileData}: \texttt{checkPoint} (say \texttt{0/1230}) and \texttt{checkPointCopy.redo} (say \texttt{0/1000}). Why aren't they equal?!
+
+Imagine what would happen on a server with 64~GB of \texttt{shared\_buffers} if the \texttt{checkpointer} process tried to take an instantaneous ``sharp'' checkpoint: freeze all user writes, blast 20~GB of dirty buffers to disk at maximum I/O queue depth, \texttt{fsync} three hundred relation files, write one checkpoint WAL record, and unfreeze clients. Every five minutes your application latency graph would flatline into a 25-second outage.
+
+Instead, PostgreSQL performs \textbf{spread (fuzzy) online checkpoints} governed by three GUCs:
+\begin{itemize}
+  \item \texttt{checkpoint\_timeout} (default \texttt{5min}, commonly tuned to \texttt{15min}--\texttt{30min}): maximum wall-clock interval between checkpoints.
+  \item \texttt{max\_wal\_size} (default \texttt{1GB}, commonly \texttt{16GB}--\texttt{64GB}): soft ceiling on \texttt{pg\_wal} growth before triggering an early checkpoint.
+  \item \texttt{checkpoint\_completion\_target} (default \texttt{0.9}): fraction of the interval over which \texttt{checkpointer} paces its dirty-buffer writes ($0.9 \times 300\text{ s} = 270\text{ s}$).
+\end{itemize}
+
+Trace carefully what happens between $t = 0\text{ s}$ and $t = 270\text{ s}$ while online transactions keep running uninterrupted:
+\begin{enumerate}
+  \item \textbf{At $t = 0\text{ s}$ (LSN \texttt{0/1000}):} \texttt{checkpointer} wakes up, records the current WAL insert position as \textbf{\texttt{RedoRecPtr = 0/1000}} (publishing it immediately so \texttt{full\_page\_writes} logs FPIs for pages touched from \texttt{0/1000} onward), and scans all \texttt{BufferDescriptors}, setting the flag \texttt{BM\_CHECKPOINT\_NEEDED} on every buffer that is \emph{already dirty right now at $t = 0\text{ s}$}.
+  \item \textbf{Across $t \in (0\text{ s}, 270\text{ s})$:} \texttt{checkpointer} trickles those \texttt{BM\_CHECKPOINT\_NEEDED} buffers out to the OS with gentle sleeps between batches and finally calls \texttt{fsync()} on every touched relation file. Meanwhile, user backends never pause. Suppose at $t = 40\text{ s}$ (LSN \texttt{0/1080}), client $T_1$ modifies clean buffer~$B_7$ (which was \emph{not} dirty at $t = 0$, or which \texttt{checkpointer} already swept past at $t = 10\text{ s}$!). Buffer~$B_7$ is now dirty in \texttt{shared\_buffers} with \texttt{pd\_lsn = 0/1080}, and \texttt{checkpointer} is \textbf{not} obligated to flush~$B_7$ during this checkpoint cycle.
+  \item \textbf{At $t = 270\text{ s}$ (LSN \texttt{0/1230}):} Having confirmed that \emph{every dirty change from before \texttt{0/1000} is safely on NAND}, \texttt{checkpointer} appends an \texttt{XLOG\_CHECKPOINT\_ONLINE} record at LSN \texttt{0/1230} whose payload records \texttt{redo = 0/1000}, calls \texttt{XLogFlush(0/1230)}, atomically updates \texttt{global/pg\_control} (\texttt{checkPoint = 0/1230}, \texttt{redo = 0/1000}), and recycles any 16~MB WAL segment strictly preceding \texttt{0/1000}.
+\end{enumerate}
+
+\begin{whybox}
+Now you see why recovery \textbf{must} rewind from \texttt{checkPoint = 0/1230} back to \texttt{redo = 0/1000}. At the moment \texttt{0/1230} hits disk, PostgreSQL only promises that changes \emph{older than \texttt{0/1000}} have been flushed to relation files; changes logged between \texttt{0/1000} and \texttt{0/1230} (like $T_1$'s edit to~$B_7$ at \texttt{0/1080}) may still live solely in volatile \texttt{shared\_buffers}. Starting Redo at \texttt{0/1230} would silently evaporate $T_1$'s committed write.
+
+That fuzzy window also yields the exact sizing formula inside \texttt{xlog.c} (\texttt{CalculateCheckpointSegments}): while Checkpoint~2 runs for $c \cdot T$ seconds ($c = \texttt{checkpoint\_completion\_target} = 0.9$), PostgreSQL cannot yet delete the WAL segments anchored at Checkpoint~1's Redo point. Just before Checkpoint~2 finishes, live unrecyclable WAL spans $(1 + c)$ checkpoint intervals:
+\[
+  \text{Peak live WAL} \;\approx\; (1 + \texttt{checkpoint\_completion\_target}) \times R_{\text{wal}} \times \texttt{checkpoint\_timeout}.
+\]
+With $c = 0.9$, if your workload writes $R_{\text{wal}} = 20\;\text{MB/s}$ and \texttt{checkpoint\_timeout = 15min} ($900\;\text{s}$, or $18\;\text{GB}$ per interval), \texttt{max\_wal\_size} must be at least $1.9 \times 18\;\text{GB} \approx \mathbf{35\;\text{GB}}$---otherwise PostgreSQL is forced to trigger early checkpoints before the 15-minute timer ever expires.
+\end{whybox}
+
+\subsection{Three Buffer Writers, Three Distinct Jobs}
+
+Newcomers often confuse \texttt{checkpointer} with the background writer (\texttt{bgwriter}). In fact, dirty 8~KB frames leave \texttt{shared\_buffers} via three different processes, visible side-by-side in \texttt{pg\_stat\_checkpointer}, \texttt{pg\_stat\_bgwriter}, and PostgreSQL~16+'s unified \texttt{pg\_stat\_io} view:
+
+\begin{itemize}
+  \item \textbf{\texttt{checkpointer} (recovery bound \& WAL reclamation):} Flushes every buffer dirtied before $\mathrm{RedoRecPtr}$ once per checkpoint cycle and issues relation \texttt{fsync()} calls. In a healthy cluster, \texttt{checkpointer} accounts for $70\%$--$95\%$ of all data-page writes (because keeping a hot page in RAM across 500 updates during a 15-minute checkpoint collapses 500 writes into 1 write).
+  \item \textbf{\texttt{bgwriter} (eviction headroom for \texttt{shared\_buffers}):} Wakes every \texttt{bgwriter\_delay} (\texttt{200ms}) and scans just ahead of the clock-sweep victim hand, cleaning low-usage-count dirty buffers (up to \texttt{bgwriter\_lru\_maxpages}) \emph{only} when buffer churn threatens to run out of clean frames. It never creates checkpoints.
+  \item \textbf{Client backend direct writes (the distress signal):} If a user query needs to read a page from disk into a full \texttt{shared\_buffers} pool and the clock-sweep hand hits a \texttt{BM\_DIRTY} victim before \texttt{bgwriter} cleaned it, \emph{your user's \texttt{SELECT} query has to call \texttt{FlushBuffer()} (and potentially \texttt{XLogFlush()}) inline.} Rising backend writes/evictions in \texttt{pg\_stat\_io} (\texttt{backend\_type = 'client backend'}) tell you immediately that \texttt{shared\_buffers} or \texttt{bgwriter\_lru\_maxpages} is starved.
+\end{itemize}
+
+\subsection{Classic ARIES (3 Passes) vs.\ PostgreSQL's 1-Pass Redo-Only Recovery}
+
+Open almost any university database textbook and crash recovery is synonymous with IBM's classic \textbf{ARIES} algorithm (Mohan et al., 1992), used by engines that overwrite rows in place or maintain separate undo segments. ARIES makes \textbf{three distinct passes} across the log on startup:
+\begin{enumerate}
+  \item \textbf{Analysis pass (forward):} Scans forward from the checkpoint to reconstruct the Dirty Page Table and identify ``loser'' transactions still active at the instant of the crash.
+  \item \textbf{Redo pass (forward, ``repeating history''):} Replays all logged physical updates---both winners and losers---bringing disk pages back to the exact state at the moment power failed.
+  \item \textbf{Undo pass (backward):} Walks backward along \texttt{prevLSN} chains for every loser transaction, physically reversing every uncommitted row modification and appending Compensation Log Records (CLRs). If a batch job updated $50\text{ million}$ rows over two hours and power died at $99\%$, an eager ARIES Undo pass must physically roll back $50\text{ million}$ rows before recovery finishes (or run complex background rollback threads holding row locks).
+\end{enumerate}
+
+Now open \texttt{src/backend/access/transam/xlogrecovery.c} in PostgreSQL and look for the Undo pass. \textbf{There isn't one.} PostgreSQL has zero Undo records, zero Compensation Log Records, and zero backward WAL scan.
+
+\begin{connectionbox}
+\textbf{How MVCC (Chapter~5) eliminates the Undo phase completely.}
+Recall from Chapter~2 that a PostgreSQL \texttt{UPDATE} never overwrites an existing tuple's bytes in place: it stamps \texttt{t\_xmax = 702} on the old tuple version and inserts a brand-new physical tuple version stamped \texttt{t\_xmin = 702}. During crash recovery, PostgreSQL executes \textbf{one single forward Redo pass} from $\mathrm{RedoRecPtr}$ to the end of valid WAL, faithfully replaying both committed transaction $T_1$ (\texttt{xid = 701}) \emph{and} crashed uncommitted transaction $T_2$ (\texttt{xid = 702}) onto the heap and B-tree pages.
+
+Why doesn't replaying $T_2$'s uncommitted tuple corrupt query results when PostgreSQL opens for connections a second later? Because transaction commit status lives in \texttt{\$PGDATA/pg\_xact/} (two bits per XID: \texttt{00 = IN\_PROGRESS}, \texttt{01 = COMMITTED}, \texttt{10 = ABORTED}, \texttt{11 = SUB\_COMMITTED}). Transaction~$T_1$ logged \texttt{XACT\_COMMIT} at \texttt{0/1210}, so Redo sets \texttt{pg\_xact[701] = 01}. Transaction~$T_2$ crashed before committing, so \texttt{pg\_xact[702]} stays \texttt{00} while recovery advances \texttt{nextXid} past \texttt{702}. As Chapter~5 proves, any past XID whose \texttt{pg\_xact} status is \texttt{00} and is no longer running is \textbf{instantaneously treated as aborted by every MVCC snapshot}. Readers skip $T_2$'s new tuple, treat the old tuple (\texttt{t\_xmax = 702} aborted) as still live, set a one-bit hint flag on first visit, and let background \texttt{VACUUM} reclaim $T_2$'s dead bytes lazily later. Whether $T_2$ modified ten rows or a hundred million rows before crashing, PostgreSQL's Undo time at startup is $\mathbf{0\;\text{ms}}$.
+\end{connectionbox}
+
+Inside \texttt{xlogutils.h}, every block reference inspected during that single forward Redo pass resolves to one of four explicit actions returned by \texttt{XLogReadBufferForRedoExtended()}:
+\begin{lstlisting}[language=C]
+typedef enum
+{
+    BLK_NEEDS_REDO, /* page.pd_lsn < record.end_lsn -> apply delta & set LSN */
+    BLK_DONE,       /* page.pd_lsn >= record.end_lsn -> already applied, skip */
+    BLK_RESTORED,   /* record carried an FPI -> 8 KB block restored from WAL  */
+    BLK_NOTFOUND    /* relation/block truncated & dropped later -> skip       */
+} XLogRedoAction;
+\end{lstlisting}
+
+Algorithm~\ref{ch04:alg-redo} puts the entire \texttt{StartupXLOG()} recovery state machine onto one page.
+
+\begin{algorithm}[H]
+\caption{\textsc{PostgresCrashRecovery}: Single-Pass Redo in \texttt{xlogrecovery.c}}
+\label{ch04:alg-redo}
+\KwIn{\texttt{global/pg\_control} and segment files in \texttt{\$PGDATA/pg\_wal/}.}
+\KwOut{Consistent \texttt{shared\_buffers}, \texttt{pg\_xact}, and relation files ready for clients.}
+Read \texttt{ControlFileData} from \texttt{global/pg\_control}; verify CRC32C\;
+\If{$\mathrm{state} = \texttt{DB\_SHUTDOWNED}$}{\Return \tcp*{clean shutdown; zero recovery needed}}
+Read Checkpoint Record at $\texttt{ControlFile.checkPoint}$; extract $\mathrm{RedoLSN} \gets \texttt{ckpt.redo}$\;
+Initialize WAL reader at $\mathrm{RedoLSN}$\;
+\While{\textsc{ReadNextXLogRecord}() returns header + payload with valid \texttt{xl\_prev} and CRC32C}{
+  $L_{\text{end}} \gets$ ending byte offset of current \texttt{XLogRecord}\;
+  $\mathrm{nextXid} \gets \max(\mathrm{nextXid},\; \texttt{record.xl\_xid} + 1)$\;
+  \uIf{$\texttt{record.xl\_rmid} = \texttt{RM\_XACT\_ID}$}{
+    Update \texttt{pg\_xact}[\texttt{record.xl\_xid}] to \texttt{01 (COMMITTED)} or \texttt{10 (ABORTED)}\;
+  }
+  \Else{
+    \ForEach{modified block reference $B$ in \texttt{record}}{
+      \uIf{$B$ carries an active Full Page Image (\texttt{BKPIMAGE\_APPLY})}{
+        Zero buffer frame $P$ in \texttt{shared\_buffers}; expand hole-stripped FPI into $P$\;
+        $\texttt{P.pd\_lsn} \gets L_{\text{end}}$; mark $P$ dirty \tcp*{\texttt{BLK\_RESTORED}: heals any tear.}
+      }
+      \Else{
+        Read disk block $B$ into buffer frame $P$\;
+        \If{$\texttt{P.pd\_lsn} < L_{\text{end}}$}{
+          Invoke \texttt{RmgrTable[record.xl\_rmid].rm\_redo(record, P)} \tcp*{\texttt{BLK\_NEEDS\_REDO}}
+          $\texttt{P.pd\_lsn} \gets L_{\text{end}}$; mark $P$ dirty\;
+        }
+        \tcp{else $\texttt{P.pd\_lsn} \ge L_{\text{end}} \implies \texttt{BLK\_DONE}$ (idempotent skip)}
+      }
+    }
+  }
+}
+\tcp{First invalid CRC32C or header marks exact end-of-WAL boundary}
+\textsc{ResetUnloggedRelations}() \tcp*{copy \texttt{\_init} forks over all \texttt{UNLOGGED} tables}
+Write end-of-recovery checkpoint (or promote); set $\mathrm{state} \gets \texttt{DB\_IN\_PRODUCTION}$\;
+\end{algorithm}
+
+\subsection{Worked LSN-by-LSN Crash Recovery Trace}
+
+Let us trace Algorithm~\ref{ch04:alg-redo} by hand on concrete hexadecimal LSNs so no moving part remains abstract. Suppose heap Block~7 of \texttt{accounts} initially sits on disk with $\texttt{pd\_lsn} = \texttt{0/0E20}$ holding one row \texttt{(id=1, bal=500)}. Watch six events unfold right before a power outage:
+
+\begin{enumerate}
+  \item \textbf{\texttt{0/1000} (Online checkpoint begins):} \texttt{checkpointer} starts an online checkpoint and sets $\mathrm{RedoRecPtr} = \texttt{0/1000}$.
+  \item \textbf{\texttt{0/1080} ($T_1$, \texttt{xid=701}, first touch to Block~7):} $T_1$ inserts \texttt{(id=2, bal=300)} onto Block~7. Because Block~7's prior $\texttt{pd\_lsn} = \texttt{0/0E20} \le \texttt{0/1000}$, PostgreSQL logs \texttt{RM\_HEAP\_ID / INSERT} carrying a \textbf{Full Page Image} ending at \texttt{0/1080}, setting in-RAM $\texttt{pd\_lsn} = \texttt{0/1080}$.
+  \item \textbf{\texttt{0/1140} ($T_1$, \texttt{xid=701}, delta update on Block~7):} $T_1$ runs \texttt{UPDATE accounts SET bal = 400 WHERE id = 1} (a same-page \texttt{HOT\_UPDATE}). Because prior $\texttt{pd\_lsn} = \texttt{0/1080} > \texttt{0/1000}$, PostgreSQL logs only a compact 64-byte delta ending at \texttt{0/1140}; in-RAM $\texttt{pd\_lsn} = \texttt{0/1140}$.
+  \item \textbf{\texttt{0/1190} ($T_2$, \texttt{xid=702}, uncommitted insert on Block~7):} Concurrent transaction~$T_2$ inserts \texttt{(id=3, bal=999)} onto Block~7 via a 58-byte delta ending at \texttt{0/1190}; in-RAM $\texttt{pd\_lsn} = \texttt{0/1190}$. Notice $T_2$ has \emph{not} committed yet.
+  \item \textbf{\texttt{0/1210} ($T_1$ commits):} $T_1$ executes \texttt{COMMIT}, writing \texttt{RM\_XACT\_ID / COMMIT} for \texttt{xid=701} and calling \texttt{XLogFlush(0/1210)}. Client~$T_1$ receives \texttt{COMMIT}.
+  \item \textbf{\texttt{0/1230} (Checkpoint finishes) \& \texttt{0/1260} (Torn write + power cut):} At \texttt{0/1230}, \texttt{checkpointer} finishes flushing pre-\texttt{0/1000} buffers, logs \texttt{XLOG\_CHECKPOINT\_ONLINE} (\texttt{redo = 0/1000}), and updates \texttt{global/pg\_control} (\texttt{checkPoint = 0/1230}). Moments later, \texttt{bgwriter} flushes dirty Block~7 (\texttt{pd\_lsn = 0/1190}) (permitted because WAL is synced past \texttt{0/1230}) and \textbf{power dies mid-write}:
+    \begin{itemize}
+      \item On disk, \textbf{Block~7 is torn}: Sector~0 carries \texttt{pd\_lsn = 0/1190} and three line pointers, while Sector~1 still holds stale pre-\texttt{0/1000} tuple bytes.
+      \item Meanwhile in \texttt{pg\_wal}, $T_2$ was writing another record at \texttt{0/1260}; only its first 40 bytes reached NAND, leaving a broken \texttt{xl\_crc}.
+    \end{itemize}
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small]
+  % Top Bootstrap Chain: pg_control -> 0/1230 -> rewind to 0/1000
+  \node[draw=structurepurple!85!black, fill=structurepurple!12, rounded corners=2.5pt, thick,
+        minimum width=3.2cm, minimum height=0.9cm, align=center, font=\scriptsize] (ctrl) at (1.7, 4.05)
+    {\textbf{\texttt{global/pg\_control}}\\\texttt{checkPoint = 0/1230}};
+
+  \node[draw=quotientorange!85!black, fill=quotientorange!15, rounded corners=2.5pt, thick,
+        minimum width=3.5cm, minimum height=0.9cm, align=center, font=\scriptsize] (ckptbox) at (10.75, 4.05)
+    {\textbf{CKPT Record @ \texttt{0/1230}}\\extract \texttt{redo = 0/1000}};
+
+  \draw[->, thick, structurepurple!85!black] (ctrl.east) --
+    node[above, font=\tiny\bfseries]{1. locate latest checkpoint} (ckptbox.west);
+
+  % Rewind curved arrow from ckptbox to 0/1000
+  \draw[->, very thick, trapred!85!black, dashed] (ckptbox.south west)
+    .. controls (6.5, 3.05) and (2.5, 3.15) ..
+    node[above, font=\tiny\bfseries, text=trapred!85!black]{2. rewind scan to Redo Point \texttt{0/1000}!}
+    (0.65, 2.38);
+
+  % Middle WAL Stream Boxes
+  \draw[fill=gray!18, draw=black!75, thick] (0.1, 1.15) rectangle (1.35, 2.35);
+  \node[font=\tiny, align=center] at (0.72, 1.75) {\textbf{\texttt{0/1000}}\\Redo\\Start};
+
+  \draw[fill=structurepurple!24, draw=structurepurple!85!black, very thick] (1.35, 1.15) rectangle (3.75, 2.35);
+  \node[font=\tiny, align=center] at (2.55, 1.75)
+    {\textbf{\texttt{0/1080}} ($T_1$:701)\\Blk 7 \textbf{FPI}\\\texttt{BLK\_RESTORED}};
+
+  \draw[fill=sourceblue!20, draw=sourceblue!85!black, thick] (3.75, 1.15) rectangle (6.05, 2.35);
+  \node[font=\tiny, align=center] at (4.9, 1.75)
+    {\textbf{\texttt{0/1140}} ($T_1$:701)\\Blk 7 \textbf{Delta}\\\texttt{0/1080 < 0/1140}};
+
+  \draw[fill=quotientorange!20, draw=quotientorange!85!black, thick] (6.05, 1.15) rectangle (8.35, 2.35);
+  \node[font=\tiny, align=center] at (7.2, 1.75)
+    {\textbf{\texttt{0/1190}} ($T_2$:702)\\Blk 7 \textbf{Delta}\\\texttt{0/1140 < 0/1190}};
+
+  \draw[fill=targetgreen!25, draw=targetgreen!85!black, very thick] (8.35, 1.15) rectangle (10.55, 2.35);
+  \node[font=\tiny, align=center] at (9.45, 1.75)
+    {\textbf{\texttt{0/1210}} ($T_1$:701)\\\textbf{\texttt{XACT\_COMMIT}}\\\texttt{pg\_xact[701]=01}};
+
+  \draw[fill=gray!18, draw=gray!70!black, thick] (10.55, 1.15) rectangle (12.65, 2.35);
+  \node[font=\tiny, align=center] at (11.6, 1.75)
+    {\textbf{\texttt{0/1230}}\\\texttt{CKPT\_ONLINE}\\\texttt{redo=0/1000}};
+
+  \draw[fill=trapred!25, draw=trapred!90!black, very thick, dashed] (12.65, 1.15) rectangle (15.1, 2.35);
+  \node[font=\tiny, align=center, text=trapred!90!black] at (13.87, 1.75)
+    {\textbf{\texttt{0/1260}} ($T_2$:702)\\\textbf{CRC32C FAIL!}\\Stop Redo Here};
+
+  \draw[->, very thick, black!80] (0.72, 0.85) --
+    node[below, font=\scriptsize\bfseries]{3. Single Forward Redo Scan (\texttt{0/1000} $\longrightarrow$ \texttt{0/1260}, Zero Undo Pass)}
+    (13.5, 0.85);
+
+  % Bottom 3 Post-Recovery Outcome Cards
+  \node[draw=targetgreen!85!black, fill=targetgreen!10, rounded corners=2.5pt, thick,
+        minimum width=4.75cm, minimum height=1.25cm, align=center, font=\scriptsize] at (2.48, -0.65)
+    {\textbf{Heap Block 7 (Healed!)}\\FPI @ \texttt{0/1080} overwrote torn disk\\+ deltas \texttt{0/1140}, \texttt{0/1190} applied};
+
+  \node[draw=sourceblue!85!black, fill=sourceblue!10, rounded corners=2.5pt, thick,
+        minimum width=4.75cm, minimum height=1.25cm, align=center, font=\scriptsize] at (7.62, -0.65)
+    {\textbf{Winner $T_1$ (\texttt{xid = 701})}\\\texttt{pg\_xact[701] = 01 (COMMITTED)}\\Rows \texttt{id=1 (400), id=2 (300)} \textbf{LIVE}};
+
+  \node[draw=trapred!85!black, fill=trapred!8, rounded corners=2.5pt, thick,
+        minimum width=4.75cm, minimum height=1.25cm, align=center, font=\scriptsize] at (12.75, -0.65)
+    {\textbf{Loser $T_2$ (\texttt{xid = 702})}\\\texttt{pg\_xact[702] = 00} (crashed)\\Row \texttt{id=3 (999)} \textbf{INVISIBLE} (MVCC)};
+\end{tikzpicture}
+\caption{Complete crash-recovery trace from \texttt{global/pg\_control} to database readiness. Recovery reads \texttt{0/1230}, jumps backward to \texttt{redo = 0/1000}, heals torn Block~7 via the \texttt{0/1080} FPI, replays both $T_1$ and $T_2$ forward, halts cleanly on the \texttt{0/1260} CRC failure, and relies on \texttt{pg\_xact} + MVCC to hide $T_2$'s uncommitted insert in $O(1)$ time.}
+\label{ch04:fig-recovery-trace}
+\end{figure}
+
+Now step through Table~\ref{ch04:tab-recovery-walk} as electricity returns and \texttt{StartupXLOG()} boots:
+\begin{table}[H]
+\centering
+\footnotesize
+\begin{tabular}{@{}l>{\raggedright\arraybackslash}p{2.4cm}>{\raggedright\arraybackslash}p{2.7cm}>{\raggedright\arraybackslash}p{2.4cm}>{\raggedright\arraybackslash}p{4.6cm}@{}}
+\toprule
+\textbf{WAL LSN} & \textbf{Record Type} & \textbf{Buffer \texttt{pd\_lsn} Check} & \textbf{Action} & \textbf{Resulting State in Memory} \\
+\midrule
+\texttt{pg\_control} & Bootstrap & \texttt{state = IN\_\allowbreak PRODUCTION} & Crash detected & Jump to \texttt{0/1230}, extract \texttt{redo = 0/1000}. \\
+\texttt{0/1080} & \texttt{HEAP INSERT+FPI} & Ignored. (has FPI) & \texttt{BLK\_RESTORED} & Torn disk \texttt{pd\_lsn=0/1190} discarded. Clean 8~KB Block~7 restored at \texttt{pd\_lsn = 0/1080}. \\
+\texttt{0/1140} & \texttt{HEAP HOT\_UPDATE} & \texttt{0/1080 < 0/1140} & \texttt{BLK\_NEEDS\_REDO} & $T_1$ updates \texttt{id=1} to \texttt{bal=400}; Block~7 \texttt{pd\_lsn $\gets$ 0/1140}. \\
+\texttt{0/1190} & \texttt{HEAP INSERT} & \texttt{0/1140 < 0/1190} & \texttt{BLK\_NEEDS\_REDO} & $T_2$ inserts \texttt{(id=3, bal=999)} (\texttt{t\_xmin=702}); Block~7 \texttt{pd\_lsn $\gets$ 0/1190}. \\
+\texttt{0/1210} & \texttt{XACT COMMIT} & --- & Update CLOG & \texttt{pg\_xact[701] $\gets$ 01 (COMMITTED)}. \\
+\texttt{0/1230} & \texttt{CKPT\_ONLINE} & --- & Metadata sync & Update \texttt{nextXid $\ge$ 703}; keep scanning. \\
+\texttt{0/1260} & Truncated tail & \texttt{xl\_crc} mismatch. & \textbf{End of WAL} & Stop scan; \texttt{pg\_xact[702]} stays \texttt{00} (never committed, so every later snapshot treats $T_2$ as aborted). \\
+\bottomrule
+\end{tabular}
+\caption{Exact LSN-by-LSN state transitions executed by \texttt{StartupXLOG()} on our crashed cluster.}
+\label{ch04:tab-recovery-walk}
+\end{table}
+
+The server log for this restart shows the same steps:
+\begin{lstlisting}
+LOG:  database system was interrupted; last known up at 2026-11-01 09:12:03 UTC
+LOG:  database system was not properly shut down; automatic recovery in progress
+LOG:  redo starts at 0/1000
+LOG:  incorrect resource manager data checksum in record at 0/1260
+LOG:  redo done at 0/1230
+LOG:  checkpoint starting: end-of-recovery immediate wait
+LOG:  database system is ready to accept connections
+\end{lstlisting}
+The checksum line is not an error: it is how recovery finds the end of valid WAL.
+
+Row~2 (\texttt{0/1080}) of Table~\ref{ch04:tab-recovery-walk}: if \texttt{0/1080} had been a delta instead of an FPI, recovery would have read torn Block~7 from disk, seen Sector~0's \texttt{pd\_lsn = 0/1190}, returned \texttt{BLK\_DONE} on \texttt{0/1080}, \texttt{0/1140}, \emph{and} \texttt{0/1190}, and left Sector~1 full of garbage. Instead, \texttt{BLK\_RESTORED} wiped the torn disk block from memory at \texttt{0/1080}, let \texttt{0/1140} and \texttt{0/1190} rebuild the exact byte-for-byte slotted page in RAM, and left $T_2$'s uncommitted tuple \texttt{(id=3, bal=999)} harmlessly invisible behind \texttt{t\_xmin = 702}.
+
+\begin{labbox}
+In PostgreSQL~15 and later, the built-in \texttt{pg\_walinspect} extension lets you watch this exact FPI-then-delta transition live inside SQL without even leaving \texttt{psql}:
+
+\begin{lstlisting}[language=SQL]
+CREATE EXTENSION IF NOT EXISTS pg_walinspect;
+
+CREATE TABLE wal_demo (id int PRIMARY KEY, bal int);
+INSERT INTO wal_demo VALUES (1, 500);
+
+-- Force a checkpoint so RedoRecPtr advances past wal_demo's current pd_lsn:
+CHECKPOINT;
+
+-- Capture LSN right after the checkpoint, then touch Block 0 TWICE:
+SELECT pg_current_wal_lsn() AS start_lsn \gset
+BEGIN;
+INSERT INTO wal_demo VALUES (2, 300);            -- 1st touch -> logs an FPI!
+UPDATE wal_demo SET bal = 400 WHERE id = 1;      -- 2nd touch -> tiny delta!
+COMMIT;
+SELECT pg_current_wal_lsn() AS end_lsn \gset
+
+SELECT start_lsn, end_lsn, xid, resource_manager AS rmgr,
+       record_type, record_length AS rec_len, fpi_length AS fpi_len
+FROM pg_get_wal_records_info(:'start_lsn', :'end_lsn')
+WHERE resource_manager IN ('Heap', 'Transaction');
+\end{lstlisting}
+
+Running this snippet produces output structured right along our theoretical trace:
+\begin{lstlisting}[language=SQL]
+--  start_lsn |  end_lsn  | xid |    rmgr     | record_type | rec_len | fpi_len
+-- -----------+-----------+-----+-------------+-------------+---------+---------
+--  0/19420A8 | 0/1942150 | 745 | Heap        | INSERT      |     168 |     120
+--  0/19421A0 | 0/19421E8 | 745 | Heap        | HOT_UPDATE  |      72 |       0
+--  0/19421E8 | 0/1942210 | 745 | Transaction | COMMIT      |      40 |       0
+\end{lstlisting}
+Notice the \texttt{fpi\_len} column: on the very first heap edit after \texttt{CHECKPOINT}, \texttt{fpi\_len} is \texttt{120} bytes: the 24-byte page header, two 4-byte line pointers, and two 44-byte tuples, with the free-space hole between \texttt{pd\_lower} and \texttt{pd\_upper} left out. The record is $168$ bytes because it also carries the 24-byte \texttt{XLogRecord} header, the block reference, and the insert's own data. Twenty microseconds later, \texttt{HOT\_UPDATE} touches the exact same heap page and writes \texttt{fpi\_len = 0}---just a 72-byte physiological delta, followed by a 40-byte \texttt{COMMIT} record. (You can also run \texttt{pg\_waldump -p \$PGDATA/pg\_wal 000000010000000000000001} from the shell to inspect raw WAL offline when a server is stopped.)
+\end{labbox}
+
+\begin{complexitybox}
+\textbf{Cost Summary of PostgreSQL WAL \& Crash Recovery:}
+\begin{itemize}
+  \item \textbf{\texttt{COMMIT} I/O (\texttt{synchronous\_commit = on}):} $1$ sequential \texttt{write()} + $1$ \texttt{fdatasync()} shared across $K$ concurrent committers ($O(1/K)$ sync calls per transaction; zero random heap/index \texttt{fsync}s).
+  \item \textbf{Per-row WAL size:} $\sim 55$--$90$ bytes per heap/B-tree delta; $+ (8{,}192 - \text{hole})$ bytes (or $\sim 0.3\times$ compressed with \texttt{lz4}) on \emph{only the first touch} per 8~KB block per checkpoint.
+  \item \textbf{Crash recovery time:} $O(\text{WAL bytes since } \mathrm{RedoRecPtr})$ in a single forward scan, plus \textbf{$O(1) = 0$ Undo work} regardless of how many rows crashed transactions modified.
+\end{itemize}
+\end{complexitybox}
+
+Everything we built in this chapter gives PostgreSQL this guarantee: physical 8~KB pages never tear, committed transactions never vanish, and crashed uncommitted transactions leave physical tuple versions behind whose \texttt{pg\_xact} bits remain \texttt{00}. That leaves one huge question hanging in the air: when twenty concurrent queries read Block~7 right now, how does each query decide in nanoseconds which tuple versions are visible to its snapshot, and who eventually sweeps away dead tuples like $T_2$'s aborted \texttt{(id=3, bal=999)} without blocking readers? That is the story of Multi-Version Concurrency Control, snapshots, and \texttt{VACUUM} in Chapter~5.
+
+\section{Exercises}
+\label{ch04:exercises}
+
+\begin{exercise}[\texttt{pg\_lsn} hex arithmetic and 24-character segment filenames]
+\label{ch04:ex-lsn-segments}
+Consider two WAL positions $L_a = \texttt{2/FE800028}$ and $L_b = \texttt{3/24001A8}$ recorded on timeline $T = 2$ in a cluster initialized with the default 16~MB segment size (\texttt{0x01000000} bytes):
+\begin{enumerate}
+  \item Rewrite both $L_a$ and $L_b$ as full 64-bit hexadecimal integers and compute the exact byte difference $\texttt{pg\_wal\_lsn\_diff}(L_b, L_a)$ in both hexadecimal and decimal. How many 16~MB segment boundaries does the interval $[L_a, L_b]$ cross?
+  \item Using Definition~\ref{ch04:def-lsn}, determine the exact 24-character filename inside \texttt{\$PGDATA/pg\_wal/} and the exact decimal byte offset inside that file for both $L_a$ and $L_b$.
+  \item Repeat part~(2) assuming the cluster was created with \texttt{initdb --wal-segsize=64} (64~MB segments $= \texttt{0x04000000}$ bytes, so each 4~GB epoch holds $64 = \texttt{0x40}$ segments).
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Hole-stripped FPI byte budget and checkpoint WAL amplification]
+\label{ch04:ex-fpi-amplification}
+An 8,192-byte heap page holds $20$ live tuples of $120$~bytes each (padded) and zero dead slots. Recall that \texttt{PageHeaderData} is $24$~bytes and each \texttt{ItemIdData} line pointer is $4$~bytes.
+\begin{enumerate}
+  \item Compute \texttt{pd\_lower}, \texttt{pd\_upper}, the byte length of the unused free-space hole, and the exact uncompressed byte size of the hole-stripped Full Page Image (plus $28$~bytes of \texttt{XLogRecord} + image headers).
+  \item Suppose an application executes $50$ consecutive single-row \texttt{HOT\_UPDATE} transactions against rows on this page (assume for steady-state accounting that in-page pruning keeps live data around $2{,}400$~bytes, and each non-FPI \texttt{HOT\_UPDATE} + \texttt{COMMIT} pair writes $72 + 40 = 112$~bytes of WAL). Compare total WAL bytes emitted across those $50$ transactions when (a) zero checkpoints start during the burst (only edit~\#1 writes an FPI) versus (b) an undersized \texttt{max\_wal\_size} triggers a new checkpoint every $10$ updates. By what factor did WAL volume grow, and how much does \texttt{wal\_compression = lz4} at a $3\colon 1$ FPI compression ratio save in case~(b)?
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Proving both failure cases of delta replay without \texttt{full\_page\_writes}]
+\label{ch04:ex-prove-torn-failure}
+Suppose an administrator sets \texttt{full\_page\_writes = off} on an \texttt{ext4} filesystem backed by a standard 4Kn NVMe SSD. Heap Block~4 initially sits cleanly on disk at $\texttt{pd\_lsn} = \texttt{0/5000}$ with $\texttt{pd\_upper} = 8000$.
+\begin{enumerate}
+  \item Construct a concrete two-record WAL sequence (\texttt{0/5060} performing in-page tuple compaction \texttt{PageRepairFragmentation}, followed by \texttt{0/50C0} inserting a 64-byte tuple) and prove step-by-step why crash recovery produces a corrupted page \emph{both} when Sector~0 (\texttt{0..4095}) hits NAND without Sector~1 (\texttt{4096..8191}) \emph{and} when Sector~1 hits NAND without Sector~0.
+  \item Suppose data checksums (\texttt{initdb --data-checksums}) are enabled. Does \texttt{pd\_checksum} allow PostgreSQL to \emph{recover} Block~4 in either case without an FPI, or only to halt with an error? Explain why.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Violating the WAL Invariant]
+\label{ch04:ex-break-wal-rule}
+Suppose you comment out the \texttt{XLogFlush(lsn)} check inside \texttt{FlushBuffer()} in \texttt{bufmgr.c}. Transaction~$T_9$ (\texttt{xid = 880}, uncommitted) splits B-tree leaf Block~10 into Block~10 and newly allocated Block~25 at WAL LSN \texttt{0/7400} while \texttt{LogwrtResult.Flush} sits at \texttt{0/7100}. \texttt{bgwriter} writes modified Block~10 (but not Block~25) to the OS, the OS writes both 4~KB sectors of Block~10 cleanly (untorn) to NAND, and building power fails before \texttt{wal\_buffers} flushes past \texttt{0/7100}.
+\begin{enumerate}
+  \item Trace what \texttt{StartupXLOG()} does on reboot. What is the highest LSN replayed?
+  \item Even though Block~10 did \emph{not} tear and $T_9$ never committed, prove that read queries scanning the B-tree for rows committed \emph{hours before the crash} can now return wrong answers or crash with missing-block errors. Why didn't MVCC visibility save you here?
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Hand-tracing a multi-page crash recovery table]
+\label{ch04:ex-trace-recovery}
+On startup after a power outage, \texttt{global/pg\_control} points to an online checkpoint record at \texttt{0/9200} whose \texttt{redo} pointer is \texttt{0/9000} and \texttt{nextXid} was \texttt{500}. On disk right after the crash:
+\begin{itemize}
+  \item Heap Block~3 is intact with $\texttt{pd\_lsn} = \texttt{0/8F00}$ holding \texttt{(k='a', v=10)}.
+  \item Heap Block~8 is \textbf{torn}: Sector~0 has $\texttt{pd\_lsn} = \texttt{0/9180}$, while Sector~1 holds stale bytes from \texttt{0/8D00}.
+\end{itemize}
+The WAL stream starting at \texttt{0/9000} contains the following eight records:
+\begin{enumerate}
+  \item \texttt{0/9060} (\texttt{xid=501}): \texttt{HEAP INSERT} + \textbf{FPI} on Block~8 (restores \texttt{(k='b', v=20)}).
+  \item \texttt{0/90C0} (\texttt{xid=502}): \texttt{HEAP INSERT} + \textbf{FPI} on Block~3 (adds \texttt{(k='c', v=30)}).
+  \item \texttt{0/9120} (\texttt{xid=501}): \texttt{HEAP HOT\_UPDATE} delta on Block~8 (\texttt{k='b'} updated to \texttt{v=25}).
+  \item \texttt{0/9160} (\texttt{xid=502}): \texttt{XACT\_ABORT}.
+  \item \texttt{0/9180} (\texttt{xid=503}): \texttt{HEAP INSERT} delta on Block~8 (adds \texttt{(k='d', v=40)}).
+  \item \texttt{0/91C0} (\texttt{xid=501}): \texttt{XACT\_COMMIT}.
+  \item \texttt{0/9200} (\texttt{xid=0}): \texttt{XLOG\_CHECKPOINT\_ONLINE} (\texttt{redo = 0/9000}).
+  \item \texttt{0/9250} (\texttt{xid=503}): \texttt{XACT\_COMMIT} --- \textbf{truncated mid-record (\texttt{xl\_crc} mismatch)}.
+\end{enumerate}
+Build a step-by-step trace table like Table~\ref{ch04:tab-recovery-walk} listing the \texttt{XLogRedoAction} for every record, the final \texttt{pd\_lsn} of Blocks~3 and~8, the two-bit \texttt{pg\_xact} entries for XIDs \texttt{501}, \texttt{502}, and \texttt{503}, and the exact \texttt{(k, v)} rows returned by \texttt{SELECT * FROM t ORDER BY k} once recovery completes. Did client \texttt{503} ever receive a \texttt{COMMIT} acknowledgment before the crash (assuming \texttt{synchronous\_commit = on})? Prove your answer.
+\end{exercise}
+
+\begin{exercise}[Group commit throughput and \texttt{synchronous\_commit} failure windows]
+\label{ch04:ex-group-commit}
+A PostgreSQL primary runs on a cloud block volume whose \texttt{fdatasync()} round-trip latency is $L_{\text{sync}} = 1.25\;\text{ms}$. Preparing and copying a transaction's WAL records into \texttt{wal\_buffers} takes $25\;\mu\text{s}$ of CPU time, parallelized across $8$ \texttt{WALInsertLocks}.
+\begin{enumerate}
+  \item With a single sequential client thread ($C = 1$) and \texttt{synchronous\_commit = on}, what is the maximum achievable \texttt{COMMIT/s}?
+  \item With $C = 64$ concurrent client connections continuously executing short one-row transactions under \texttt{synchronous\_commit = on}, compute (a) how many \texttt{fdatasync()} calls per second \texttt{WALWriteLock} issues, (b) the average batch size swept per leader \texttt{XLogWrite()}, and (c) the new commit throughput ceiling (compare serialization on \texttt{fdatasync} against the $8$-slot WAL insertion ceiling).
+  \item Suppose a synchronous standby lies $2.0\;\text{ms}$ away (round-trip). For each of the five \texttt{synchronous\_commit} settings in Table~\ref{ch04:tab-sync-commit}, state the client-perceived commit latency and whether acknowledged commits can be lost if (i) the primary kernel panics, (ii) building power drops on the primary only, or (iii) a storage rack fire permanently destroys the primary's SSDs.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Sizing \texttt{max\_wal\_size} and checkpointer I/O bandwidth]
+\label{ch04:ex-checkpoint-sizing}
+A high-throughput OLTP cluster has \texttt{shared\_buffers = 32GB}, generates WAL at a steady average rate of $R_{\text{wal}} = 45\;\text{MB/s}$, dirties $14.4\;\text{GB}$ of distinct 8~KB buffers during each checkpoint window, and configures \texttt{checkpoint\_timeout = 20min} with \texttt{checkpoint\_completion\_target = 0.9}.
+\begin{enumerate}
+  \item Calculate the WAL volume generated during one 20-minute interval and use the $(1 + \texttt{checkpoint\_completion\_target})$ retention law to compute the minimum \texttt{max\_wal\_size} (rounded up to whole gigabytes, plus a $20\%$ burst headroom) required so checkpoints are triggered cleanly by time rather than WAL-space pressure.
+  \item Compute the average write bandwidth (in MB/s) and 8~KB write rate (in IOPS) that \texttt{checkpointer} pushes to the OS over the spread window ($0.9 \times 1{,}200\;\text{s}$).
+  \item Suppose power fails one second \emph{before} Checkpoint~$k+1$ writes its \texttt{XLOG\_CHECKPOINT\_ONLINE} record. What is the exact worst-case gigabyte volume of WAL that \texttt{StartupXLOG()} must scan on reboot, and how long will recovery take if your NVMe drive + single-process Redo pipeline replays WAL at $600\;\text{MB/s}$?
+\end{enumerate}
+\end{exercise}
+
+\chapterline

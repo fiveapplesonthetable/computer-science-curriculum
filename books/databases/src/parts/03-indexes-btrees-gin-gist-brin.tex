@@ -1,0 +1,892 @@
+\chapter{Indexes: Lehman-Yao B-Link Trees, GIN, GiST, and BRIN}
+\label{ch:indexes}
+
+At the end of Chapter~2, we left our data sitting inside an array of 8,192-byte slotted heap pages. Every row lives at a physical address $\texttt{ctid} = (\text{block}, \text{offset})$: a 32-bit block number naming the 8~KB page inside the relation fork, paired with a 16-bit line-pointer slot inside that page's \texttt{ItemIdData} array. If someone hands you $\texttt{ctid} = (8412, 9)$, PostgreSQL can pin block~8,412 in \texttt{shared\_buffers}, read slot~9 at a known byte offset, jump to \texttt{lp\_off}, and hand you the tuple in microseconds.
+
+The trouble is that SQL queries never hand you a \texttt{ctid}. An API request arrives asking for every ledger posting belonging to \texttt{account\_id = 4291804} since October~1, or the single user row matching \texttt{email = 'ada@lovelace.org'}. Because heap pages accept new tuples wherever the Free Space Map (\texttt{\_fsm}) finds room, rows have no guaranteed physical order on disk. Without an auxiliary directory mapping logical column values to physical \texttt{ctid}s, the executor has only one possible plan: pin block~0, inspect every live tuple, pin block~1, inspect every live tuple, and keep walking until \texttt{EOF}.
+
+\begin{focusbox}
+In this chapter we build PostgreSQL's indexing subsystem from physical byte layouts up to production query geometry:
+\begin{enumerate}
+  \item \textbf{Fanout arithmetic and 8~KB \texttt{nbtree} pages:} why binary trees fail on block storage, how branching factor $B \approx 350$ compresses 100~million rows into three cached hops, and how \texttt{BTPageOpaqueData} links leaves into a doubly-linked ribbon.
+  \item \textbf{Lehman--Yao high-concurrency B-link trees:} why textbook top-down latch crabbing stalls multi-core servers, and how PostgreSQL's \texttt{P\_HIKEY} slot plus right-sibling link (\texttt{btpo\_next}) lets readers traverse unfinished page splits without holding two page locks during descent.
+  \item \textbf{Composite index geometry:} how multi-column keys flatten 2D predicates into a 1D lexicographic ribbon, why equality-before-range reads one contiguous leaf slice while range-before-equality scatters reads, and when \texttt{ORDER BY ... LIMIT} eliminates sorting altogether.
+  \item \textbf{Covering indexes (\texttt{INCLUDE}) and the Visibility Map (\texttt{\_vm}):} why PostgreSQL index tuples store zero MVCC visibility metadata, and how a 2-bit-per-page bitmap rescues true Index-Only Scans.
+  \item \textbf{Partial, expression, and specialized access methods:} shrinking queue indexes by $2{,}000\times$ with \texttt{WHERE}, aligning functional predicates, and choosing cleanly among \textbf{Hash}, \textbf{GIN} (inverted trees with \texttt{fastupdate}), \textbf{GiST} (bounding hierarchies and exclusion constraints), and \textbf{BRIN} (min/max block-range summaries).
+\end{enumerate}
+\end{focusbox}
+
+\chapterline
+
+\section{Why Secondary Indexes Exist and B+Tree Branching Math}
+\label{sec:ch03-fanout-math}
+
+Put concrete numbers on that sequential heap scan first. Suppose our \texttt{postings} table holds $N = 100{,}000{,}000$ ($10^8$) rows. Each row stores a \texttt{BIGINT} primary key, an \texttt{account\_id}, an \texttt{amount\_cents}, a \texttt{TIMESTAMPTZ}, a 3-byte currency code, and status flags---roughly 72~bytes of payload plus the 24-byte \texttt{HeapTupleHeaderData}, or 96~bytes per tuple. Add the 4-byte \texttt{ItemIdData} line pointer from Chapter~2 and each row consumes 100~bytes inside an 8,192-byte page. Subtracting the 24-byte \texttt{PageHeaderData} leaves 8,168 usable bytes, packing $\floor{8168 / 100} = 81$ rows per page.
+
+Across $10^8$ rows, the heap spans
+\[
+  \ceil*{\frac{100{,}000{,}000}{81}} = 1{,}234{,}568 \text{ pages} \times 8{,}192\text{ bytes} \approx 10.11\text{ GB}.
+\]
+Even if a sequential scan streams through Chapter~2's 256~KB \texttt{BAS\_BULKREAD} ring buffer at $2.5\text{ GB/s}$ on a fast NVMe array, reading $10.11\text{ GB}$ to answer one point lookup takes four full seconds and burns $2.5\text{ GB/s}$ of storage bandwidth. At 500 user requests per second, those scans would need 2,000 seconds of disk time every second, so the system cannot keep up.
+
+\subsection{Why Binary Search Trees Lose Badly on Block Devices}
+
+Your algorithms instinct says: keep a balanced binary search tree over the keys. For $N = 10^8$, an AVL or red-black tree has height $\ceil{\log_2(10^8)} = 27$. Twenty-seven comparisons in CPU registers take less than a microsecond. This is Java's \texttt{TreeMap}: a red-black tree in which every entry is its own heap object holding \texttt{left}, \texttt{right}, and \texttt{parent} references. In RAM that design works well, because following a reference costs a few nanoseconds.
+
+On block storage, however, comparisons are free and \emph{page misses} dominate everything. Storage hardware and \texttt{shared\_buffers} move data in 8,192-byte pages, never 32-byte tree nodes. If you allocate binary tree nodes inside 8~KB pages as rows arrive over months of random traffic, parent and child nodes land on unrelated pages. Descending 27 pointer hops where the top 10 levels sit in RAM still triggers $\approx 17$ sequential dependent random 8~KB reads from NVMe. At $70~\mu\text{s}$ per random NVMe read, $17 \times 70~\mu\text{s} \approx 1.2\text{ ms}$ of pure I/O stall---and every 8~KB transfer hauled 8,160~bytes of unrelated neighbors across the PCIe bus just to read one 8-byte key and two child pointers.
+
+The remedy, introduced by Rudolf Bayer and Edward McCreight in 1970 and refined into the \textbf{B+tree} showcased in Douglas Comer's 1979 survey, is to design the tree node around the 8,192-byte page itself. Instead of 2 children per node, pack \emph{hundreds} of separator keys and child block numbers into a single 8~KB internal page, and push all heap \texttt{ctid} payloads down to the bottom leaf level.
+
+\begin{example}[Exact Fanout Arithmetic on an 8~KB \texttt{nbtree} Page]
+\label{ex:ch03-fanout}
+Let us count the exact bytes inside an 8,192-byte PostgreSQL B-tree (\texttt{nbtree}) internal page indexing an 8-byte \texttt{BIGINT} column such as \texttt{account\_id}:
+\begin{itemize}
+  \item \textbf{Fixed page overhead:} 24-byte \texttt{PageHeaderData} at the top of the page, plus a 16-byte \texttt{BTPageOpaqueData} trailer in the special space at the bottom ($\texttt{pd\_special} = 8192 - 16 = 8176$). That leaves $8192 - 40 = 8{,}152$ bytes for line pointers and index tuples.
+  \item \textbf{Per-entry byte cost:} Each entry requires a 4-byte \texttt{ItemIdData} line pointer plus an \texttt{IndexTupleData} struct. As we will inspect shortly in C, \texttt{IndexTupleData} has an 8-byte header (\texttt{t\_tid} storing 6~bytes of block/offset metadata plus 2~bytes of \texttt{t\_info} length and null flags), followed immediately by the 8-byte \texttt{BIGINT} key. Because $8 + 8 = 16$ is already a multiple of \texttt{MAXALIGN} ($8$~bytes on 64-bit Linux), zero padding is added. Each entry costs $4 + 16 = 20$~bytes.
+  \item \textbf{Theoretical and practical branching factor:} Dividing $8{,}152$ usable bytes (minus one 20-byte slot reserved for the page's high key) by $20$~bytes yields $\floor{8132 / 20} = 406$ child downlinks on a completely full internal page. In real production indexes, internal pages sit between $70\%$ and $95\%$ occupancy after splits, and composite or \texttt{UUID} keys are slightly wider (24--28~bytes per entry). That puts the everyday internal branching factor right around $B \approx 350$.
+\end{itemize}
+Now watch what $B = 350$ does to tree height as we descend from the root:
+\begin{center}
+\small
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+\textbf{Tree Level} & \textbf{Pages} & \textbf{Size ($8\text{ KB/pg}$)} & \textbf{Where It Lives in Production} \\
+\midrule
+Level~2 (Root page) & $1$ & $8\text{ KB}$ & Permanently hot in \texttt{shared\_buffers} \\
+Level~1 (Internal) & $350$ & $2.73\text{ MB}$ & Permanently hot in \texttt{shared\_buffers} \\
+Level~0 (Leaves, $350^2$) & $122{,}500$ & $957.03\text{ MB}$ & Hot subset in RAM; cold on NVMe \\
+\bottomrule
+\end{tabular}
+\end{center}
+At default \texttt{fillfactor = 90}, each leaf page uses $0.90 \times 8132 \approx 7{,}318$ bytes, holding $\floor{7318 / 20} = 365$ \texttt{(account\_id, heap\_ctid)} entries. Multiply $122{,}500$ leaf pages by $365$ entries per leaf: \textbf{three index levels cover $44{,}712{,}500$ rows.} Add just one more internal level ($350^3 = 42{,}875{,}000$ leaf pages, with levels~3, 2, and~1 totaling $1 + 350 + 122{,}500 = 122{,}851$ internal pages $\approx 960\text{ MB}$ of RAM) and a four-level B+tree addresses \textbf{over 15.6~billion rows}.
+\end{example}
+
+Pause on the RAM column of Example~\ref{ex:ch03-fanout}. To find a single row out of $44.7$~million:
+\begin{enumerate}
+  \item Pin the root page (in RAM, $0$ disk reads) and binary-search 350 keys ($\ceil{\log_2 350} = 9$ CPU comparisons) to pick 1 of 350 level-1 child blocks.
+  \item Pin that level-1 internal page (part of a $2.73\text{ MB}$ working set that never leaves \texttt{shared\_buffers}, $0$ disk reads) and run 9 CPU comparisons to pick 1 of $122{,}500$ leaf blocks.
+  \item Pin the leaf page (at most $1$ NVMe read if cold) and binary-search its 365 entries to extract $\texttt{ctid} = (8412, 9)$.
+  \item Pin heap block~8,412 (at most $1$ NVMe read if cold) and read tuple slot~9.
+\end{enumerate}
+Instead of reading $1{,}234{,}568$ pages ($10.11\text{ GB}$), PostgreSQL pins \textbf{4 buffers total}, performing \textbf{0 to 2 physical NVMe reads} ($16\text{ KB}$ worst case)---a $630{,}000\times$ reduction in I/O.
+
+\subsection{Inside an 8~KB \texttt{nbtree} Page: \texttt{IndexTupleData} and \texttt{BTPageOpaqueData}}
+
+Because PostgreSQL reuses the exact same 8,192-byte slotted page container from Chapter~2 for both tables and indexes, an \texttt{nbtree} page starts with the familiar 24-byte \texttt{PageHeaderData} and an array of 4-byte \texttt{ItemIdData} line pointers growing downward toward \texttt{pd\_lower}. Two things change inside an index page: the tuple format at \texttt{pd\_upper}, and the 16-byte trailer sitting at \texttt{pd\_special}. Here are the core structures from \texttt{src/include/access/itup.h} and \texttt{src/include/access/nbtree.h}:
+
+\begin{lstlisting}[language=C]
+/* 8-byte header prepended to every index entry (src/include/access/itup.h) */
+typedef struct IndexTupleData {
+    ItemPointerData t_tid;   /* 6 bytes: heap ctid on leaf, or child blkno on internal */
+    unsigned short  t_info;  /* 2 bytes: bit 15 = has nulls, bit 14 = has varlena,
+                                         bits 12..0 = tuple byte length (max 8191) */
+} IndexTupleData;            /* Key column bytes follow immediately after t_info */
+
+/* 16-byte trailer at offset 8176..8192 of every nbtree page (nbtree.h) */
+typedef struct BTPageOpaqueData {
+    BlockNumber btpo_prev;   /* 4 bytes: left sibling block (P_NONE = 0 if leftmost) */
+    BlockNumber btpo_next;   /* 4 bytes: right sibling block (P_NONE = 0 if rightmost) */
+    uint32      btpo_level;  /* 4 bytes: tree level (0 = leaf, >= 1 = internal;
+                                         reused for xact epoch on deleted pages) */
+    uint16      btpo_flags;  /* 2 bytes: BTP_LEAF, BTP_ROOT, BTP_META,
+                                         BTP_DELETED, BTP_HALF_DEAD, BTP_INCOMPLETE_SPLIT */
+    BTCycleId   btpo_cycleid;/* 2 bytes: vacuum cycle ID preventing split-scan races */
+} BTPageOpaqueData;
+\end{lstlisting}
+
+Three details in those 24~bytes of C declarations matter:
+\begin{itemize}
+  \item \textbf{Dual use of \texttt{t\_tid}:} On a leaf page ($\texttt{btpo\_level} == 0$), \texttt{t\_tid} holds the 6-byte heap \texttt{ctid} $(\text{block}, \text{offset})$ of the table row. On an internal branch page ($\texttt{btpo\_level} \ge 1$), there is no heap row to point to---so \texttt{t\_tid}'s 4-byte block field stores the \emph{child index page's block number}, while its 2-byte offset field is repurposed to pack metadata flags (such as \texttt{BT\_STATUS\_OFFSET\_MASK} and column count overrides during suffix truncation).
+  \item \textbf{Dynamic root via Block~0's metapage:} Block~0 of every \texttt{nbtree} file is never a tree node; it carries \texttt{BTP\_META} and stores \texttt{BTMetaPageData}, including \texttt{btm\_root} (the current root block number) and \texttt{btm\_level} (its height). When a single-leaf index splits for the first time, PostgreSQL allocates a second leaf and a new root page at block~3, updating \texttt{btm\_root = 3} rather than copying tuples into block~1. Backends cache \texttt{btm\_root} in backend-local \texttt{relcache} memory so normal lookups jump straight to the root without even pinning block~0.
+  \item \textbf{Bidirectional sibling chains (\texttt{btpo\_prev} and \texttt{btpo\_next}):} Every level of the tree---especially leaf level~0---forms a doubly-linked horizontal list of sorted pages. Once a range query descends from the root to the starting key $\texttt{account\_id} = 42, \texttt{created\_at} = \text{'2026-10-01'}$, it \emph{never climbs back up to internal parent pages}. Forward scans (\texttt{ASC}) walk horizontally via \texttt{btpo\_next}; backward scans (\texttt{DESC}) walk via \texttt{btpo\_prev}.
+\end{itemize}
+
+\begin{intuitionbox}
+\textbf{Why B+trees keep heap pointers strictly at the leaves.} In Rudolf Bayer's original 1970 B-tree, internal nodes also carried data pointers alongside separator keys. In a B+tree, internal nodes act purely as \emph{road signs} (copied or truncated separator keys + 4-byte child block numbers), and \emph{every} key-to-\texttt{ctid} entry appears in the sorted leaf chain. That tiny duplication buys two huge payoffs: first, internal nodes stay narrow (especially when payload columns are wide or \texttt{INCLUDE}d), maximizing fanout $B$; second, a range scan across 5,000 rows simply marches straight across adjacent leaves instead of performing an in-order tree traversal up and down internal levels.
+\end{intuitionbox}
+
+\section{From Textbook B+Trees to PostgreSQL's Lehman--Yao B-Link Tree}
+\label{sec:ch03-lehman-yao}
+
+If you implement a textbook B+tree and run it single-threaded on your laptop, it flies. Now run 128 concurrent OLTP worker processes inserting orders and reading balances at 80,000 transactions per second. Within milliseconds, a naive textbook concurrency protocol grinds all 128 cores to a halt on a single 64-byte CPU cache line: the \texttt{LWLock} inside the root page's \texttt{BufferDesc}.
+
+\subsection{Why Naive Top-Down Latch Crabbing Limits Multi-Core Scaling}
+
+To see why, trace what can go wrong if two backends touch a B+tree without synchronization:
+\begin{enumerate}
+  \item \textbf{Reader vs.\ concurrent leaf split:} Reader $Q$ reads internal parent $R$, learns that keys in $(40, 100]$ live on child leaf $P$ (block~17), and pauses for $2~\mu\text{s}$ on an OS context switch before pinning block~17. During those $2~\mu\text{s}$, Writer $W$ fills block~17, splits it into block~17 covering $(40, 60]$ and block~41 covering $(60, 100]$, and moves keys $\{71, 82, 85, 94\}$ off block~17 onto block~41. When Reader $Q$ wakes up and pins block~17 looking for key $k = 85$, key $85$ is gone. A naive reader concludes $85$ does not exist and returns zero rows for a committed account.
+  \item \textbf{Cascading splits upward:} When Writer $W$ descends to insert a key into leaf $P$, $P$ might be full. Splitting $P$ inserts a new separator key into parent $R$---which might \emph{also} be full, splitting $R$ and inserting into the grandparent, all the way up to the root.
+\end{enumerate}
+
+The classic textbook answer is \textbf{pessimistic latch crabbing} (lock coupling):
+\begin{itemize}
+  \item A \emph{reader} holds a shared latch on parent $R$, acquires a shared latch on child $P$, and \emph{only then} releases $R$.
+  \item A \emph{writer} descending the tree holds \textbf{exclusive latches} on its ancestor chain all the way down until it reaches a ``safe'' internal node (one with enough free space that a child split cannot force \emph{it} to split). Even under optimistic retry protocols, any split near full internal nodes forces writers to re-descend acquiring exclusive upper latches while readers constantly toggle atomic reference counts on the root's \texttt{LWLock}.
+\end{itemize}
+
+Holding two latches during every parent-to-child step sounds harmless until you count cache-coherency traffic: even shared read latches execute atomic \texttt{fetch\_add} instructions on \texttt{BufferDesc.state}, bouncing the root page's cache line across CPU sockets twice per query. Worse, holding a parent latch while waiting for a child page to be read from NVMe stalls every concurrent writer whose subtree passes through that parent.
+
+In Java~6 terms, latch crabbing is hand-over-hand locking: \texttt{synchronized (parent) \{ synchronized (child) \{ ... \} \}}, releasing the parent once the child is held. Java~6 also shipped the alternative in \texttt{java.util.concurrent.ConcurrentSkipListMap}: readers traverse without taking any lock, and writers publish new links with a single compare-and-swap so a reader always sees either the old or the new structure. Lehman and Yao applied the same principle to disk pages, as the next subsection shows.
+
+\subsection{The Lehman--Yao Insight: \texttt{P\_HIKEY} and Right-Links (\texttt{btpo\_next})}
+
+In 1981, Philip Lehman and S.~Bing Yao published \emph{Efficient Locking for Concurrent Operations on B-Trees} (later extended to deletions by Vladimir Lanin and Dennis Shasha in 1986), introducing the \textbf{B-link tree}. PostgreSQL's \texttt{src/backend/access/nbtree/} is a production implementation of Lehman--Yao and Lanin--Shasha, documented in one of the clearest design essays in open-source systems software (\texttt{src/backend/access/nbtree/README}).
+
+Lehman and Yao asked a deceptively simple question: \emph{why did Reader $Q$ get lost when Leaf $P$ split?} Two things lacked local witnesses on $P$ itself:
+\begin{enumerate}
+  \item Looking only at block~17, $Q$ had \emph{no way to tell} that key $85$ used to belong on block~17 and had just migrated rightward.
+  \item Even if $Q$ knew $85$ had moved off block~17, $Q$ had no direct pointer to the new sibling page because the parent $R$ might not even be updated yet.
+\end{enumerate}
+
+The B-link tree adds two structural invariants to every page at every level of the tree:
+
+\begin{definition}[Lehman--Yao B-Link Page Invariants in PostgreSQL]
+\label{def:ch03-blink-invariants}
+Every live \texttt{nbtree} page $P$ (leaf or internal) maintains two local fields inside its own 8~KB image:
+\begin{enumerate}
+  \item \textbf{Right-sibling link (\texttt{btpo\_next}):} Every non-rightmost page stores the block number of its immediate right neighbor at the same tree level ($\texttt{btpo\_next} \ne \texttt{P\_NONE}$). When $P$ splits into $P$ and $P'$, $P.\texttt{btpo\_next}$ points to $P'$ \emph{before} $P$'s exclusive lock is released.
+  \item \textbf{Explicit High Key (\texttt{P\_HIKEY}, slot~1):} On every non-rightmost page ($\neg\texttt{P\_RIGHTMOST}(\text{opaque})$), line-pointer slot~1 (\texttt{P\_HIKEY = 1}) stores an upper-bound key $K_{\text{high}}$ rather than data. Every key $k$ currently residing on $P$ satisfies $k \le K_{\text{high}}$, and any key strictly greater than $K_{\text{high}}$ that reached $P$ via an older parent downlink belongs somewhere to the right via \texttt{btpo\_next}. Real data items begin at \texttt{P\_FIRSTDATAKEY}: slot~2 on non-rightmost pages, and slot~1 on the rightmost page of each level (whose implicit upper bound is $+\infty$).
+\end{enumerate}
+\end{definition}
+
+\begin{historybox}
+\textbf{From Berkeley Postgres to Lehman--Yao.} Early university Postgres used a simpler locking discipline over its B-trees that suffered severe contention under multi-user benchmarks. Paul Aoki and Mike Olson replaced it with the Lehman--Yao \texttt{nbtree} (``New B-Tree'') access method in the early 1990s; Tom Lane later integrated Lanin--Shasha concurrent page deletion, and Peter Geoghegan re-architected tuple uniqueness tie-breaking, suffix truncation, deduplication, and bottom-up deletion across PostgreSQL~12--14. The folder name \texttt{nbtree} still preserves that 1990s ``New B-Tree'' moniker today.
+\end{historybox}
+
+\subsection{Step-by-Step Trace: A Concurrent Reader Crossing an Unfinished Split}
+
+Let us trace every single lock and pointer step with concrete numbers so you can watch Lehman--Yao eliminate downward lock coupling.
+
+Suppose internal parent $R$ (block~4, $\texttt{btpo\_level} = 1$) currently routes keys in $(40, 100]$ to leaf $P$ (block~17) and keys $> 100$ to leaf block~29. Leaf $P$ (block~17) has $\texttt{P\_HIKEY} = 100$ at slot~1, data keys $\{42, 49, 55, 60, 71, 82, 94\}$ in slots~2..8, and $\texttt{btpo\_next} = 29$.
+
+Now Writer $W$ arrives to insert key $k = 85$ (pointing to heap $\texttt{ctid} = (912, 6)$), and Leaf $P$ has zero free bytes left:
+
+\begin{enumerate}
+  \item \textbf{Phase~1 of Split (Bottom-Up, Leaf Only):} Writer $W$ holds an exclusive content lock on $P$ (block~17) and allocates a fresh page $P'$ at block~41, locking block~41 exclusively as well. Notice that $W$ holds \textbf{zero locks on parent $R$ (block~4)}. Choosing split point $60$, $W$ rebuilds both pages in memory:
+  \begin{itemize}
+    \item Right sibling $P'$ (block~41) inherits the old high key ($\texttt{P\_HIKEY} = 100$), receives upper keys $\{71, 82, 85, 94\}$, sets $\texttt{btpo\_prev} = 17$, and sets $\texttt{btpo\_next} = 29$ (updating block~29's \texttt{btpo\_prev} to $41$).
+    \item Original leaf $P$ (block~17) keeps lower keys $\{42, 49, 55, 60\}$, lowers its own high key to $\texttt{P\_HIKEY} = 60$, sets $\texttt{btpo\_next} = 41$, and sets the \texttt{BTP\_INCOMPLETE\_SPLIT} flag in \texttt{btpo\_flags} as a breadcrumb that parent $R$ does not yet know about block~41.
+  \end{itemize}
+  $W$ writes a single atomic WAL record covering the split and \textbf{releases its exclusive locks on both block~17 and block~41}.
+
+  \item \textbf{The Half-Split Window (Reader $Q$ Descends Lock-Couple-Free):} At this exact microsecond, Writer $W$ is preempted by the OS kernel before touching parent $R$ (block~4). Reader $Q$ begins executing \texttt{SELECT * FROM accounts WHERE account\_id = 85}:
+  \begin{itemize}
+    \item $Q$ acquires a shared lock on root/parent $R$ (block~4), binary-searches $R$'s stale separator keys, sees $40 < 85 \le 100 \implies \text{child block } 17$, \textbf{releases the shared lock on block~4 completely}, and then acquires a shared lock on block~17 ($P$). At the instant between releasing block~4 and locking block~17, $Q$ holds \textbf{zero page latches anywhere in the tree}.
+  \end{itemize}
+
+  \item \textbf{Horizontal Recovery via \texttt{\_bt\_moveright}:} Reader $Q$ inspects block~17. Before binary-searching data slots~2..5, PostgreSQL's \texttt{\_bt\_moveright()} routine checks one condition: is block~17 non-rightmost, and is our target key strictly past slot~1 (\texttt{P\_HIKEY})?
+  \[
+    k = 85 \;>\; P.\texttt{P\_HIKEY} = 60 \quad\Longrightarrow\quad \text{Block~17 split after we read its parent.}
+  \]
+  Without ever re-visiting parent $R$, $Q$ reads $\texttt{btpo\_next} = 41$ from block~17's footer, steps rightward (coupling left-to-right: lock block~41 shared, unlock block~17), checks $85 \le P'.\texttt{P\_HIKEY}\ (100)$, binary-searches slots~2..5 of block~41 via \texttt{\_bt\_binsrch()}, and finds $(85, \texttt{ctid}=(912, 6))$ at slot~4.
+
+  \item \textbf{Phase~2 of Split (Parent Downlink Insertion):} Writer $W$ wakes up, locks parent $R$ (block~4) and briefly re-locks child $P$ to clear \texttt{BTP\_INCOMPLETE\_SPLIT}, inserts the new separator tuple $(60 \to \text{blk } 41)$ into $R$, and unlocks. Future readers searching for $85$ now jump straight from block~4 to block~41 in one hop.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  >=Latex,
+  font=\small,
+  nodebox/.style={draw=black!75, rounded corners=2pt, line width=0.7pt, fill=white},
+  hikey/.style={draw=quotientorange!85!black, fill=quotientorange!16, rounded corners=1.5pt, font=\scriptsize\ttfamily},
+  datakey/.style={draw=sourceblue!70!black, fill=sourceblue!8, rounded corners=1.5pt, font=\scriptsize\ttfamily},
+  hitkey/.style={draw=targetgreen!80!black, fill=targetgreen!20, rounded corners=1.5pt, font=\scriptsize\ttfamily\bfseries}
+]
+  % Parent node R (Block 4)
+  \draw[nodebox, fill=gray!5] (3.1, 4.75) rectangle (12.7, 6.50);
+  \node[anchor=west, font=\footnotesize\bfseries, text=sourceblue!85!black] at (3.3, 6.22) {Internal Parent $R$ (Blk 4, \texttt{btpo\_level = 1})};
+  \node[anchor=west, font=\scriptsize\bfseries, text=trapred] at (3.3, 5.82) {Momentarily stale: no downlink for Blk 41 yet!};
+
+  \node[datakey, minimum width=4.2cm, minimum height=0.58cm] (p1) at (5.55, 5.20) {(40 < k <= 100) -> Blk 17};
+  \node[datakey, minimum width=4.2cm, minimum height=0.58cm] (p2) at (10.25, 5.20) {(k > 100) -> Blk 29};
+
+  % Left Leaf P (Block 17)
+  \draw[nodebox] (0.0, 0.35) rectangle (6.55, 2.75);
+  \node[anchor=west, font=\footnotesize\bfseries, text=sourceblue!85!black] at (0.18, 2.45) {Leaf $P$ (Blk 17, level 0)};
+  \node[hikey, minimum width=1.95cm, minimum height=0.58cm] (hk1) at (1.18, 1.65) {P\_HIKEY: 60};
+  \node[datakey, minimum width=0.88cm, minimum height=0.58cm] at (2.78, 1.65) {42};
+  \node[datakey, minimum width=0.88cm, minimum height=0.58cm] at (3.78, 1.65) {49};
+  \node[datakey, minimum width=0.88cm, minimum height=0.58cm] at (4.78, 1.65) {55};
+  \node[datakey, minimum width=0.88cm, minimum height=0.58cm] at (5.78, 1.65) {60};
+
+  \draw[draw=gray!55, fill=gray!10, rounded corners=1.5pt] (0.18, 0.52) rectangle (6.37, 1.04);
+  \node[font=\scriptsize\ttfamily] at (3.27, 0.78) {prev=11 | next=41 | INCOMP\_SPLIT};
+
+  % Right Sibling Leaf P' (Block 41)
+  \draw[nodebox] (9.25, 0.35) rectangle (15.80, 2.75);
+  \node[anchor=west, font=\footnotesize\bfseries, text=targetgreen!75!black] at (9.43, 2.45) {Right Sibling $P'$ (Blk 41, level 0)};
+  \node[hikey, minimum width=2.05cm, minimum height=0.58cm] (hk2) at (10.48, 1.65) {P\_HIKEY: 100};
+  \node[datakey, minimum width=0.88cm, minimum height=0.58cm] at (12.13, 1.65) {71};
+  \node[datakey, minimum width=0.88cm, minimum height=0.58cm] at (13.10, 1.65) {82};
+  \node[hitkey, minimum width=0.88cm, minimum height=0.58cm] (k85) at (14.07, 1.65) {85};
+  \node[datakey, minimum width=0.88cm, minimum height=0.58cm] at (15.04, 1.65) {94};
+
+  \draw[draw=gray!55, fill=gray!10, rounded corners=1.5pt] (9.43, 0.52) rectangle (15.62, 1.04);
+  \node[font=\scriptsize\ttfamily] at (12.52, 0.78) {prev=17 | next=29 | BTP\_LEAF};
+
+  % Step 1: Reader descent
+  \draw[->, line width=1.1pt, sourceblue] (5.35, 4.90) -- node[right, font=\scriptsize, align=left, pos=0.38] {\textbf{(1)} Reader ($k=85$)\\[-1pt]unlocks $R$, pins Blk 17} (3.65, 2.78);
+
+  % Step 2: Compare against P_HIKEY
+  \node[draw=trapred!80!black, fill=trapred!8, rounded corners=2pt, font=\scriptsize, inner sep=3pt] (cmp) at (1.50, 3.55) {\textbf{(2)} $85 > \texttt{P\_HIKEY}\ (60)$};
+  \draw[->, densely dotted, thick, trapred!80!black] (cmp.south) -- (hk1.north);
+
+  % Step 3: MoveRight across btpo_next (generous 2.7 cm gap between 6.55 and 9.25!)
+  \draw[->, line width=1.4pt, targetgreen!80!black] (6.60, 1.45) -- node[above, font=\scriptsize\bfseries, text=targetgreen!75!black] {(3) MoveRight} node[below, font=\scriptsize\ttfamily, text=targetgreen!75!black] {btpo\_next=41} (9.20, 1.45);
+
+  % Step 4: Hit key 85
+  \node[draw=targetgreen!80!black, fill=targetgreen!10, rounded corners=2pt, font=\scriptsize, inner sep=3pt] (found) at (13.85, 3.55) {\textbf{(4)} $85 \le 100 \Rightarrow \texttt{ctid=(912,6)}$};
+  \draw[->, thick, targetgreen!80!black] (found.south) -- (k85.north);
+
+  % Async writer parent insert
+  \draw[->, dashed, line width=0.95pt, structurepurple] (7.90, 2.55) -- node[right, font=\scriptsize, text=structurepurple, pos=0.52, align=left] {Writer later inserts\\[-1pt]\texttt{(60 -> Blk 41)}} (7.90, 4.73);
+\end{tikzpicture}
+\caption{Lehman--Yao B-link split in action. Writer splits Leaf~$P$ (Block~17) into $P$ and $P'$ (Block~41), installs lowered \texttt{P\_HIKEY = 60} and \texttt{btpo\_next = 41}, and unlocks both leaves \emph{before} updating Parent~$R$. A concurrent reader seeking $k = 85$ follows the stale parent pointer to Block~17 without holding two locks during descent, sees $85 > 60$, and steps right via \texttt{\_bt\_moveright} to find $85$ on Block~41.}
+\label{fig:ch03-lehman-yao}
+\end{figure}
+
+\begin{whybox}
+\textbf{Why Lehman--Yao cannot deadlock (even if the writer crashes mid-split).} Notice the lock acquisition order across the entire tree:
+\begin{itemize}
+  \item Descending readers hold \emph{at most one page latch at a time} (release parent, then lock child). A thread holding zero locks while requesting one cannot participate in a lock-wait cycle.
+  \item Horizontal \texttt{\_bt\_moveright} steps acquire locks strictly \emph{left-to-right} ($\text{Blk } 17 \to \text{Blk } 41$). Splitting writers and parent insertions also acquire sibling locks strictly left-to-right and climb strictly \emph{bottom-up} (releasing leaf locks before locking the parent, then re-acquiring left-to-right only when clearing \texttt{BTP\_INCOMPLETE\_SPLIT}). Because the dependency graph of simultaneously held latches is a strict DAG, deadlocks among page latches are impossible by construction.
+  \item Even if the power cord is yanked out of the wall between Step~1 and Step~4---so the parent downlink for Block~41 is \emph{never} written before crash recovery ends---the index remains $100\%$ readable and accurate. Every lookup for keys in $(60, 100]$ simply takes one extra \texttt{\_bt\_moveright} hop from Block~17 to Block~41 until the next split on that parent notices \texttt{BTP\_INCOMPLETE\_SPLIT} and finishes inserting the missing downlink.
+\end{itemize}
+\end{whybox}
+
+\subsection{Modern \texttt{nbtree} Engineering: Tie-Breaking, Deduplication, and Bottom-Up Deletion}
+
+Three subtle real-world hazards threatened classical B-link trees under heavy OLTP workloads until PostgreSQL~12, 13, and~14 solved them cleanly:
+
+\begin{enumerate}
+  \item \textbf{Unique keys in internal nodes via heap \texttt{ctid} tie-breaking (PG~12):} What happens if you index a low-cardinality column like \texttt{status = 'PENDING'} where 2,000,000 rows share the exact same key? In older PostgreSQL versions, duplicate keys had arbitrary physical order across thousands of identical leaf pages, turning inserts into linear scans across duplicate runs. Since PostgreSQL~12, \texttt{nbtree} appends the 6-byte heap \texttt{ctid} as an implicit final tie-breaker attribute during comparisons. Every index entry $(k, \texttt{ctid})$ is now \emph{globally unique}, so binary search lands directly on the exact leaf page where a new duplicate belongs in $O(\log N)$ time.
+  \item \textbf{B-tree deduplication and posting list tuples (PG~13):} Making duplicates fast still left them fat: storing \texttt{'USD'} 365 times on a leaf page repeats key headers and string bytes 365 times. With \texttt{deduplicate\_items = on} (the default since PG~13), when a leaf page fills up, \texttt{nbtree} runs a deduplication pass before splitting. Identical keys merge into a single \textbf{posting list tuple} flagged with \texttt{BT\_IS\_POSTING}: one copy of the key \texttt{'USD'} followed by a packed array of 6-byte heap \texttt{ItemPointerData} (\texttt{ctid}s), shrinking foreign-key and status indexes by $3\times$ to $4\times$!
+  \item \textbf{Bottom-up index deletion against version churn (PG~14):} Recall from Chapter~2 (and Chapter~5's upcoming MVCC analysis) that updating a heap row creates a new tuple version at a new \texttt{ctid}. Whenever \emph{any} indexed column changes, PostgreSQL cannot use a Heap-Only Tuple (HOT) update---it must insert a fresh index entry into \emph{every} index on the table, even indexes whose own columns did not change. Before PG~14, updating a \texttt{last\_seen\_at} column 50~times on an account forced 50 dead duplicate entries into \texttt{idx\_accounts\_email}, splitting leaf pages irreversibly (index bloat) before \texttt{autovacuum} ever arrived. PostgreSQL~14 introduced \textbf{bottom-up index deletion}: right before a leaf split caused by duplicate keys, \texttt{nbtree} visits the heap pages pointed to by duplicate entries on that leaf, reclaims known-dead \texttt{ctid} slots in place, and cancels the page split completely.
+\end{enumerate}
+
+\begin{labbox}
+Inspect a real \texttt{nbtree} metapage, \texttt{P\_HIKEY} slot, and PG~13+ deduplicated posting list tuple using PostgreSQL's built-in \texttt{pageinspect} extension:
+\begin{lstlisting}[language=SQL]
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+
+CREATE TABLE ledger_demo (
+    posting_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    currency   CHAR(3) NOT NULL,
+    amount     BIGINT  NOT NULL
+);
+
+INSERT INTO ledger_demo (currency, amount)
+SELECT CASE WHEN mod(g, 5) = 0 THEN 'EUR' ELSE 'USD' END, g * 100
+FROM generate_series(1, 5000) AS g;
+
+CREATE INDEX idx_ledger_currency ON ledger_demo (currency);
+
+-- 1. Inspect Block 0 (the metapage) to find root block & tree height
+SELECT version, root, level, fastroot, fastlevel
+FROM bt_metap('idx_ledger_currency');
+--  version | root | level | fastroot | fastlevel
+-- ---------+------+-------+----------+-----------
+--        4 |    3 |     1 |        3 |         1
+
+-- 2. Inspect Leaf Block 1: slot 1 is P_HIKEY; slots 2+ are posting lists!
+SELECT itemoffset AS off, ctid, itemlen, htid, tids[1:2] AS sample_tids, data
+FROM bt_page_items('idx_ledger_currency', 1)
+LIMIT 4;
+--  off |  ctid   | itemlen |  htid  |     sample_tids     |    data
+-- -----+---------+---------+--------+---------------------+------------
+--    1 | (0,1)   |      16 | (5,42) | NULL                | 55 53 44 20
+--    2 | (16,42) |     808 | (0,5)  | {"(0,5)","(0,10)"}  | 45 55 52 20
+--    3 | (16,42) |     808 | (1,28) | {"(1,28)","(1,33)"} | 45 55 52 20
+--    4 | (16,22) |     224 | (3,11) | {"(3,11)","(3,16)"} | 45 55 52 20
+\end{lstlisting}
+Look at \texttt{off = 1}: \texttt{tids} is \texttt{NULL} because slot~1 on non-rightmost leaf Block~1 is \texttt{P\_HIKEY} (\texttt{'USD'} with tie-breaker $\texttt{htid} = (5, 42)$, ASCII hex \texttt{55 53 44}). Look at \texttt{off = 2}: a single 808-byte posting list tuple packs \textbf{132 heap \texttt{ctid}s} for \texttt{'EUR'} (\texttt{45 55 52}) at just $808 / 132 \approx 6.12$~bytes per row.
+\end{labbox}
+
+\section{Composite Index Lexicographic Geometry and Column Order}
+\label{sec:ch03-composite-geometry}
+
+Single-column B-trees are straightforward because numbers and timestamps already live on a 1D line. Real production queries, however, almost always filter on two or three dimensions at once:
+\begin{lstlisting}[language=SQL]
+SELECT posting_id, amount_cents, created_at
+FROM postings
+WHERE account_id = 42
+  AND created_at >= '2026-10-01 00:00:00+00'
+ORDER BY created_at DESC
+LIMIT 20;
+\end{lstlisting}
+A B-tree leaf chain is strictly one-dimensional: every tuple sits before or after its neighbor along a single ribbon of pages linked by \texttt{btpo\_next}. How do you map a 2D plane of $(\texttt{account\_id}, \texttt{created\_at})$ pairs onto a 1D leaf ribbon, and why does declaring \texttt{(account\_id, created\_at DESC)} run in $0.08\text{ ms}$ while declaring \texttt{(created\_at DESC, account\_id)} on the exact same two columns can take $450\text{ ms}$?
+
+\subsection{The Phonebook Ribbon: Equality Pins a Slice, Range Scatters Jumps}
+
+Suppose we build:
+\begin{lstlisting}[language=SQL]
+CREATE INDEX idx_postings_acct_created
+    ON postings (account_id ASC, created_at DESC);
+\end{lstlisting}
+PostgreSQL compares two composite keys $(a_1, t_1)$ and $(a_2, t_2)$ in \textbf{lexicographic (dictionary) order}, just like sorting a phonebook by $(\text{Last Name}, \text{First Name})$:
+\[
+  (a_1, t_1) \prec (a_2, t_2)
+  \quad\Longleftrightarrow\quad
+  (a_1 < a_2) \;\lor\; \bigl(a_1 = a_2 \;\land\; t_1 > t_2\bigr),
+\]
+where the second inequality flips to $t_1 > t_2$ because we specified \texttt{created\_at DESC}. In Java~6 this is exactly the \texttt{Comparator} you would hand to \texttt{Collections.sort} or to a \texttt{TreeMap}:
+\begin{lstlisting}[language=Java]
+public int compare(Posting x, Posting y) {
+    if (x.accountId != y.accountId)
+        return x.accountId < y.accountId ? -1 : 1;  // ascending
+    return y.createdAt.compareTo(x.createdAt);      // descending
+}
+\end{lstlisting}
+The B-tree keeps its leaf entries in this order, so everything you know about a sorted \texttt{TreeMap} (cheap range scans with \texttt{subMap}, no help for a lookup on the second field alone) carries over directly.
+
+Picture the resulting leaf pages stretched left-to-right across the floor. First come \emph{all} postings for \texttt{account\_id = 1}, sorted newest-to-oldest from 2026 back to 2019. Immediately after account~1's oldest 2019 posting sits account~2's newest 2026 posting, and so on.
+
+Now trace two queries across that exact same leaf ribbon (illustrated side by side in Figure~\ref{fig:ch03-composite-ribbon}):
+
+\begin{enumerate}
+  \item \textbf{Equality on leading column, range on second column (\texttt{account\_id = 42 AND created\_at >= '2026-10-01'}):}
+  Fixing $\texttt{account\_id} = 42$ collapses the outer dimension to a single contiguous sub-ribbon. Within that sub-ribbon, \texttt{created\_at} is monotonically ordered from newest to oldest. PostgreSQL descends the tree directly to $(42, +\infty)$, reads consecutive index tuples while $\texttt{created\_at} \ge \text{'2026-10-01'}$, and \textbf{halts the instant it encounters the first tuple with $\texttt{created\_at} < \text{'2026-10-01'}$}. Every single index tuple touched satisfies \emph{both} predicates.
+  \item \textbf{Range on leading column, filter on second column (\texttt{account\_id BETWEEN 41 AND 43 AND created\_at >= '2026-10-25'}, or \texttt{amount\_cents > 50000 AND created\_at >= '2026-10-25'} on an \texttt{(amount\_cents, created\_at)} index):}
+  Because the leading column varies across a range, October~2026 timestamps are \emph{no longer contiguous} in the leaf chain. Account~41's late-October entries sit at the start of sub-ribbon~41, followed by \emph{seven years of historical postings for account~41} (\texttt{2026-10-24} down to \texttt{2019-01-02}), before account~42's late-October entries appear. A naive index range scan starting at $(41, +\infty)$ and ending at $(43, \text{'2026-10-25'})$ must trudge through hundreds or thousands of irrelevant leaf pages between matching pockets, applying $\texttt{created\_at} \ge \text{'2026-10-25'}$ as an in-index filter on every skipped entry.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  >=Latex,
+  font=\small,
+  seg/.style={draw=black!70, minimum height=0.82cm, anchor=west, inner sep=2pt, font=\scriptsize\ttfamily},
+  hitseg/.style={draw=targetgreen!85!black, fill=targetgreen!24, line width=0.9pt, minimum height=0.82cm, anchor=west, inner sep=2pt, font=\scriptsize\ttfamily\bfseries},
+  wasteseg/.style={draw=trapred!80!black, fill=trapred!14, line width=0.7pt, minimum height=0.82cm, anchor=west, inner sep=2pt, font=\scriptsize\ttfamily, text=trapred!70!black}
+]
+  % ---- Panel A: Equality + Range ----
+  \node[anchor=west, font=\footnotesize\bfseries, text=targetgreen!70!black] at (0.0, 3.85)
+    {(a) Equality + Range: \texttt{account\_id = 42 AND created\_at >= '2026-10-01'} (1 slice)};
+
+  \node[seg, fill=gray!8, minimum width=3.55cm] at (0.0, 2.95) {acct=41: Oct31..19};
+  \node[hitseg, minimum width=3.25cm] (a_hit) at (3.55, 2.95) {42: Oct31..Oct01};
+  \node[seg, fill=gray!8, minimum width=4.40cm] at (6.80, 2.95) {acct=42: Sep30..2019};
+  \node[seg, fill=gray!8, minimum width=4.30cm] at (11.20, 2.95) {acct=43: Oct30..2019};
+
+  \draw[->, line width=1.1pt, targetgreen!80!black] (3.55, 2.25) -- node[below, font=\scriptsize\bfseries, text=targetgreen!75!black] {1 seek + contiguous scan, STOP!} (6.80, 2.25);
+  \draw[densely dashed, targetgreen!80!black] (3.55, 2.54) -- (3.55, 2.15);
+  \draw[densely dashed, trapred!80!black, line width=0.9pt] (6.80, 3.42) -- (6.80, 2.15);
+
+  % ---- Panel B: Leading Range + Second-Column Range ----
+  \node[anchor=west, font=\footnotesize\bfseries, text=trapred!85!black] at (0.0, 1.45)
+    {(b) Range + Range: \texttt{account\_id BETWEEN 41 AND 43 AND created\_at >= '2026-10-25'}};
+
+  \node[hitseg, minimum width=1.90cm] at (0.0, 0.55) {41:Oct25+};
+  \node[wasteseg, minimum width=3.30cm] at (1.90, 0.55) {41: Oct24..19 (skip)};
+  \node[hitseg, minimum width=1.90cm] at (5.20, 0.55) {42:Oct25+};
+  \node[wasteseg, minimum width=3.30cm] at (7.10, 0.55) {42: Oct24..19 (skip)};
+  \node[hitseg, minimum width=1.90cm] at (10.40, 0.55) {43:Oct25+};
+  \node[seg, fill=gray!8, minimum width=3.20cm] at (12.30, 0.55) {43: Oct24..19};
+
+  \draw[->, line width=1.1pt, trapred!80!black] (0.0, -0.15) -- node[below, font=\scriptsize\bfseries, text=trapred!80!black] {Scan walks across ALL historical years of accts 41 and 42 just to reach acct 43!} (12.30, -0.15);
+\end{tikzpicture}
+\caption{Lexicographic ribbon geometry on \texttt{(account\_id ASC, created\_at DESC)}. In~(a), fixing \texttt{account\_id = 42} isolates one sub-ribbon where \texttt{created\_at} is contiguous. In~(b), a leading range scatters recent timestamps into disconnected islands separated by years of cold index entries.}
+\label{fig:ch03-composite-ribbon}
+\end{figure}
+
+\begin{trapbox}
+\textbf{\texttt{IN (...)} lists vs.\ true range inequalities.} PostgreSQL's \texttt{nbtree} executor has a smart trick for small discrete \texttt{ScalarArrayOpExpr} predicates like \texttt{WHERE account\_id IN (41, 42, 43) AND created\_at >= '2026-10-25'}: instead of blindly scanning every historical entry of account~41, \texttt{\_bt\_advance\_array\_keys()} detects the end of $(41, \text{'2026-10-25'})$ and leaps directly to $(42, +\infty)$. However, once your leading predicate is a continuous inequality (\texttt{amount\_cents > 50000}, \texttt{created\_at >= ...}, or a wide \texttt{BETWEEN}), there is no small list of discrete keys to leap across. Follow the golden ordering rule for composite B-trees:
+\[
+  \textbf{1.\ Equality } (\texttt{=}) \;\longrightarrow\; \textbf{2.\ Range / } \texttt{ORDER BY} \;\longrightarrow\; \textbf{3.\ } \texttt{INCLUDE} \textbf{ payload.}
+\]
+And do not trust the folk myth ``always put the highest-cardinality column first'' blindly: if every query writes \texttt{WHERE tenant\_id = \$1 AND status = 'OPEN' AND created\_at >= \$2}, both \texttt{tenant\_id} and \texttt{status} are equality predicates, so \emph{both} belong ahead of the range column \texttt{created\_at}, regardless of whether \texttt{status} only has four distinct values.
+\end{trapbox}
+
+\subsection{Sort Elimination and Backward Leaf Scans}
+
+Composite column order also governs whether PostgreSQL can stream \texttt{ORDER BY ... LIMIT} $k$ in $O(k)$ page touches without allocating a \texttt{Sort} work buffer. Look back at our opening query:
+\begin{lstlisting}[language=SQL]
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT posting_id, amount_cents, created_at
+FROM postings
+WHERE account_id = 42
+  AND created_at >= '2026-10-01 00:00:00+00'
+ORDER BY created_at DESC
+LIMIT 20;
+-- Limit  (cost=0.56..28.41 rows=20 width=24) (actual time=0.031..0.068 rows=20 loops=1)
+--   Buffers: shared hit=22
+--   -> Index Scan using idx_postings_acct_created on postings
+--        Index Cond: ((account_id = 42) AND (created_at >= '2026-10-01 00:00:00+00'::timestamptz))
+\end{lstlisting}
+Notice what is \emph{missing} from that \texttt{EXPLAIN} output: there is \textbf{no \texttt{Sort} node}. Even if \texttt{account\_id = 42} is a mega-merchant with $5{,}000{,}000$ postings in October, PostgreSQL descends to $(42, +\infty)$, emits the first 20 live rows from the leaf ribbon, and stops after 22 buffer hits in $68~\mu\text{s}$.
+
+What if an analyst flips the sort direction and asks for \texttt{ORDER BY account\_id DESC, created\_at ASC} against our \texttt{(account\_id ASC, created\_at DESC)} index? Because \emph{every} column's direction reversed simultaneously, the requested order is the exact mirror image of our leaf ribbon. PostgreSQL executes an \texttt{Index Scan Backward}, following \texttt{btpo\_prev} links right-to-left with zero sorting. By contrast, if a query asks for \texttt{ORDER BY account\_id ASC, created\_at ASC} (matching the first column's direction while flipping only the second), neither forward nor backward traversal visits rows in that order---forcing the planner to insert an explicit \texttt{Sort} or PG~13+'s \texttt{Incremental Sort} (which sorts one \texttt{account\_id} group at a time).
+
+\section{Covering Indexes (\texttt{INCLUDE}), the Visibility Map, and True Index-Only Scans}
+\label{sec:ch03-visibility-map}
+
+Look again at the \texttt{EXPLAIN (ANALYZE, BUFFERS)} plan at the end of Section~\ref{sec:ch03-composite-geometry}: returning 20 rows from a 3-level B-tree touched \textbf{22 buffers}. Where did those 22 buffer hits come from? Three index pages (root, level~1, leaf) plus 19 separate 8~KB heap pages. Even when all 20 index entries sit shoulder-to-shoulder inside a single 8~KB leaf page, their heap \texttt{ctid}s point to 19 different historical heap blocks scattered across a 10~GB table file. If those 19 heap blocks are cold on NVMe, a dashboard summing \texttt{SUM(amount\_cents)} across 10,000 postings triggers up to 10,000 random 8~KB heap reads ($\approx 700\text{ ms}$).
+
+The obvious dream is: \emph{if we store \texttt{amount\_cents} and \texttt{currency} right inside the B-tree leaf tuple alongside \texttt{(account\_id, created\_at)}, can PostgreSQL answer the query from the index alone without ever touching the heap?}
+
+\subsection{Why PostgreSQL Index Tuples Carry Zero MVCC Visibility Metadata}
+
+In storage engines built around \textbf{clustered primary indexes} (such as MySQL's InnoDB or SQL Server), the table \emph{is} the primary-key B+tree: leaf pages hold the full rows together with transaction IDs and undo-log pointers, while secondary indexes map secondary keys to the primary key.
+
+PostgreSQL made the opposite architectural bet: tables are unclustered slotted heaps addressed by 6-byte physical \texttt{ctid}s, and \textbf{an \texttt{IndexTupleData} carries zero transaction visibility fields (\texttt{t\_xmin}, \texttt{t\_xmax}, \texttt{t\_cid})}. Go back and inspect \texttt{struct IndexTupleData} in Section~\ref{sec:ch03-fanout-math}: 6~bytes of \texttt{t\_tid}, 2~bytes of \texttt{t\_info}, and raw column bytes. Nothing else.
+
+\begin{intuitionbox}
+\textbf{Why omit \texttt{xmin} and \texttt{xmax} from every index?} Count the write amplification if indexes stored MVCC transaction headers. Suppose your \texttt{orders} table has 6 secondary indexes. When a transaction runs \texttt{DELETE FROM orders WHERE order\_id = 991}, heap-only MVCC simply stamps \texttt{t\_xmax} on \emph{one} 8~KB heap page---zero index pages are dirtied at \texttt{DELETE} time. If every index tuple carried its own \texttt{t\_xmax}, every \texttt{DELETE} and every non-HOT \texttt{UPDATE} would have to descend and dirty all 6 secondary indexes synchronously inside the foreground transaction, multiplying random write I/O and WAL volume by $6\times$.
+\end{intuitionbox}
+
+Omitting \texttt{xmin} and \texttt{xmax} from indexes makes writes fast, but it creates an immediate puzzle for reads: when an index scan sees a leaf tuple \texttt{(account\_id=42, amount\_cents=12500, ctid=(8412, 9))}, how does the executor know whether heap tuple \texttt{(8412, 9)} was committed five days ago, inserted two microseconds ago by an uncommitted transaction that is about to \texttt{ROLLBACK}, or already deleted by a concurrent session?
+
+Before PostgreSQL~9.2, the answer was blunt: \emph{it didn't}, so PostgreSQL had to visit the heap page on every single index match without exception.
+
+\subsection{How the Visibility Map (\texttt{\_vm}) Rescues Index-Only Scans}
+
+PostgreSQL~9.2 solved the puzzle without adding a single byte to \texttt{IndexTupleData} by enlisting the \textbf{Visibility Map (\texttt{\_vm})} relation fork we met in Chapter~2.
+
+Inside \texttt{\$PGDATA/base/<dbOid>/<relfilenode>\_vm}, PostgreSQL maintains exactly \textbf{2~bits per 8~KB heap page}:
+\begin{itemize}
+  \item Bit~0 (\texttt{VISIBILITYMAP\_ALL\_VISIBLE}): when set to $1$, \texttt{VACUUM} has verified that \emph{every live tuple on this entire 8~KB heap block is committed and visible to all current and future database snapshots}, and no transaction has inserted, updated, or deleted any row on that block since.
+  \item Bit~1 (\texttt{VISIBILITYMAP\_ALL\_FROZEN}): used by aggressive \texttt{VACUUM} to skip frozen pages entirely during transaction-ID wraparound maintenance (Chapter~5).
+\end{itemize}
+Look at the compression ratio of that bitmap: 2~bits per 8,192~bytes means 1~byte of \texttt{\_vm} covers 4 heap pages ($32\text{ KB}$), and a single 8~KB \texttt{\_vm} page (holding $\approx 8{,}160$ payload bytes) tracks $\approx 32{,}640$ heap blocks ($255\text{ MB}$ of table data). For our entire $10.11\text{ GB}$ \texttt{postings} heap ($1{,}234{,}568$ pages), the entire \texttt{\_vm} fork occupies just $\ceil{1{,}234{,}568 / 4} \approx \mathbf{308\text{ KB}}$---roughly 38 pages pinned permanently in \texttt{shared\_buffers}.
+
+When all columns referenced by a query are available inside the index leaf tuple, PostgreSQL's \texttt{IndexOnlyScan} node runs a two-path check for each matching leaf entry $\texttt{ctid} = (\text{blk}, \text{off})$, shown in Figure~\ref{fig:ch03-ios-visibility-map}:
+\begin{enumerate}
+  \item Probe bit~0 for \texttt{blk} inside the in-memory \texttt{\_vm} page.
+  \item \textbf{Fast path ($\texttt{ALL\_VISIBLE} == 1$):} Every tuple on heap block \texttt{blk} is guaranteed visible. Emit the column values straight from the B-tree leaf tuple and advance to the next index entry. \textbf{Zero heap buffer pins, zero NVMe reads.}
+  \item \textbf{Fallback path ($\texttt{ALL\_VISIBLE} == 0$):} A recent write modified heap block \texttt{blk} and cleared its \texttt{\_vm} bit. Pin heap block \texttt{blk}, inspect slot \texttt{off}'s \texttt{t\_xmin}/\texttt{t\_xmax} against the query snapshot, emit the row only if visible, and increment the \texttt{Heap Fetches} counter reported by \texttt{EXPLAIN (ANALYZE, BUFFERS)}.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  >=Latex,
+  font=\small,
+  box/.style={draw=black!75, rounded corners=2pt, line width=0.7pt, fill=white},
+  vmbox/.style={draw=structurepurple!85!black, fill=structurepurple!8, rounded corners=2pt, line width=0.8pt},
+  fastbox/.style={draw=targetgreen!85!black, fill=targetgreen!14, rounded corners=2pt, line width=0.85pt},
+  slowbox/.style={draw=quotientorange!90!black, fill=quotientorange!14, rounded corners=2pt, line width=0.85pt}
+]
+  % Internal branch node (truncated keys only!)
+  \draw[box, fill=sourceblue!6] (0.0, 4.15) rectangle (6.20, 5.45);
+  \node[anchor=west, font=\footnotesize\bfseries, text=sourceblue!85!black] at (0.18, 5.18) {Internal Branch (\texttt{btpo\_level = 1})};
+  \node[anchor=west, font=\scriptsize\ttfamily] at (0.18, 4.76) {Keys ONLY: (acct\_id, created\_at)};
+  \node[anchor=west, font=\scriptsize, text=sourceblue!80!black] at (0.18, 4.38) {\texttt{\_bt\_truncate} drops \texttt{INCLUDE} $\Rightarrow B \approx 350$};
+
+  % Leaf node (full key + INCLUDE payload + ctid)
+  \draw[box] (0.0, 1.35) rectangle (6.20, 3.45);
+  \node[anchor=west, font=\footnotesize\bfseries, text=sourceblue!85!black] at (0.18, 3.16) {B-Tree Leaf (level 0, zero \texttt{xmin/xmax})};
+
+  \draw[draw=targetgreen!80!black, fill=targetgreen!10, rounded corners=1.5pt] (0.18, 2.32) rectangle (6.02, 2.86);
+  \node[font=\scriptsize\ttfamily] at (3.10, 2.59) {(42,Oct31) + (12500,'USD') -> (8412,9)};
+
+  \draw[draw=quotientorange!85!black, fill=quotientorange!10, rounded corners=1.5pt] (0.18, 1.55) rectangle (6.02, 2.09);
+  \node[font=\scriptsize\ttfamily] at (3.10, 1.82) {(42,Oct31) + (-4000,'USD') -> (8413,4)};
+
+  \draw[->, thick, sourceblue] (3.10, 4.15) -- (3.10, 3.48);
+
+  % Visibility Map (_vm fork in RAM)
+  \draw[vmbox] (7.10, 1.40) rectangle (10.55, 3.98);
+  \node[font=\footnotesize\bfseries, text=structurepurple!85!black] at (8.82, 3.68) {Visibility Map (\texttt{\_vm})};
+  \node[font=\scriptsize, text=black!75] at (8.82, 3.30) {$\approx 308$ KB in RAM};
+
+  \node[draw=targetgreen!80!black, fill=white, rounded corners=1.5pt, font=\scriptsize\ttfamily, minimum width=3.05cm, minimum height=0.52cm] (vm1) at (8.82, 2.60) {Blk 8412: bit = 1};
+  \node[draw=quotientorange!90!black, fill=white, rounded corners=1.5pt, font=\scriptsize\ttfamily, minimum width=3.05cm, minimum height=0.52cm] (vm2) at (8.82, 1.82) {Blk 8413: bit = 0};
+
+  \draw[->, line width=1.0pt, targetgreen!80!black] (6.02, 2.60) -- (vm1.west);
+  \draw[->, line width=1.0pt, quotientorange!90!black] (6.02, 1.82) -- (vm2.west);
+
+  % Fast path (top right)
+  \draw[fastbox] (12.10, 3.05) rectangle (15.80, 4.65);
+  \node[font=\footnotesize\bfseries, text=targetgreen!75!black] at (13.95, 4.35) {True Index-Only Path};
+  \node[font=\scriptsize, align=center] at (13.95, 3.66) {\textbf{0 Heap Fetches!}\\[1pt]Emit \texttt{(12500, 'USD')}\\[-1pt]straight from leaf};
+
+  \draw[->, line width=1.2pt, targetgreen!80!black] (vm1.east) -- node[above left, font=\scriptsize\bfseries, text=targetgreen!75!black, pos=0.62] {bit=1} (12.10, 3.85);
+
+  % Slow fallback path (bottom right)
+  \draw[slowbox] (12.10, 0.80) rectangle (15.80, 2.45);
+  \node[font=\footnotesize\bfseries, text=trapred!85!black] at (13.95, 2.15) {Heap Fetch Fallback};
+  \node[font=\scriptsize, align=center] at (13.95, 1.45) {Pin Heap Blk 8413, Off 4\\[-1pt]Check \texttt{xmin}/\texttt{xmax}\\[-1pt]\texttt{Heap Fetches++}};
+
+  \draw[->, line width=1.2pt, quotientorange!90!black] (vm2.east) -- node[below left, font=\scriptsize\bfseries, text=trapred!85!black, pos=0.62] {bit=0} (12.10, 1.62);
+\end{tikzpicture}
+\caption{Covering index (\texttt{INCLUDE}) and Visibility Map (\texttt{\_vm}) execution pipeline. Internal branch nodes drop \texttt{INCLUDE} attributes via \texttt{\_bt\_truncate} to stay narrow. At the leaf level, the executor probes the cached 2-bit-per-page \texttt{\_vm} bitmap: bit~$1$ emits payload straight from the index with zero heap I/O; bit~$0$ falls back to pinning the heap block to verify MVCC visibility.}
+\label{fig:ch03-ios-visibility-map}
+\end{figure}
+
+\subsection{Why \texttt{INCLUDE} Beats Appending Payload Columns to the Key}
+
+Since PostgreSQL~11, you create a covering index using the \texttt{INCLUDE} clause:
+\begin{lstlisting}[language=SQL]
+CREATE INDEX idx_postings_acct_created_cov
+    ON postings (account_id ASC, created_at DESC)
+    INCLUDE (amount_cents, currency);
+\end{lstlisting}
+Why write \texttt{INCLUDE (amount\_cents, currency)} instead of simply listing all four columns inside the key parentheses \texttt{(account\_id, created\_at, amount\_cents, currency)}? Two physical and logical wins separate them:
+\begin{enumerate}
+  \item \textbf{Suffix truncation keeps upper internal nodes tiny (\texttt{\_bt\_truncate}):} When a leaf page splits, PostgreSQL promotes a separator key into the parent internal page. For an \texttt{INCLUDE} index, \texttt{\_bt\_truncate()} unconditionally strips \emph{all} non-key \texttt{INCLUDE} columns (and even strips trailing key columns that are unnecessary to distinguish the left leaf's max key from the right leaf's min key) before writing the parent tuple. Upper branch pages store only \texttt{(account\_id, created\_at)}, preserving a high branching factor $B \approx 350$ even if you \texttt{INCLUDE} a 64-byte merchant description.
+  \item \textbf{Clean uniqueness constraints:} Suppose \texttt{users.email} must be unique and your authentication hot path runs \texttt{SELECT user\_id, pw\_hash FROM users WHERE email = \$1}. Writing \texttt{CREATE UNIQUE INDEX ON users (email, user\_id, pw\_hash)} breaks your constraint---it would allow two users to register the same \texttt{email} with different \texttt{user\_id}s. Writing \texttt{CREATE UNIQUE INDEX ON users (email) INCLUDE (user\_id, pw\_hash)} enforces uniqueness strictly on \texttt{email} while making every login lookup a single-buffer Index-Only Scan.
+\end{enumerate}
+
+\begin{trapbox}
+\textbf{When ``Index Only Scan'' in \texttt{EXPLAIN} is a mirage.} Never stop reading \texttt{EXPLAIN} at the node title \texttt{Index Only Scan}; always run \texttt{EXPLAIN (ANALYZE, BUFFERS)} and read the line right underneath it: \texttt{Heap Fetches}. On an insert-heavy or update-heavy table whose \texttt{autovacuum\_vacuum\_scale\_factor} (default $0.20 = 20\%$ of the table) waits for 20~million changed rows before running \texttt{VACUUM}, vast stretches of heap blocks sit with $\texttt{ALL\_VISIBLE} = 0$. Your query plan proudly prints \texttt{Index Only Scan}, yet \texttt{Heap Fetches: 48219} reveals it read 48,219 heap blocks anyway. Lowering per-table \texttt{autovacuum\_vacuum\_scale\_factor = 0.01} (or \texttt{autovacuum\_vacuum\_insert\_scale\_factor = 0.005} on append-heavy ledgers in PG~13+) keeps \texttt{\_vm} bits set and turns \texttt{Heap Fetches} back to~$0$.
+\end{trapbox}
+
+\section{Partial Indexes (\texttt{WHERE ...}) and Expression Indexes}
+\label{sec:ch03-partial-expression}
+
+Every index we have built so far paid storage, \texttt{shared\_buffers} RAM, and write-ahead log tax for $100\%$ of the rows in the table. Yet many of the hottest queries in production care about a tiny, predictable fraction of rows.
+
+\subsection{Partial Indexes: Shrinking a 4~GB Queue Index to 2~MB}
+
+Consider a transactional outbox or webhook job table \texttt{jobs} holding $100{,}000{,}000$ historical delivery rows. At any moment, $99{,}950{,}000$ rows ($99.95\%$) have \texttt{status = 'processed'}, while only $50{,}000$ rows ($0.05\%$) have \texttt{status = 'pending'}. Every millisecond, worker threads poll for the oldest ready jobs:
+\begin{lstlisting}[language=SQL]
+SELECT job_id, payload
+FROM jobs
+WHERE status = 'pending' AND run_after <= NOW()
+ORDER BY run_after ASC
+LIMIT 50
+FOR UPDATE SKIP LOCKED;
+\end{lstlisting}
+Compare a full composite index against a \textbf{partial index} carrying a \texttt{WHERE} filter:
+\begin{lstlisting}[language=SQL]
+-- Naive full index: indexes all 100,000,000 rows (~3.8 GB on disk!)
+CREATE INDEX idx_jobs_full ON jobs (status, run_after);
+
+-- Partial index: indexes ONLY the 50,000 pending rows (~1.9 MB on disk!)
+CREATE INDEX idx_jobs_pending ON jobs (run_after ASC)
+    WHERE status = 'pending';
+\end{lstlisting}
+Count the wins of \texttt{idx\_jobs\_pending}:
+\begin{itemize}
+  \item \textbf{$2{,}000\times$ smaller memory footprint:} $50{,}000$ rows $\times \sim 28$~bytes (plus transient churn slack) fits inside $\approx 240$ pages ($\sim 1.9\text{ MB}$), residing $100\%$ inside CPU L3 cache and \texttt{shared\_buffers} instead of evicting $3.8\text{ GB}$ of heap pages. Notice we did not even need \texttt{status} as a key column inside \texttt{(run\_after ASC)}---every entry in the index already satisfies \texttt{status = 'pending'}.
+  \item \textbf{Zero index maintenance on excluded writes:} When a historical audit job updates a \texttt{'processed'} row's metadata, neither the old row nor the new row satisfies \texttt{status = 'pending'}, so PostgreSQL skips touching \texttt{idx\_jobs\_pending} completely (preserving HOT updates on the heap page).
+  \item \textbf{Conditional uniqueness:} Partial unique indexes enforce invariants that standard SQL \texttt{UNIQUE} constraints cannot express cleanly. The index below guarantees each customer has at most one primary card while allowing any number of non-primary saved cards (\texttt{is\_primary = FALSE}):
+\begin{lstlisting}[language=SQL]
+CREATE UNIQUE INDEX uq_one_primary_card
+    ON payment_methods (customer_id)
+ WHERE is_primary = TRUE;
+-- A second primary card for customer 42 fails with:
+-- ERROR:  duplicate key value violates unique constraint "uq_one_primary_card"
+-- DETAIL:  Key (customer_id)=(42) already exists.
+\end{lstlisting}
+\end{itemize}
+
+One rule governs planner eligibility: \textbf{the query's \texttt{WHERE} clause must logically imply the index's \texttt{WHERE} predicate} using constants visible at plan time. A query filtering \texttt{WHERE status = 'pending'} matches \texttt{WHERE status = 'pending'} immediately. However, a prepared statement parameterized as \texttt{WHERE status = \$1} cannot use \texttt{idx\_jobs\_pending} under a generic plan (because \texttt{\$1} might be \texttt{'processed'} at execution time), though PostgreSQL~12+'s custom-plan mode can use it when planning with the bound literal \texttt{'pending'}.
+
+\subsection{Expression Indexes and Syntactic Predicate Alignment}
+
+What if your login endpoint performs case-insensitive lookups or filters a scalar key extracted from a \texttt{JSONB} webhook payload?
+\begin{lstlisting}[language=SQL]
+-- A plain index on (email) CANNOT satisfy LOWER(email) = ...!
+CREATE UNIQUE INDEX idx_users_email_lower ON users (LOWER(email));
+
+-- Indexing a scalar TEXT value extracted from a JSONB column
+-- Note the mandatory double parentheses around non-function expressions!
+CREATE INDEX idx_webhooks_merchant ON webhooks ((payload->>'merchant_id'));
+\end{lstlisting}
+In an \textbf{expression index}, PostgreSQL evaluates the expression at \texttt{INSERT}/\texttt{UPDATE} time and stores the \emph{result} inside the \texttt{IndexTupleData}---so \texttt{idx\_users\_email\_lower} stores \texttt{'ada@lovelace.org'} even if the heap row holds \texttt{'Ada@Lovelace.org'}. Even better, when you run \texttt{ANALYZE}, PostgreSQL computes dedicated histograms and most-common-value statistics on the expression itself in \texttt{pg\_stats}, giving the query planner accurate selectivity estimates on \texttt{(payload->>'merchant\_id')}.
+
+Two strict rules bite engineers who deploy expression indexes carelessly:
+\begin{enumerate}
+  \item \textbf{Expressions must be \texttt{IMMUTABLE}:} Given identical input bytes, the function must return the exact same output forever, independent of database settings or wall-clock time. Indexing \texttt{DATE\_TRUNC('day', created\_at)} on a \texttt{TIMESTAMPTZ} column fails with \texttt{ERROR: functions in index expression must be marked IMMUTABLE}, because ``midnight'' depends on the session's \texttt{TimeZone} GUC. Fix it by pinning the zone explicitly: \texttt{DATE\_TRUNC('day', created\_at AT TIME ZONE 'UTC')} \emph{is} \texttt{IMMUTABLE}.
+  \item \textbf{Query predicates must align syntactically:} PostgreSQL's planner does not do open-ended algebraic theorem proving across arbitrary string functions. If the index is defined on \texttt{LOWER(email)}, a query writing \texttt{WHERE email ILIKE 'ada@lovelace.org'} or \texttt{WHERE UPPER(email) = 'ADA@LOVELACE.ORG'} will walk right past the index and run a \texttt{Seq Scan}. Write \texttt{WHERE LOWER(email) = LOWER(\$1)}.
+\end{enumerate}
+
+\section{Beyond B-Trees: Hash, GIN, GiST, and BRIN}
+\label{sec:ch03-beyond-btrees}
+
+A Lehman--Yao B-link tree assumes one foundational property about your search predicate: \emph{every row maps to a single scalar (or tuple) key drawn from a totally ordered 1D domain ($<, \le, =, \ge, >$)}.
+
+The moment your data violates that assumption, B-trees hit a geometric wall:
+\begin{itemize}
+  \item What if keys are 250-byte URLs queried \emph{only} for exact equality \texttt{=}?
+  \item What if a single row contains \emph{50 distinct searchable tokens}---an array \texttt{tags TEXT[]}, a nested \texttt{JSONB} document, or a 300-word full-text \texttt{tsvector}?
+  \item What if keys live in 2D space (polygons, GPS coordinates) or represent intervals (\texttt{tstzrange}) tested for \emph{overlap} (\texttt{\&\&}), where no 1D total order preserves containment?
+  \item What if an append-only ledger holds $10\text{ billion}$ rows ($1\text{ TB}$) and you cannot afford $215\text{ GB}$ of B-tree pages just to slice time windows?
+\end{itemize}
+Rather than hard-wiring B-trees into the executor, Stonebraker and Rowe designed Postgres around an extensible \textbf{Access Method API} (\texttt{pg\_am} and \texttt{IndexAmRoutine}). Let us open the hood on the four companions sitting beside \texttt{nbtree} in \texttt{src/backend/access/}.
+
+\subsection{Hash Indexes (\texttt{USING hash}): 32-Bit Codes Only}
+
+A PostgreSQL Hash index (\texttt{src/backend/access/hash/}) organizes 8~KB pages into a dynamic linear-hashing directory of \emph{primary bucket pages} (chained to overflow pages only when collisions or duplicates exceed one page). Its standout physical trick is what it leaves out: \textbf{a Hash index never stores the raw column value.} Each index tuple stores only the \textbf{4-byte (32-bit) hash code} plus the 6-byte heap \texttt{ctid} (16~bytes aligned, sorted by hash code within each bucket page for binary search).
+
+Put numbers on that: indexing a 240-byte \texttt{webhook\_url} or \texttt{idempotency\_token} across $50{,}000{,}000$ rows produces a $\sim 13.5\text{ GB}$ B-tree, whereas \texttt{CREATE INDEX ON deliveries USING hash (webhook\_url)} takes just $\sim 1.1\text{ GB}$! Because two distinct strings can collide on a 32-bit hash, a Hash scan \emph{always} visits the heap page to recheck \texttt{webhook\_url = \$1} (so Hash indexes cannot perform Index-Only Scans, nor can they enforce \texttt{UNIQUE}, sort \texttt{ORDER BY}, or index multiple columns).
+
+\begin{marginnotebox}
+Prior to PostgreSQL~10, manuals famously warned against Hash indexes because bucket splits were not WAL-logged---a crash required a manual \texttt{REINDEX}. Since PostgreSQL~10, Hash indexes are $100\%$ WAL-logged, crash-safe, and replicated cleanly. Reach for them specifically when you have wide \texttt{TEXT}/\texttt{BYTEA} keys queried strictly with \texttt{=}.
+\end{marginnotebox}
+
+\subsection{GIN (Generalized Inverted Index): Multi-Element Containment at Scale}
+
+Suppose a \texttt{payments} table stores provider metadata in a \texttt{JSONB} column \texttt{meta}, and risk engineers filter with \texttt{meta @>} on \texttt{"card\_brand": "visa"} and \texttt{"three\_ds": "failed"}, or support engineers search ticket bodies via full-text search \texttt{WHERE body\_tsv @@ plainto\_tsquery('english', 'chargeback reversal')}. A B-tree on the whole \texttt{JSONB} blob is useless here: \texttt{'three\_ds'} sits buried inside the document, not at byte~0.
+
+A \textbf{GIN index} (\texttt{src/backend/access/gin/}) works like the subject index at the back of a textbook. Instead of mapping $1\text{ row} \to 1\text{ key}$, GIN invokes the operator class's \texttt{extractValue} function to shatter a single row into \emph{dozens of atomic element keys} (lexemes like \texttt{'chargeback'} and \texttt{'revers'}, or JSONB keys/values), and maps each distinct element key to the sorted set of all heap \texttt{ctid}s containing it (left half of Figure~\ref{fig:ch03-gin-vs-brin}):
+\begin{enumerate}
+  \item \textbf{The Entry Tree:} A standard B-tree over \emph{distinct extracted keys}. Even across 50~million documents, English vocabulary or JSONB field paths might have only 200,000 distinct keys, keeping the Entry Tree compact.
+  \item \textbf{Posting List vs.\ Posting Tree:} If a rare key like \texttt{'chargeback'} appears in 40 rows, GIN packs those 40 \texttt{ctid}s directly inside the Entry Tree leaf tuple as a \textbf{varbyte delta-compressed posting list} (often just 2--3~bytes per \texttt{ctid}). Once a popular key like \texttt{'visa'} accumulates more \texttt{ctid}s than fit comfortably inline ($\sim\texttt{GinMaxItemSize}$), GIN spills that key's list into a dedicated \textbf{Posting Tree}---a mini B-tree keyed by \texttt{(block, offset)} itself. Keeping \texttt{ctid}s physically sorted lets multi-term queries (\texttt{'visa' AND 'failed'}) intersect bitmaps in a single linear pass and read matching heap blocks sequentially (\texttt{Bitmap Index Scan} $\to$ \texttt{Bitmap Heap Scan}).
+  \item \textbf{The \texttt{fastupdate} Pending List:} Notice GIN's achilles heel on writes: inserting \emph{one} JSONB row with 60 fields would otherwise descend and dirty up to 60 separate Entry Tree leaf pages. To prevent $60\times$ write amplification on foreground \texttt{INSERT}s, PostgreSQL enables \texttt{fastupdate = on} by default: new key/\texttt{ctid} pairs append sequentially to an unsorted \textbf{pending list} of pages (capped by \texttt{gin\_pending\_list\_limit}, default $4\text{ MB}$). Every GIN query scans both the main Entry Tree and the tiny pending list, until \texttt{VACUUM} (or an \texttt{INSERT} crossing $4\text{ MB}$) bulk-sorts and merges the pending list into the main tree in one batched pass.
+\end{enumerate}
+
+\begin{applicationbox}
+\textbf{\texttt{jsonb\_ops} vs.\ \texttt{jsonb\_path\_ops} and OLTP latency spikes.} PostgreSQL ships two GIN operator classes for \texttt{JSONB}:
+\begin{lstlisting}[language=SQL]
+-- Default jsonb_ops: indexes every key AND value separately (supports @>, ?, ?|, ?&)
+CREATE INDEX idx_pay_meta_default ON payments USING gin (meta);
+
+-- jsonb_path_ops: hashes each full root-to-leaf path (e.g. hash('card_brand','visa'))
+-- Supports @> containment ONLY, but is 2x-3x smaller and much faster when values repeat!
+CREATE INDEX idx_pay_meta_paths   ON payments USING gin (meta jsonb_path_ops);
+
+-- Full-text search via generated stored tsvector column + GIN
+ALTER TABLE support_tickets
+  ADD COLUMN search_tsv TSVECTOR
+  GENERATED ALWAYS AS (to_tsvector('english', coalesce(subject,'') || ' ' || coalesce(body,''))) STORED;
+CREATE INDEX idx_tickets_fts ON support_tickets USING gin (search_tsv);
+\end{lstlisting}
+Watch out for one classic production tail-latency spike: when an unlucky user's \texttt{INSERT} pushes the \texttt{fastupdate} pending list past \texttt{gin\_pending\_list\_limit} ($4\text{ MB}$), \emph{that foreground backend} synchronously flushes all $4\text{ MB}$ into the Entry Tree, stalling one API call for 50--300~ms. On strict p99 latency tables, either tune aggressive \texttt{autovacuum} with a smaller \texttt{gin\_pending\_list\_limit = '1MB'} on the index, or set \texttt{WITH (fastupdate = off)} if each row extracts only 2--4 keys.
+\end{applicationbox}
+
+\subsection{GiST (Generalized Search Tree): Bounding Hierarchies and Exclusion Constraints}
+
+In 1995, Joseph Hellerstein, Jeffrey Naughton, and Avi Pfeffer asked: \emph{can one single balanced-tree engine implement R-trees for 2D PostGIS maps, interval trees for calendar ranges, and nearest-neighbor $k$-NN priority search without rewriting buffer locking and WAL recovery every time?} Their answer, built straight into Berkeley Postgres and hardened in \texttt{src/backend/access/gist/}, is \textbf{GiST}.
+
+Unlike a B-tree---which partitions a 1D line into strictly disjoint intervals $(-\infty, 60]$, $(60, 100]$, $(100, +\infty)$---an internal node entry in GiST stores a \textbf{bounding predicate} $P$ that encloses every entry in its child subtree (for example, a 2D minimum bounding rectangle around 300 delivery zones, or the span from the earliest start to the latest end across 300 \texttt{tstzrange} bookings). Notice the structural difference: \textbf{sibling bounding boxes in GiST are allowed to overlap.} Consequently, a GiST lookup calls the operator class's \texttt{consistent(entry, query)} method on every entry of an internal page and descends \emph{all} child subtrees whose bounding boxes overlap the query, while inserts pick the child requiring minimal bounding-box expansion (\texttt{penalty}) and split full nodes via \texttt{picksplit}.
+
+Beyond PostGIS geometry (\texttt{\&\&}, \texttt{ST\_Contains}, nearest-neighbor \texttt{<->}), GiST enables a relational integrity guarantee that B-trees cannot express: \textbf{Exclusion Constraints}. Suppose you build a room-booking or ledger fee-schedule table where no two active rows for the same \texttt{room\_id} may have overlapping \texttt{during} time intervals. A \texttt{UNIQUE} B-tree constraint can only forbid \emph{identical} intervals (\texttt{=}); checking \texttt{SELECT COUNT(*) ... WHERE during \&\& \$new} in application code suffers classic race conditions when two concurrent transactions insert overlapping slots simultaneously under \texttt{READ COMMITTED}. With the built-in \texttt{btree\_gist} contrib extension, PostgreSQL enforces non-overlap directly inside the physical GiST index:
+\begin{lstlisting}[language=SQL]
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+CREATE TABLE room_bookings (
+    booking_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    room_id    INT       NOT NULL,
+    during     TSTZRANGE NOT NULL,
+    -- Forbid any two rows where (room_id = room_id) AND (during && during)!
+    CONSTRAINT no_double_booking
+        EXCLUDE USING gist (room_id WITH =, during WITH &&)
+);
+\end{lstlisting}
+Just like \texttt{UNIQUE} in \texttt{nbtree}, \texttt{EXCLUDE USING gist} checks physical index pages across both committed and in-flight uncommitted tuples (blocking the second overlapping transaction until the first commits or aborts), eliminating double-booking anomalies at the storage layer. An overlapping insert fails with:
+\begin{lstlisting}
+ERROR:  conflicting key value violates exclusion constraint "no_double_booking"
+DETAIL:  Key (room_id, during)=(7, ["2026-11-02 10:00:00+00","2026-11-02 11:00:00+00"))
+         conflicts with existing key (room_id, during)=(7, ["2026-11-02 09:30:00+00",
+         "2026-11-02 10:30:00+00")).
+\end{lstlisting}
+
+\subsection{BRIN (Block Range Index): Indexing a Terabyte in 30~Megabytes}
+
+Finally, consider an append-only \texttt{ledger\_events} table recording $10{,}000{,}000{,}000$ ($10^{10}$) immutable events at $\sim 100$~bytes per row---roughly $134{,}217{,}728$ pages, or \textbf{$1.0\text{ TB}$ of heap}. Compliance analysts query 15-minute slices by \texttt{recorded\_at}. A standard B-tree on \texttt{recorded\_at} costs $\sim 20$~bytes $\times 10^{10}$ rows (plus split slack) $\approx \mathbf{215\text{ GB}}$ on disk.
+
+Ask yourself: since rows are appended chronologically as wall-clock time advances, heap blocks $0..127$ already hold events from 00:00:00 to 00:00:04 on January~1, blocks $128..255$ hold 00:00:04 to 00:00:09, and so on. Why store ten billion individual row pointers when the heap is \emph{already physically sorted by arrival time}?
+
+Introduced in PostgreSQL~9.5 (\texttt{src/backend/access/brin/}), a \textbf{Block Range Index (BRIN)} abandons per-row \texttt{ctid}s completely. It slices the heap into fixed-size consecutive chunks of \texttt{pages\_per\_range} blocks (default $128\text{ pages} = 1\text{ MB}$ of heap). For each 128-page range, BRIN stores \textbf{one tiny summary tuple} containing only $(\texttt{min\_val}, \texttt{max\_val})$ across all rows anywhere in those 128 pages (right half of Figure~\ref{fig:ch03-gin-vs-brin}):
+\[
+  \frac{134{,}217{,}728\text{ heap pages}}{128\text{ pages/range}} = 1{,}048{,}576\text{ ranges} \;\times\; \sim 28\text{ bytes/summary} \;\approx\; \mathbf{29.4\text{ MB total.}}
+\]
+That is \textbf{$215\text{ GB}$ for a B-tree versus $\sim 30\text{ MB}$ for BRIN}, more than $7{,}000\times$ smaller. When a query asks for \texttt{WHERE recorded\_at BETWEEN '2026-10-20 14:00Z' AND '2026-10-20 14:15Z'}, PostgreSQL scans the $30\text{ MB}$ BRIN summary in milliseconds, skips $99.98\%$ of the 128-page ranges whose $[\min, \max]$ fails to overlap the 15-minute window, and runs a lossy \texttt{Bitmap Heap Scan} with \texttt{Recheck Cond} across only the $\approx 150$ matching 1~MB ranges.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  >=Latex,
+  font=\small,
+  panel/.style={draw=gray!55, dashed, line width=0.7pt},
+  box/.style={draw=black!75, rounded corners=2pt, line width=0.7pt, fill=white}
+]
+  % ==== TOP PANEL (a): GIN ====
+  \node[anchor=west, font=\footnotesize\bfseries, text=sourceblue!85!black] at (0.0, 6.25)
+    {(a) GIN: Inverted Element-to-\texttt{ctid} Architecture (\texttt{JSONB}, \texttt{ARRAY}, \texttt{tsvector})};
+
+  % Pending list (left)
+  \draw[box, fill=quotientorange!12, draw=quotientorange!85!black] (0.0, 4.35) rectangle (3.95, 5.75);
+  \node[font=\scriptsize\bfseries, text=quotientorange!85!black] at (1.97, 5.45) {\texttt{fastupdate} Pending List};
+  \node[font=\scriptsize\ttfamily, align=center] at (1.97, 4.82) {4 MB append buffer\\[-1pt](avoids $60\times$ write I/O)};
+
+  % Entry B-Tree (center)
+  \draw[box, fill=sourceblue!8, draw=sourceblue!80!black] (5.35, 4.35) rectangle (9.85, 5.75);
+  \node[font=\scriptsize\bfseries, text=sourceblue!85!black] at (7.60, 5.45) {Entry B-Tree (Distinct Atomic Keys)};
+  \node[font=\scriptsize\ttfamily] at (7.60, 5.02) {'chargeback' | 'm\_42' | 'visa'};
+  \node[font=\scriptsize, text=black!70] at (7.60, 4.62) {extracted via \texttt{extractValue}};
+
+  \draw[->, densely dashed, line width=1.0pt, quotientorange!85!black] (3.95, 5.05) --
+    node[above, font=\scriptsize\bfseries, text=quotientorange!85!black] {bulk}
+    node[below, font=\scriptsize, text=quotientorange!85!black] {merge} (5.35, 5.05);
+
+  % Inline Posting List (top-right)
+  \draw[box, fill=targetgreen!12, draw=targetgreen!80!black] (11.20, 5.18) rectangle (15.65, 6.18);
+  \node[font=\scriptsize\bfseries, text=targetgreen!75!black] at (13.42, 5.93) {Inline Posting List (Rare)};
+  \node[font=\scriptsize\ttfamily] at (13.42, 5.50) {varbyte: (12,3),(19,1),(44,8)};
+
+  % Spilled Posting Tree (bottom-right of top panel)
+  \draw[box, fill=structurepurple!10, draw=structurepurple!80!black] (11.20, 3.92) rectangle (15.65, 4.92);
+  \node[font=\scriptsize\bfseries, text=structurepurple!85!black] at (13.42, 4.67) {Posting B-Tree (Frequent)};
+  \node[font=\scriptsize\ttfamily] at (13.42, 4.24) {mini B-tree sorted by ctid};
+
+  \draw[->, line width=1.0pt, targetgreen!80!black] (9.85, 5.32) -- (11.20, 5.68);
+  \draw[->, line width=1.0pt, structurepurple!80!black] (9.85, 4.78) -- (11.20, 4.42);
+
+  % Horizontal divider
+  \draw[panel] (0.0, 3.45) -- (15.65, 3.45);
+
+  % ==== BOTTOM PANEL (b): BRIN ====
+  \node[anchor=west, font=\footnotesize\bfseries, text=targetgreen!75!black] at (0.0, 3.00)
+    {(b) BRIN: 128-Page ($1\text{ MB}$) Block-Range Summaries ($\sim 30\text{ MB}$ for $1\text{ TB}$ Heap, Query: \texttt{Oct 20})};
+
+  % Four horizontal 128-page ranges!
+  \draw[box, fill=gray!10, draw=gray!65] (0.0, 1.35) rectangle (3.65, 2.55);
+  \node[font=\scriptsize\bfseries, text=gray!75!black] at (1.82, 2.28) {Range 0 (Blks 0..127)};
+  \node[font=\scriptsize\ttfamily, text=gray!75!black] at (1.82, 1.88) {[Oct 01, Oct 08]};
+  \node[font=\scriptsize, text=gray!70!black] at (1.82, 1.54) {Pruned (0 I/O)};
+
+  \draw[box, fill=gray!10, draw=gray!65] (4.00, 1.35) rectangle (7.65, 2.55);
+  \node[font=\scriptsize\bfseries, text=gray!75!black] at (5.82, 2.28) {Range 1 (128..255)};
+  \node[font=\scriptsize\ttfamily, text=gray!75!black] at (5.82, 1.88) {[Oct 08, Oct 16]};
+  \node[font=\scriptsize, text=gray!70!black] at (5.82, 1.54) {Pruned (0 I/O)};
+
+  \draw[box, fill=targetgreen!18, draw=targetgreen!85!black, line width=0.95pt] (8.00, 1.35) rectangle (11.65, 2.55);
+  \node[font=\scriptsize\bfseries, text=targetgreen!75!black] at (9.82, 2.28) {Range 2 (256..383)};
+  \node[font=\scriptsize\ttfamily\bfseries, text=targetgreen!75!black] at (9.82, 1.88) {[Oct 16, Oct 24]};
+  \node[font=\scriptsize\bfseries, text=targetgreen!75!black] at (9.82, 1.54) {Overlap! Scan + Recheck};
+
+  \draw[box, fill=gray!10, draw=gray!65] (12.00, 1.35) rectangle (15.65, 2.55);
+  \node[font=\scriptsize\bfseries, text=gray!75!black] at (13.82, 2.28) {Range 3 (384..511)};
+  \node[font=\scriptsize\ttfamily, text=gray!75!black] at (13.82, 1.88) {[Oct 24, Nov 01]};
+  \node[font=\scriptsize, text=gray!70!black] at (13.82, 1.54) {Pruned (0 I/O)};
+
+  \node[draw=trapred!75!black, fill=trapred!8, rounded corners=2pt, font=\scriptsize, minimum width=15.65cm, align=center] at (7.825, 0.72)
+    {BRIN stores zero \texttt{ctid}s: pruning relies strictly on physical heap correlation ($\texttt{pg\_stats.correlation} \approx \pm 1.0$).};
+\end{tikzpicture}
+\caption{Two opposite poles of non-B-tree indexing. In~(a), \textbf{GIN} inverts multi-element rows into exact \texttt{ctid} posting lists/trees cushioned by a \texttt{fastupdate} buffer. In~(b), \textbf{BRIN} summarizes 128-page ($1\text{ MB}$) heap chunks by $[\min, \max]$ to prune append-only streams at $0.003\%$ space overhead.}
+\label{fig:ch03-gin-vs-brin}
+\end{figure}
+
+\begin{attackbox}
+\textbf{The BRIN trap: physical correlation decay.} BRIN stores no row-level pointers; its pruning power comes $100\%$ from how tightly each 128-page physical block range clusters values on disk. Check \texttt{SELECT correlation FROM pg\_stats WHERE tablename = 'ledger\_events' AND attname = 'recorded\_at';}:
+\begin{itemize}
+  \item If \texttt{correlation} sits near $+1.0$ or $-1.0$ (pure append-only monotonic \texttt{TIMESTAMPTZ} or \texttt{BIGINT} sequence, never updated or deleted), each 128-page range has a narrow $[\min, \max]$ window and BRIN skips $> 99.9\%$ of the table.
+  \item Now suppose you build a BRIN index on a random \texttt{UUIDv4} or \texttt{account\_id} ($\texttt{correlation} \approx 0.00$), \emph{or} suppose a retention job runs \texttt{DELETE} on January heap pages, \texttt{VACUUM} registers free space inside blocks $0..127$ in \texttt{\_fsm}, and November \texttt{INSERT}s reuse slots inside blocks $0..127$! \textbf{One single November row landing inside block~12 stretches Range~0's summary from \texttt{[Jan 01, Jan 01]} to \texttt{[Jan 01, Nov 01]}.} Worse still, BRIN deliberately never shrinks a summary's $[\min, \max]$ automatically when extreme rows are deleted (doing so requires \texttt{brin\_desummarize\_range()} or \texttt{VACUUM} / \texttt{REINDEX}). Once a few scattered updates or \texttt{\_fsm} reuses ``poison'' every 128-page range with both old and new timestamps, every range overlaps every query, and your $30\text{ MB}$ BRIN index silently reads $100\%$ of the $1\text{ TB}$ heap.
+\end{itemize}
+\end{attackbox}
+
+\begin{complexitybox}
+\textbf{PostgreSQL Access Method Decision Matrix:}
+\begin{center}
+\scriptsize
+\setlength{\tabcolsep}{4.5pt}
+\begin{tabular}{@{}lllp{1.85cm}p{4.35cm}@{}}
+\toprule
+\textbf{Method} & \textbf{Key Structure} & \textbf{Operators} & \textbf{Typical Size} & \textbf{Sweet-Spot Workload} \\
+\midrule
+\texttt{btree} & 1D total order + \texttt{ctid} & \texttt{< <= = >= >} & $15\text{--}30\%$ heap & OLTP point/range, \texttt{ORDER BY}, \texttt{UNIQUE}, \texttt{INCLUDE} \\
+\texttt{hash} & 32-bit hash + \texttt{ctid} & \texttt{=} only & $5\text{--}12\%$ heap & Exact lookups on wide URLs, tokens, \texttt{BYTEA} \\
+\texttt{gin} & Inverted key $\to$ \texttt{ctid}s & \texttt{@> <@ ? @@ \&\&} & $20\text{--}80\%$ heap & \texttt{JSONB}, \texttt{ARRAY}, \texttt{tsvector} full-text, trigrams \\
+\texttt{gist} & Bounding hierarchy & \texttt{\&\& @> <->} & $20\text{--}50\%$ heap & PostGIS 2D shapes, \texttt{tstzrange}, \texttt{EXCLUDE} \\
+\texttt{brin} & 128-page $[\min,\max]$ & \texttt{< <= = >= >} & $\sim 0.003\%$ heap & Multi-TB append-only streams ($\abs{r} \approx 1$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{complexitybox}
+
+In Chapter~2 and Chapter~3, we treated buffer edits---inserting a heap tuple, updating \texttt{P\_HIKEY}, linking \texttt{btpo\_next} across a Lehman--Yao leaf split---as if writing bytes into \texttt{shared\_buffers} made them immortal. What happens if the server loses power after Leaf~$P$ flushes to NVMe while Leaf~$P'$ is still sitting in volatile RAM, or when Linux tears an 8,192-byte page in half across two 4,096-byte sectors? That question brings us to Part~II and Chapter~4: Write-Ahead Logging, checkpoints, and crash recovery.
+
+\section{Exercises}
+\label{sec:ch03-exercises}
+
+\begin{exercise}[Exact B+Tree Fanout: \texttt{BIGINT} vs.\ \texttt{UUID} Keys]
+\label{exer:ch03-fanout-uuid}
+Using the exact byte layout of an 8,192-byte \texttt{nbtree} page from Section~\ref{sec:ch03-fanout-math} (24-byte \texttt{PageHeaderData}, 16-byte \texttt{BTPageOpaqueData}, 4-byte \texttt{ItemIdData} per slot, 8-byte \texttt{IndexTupleData} header, and \texttt{MAXALIGN = 8} padding on 64-bit Linux):
+\begin{enumerate}
+  \item Compute the exact per-entry byte cost (line pointer + aligned \texttt{IndexTupleData}) for an index on a single 16-byte \texttt{UUID} column, and compare it against the 20-byte cost of an 8-byte \texttt{BIGINT}.
+  \item Assuming internal pages average $80\%$ occupancy after splits (reserving one slot for \texttt{P\_HIKEY}) and leaf pages run at \texttt{fillfactor = 90} (also reserving \texttt{P\_HIKEY}), compute the effective internal branching factor $B$ and leaf capacity $L$ for both \texttt{BIGINT} and \texttt{UUID}.
+  \item For a table of $500{,}000{,}000$ ($5 \times 10^8$) rows, determine the exact number of tree levels (root down to leaf) and the total megabytes of \texttt{shared\_buffers} required to keep \emph{all non-leaf internal pages} pinned in RAM for both key types.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Tracing a Concurrent Lehman--Yao Split by Hand]
+\label{exer:ch03-lehman-yao-trace}
+Leaf page Block~22 initially covers $(100, 200]$ ($\texttt{P\_HIKEY} = 200$, $\texttt{btpo\_prev} = 9$, $\texttt{btpo\_next} = 35$) and holds keys $\{108, 115, 124, 130, 152, 168, 191\}$. Parent Block~5 routes $(100, 200] \to \text{Block } 22$. Writer~$W$ inserts key $175$, splits Block~22 at separator $130$ into Block~22 and newly allocated Block~59, unlocks both leaf pages, and is paused by the OS scheduler \emph{before} locking Parent Block~5.
+\begin{enumerate}
+  \item Write down the exact \texttt{P\_HIKEY}, data keys, \texttt{btpo\_prev}, \texttt{btpo\_next}, and \texttt{BTP\_INCOMPLETE\_SPLIT} flag state on both Block~22 and Block~59 during this pause.
+  \item Trace the exact sequence of page pins, shared latches acquired/released, and \texttt{P\_HIKEY} comparisons performed by Reader~$A$ searching for $k = 124$, and Reader~$B$ searching for $k = 175$. At any instant, how many page latches does Reader~$B$ hold simultaneously during descent vs.\ during \texttt{\_bt\_moveright}?
+  \item Why must \texttt{\_bt\_moveright} acquire latches strictly left-to-right ($\text{Block } 22 \to \text{Block } 59$), and what subtle deadlock hazard arises for \emph{backward} scans (\texttt{ORDER BY k DESC} walking \texttt{btpo\_prev} right-to-left) if a left neighbor splits concurrently? Explain how releasing and re-checking prevents a right-to-left latch cycle.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Deduplication Math and Bottom-Up Deletion]
+\label{exer:ch03-dedup-math}
+An \texttt{orders} table holds $20{,}000{,}000$ rows distributed evenly across 5 values of \texttt{status CHAR(4)} (\texttt{'OPEN'}, \texttt{'PAID'}, \texttt{'SHIP'}, \texttt{'DONE'}, \texttt{'VOID'}).
+\begin{enumerate}
+  \item With \texttt{deduplicate\_items = off}, calculate the byte size of one leaf entry (remembering the 1-byte short \texttt{varlena} header + 4~ASCII bytes padded to \texttt{MAXALIGN = 8} after the 8-byte \texttt{IndexTupleData} header, plus the 4-byte \texttt{ItemIdData}) and estimate the total leaf-level size in MB at \texttt{fillfactor = 90}.
+  \item With \texttt{deduplicate\_items = on} (PG~13+), suppose \texttt{nbtree} packs up to $130$ 6-byte heap \texttt{ctid}s into each posting list tuple (16-byte header+key + $130 \times 6 = 780$ bytes $\to 796$ bytes, padded to $800$ bytes + 4-byte line pointer). Recompute the leaf-level size in MB and the compression factor.
+  \item Suppose \texttt{orders} also has an index on \texttt{updated\_at}, and a worker updates \texttt{updated\_at = NOW()} ten times on an \texttt{'OPEN'} order without changing \texttt{status}. Explain why Chapter~2/5's HOT optimization is blocked, why 10 index entries for \texttt{'OPEN'} accumulate on the leaf page, and how PostgreSQL~14's bottom-up index deletion prevents that leaf page from splitting.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Composite Ribbon Geometry and Sort Elimination]
+\label{exer:ch03-composite-design}
+A multi-tenant ledger table \texttt{entries(entry\_id, tenant\_id, account\_id, status, posted\_at, amount\_cents)} serves three critical production queries:
+\begin{itemize}
+  \item $Q_1$: \texttt{WHERE tenant\_id = \$1 AND account\_id = \$2 AND posted\_at >= \$3 ORDER BY posted\_at DESC LIMIT 25}
+  \item $Q_2$: \texttt{WHERE tenant\_id = \$1 AND status = 'SETTLED' AND posted\_at BETWEEN \$2 AND \$3}
+  \item $Q_3$: \texttt{WHERE tenant\_id = \$1 AND amount\_cents > 100000 AND posted\_at >= \$2}
+\end{itemize}
+\begin{enumerate}
+  \item Design the minimal set of composite B-tree indexes so that $Q_1$ runs with \textbf{zero \texttt{Sort} node} and touches at most $\sim 28$ index tuples, and $Q_2$ reads a single contiguous leaf slice. Specify exact column order and \texttt{ASC}/\texttt{DESC} modifiers.
+  \item For $Q_3$, explain geometrically using Figure~\ref{fig:ch03-composite-ribbon} why \emph{no single 1D B-tree} can make both \texttt{amount\_cents > 100000} and \texttt{posted\_at >= \$2} contiguous simultaneously. If $0.1\%$ of a tenant's rows have \texttt{posted\_at >= \$2} while $15\%$ have \texttt{amount\_cents > 100000}, which column should come second after \texttt{tenant\_id}, and why?
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Visibility Map Churn and \texttt{Heap Fetches} Latency]
+\label{exer:ch03-vm-math}
+A $50{,}000{,}000$-row \texttt{transactions} table occupies $600{,}000$ heap pages ($\approx 4.69\text{ GB}$) and has a covering index \texttt{(merchant\_id, created\_at) INCLUDE (net\_cents)}.
+\begin{enumerate}
+  \item Calculate the exact byte size (and number of 8~KB pages) of the relation's \texttt{\_vm} fork at 2~bits per heap page.
+  \item Right after \texttt{VACUUM}, $100\%$ of heap pages have \texttt{VISIBILITYMAP\_ALL\_VISIBLE = 1}. Over the next 20~minutes before \texttt{autovacuum} triggers, OLTP traffic performs $90{,}000$ single-row updates distributed uniformly at random across the $600{,}000$ heap pages. Using $1 - (1 - 1/M)^K \approx 1 - e^{-K/M}$, compute the fraction of heap pages whose \texttt{\_vm} bit is now cleared to $0$.
+  \item An analytics query runs \texttt{SELECT SUM(net\_cents) FROM transactions WHERE merchant\_id = 77}, matching $20{,}000$ index entries scattered uniformly across cold heap pages ($80~\mu\text{s}$ per random NVMe read; index pages and \texttt{\_vm} are warm in RAM). Compute the expected \texttt{Heap Fetches} count and wall-clock query time right after \texttt{VACUUM} versus 20~minutes later.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Partial and Expression Index Debugging]
+\label{exer:ch03-partial-debug}
+A teammate submits a migration containing three indexes on a $150{,}000{,}000$-row \texttt{invoices} table ($99.7\%$ \texttt{'paid'}, $0.2\%$ \texttt{'open'}, $0.1\%$ \texttt{'overdue'}):
+\begin{lstlisting}[language=SQL]
+-- Index 1
+CREATE INDEX idx_inv_day ON invoices (DATE_TRUNC('day', issued_at));
+-- Index 2
+CREATE INDEX idx_inv_code ON invoices (LOWER(reference_code));
+-- Index 3
+CREATE INDEX idx_inv_unpaid ON invoices (due_at) WHERE status IN ('open', 'overdue');
+\end{lstlisting}
+\begin{enumerate}
+  \item \texttt{issued\_at} has type \texttt{TIMESTAMPTZ}. Explain why Index~1 fails immediately with an immutability error, and rewrite both the \texttt{CREATE INDEX} and a fast full-day range query for UTC day \texttt{2026-10-31} (bonus: show how writing a half-open range on bare \texttt{issued\_at} avoids needing an expression index at all).
+  \item Application code queries \texttt{WHERE LOWER(TRIM(reference\_code)) = 'inv-901'}. Explain why PostgreSQL ignores Index~2, and fix the schema/index contract cleanly.
+  \item Estimate the storage reduction ratio of Index~3 compared to a full index on \texttt{(status, due\_at)}, and determine whether \texttt{WHERE status = 'overdue' AND due\_at < NOW()} can use Index~3 (justify via predicate implication).
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[GIN Internals: \texttt{jsonb\_ops}, \texttt{jsonb\_path\_ops}, and Pending Flushes]
+\label{exer:ch03-gin-trace}
+Consider inserting the following \texttt{JSONB} document into a \texttt{charges(charge\_id, meta)} table:
+\begin{lstlisting}[language=SQL]
+INSERT INTO charges (meta) VALUES
+('{"gateway":"stripe","risk":{"score":92,"flags":["avs_mismatch","velocity"]}}');
+\end{lstlisting}
+\begin{enumerate}
+  \item List all distinct Entry Tree keys extracted under default \texttt{jsonb\_ops} versus the root-to-leaf path hashes extracted under \texttt{jsonb\_path\_ops}.
+  \item Which of the following predicates can \texttt{jsonb\_path\_ops} accelerate, and which force a sequential scan: (a)~\texttt{meta @>} matching \texttt{velocity} inside \texttt{risk.flags}; (b)~\texttt{meta ? 'gateway'}; (c)~\texttt{meta->'risk'->>'score' = '92'}?
+  \item Suppose each inserted charge appends $\sim 256$~bytes to the GIN \texttt{fastupdate} pending list (\texttt{gin\_pending\_list\_limit = 4MB}). After roughly how many \texttt{INSERT}s does a foreground transaction trigger a synchronous pending-list merge, and what two configuration knobs eliminate that p99 latency cliff?
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Quantifying BRIN Scan Amplification Under \texttt{\_fsm} Poisoning]
+\label{exer:ch03-brin-poisoning}
+An append-only \texttt{telemetry} table holds $102{,}400{,}000$ rows packed at $80$ rows per 8~KB page across $1{,}280{,}000$ heap pages ($\approx 10\text{ GB}$), indexed by BRIN on \texttt{ts} with default \texttt{pages\_per\_range = 128} ($R = 10{,}000$ block ranges total, covering 100 consecutive days so 100 ranges $= 1\text{ day}$).
+\begin{enumerate}
+  \item Initially rows are strictly chronological: a query for the latest 1~hour of Day~100 overlaps $\ceil{100 / 24} = 5$ block ranges. How many megabytes of heap does PostgreSQL read?
+  \item A cleanup job deletes $0.1\%$ of rows scattered uniformly across Days~1..99 and runs \texttt{VACUUM} (without desummarizing or clustering). During Day~100, just $K = 30{,}000$ new Day-100 rows are directed by the Free Space Map (\texttt{\_fsm}) uniformly at random into the $9{,}900$ historical block ranges of Days~1..99. What is the probability $1 - (1 - 1/9900)^{30000}$ that a given historical 128-page range receives \emph{at least one} Day-100 row?
+  \item Explain what happens to that historical range's BRIN $[\min, \max]$ tuple the moment a single Day-100 row lands inside it, and compute how many megabytes of heap the exact same ``latest 1~hour of Day~100'' query is now forced to scan and recheck.
+\end{enumerate}
+\end{exercise}
+
+\chapterline

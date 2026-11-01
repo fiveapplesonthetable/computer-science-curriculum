@@ -1,0 +1,969 @@
+\chapter{Traits, Generics, Monomorphization, and Fat Pointers}
+\label{ch06:traits-generics-dispatch}
+
+In Chapter~5, we threw out two pillars of Java~6 and C++ object-oriented design at the same time: \texttt{null} references and \texttt{extends} class inheritance. Replacing \texttt{null} with \texttt{Option<T>} and state flags with \texttt{enum}s immediately paid off---illegal states stopped compiling, and data sat flat in memory without hidden object headers.
+
+Yet if you have spent years building systems in Java~6 or C++, a nagging question should be tugging at your sleeve right now. \emph{Without class inheritance, how do we write code that works across many types?} How do you write a single settlement engine that can price a wire transfer under a flat cents fee, a basis-points percentage fee, or a tiered institutional schedule? How do you swap a live PostgreSQL ledger store for a fast in-memory fake inside unit tests? How does \texttt{slice.sort()} sort integers, timestamps, and account identifiers without knowing your structs ahead of time?
+
+Rust's answer is the \textbf{trait}. At a casual squint from thirty thousand feet, a \texttt{trait} looks a lot like a Java~6 \texttt{interface}. Both list method signatures that a concrete type promises to provide. Below the surface, however, Rust traits work on a completely different mechanical model from both Java interfaces and C++ \texttt{virtual} base classes:
+
+\begin{enumerate}
+  \item \textbf{Data and behavior live apart.} A \texttt{struct} or \texttt{enum} defines \emph{only} byte layout; \texttt{impl Trait for Type} attaches shared behavior afterward, from the outside---even onto primitive integers like \texttt{i64} or types from another library.
+  \item \textbf{Generics specialize without losing type checking.} When you write a bounded signature \texttt{fn price<P: FeePolicy>(p: \&P)}, Rust checks the body of \texttt{price} \emph{once} against \texttt{FeePolicy} (like Java generics, unlike C++98 templates), and then stamps out specialized, vtable-free machine code for each concrete \texttt{P} (like C++ templates, unlike Java's type erasure and heap boxing).
+  \item \textbf{Dynamic dispatch puts the vtable pointer in the reference, not in the object.} A Rust struct never carries a hidden C++ \texttt{vptr} or a 16-byte Java object header. You pay for virtual dispatch \emph{only} at the exact boundary where you ask for a \textbf{trait object} (\texttt{\&dyn FeePolicy} or \texttt{Box<dyn FeePolicy>}), represented as a 16-byte \textbf{fat pointer} pairing \texttt{data\_ptr} and \texttt{vtable\_ptr}.
+\end{enumerate}
+
+Once you see those three mechanics clearly---down to the stack slots, heap allocations, and read-only \texttt{.rodata} tables---every rule in Rust's trait system stops looking like an arbitrary compiler restriction and starts looking like simple physical necessity.
+
+\chapterline
+
+\section{Decoupling Data from Behavior: \texttt{struct} vs \texttt{impl Trait}}
+\label{ch06:data-vs-behavior}
+
+Think about how Java~6 asks you to model a fee calculation contract for a payment processor. You start with an \texttt{interface}, and every concrete pricing rule must declare \texttt{implements FeePolicy} on the very line where the class is born:
+
+\begin{lstlisting}[language=Java, caption={Java 6 fuses memory layout, inherent methods, and interface membership inside a single class declaration.}]
+public interface FeePolicy {
+    long feeInCents(long amountCents);
+}
+
+public final class FlatCentsFee implements FeePolicy {
+    private final long cents;
+
+    public FlatCentsFee(long cents) {
+        this.cents = cents;
+    }
+
+    public long feeInCents(long amountCents) {
+        return this.cents;
+    }
+}
+\end{lstlisting}
+
+That arrangement feels completely natural until the day you meet two everyday engineering problems:
+
+\begin{itemize}
+  \item \textbf{Retroactive capability.} Suppose a risk library you imported defines \texttt{FixedRateBps}, or suppose you want a raw primitive \texttt{long} (representing basis points) to satisfy \texttt{FeePolicy} directly in tests. In Java~6, \texttt{FixedRateBps} was compiled without \texttt{implements FeePolicy}, and \texttt{long} is not even an \texttt{Object}. Your only option is the Adapter pattern: allocate a brand-new wrapper object on the heap around every single value just to forward one method call.
+  \item \textbf{Coupled responsibilities.} A Java \texttt{class} simultaneously defines three distinct things: (a) how fields sit in memory, (b) helper methods specific to that type, and (c) every polymorphic contract the type will ever participate in. Large enterprise classes accumulate \texttt{implements Serializable, Comparable<Order>, Auditable, Printable, Cloneable} until a single file becomes a magnet for every subsystem in the codebase.
+\end{itemize}
+
+Rust pulls those three jobs apart into separate, independent declarations. First, \texttt{struct} (or \texttt{enum}) describes \emph{pure memory layout}---nothing else. Second, an \textbf{inherent \texttt{impl} block} (\texttt{impl FlatCentsFee}) attaches constructors and methods that belong directly to that type. Third, a \textbf{trait \texttt{impl} block} (\texttt{impl FeePolicy for Type}) bridges a trait contract onto \emph{any} type---including built-in primitives like \texttt{i64}:
+
+\begin{lstlisting}[language=Rust, caption={Rust separates byte layout (struct), inherent methods (impl Type), and polymorphic contracts (impl Trait for Type).}]
+pub trait FeePolicy {
+    // Required method: every implementor must supply this body.
+    fn fee_in_cents(&self, amount_cents: i64) -> i64;
+
+    // Default method: calls fee_in_cents(&self, ...) automatically.
+    // Implementors get this for free, or may override it.
+    fn net_settlement_cents(&self, amount_cents: i64) -> i64 {
+        amount_cents - self.fee_in_cents(amount_cents)
+    }
+}
+
+// 1. Pure data layout: exactly 8 bytes in memory, zero hidden header.
+pub struct FlatCentsFee {
+    pub cents: i64,
+}
+
+// 2. Inherent methods specific to FlatCentsFee.
+impl FlatCentsFee {
+    pub fn new(cents: i64) -> Self {
+        assert!(cents >= 0, "fee cannot be negative");
+        Self { cents }
+    }
+}
+
+// 3. Attaching the FeePolicy contract to FlatCentsFee.
+impl FeePolicy for FlatCentsFee {
+    fn fee_in_cents(&self, _amount_cents: i64) -> i64 {
+        self.cents
+    }
+}
+
+// 4. Attaching our trait directly to Rust's built-in 64-bit integer!
+//    Here an i64 represents basis points (1 bp = 1/100 of 1 percent).
+impl FeePolicy for i64 {
+    fn fee_in_cents(&self, amount_cents: i64) -> i64 {
+        (amount_cents * (*self)) / 10_000
+    }
+}
+\end{lstlisting}
+
+Pause on block~4 for a moment. We just implemented \texttt{FeePolicy} directly on \texttt{i64}. No \texttt{LongWrapper} class, no heap allocation, no pointer indirection: calling \texttt{25\_i64.fee\_in\_cents(100\_000)} passes the address of an 8-byte integer on the stack and computes \texttt{250} cents directly in registers. Figure~\ref{ch06:fig-coupled-vs-decoupled} contrasts the coupled OOP class boundary against Rust's separated layout and trait bridges.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\footnotesize, >=Stealth]
+  % Left side: Java / C++ Coupled Class
+  \begin{scope}[shift={(0,0)}]
+    \node[font=\bfseries\small, text=trapred!90!black] at (2.8, 4.15) {Java 6 / C++: Sealed Inside One Class};
+    \draw[thick, draw=trapred!75, fill=trapred!6, rounded corners=4pt] (0, 0.7) rectangle (5.6, 3.75);
+    \node[font=\bfseries, text=trapred!90!black] at (2.8, 3.4) {\texttt{class FlatCentsFee}};
+
+    \draw[draw=trapred!60, fill=white, rounded corners=2pt] (0.3, 2.35) rectangle (5.3, 3.05);
+    \node[align=center] at (2.8, 2.7) {\textbf{Object Header / \texttt{vptr}} + \textbf{Fields}\\ {\scriptsize 16B JVM header or 8B \texttt{vptr}, then \texttt{cents}}};
+
+    \draw[draw=trapred!60, fill=white, rounded corners=2pt] (0.3, 1.6) rectangle (5.3, 2.2);
+    \node at (2.8, 1.9) {Inherent constructors \& helpers};
+
+    \draw[draw=trapred!60, fill=white, rounded corners=2pt] (0.3, 0.85) rectangle (5.3, 1.45);
+    \node at (2.8, 1.15) {\texttt{implements FeePolicy}: fixed at birth};
+
+    \node[draw=gray!60, fill=gray!10, rounded corners=2pt, minimum width=5.0cm, minimum height=0.6cm] (jprim) at (2.8, 0.0) {Primitive \texttt{long} or 3rd-party \texttt{FixedRate}};
+    \node[font=\scriptsize, text=trapred!90!black, align=center] at (2.8, -0.65) {Cannot attach \texttt{FeePolicy} retroactively;\\requires heap-allocated Adapter wrapper.};
+  \end{scope}
+
+  % Right side: Rust Orthogonal Separation
+  \begin{scope}[shift={(7.2,0)}]
+    \node[font=\bfseries\small, text=targetgreen!85!black] at (3.2, 4.15) {Rust: Layout Separated from Behavior};
+
+    \node[draw=sourceblue!80, fill=sourceblue!10, thick, rounded corners=3pt, minimum width=2.7cm, minimum height=1.05cm, align=center] (rstruct) at (1.35, 3.1) {\textbf{\texttt{FlatCentsFee}}\\ {\scriptsize Pure data: \texttt{cents: i64}}\\ {\scriptsize (8 bytes total)}};
+
+    \node[draw=sourceblue!80, fill=sourceblue!10, thick, rounded corners=3pt, minimum width=2.7cm, minimum height=1.05cm, align=center] (ri64) at (5.05, 3.1) {\textbf{Primitive \texttt{i64}}\\ {\scriptsize Built-in scalar}\\ {\scriptsize (8 bytes total)}};
+
+    \node[draw=structurepurple!80, fill=structurepurple!10, thick, rounded corners=3pt, minimum width=6.1cm, minimum height=0.8cm, align=center] (rtrait) at (3.2, 1.55) {\textbf{\texttt{trait FeePolicy}}\\ {\scriptsize Contract: \texttt{fn fee\_in\_cents(\&self, i64) -> i64}}};
+
+    \node[draw=targetgreen!80, fill=targetgreen!12, thick, rounded corners=3pt, minimum width=2.85cm, minimum height=0.85cm, align=center] (impl1) at (1.35, 0.1) {\texttt{impl FeePolicy}\\ {\scriptsize \texttt{for FlatCentsFee}}};
+
+    \node[draw=targetgreen!80, fill=targetgreen!12, thick, rounded corners=3pt, minimum width=2.85cm, minimum height=0.85cm, align=center] (impl2) at (5.05, 0.1) {\texttt{impl FeePolicy}\\ {\scriptsize \texttt{for i64}}};
+
+    \draw[->, thick, targetgreen!80!black] (impl1.north) -- (rtrait.south west -| impl1.north);
+    \draw[->, thick, targetgreen!80!black] (impl2.north) -- (rtrait.south east -| impl2.north);
+    \draw[->, thick, sourceblue!80!black, bend left=18] (impl1.west) to ([xshift=1pt]rstruct.west);
+    \draw[->, thick, sourceblue!80!black, bend right=18] (impl2.east) to ([xshift=-1pt]ri64.east);
+
+    \node[font=\scriptsize, text=targetgreen!85!black, align=center] at (3.2, -0.65) {Zero bytes added to \texttt{FlatCentsFee} or \texttt{i64};\\capabilities attach cleanly from outside.};
+  \end{scope}
+\end{tikzpicture}
+\caption{In Java~6 and C++, polymorphic interfaces and virtual tables must be baked into the class definition itself, bloating object layout and excluding primitives or external structs. Rust keeps data layout completely separate from \texttt{impl Trait for Type} blocks.}
+\label{ch06:fig-coupled-vs-decoupled}
+\end{figure}
+
+\subsection{Reading \texttt{self} vs \texttt{Self} Through the Ownership Lens}
+
+Notice two spellings that appear side by side in almost every Rust trait: lowercase \texttt{self} and uppercase \texttt{Self}. Keeping them distinct makes every trait signature in the standard library immediately legible:
+
+\begin{itemize}
+  \item \textbf{Uppercase \texttt{Self} is a type alias for ``whichever concrete type is implementing this trait right now.''} Inside \texttt{impl FeePolicy for FlatCentsFee}, \texttt{Self} means \texttt{FlatCentsFee}; inside \texttt{impl FeePolicy for i64}, \texttt{Self} means \texttt{i64}.
+  \item \textbf{Lowercase \texttt{self} is the method's first value parameter---the receiver---with its ownership mode spelled out explicitly.} In Java~6 and C++, every non-static method implicitly receives a mutable pointer \texttt{this}. Rust refuses to hide how a method accesses its receiver; instead, trait methods use the exact three ownership modes from Chapter~3:
+  \begin{enumerate}
+    \item \texttt{\&self} (short for \texttt{self: \&Self}): borrows the receiver immutably, as in \texttt{fee\_in\_cents}. Ten callers can share references and compute fees at the same time.
+    \item \texttt{\&mut self} (short for \texttt{self: \&mut Self}): borrows the receiver exclusively to mutate state in place, as when \texttt{next(\&mut self)} on \texttt{Iterator} advances a cursor.
+    \item \texttt{self} (short for \texttt{self: Self}): \textbf{consumes the receiver by value}, like \texttt{into\_iter(self)} on \texttt{IntoIterator} tearing open a \texttt{Vec<T>} to yield owned items, after which the original \texttt{Vec} cannot be touched again.
+  \end{enumerate}
+  \item \textbf{Trait functions with no \texttt{self} parameter at all} are called \textbf{associated functions} (analogous to static interface factories, except polymorphic over \texttt{Self}), such as \texttt{Default::default()} returning \texttt{Self} or \texttt{FromStr::from\_str(s)} returning \texttt{Result<Self, Self::Err>}.
+\end{itemize}
+
+\begin{trapbox}
+\textbf{Trait methods are only in scope when the trait itself is in scope.} If module \texttt{billing} defines \texttt{pub trait FeePolicy} and implements it for \texttt{FlatCentsFee}, another module that imports \emph{only} \texttt{use crate::billing::FlatCentsFee;} cannot call \texttt{flat.fee\_in\_cents(500)} until it \emph{also} writes \texttt{use crate::billing::FeePolicy;}. At first this surprises Java developers (where importing a class imports all its interface methods). Rust requires importing the trait so that two independent crates can each define their own helper trait on \texttt{FlatCentsFee} (or \texttt{i64}) without colliding in modules that did not ask for them.
+\end{trapbox}
+
+\section{Generics Across Three Worlds: Erasure, Templates, and Bounds}
+\label{ch06:generics-three-models}
+
+Suppose we want to write a batch settlement calculator \texttt{total\_fees} that sums the fees across a slice of payment amounts using \emph{any} pricing rule that implements \texttt{FeePolicy}. Java~6, C++, and Rust all let you write a generic function for this job, yet what their compilers check---and what bytes they feed to the CPU---differ sharply. Let us line all three up on the same problem.
+
+\subsection{World 1: Java~6 Type Erasure (Safe Definition Check, Boxed Runtime)}
+
+In Java~6 (which added generics in JDK~5 while preserving backwards bytecode compatibility with JDK~1.4), you write a bounded type parameter \texttt{<P extends FeePolicy>}:
+
+\begin{lstlisting}[language=Java, caption={Java 6 bounded generic method and what the compiler erases it into.}]
+// What you write in Java 6:
+public static <P extends FeePolicy> long totalFees(
+        List<Long> amounts, P policy) {
+    long sum = 0L;
+    for (Long amt : amounts) {
+        sum += policy.feeInCents(amt.longValue());
+    }
+    return sum;
+}
+
+// What javac actually emits in bytecode (type erasure):
+public static long totalFees(List amounts, FeePolicy policy) {
+    long sum = 0L;
+    for (Iterator it = amounts.iterator(); it.hasNext(); ) {
+        Long amt = (Long) it.next(); // runtime checkcast!
+        sum += policy.feeInCents(amt.longValue()); // invokeinterface!
+    }
+    return sum;
+}
+\end{lstlisting}
+
+Here is the bargain Java~6 struck. On the bright side, \textbf{definition-site type checking is rock solid}: \texttt{javac} type-checks \texttt{totalFees} \emph{once}, right when you compile \texttt{totalFees}, verifying that every method called on \texttt{policy} is guaranteed by \texttt{FeePolicy}. If you accidentally type \texttt{policy.discountBps()} inside \texttt{totalFees}, \texttt{javac} rejects \texttt{totalFees} immediately, before anyone ever calls it.
+
+On the hardware side, however, type erasure exacts three steep tolls:
+\begin{enumerate}
+  \item \textbf{No primitives in type parameters.} Because every generic parameter \texttt{T} erases to \texttt{Object} (or its upper bound), \texttt{List<long>} is illegal in Java~6. A million payment amounts in \texttt{List<Long>} become a million 8-byte references pointing to a million separate 24-byte \texttt{java.lang.Long} heap objects---32~MB of pointer-chasing cache misses for 8~MB of numbers, as we measured in Chapter~1.
+  \item \textbf{One unspecialized bytecode body.} Whether you pass \texttt{FlatCentsFee} or \texttt{TieredFee}, both execute the exact same erased \texttt{totalFees} method and dispatch \texttt{policy.feeInCents(...)} via an \texttt{invokeinterface} lookup. (HotSpot's JIT compiler works hard at runtime with inline caches to devirtualize monomorphic call sites, and falls right back off a cliff into megamorphic vtable dispatch the moment three or four implementations share that call site)
+  \item \textbf{Runtime amnesia.} Inside a generic Java method, \texttt{T} is gone at runtime: you cannot write \texttt{new T()}, \texttt{new T[n]}, or \texttt{x instanceof T}.
+\end{enumerate}
+
+\subsection{World 2: C++ Templates (Zero-Cost Machine Code, Late Duck-Typed Checks)}
+
+C++ went to the opposite extreme. A C++98/17 function template does not erase anything; it treats the template like a typed code generator stamped out separately for every concrete type \texttt{P} you pass at call sites:
+
+\begin{lstlisting}[language=C++, caption={C++98/17 unconstrained template vs C++20 Concept constraint.}]
+#include <cstdint>
+#include <vector>
+
+// C++98/17 unconstrained template: P is not checked against any
+// explicit contract until a caller instantiates total_fees<SomeType>!
+template <typename P>
+std::int64_t total_fees_cpp17(
+        const std::vector<std::int64_t>& amounts, const P& policy) {
+    std::int64_t sum = 0;
+    for (std::int64_t amt : amounts) {
+        sum += policy.fee_in_cents(amt); // duck-typed lookup!
+    }
+    return sum;
+}
+
+// C++20 Concept: constrains call sites structurally, though the
+// template body itself is still NOT restricted solely to the concept!
+template <typename P>
+concept FeePolicyConcept = requires(const P& p, std::int64_t amt) {
+    { p.fee_in_cents(amt) } -> std::same_as<std::int64_t>;
+};
+\end{lstlisting}
+
+At runtime, C++ wins completely: \texttt{std::vector<std::int64\_t>} is one contiguous slab of 8-byte integers, \texttt{policy} has no \texttt{virtual} keyword, and calling \texttt{total\_fees\_cpp17} with \texttt{FlatCentsFee\{25\}} generates a dedicated machine-code function where \texttt{policy.fee\_in\_cents(amt)} inlines straight into \texttt{sum += 25}.
+
+Yet notice the modularity flaw in C++ templates: \textbf{structural duck typing at instantiation time}. In \texttt{total\_fees\_cpp17}, if the library author accidentally writes \texttt{policy.typo\_method()} inside an \texttt{if constexpr} or helper branch, or if a caller five layers up passes a struct whose \texttt{fee\_in\_cents} returns \texttt{double} instead of \texttt{int64\_t}, the error explodes \emph{inside the library's implementation lines} with a notorious multi-screen template instantiation backtrace. Even with C++20 \texttt{concept}s (which cleanly catch bad arguments at the call boundary), the compiler \emph{still} permits the body of a concept-constrained C++20 template to call extra methods on \texttt{policy} that were never listed in \texttt{FeePolicyConcept}---you only find out you forgot a requirement in your concept when some future caller passes a type that satisfies the concept minimalistically.
+
+\subsection{World 3: Rust's Synthesis (Definition-Checked Bounds + Specialization)}
+
+Rust combines Java's strict, modular definition-time contract checking with C++'s zero-cost per-type code generation. Look at \texttt{total\_fees} in Rust:
+
+\begin{lstlisting}[language=Rust, caption={Rust checks generic bodies strictly against trait bounds once at definition time, then compiles specialized machine code per concrete type.}]
+pub fn total_fees<P: FeePolicy>(amounts: &[i64], policy: &P) -> i64 {
+    let mut sum = 0_i64;
+    for &amt in amounts {
+        sum += policy.fee_in_cents(amt);
+    }
+    sum
+}
+\end{lstlisting}
+
+Try an experiment in your head: suppose \texttt{FlatCentsFee} also has an inherent method \texttt{pub fn label(\&self) -> \&'static str}, and inside \texttt{total\_fees} we try to call \texttt{policy.label()}. Even if the \emph{only} call to \texttt{total\_fees} in the entire program passes a \texttt{FlatCentsFee}, \textbf{\texttt{rustc} rejects \texttt{total\_fees} immediately.} Why? Because \texttt{P: FeePolicy} promises \emph{only} the methods of \texttt{FeePolicy}, and \texttt{label} is not part of \texttt{FeePolicy}. Once \texttt{total\_fees} compiles, you have a mathematical guarantee that \emph{every} type implementing \texttt{FeePolicy}---today or five years from now in a downstream crate---will instantiate \texttt{total\_fees} without a single error inside its body. Figure~\ref{ch06:fig-generics-pipeline} maps all three compilation models side by side.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\scriptsize, >=Stealth,
+  stage/.style={draw, rounded corners=2pt, minimum height=0.88cm, align=center, inner sep=3pt}
+]
+  % Row 1: Java 6
+  \node[font=\bfseries\footnotesize, anchor=west, text=quotientorange!90!black] at (0, 3.65) {1. Java 6 Generics (Type Erasure)};
+  \node[stage, draw=quotientorange!80, fill=quotientorange!10, minimum width=3.5cm] (j1) at (1.85, 2.95) {\texttt{<P extends FeePolicy>}\\Checked \textbf{once} vs bound};
+  \node[stage, draw=quotientorange!80, fill=quotientorange!10, minimum width=3.9cm] (j2) at (6.45, 2.95) {Erase \texttt{P -> FeePolicy};\\primitives boxed on heap};
+  \node[stage, draw=trapred!80, fill=trapred!10, minimum width=4.3cm] (j3) at (11.55, 2.95) {1 shared bytecode body:\\\texttt{checkcast} + \texttt{invokeinterface}};
+  \draw[->, thick, quotientorange!85!black] (j1) -- (j2);
+  \draw[->, thick, quotientorange!85!black] (j2) -- (j3);
+
+  % Row 2: C++ Templates
+  \node[font=\bfseries\footnotesize, anchor=west, text=structurepurple!95!black] at (0, 2.05) {2. C++ Templates (Instantiation Duck Typing)};
+  \node[stage, draw=trapred!80, fill=trapred!10, minimum width=3.5cm] (c1) at (1.85, 1.35) {\texttt{template <typename P>}\\Body \textbf{not} sealed to bound};
+  \node[stage, draw=structurepurple!80, fill=structurepurple!10, minimum width=3.9cm] (c2) at (6.45, 1.35) {Substitute each caller \texttt{P};\\type-check body \emph{per} \texttt{P}};
+  \node[stage, draw=targetgreen!80, fill=targetgreen!12, minimum width=4.3cm] (c3) at (11.55, 1.35) {Specialized native code:\\inlined, zero heap boxing};
+  \draw[->, thick, structurepurple!85!black] (c1) -- (c2);
+  \draw[->, thick, structurepurple!85!black] (c2) -- (c3);
+
+  % Row 3: Rust Bounded Generics
+  \node[font=\bfseries\footnotesize, anchor=west, text=sourceblue!95!black] at (0, 0.45) {3. Rust Bounded Generics (Checked + Monomorphized)};
+  \node[stage, draw=targetgreen!80, fill=targetgreen!12, minimum width=3.5cm] (r1) at (1.85, -0.25) {\texttt{<P: FeePolicy>}\\Checked \textbf{once} vs trait};
+  \node[stage, draw=sourceblue!80, fill=sourceblue!10, minimum width=3.9cm] (r2) at (6.45, -0.25) {Monomorphize per \texttt{P};\\unboxed values in slices};
+  \node[stage, draw=targetgreen!80, fill=targetgreen!12, minimum width=4.3cm] (r3) at (11.55, -0.25) {Specialized native code:\\inlined, zero vtable calls};
+  \draw[->, thick, sourceblue!85!black] (r1) -- (r2);
+  \draw[->, thick, sourceblue!85!black] (r2) -- (r3);
+\end{tikzpicture}
+\caption{Three ways to compile a generic function. Java~6 checks the generic body cleanly at definition time, then erases type arguments to heap pointers at runtime. C++ templates emit specialized native code, at the cost of checking the body during substitution. Rust keeps definition-time checking \emph{and} specialized zero-overhead machine code.}
+\label{ch06:fig-generics-pipeline}
+\end{figure}
+
+\subsection{Syntax Ergonomics: \texttt{where} Clauses and \texttt{impl Trait}}
+
+As signatures grow beyond one bound, stuffing constraints inside \texttt{<...>} clutters the function name and parameter list. Rust gives you three clean ways to express trait bounds, and knowing what \texttt{impl Trait} means in argument position versus return position saves hours of confusion:
+
+\begin{lstlisting}[language=Rust, caption={Equivalent trait bound spellings, plus return-position impl Trait.}]
+use std::fmt::Debug;
+
+// 1. Inline bound: crisp for 1 or 2 short bounds.
+pub fn quote_a<P: FeePolicy + Debug>(amt: i64, policy: &P) -> i64 {
+    policy.fee_in_cents(amt)
+}
+
+// 2. 'where' clause: cleanest when bounds span multiple types.
+pub fn quote_b<P>(amt: i64, policy: &P) -> i64
+where
+    P: FeePolicy + Debug,
+{
+    policy.fee_in_cents(amt)
+}
+
+// 3. Argument-position 'impl Trait': syntactic sugar for an anonymous
+//    generic parameter (note: callers cannot turbofish ::<Type>!).
+pub fn quote_c(amt: i64, policy: &(impl FeePolicy + Debug)) -> i64 {
+    policy.fee_in_cents(amt)
+}
+
+// 4. Return-position '-> impl Trait': "I return ONE specific concrete
+//    type known to the compiler, without exposing its struct name."
+pub fn standard_retail_fee() -> impl FeePolicy {
+    FlatCentsFee::new(35)
+}
+\end{lstlisting}
+
+\begin{trapbox}
+\textbf{Return-position \texttt{-> impl FeePolicy} still returns ONE concrete type.} A classic surprise for Java developers is writing:
+\begin{lstlisting}[language=Rust]
+// COMPILE ERROR: 'if' and 'else' have incompatible types!
+pub fn choose_policy(vip: bool) -> impl FeePolicy {
+    if vip {
+        FlatCentsFee::new(0)  // 8-byte FlatCentsFee
+    } else {
+        25_i64                // 8-byte i64 (different concrete type!)
+    }
+}
+\end{lstlisting}
+Why does \texttt{rustc} reject this? Because \texttt{-> impl FeePolicy} is \emph{static dispatch} with zero heap boxing: the caller reserves exact stack space for \emph{one} concrete return type decided at compile time (often an unnameable closure or iterator adapter chain, as we will see in Chapter~7). If two branches genuinely return \emph{different} concrete types chosen at runtime, you have two idiomatic options: either return a closed \texttt{enum AnyFee \{ Flat(FlatCentsFee), Bps(i64) \}} (stack-allocated, zero heap), or box a trait object \texttt{Box<dyn FeePolicy>} (Section~\ref{ch06:fat-pointers}).
+\end{trapbox}
+
+\section{Static Dispatch and Monomorphization Down to Machine Code}
+\label{ch06:monomorphization}
+
+Let us trace \emph{monomorphization} (from Greek \emph{mono} ``single'' + \emph{morphe} ``form'': turning one polymorphic generic template into single-form concrete functions) all the way down to what LLVM hands your CPU. Suppose our binary calls \texttt{total\_fees} in two places---once with a \texttt{FlatCentsFee} and once with a \texttt{TieredBpsFee}:
+
+\begin{lstlisting}[language=Rust, caption={Two calls to a generic function and the two specialized functions rustc stamps out before LLVM optimization.}]
+pub struct TieredBpsFee {
+    pub threshold_cents: i64,
+    pub low_bps: i64,
+    pub high_bps: i64,
+}
+
+impl FeePolicy for TieredBpsFee {
+    fn fee_in_cents(&self, amount_cents: i64) -> i64 {
+        let bps = if amount_cents >= self.threshold_cents {
+            self.high_bps
+        } else {
+            self.low_bps
+        };
+        (amount_cents * bps) / 10_000
+    }
+}
+
+pub fn run_settlement_demo(batch: &[i64]) -> (i64, i64) {
+    let flat = FlatCentsFee::new(30);
+    let tiered = TieredBpsFee {
+        threshold_cents: 100_000,
+        low_bps: 25,
+        high_bps: 10,
+    };
+    // Call 1 instantiates P = FlatCentsFee
+    // Call 2 instantiates P = TieredBpsFee
+    (total_fees(batch, &flat), total_fees(batch, &tiered))
+}
+\end{lstlisting}
+
+During compilation, \texttt{rustc} walks the call graph starting from \texttt{main} (or exported public symbols), discovers that \texttt{total\_fees} is instantiated with \texttt{P = FlatCentsFee} and \texttt{P = TieredBpsFee}, and emits two completely separate functions in LLVM IR---as if you had written them by hand:
+
+\begin{lstlisting}[language=Rust, caption={Conceptual monomorphized output generated by rustc prior to LLVM inlining.}]
+fn total_fees_for_FlatCentsFee(
+    amounts: &[i64],
+    policy: &FlatCentsFee,
+) -> i64 {
+    let mut sum = 0_i64;
+    for &amt in amounts {
+        // Direct static call to FlatCentsFee::fee_in_cents!
+        sum += FlatCentsFee::fee_in_cents(policy, amt);
+    }
+    sum
+}
+
+fn total_fees_for_TieredBpsFee(
+    amounts: &[i64],
+    policy: &TieredBpsFee,
+) -> i64 {
+    let mut sum = 0_i64;
+    for &amt in amounts {
+        // Direct static call to TieredBpsFee::fee_in_cents!
+        sum += TieredBpsFee::fee_in_cents(policy, amt);
+    }
+    sum
+}
+\end{lstlisting}
+
+\begin{happeningbox}
+\textbf{Why skipping the vtable call is only 10\% of the speedup; the other 90\% is inlining.} Beginners often hear ``virtual calls are slower than static calls'' and think of the 1--3 CPU cycles spent loading a function pointer from a vtable. On a modern out-of-order CPU with branch target buffers, an indirect call that always hits the same target barely costs two nanoseconds on its own.
+
+The real mechanical advantage of static dispatch is \textbf{compiler visibility across the call boundary}. In \texttt{total\_fees\_for\_FlatCentsFee}, LLVM sees the body of \texttt{FlatCentsFee::fee\_in\_cents} right inside the loop:
+\begin{enumerate}
+  \item LLVM inlines \texttt{policy.cents} directly into \texttt{sum += policy.cents}.
+  \item LLVM notices \texttt{amt} is never even read. It deletes the entire memory scan over \texttt{amounts} and collapses a 1,000,000-iteration loop into a \textbf{single integer multiplication}: \texttt{(amounts.len() as i64) * policy.cents}.
+\end{enumerate}
+Across an opaque virtual call (\texttt{\&dyn FeePolicy}), the compiler cannot prove what \texttt{fee\_in\_cents} does, so it \emph{must} execute all 1,000,000 loop iterations and indirect calls one by one. Static dispatch lets small generic abstractions melt completely into surrounding arithmetic.
+\end{happeningbox}
+
+\subsection{The Cost of Monomorphization---and the Inner-Function Cure}
+
+Zero runtime overhead is not zero \emph{compile-time} or \emph{binary-size} cost. Suppose you write a 150-line function \texttt{load\_settlement\_csv<P: AsRef<Path>>(path: P)} that converts \texttt{path.as\_ref()} into a \texttt{\&Path} on line~1, and then spends lines~2--150 opening a file, parsing headers, and validating rows. If callers invoke \texttt{load\_settlement\_csv} with \texttt{\&str}, \texttt{String}, \texttt{PathBuf}, and \texttt{\&Path}, naive monomorphization stamps out \textbf{four identical 149-line copies} of the CSV parser in your compiled binary---slowing down LLVM optimization and polluting the CPU's L1 instruction cache.
+
+Look inside Rust's own standard library (\texttt{std::fs::read}) and you will see the three-line cure used everywhere in production Rust: \textbf{monomorphize only the tiny conversion shim, and delegate immediately to a non-generic inner function}:
+
+\begin{lstlisting}[language=Rust, caption={The std::fs::read pattern: a 3-line generic wrapper calling a single non-generic machine-code body.}]
+use std::io;
+use std::path::Path;
+
+#[inline]
+pub fn load_settlement_csv<P: AsRef<Path>>(path: P) -> io::Result<usize> {
+    // Only this 1-line conversion is monomorphized per P (and inlined)!
+    load_settlement_csv_inner(path.as_ref())
+}
+
+// Compiled ONCE in the binary: zero code duplication!
+fn load_settlement_csv_inner(path: &Path) -> io::Result<usize> {
+    let contents = std::fs::read_to_string(path)?;
+    Ok(contents.lines().count())
+}
+\end{lstlisting}
+
+\section{Dynamic Dispatch and the 16-Byte Fat Pointer (\texttt{\&dyn Trait})}
+\label{ch06:fat-pointers}
+
+Static dispatch works whenever the compiler knows the exact concrete type at each call site. Sometimes, however, the whole point of your program is that \emph{you do not know the concrete types until runtime}. Imagine loading active merchant fee rules from PostgreSQL at server startup: Merchant~A uses a \texttt{FlatCentsFee}, Merchant~B uses a \texttt{TieredBpsFee}, Merchant~C uses a promotional \texttt{ZeroFee}, and you want to store all of them side by side in a single \texttt{Vec} or \texttt{HashMap<MerchantId, ...>}.
+
+Can we write \texttt{Vec<FeePolicy>}? Think physically about what \texttt{Vec<T>} is from Chapter~3: a contiguous array where slot~$k$ starts at byte offset $k \times \texttt{size\_of::<T>()}$. \texttt{FlatCentsFee} is 8~bytes; \texttt{TieredBpsFee} is 24~bytes; a custom \texttt{BracketSchedule} might be 64~bytes. A \texttt{FeePolicy} without a pointer wrapper has no fixed size (\textbf{Dynamically Sized Type}, or \textbf{DST}, written \texttt{!Sized}), so it cannot sit directly by value inside a \texttt{Vec} or stack slot. To hold heterogeneous implementors uniformly, we must refer to them behind a pointer: \texttt{\&dyn FeePolicy} (borrowed) or \texttt{Box<dyn FeePolicy>} (heap-owned). The keyword \texttt{dyn} (added in Rust~2018 so dynamic dispatch is never invisible at the type level) marks a \textbf{trait object}.
+
+Now comes the central design question of this chapter: \emph{where does the virtual method table pointer live in memory?}
+
+\subsection{Why C++ and Java Hide Vtable Pointers Inside Every Object}
+
+In C++, the moment you mark \emph{even one} method \texttt{virtual} on a base class \texttt{FeePolicy}, the C++ compiler inserts an invisible 8-byte pointer called a \textbf{\texttt{vptr}} at byte offset~0 of \emph{every instance} of \texttt{FlatCentsFee}:
+
+\begin{lstlisting}[language=C++, caption={Adding virtual in C++ silently doubles the byte size of every FlatCentsFee instance from 8 bytes to 16 bytes.}]
+#include <cstdint>
+
+struct NonVirtualFlatFee {
+    std::int64_t cents; // sizeof == 8 bytes
+};
+
+struct VirtualFeeBase {
+    virtual ~VirtualFeeBase() = default;
+    virtual std::int64_t fee_in_cents(std::int64_t amt) const = 0;
+};
+
+struct VirtualFlatFee : VirtualFeeBase {
+    std::int64_t cents; // sizeof == 16 bytes! ([8B vptr | 8B cents])
+};
+\end{lstlisting}
+
+Look at the two consequences of embedding \texttt{vptr} inside the object itself (Java~6 does the exact same thing via its 12-to-16-byte \texttt{mark + klass} object header on every heap object):
+
+\begin{enumerate}
+  \item \textbf{You pay the memory tax even when you do not use dynamic dispatch.} If you hold \texttt{std::vector<VirtualFlatFee>} with ten million elements and call methods statically, you still waste $10{,}000{,}000 \times 8 = 80\text{ MB}$ of RAM storing ten million identical copies of the exact same \texttt{vptr}.
+  \item \textbf{You can never implement an interface on a type you did not define.} Where would the \texttt{vptr} go on a raw 8-byte \texttt{int64\_t}, or on a \texttt{struct} compiled in a third-party C/C++ library? Those 8~bytes are already spoken for; there is nowhere inside the value to stash a vtable address.
+\end{enumerate}
+
+\subsection{Rust's Inversion: Keep Objects Headerless, Make the Pointer 16 Bytes}
+
+Rust turns the C++/Java layout inside out. \texttt{FlatCentsFee} is \textbf{8~bytes, always}---whether zero traits are implemented for it or fifty traits are implemented for it. An \texttt{i64} is \textbf{8~bytes, always}. When you coerce a regular 8-byte reference \texttt{\&flat} (or \texttt{\&25\_i64}) into a trait object reference \texttt{\&dyn FeePolicy}, \textbf{the pointer itself widens from 8~bytes to 16~bytes} (two machine words on 64-bit hardware):
+
+\begin{itemize}
+  \item \textbf{Word 0 (\texttt{bytes 0..8}): \texttt{data\_ptr}} --- points directly to the raw, headerless concrete value in memory (e.g., the 8~bytes of \texttt{FlatCentsFee} or \texttt{i64} on the stack or heap).
+  \item \textbf{Word 1 (\texttt{bytes 8..16}): \texttt{vtable\_ptr}} --- points to a static, read-only table in the binary's \texttt{.rodata} segment generated specifically for the pair \texttt{(ConcreteType, Trait)}.
+\end{itemize}
+
+Figure~\ref{ch06:fig-vptr-vs-fat-pointer} lays out all three memory representations byte by byte. Study where the green vtable arrow originates in each row---that single arrow explains half of Rust's design.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\scriptsize, >=Stealth,
+  word/.style={draw, minimum height=0.68cm, align=center, inner sep=2pt},
+  vtrow/.style={draw=targetgreen!80, fill=targetgreen!10, minimum width=3.35cm, minimum height=0.46cm, align=left, inner sep=2pt, font=\ttfamily\tiny},
+  sub/.style={font=\tiny, text=gray!80!black}
+]
+  % ==================== (A) C++ virtual ====================
+  \node[font=\bfseries\footnotesize, anchor=west, text=structurepurple!95!black] at (0, 8.15) {(A) C++ \texttt{const VirtualFeeBase* p} (8B thin pointer; \texttt{vptr} inside every object)};
+  \node[word, draw=sourceblue!80, fill=sourceblue!12, minimum width=2.2cm] (cpp_p) at (1.1, 7.1) {\texttt{ptr} (8B)};
+  \node[word, draw=trapred!80, fill=trapred!14, minimum width=2.0cm] (cpp_vptr) at (4.6, 7.1) {\textbf{\texttt{vptr}} (8B)};
+  \node[word, draw=sourceblue!80, fill=sourceblue!10, minimum width=2.1cm, right=0pt of cpp_vptr] (cpp_val) {\texttt{cents: 25} (8B)};
+  \node[sub, below=3pt of cpp_vptr.south east] {16-byte \texttt{VirtualFlatFee} object};
+  \node[vtrow] (cpp_vt1) at (11.5, 7.33) {0: \~{}VirtualFlatFee()};
+  \node[vtrow, below=0pt of cpp_vt1] (cpp_vt2) {1: FlatFee::fee\_in\_cents};
+  \node[font=\tiny\bfseries, text=targetgreen!85!black, below=3pt of cpp_vt2.south] {\texttt{.rodata} vtable};
+  \draw[->, thick, sourceblue!85!black] (cpp_p.east) -- (cpp_vptr.west);
+  \draw[->, thick, targetgreen!85!black] (cpp_vptr.north) -- ++(0,0.3) -| (cpp_vt1.north);
+
+  % ==================== (B) Java 6 interface ====================
+  \node[font=\bfseries\footnotesize, anchor=west, text=quotientorange!95!black] at (0, 5.5) {(B) Java 6 \texttt{FeePolicy p} (8B ref; 16B JVM object header on every heap instance)};
+  \node[word, draw=sourceblue!80, fill=sourceblue!12, minimum width=2.2cm] (jav_p) at (1.1, 4.45) {\texttt{ref} (8B)};
+  \node[word, draw=trapred!80, fill=trapred!14, minimum width=1.55cm] (jav_mk) at (4.35, 4.45) {\texttt{mark} (8B)};
+  \node[word, draw=trapred!80, fill=trapred!14, minimum width=1.6cm, right=0pt of jav_mk] (jav_kl) {\textbf{\texttt{klass}} (8B)};
+  \node[word, draw=sourceblue!80, fill=sourceblue!10, minimum width=1.9cm, right=0pt of jav_kl] (jav_val) {\texttt{cents: 25} (8B)};
+  \node[sub, below=3pt of jav_kl.south] {24-byte heap \texttt{FlatCentsFee}};
+  \node[vtrow] (jav_vt1) at (11.5, 4.68) {Klass metadata + GC map};
+  \node[vtrow, below=0pt of jav_vt1] (jav_vt2) {itable: feeInCents};
+  \node[font=\tiny\bfseries, text=targetgreen!85!black, below=3pt of jav_vt2.south] {class metadata (one per class)};
+  \draw[->, thick, sourceblue!85!black] (jav_p.east) -- (jav_mk.west);
+  \draw[->, thick, targetgreen!85!black] (jav_kl.north) -- ++(0,0.3) -| (jav_vt1.north);
+
+  % ==================== (C) Rust Fat Pointer ====================
+  \node[font=\bfseries\footnotesize, anchor=west, text=targetgreen!85!black] at (0, 2.85) {(C) Rust \texttt{\&dyn FeePolicy} or \texttt{Box<dyn FeePolicy>} (16B fat pointer; 0B object header)};
+  \node[word, draw=sourceblue!85, fill=sourceblue!14, minimum width=1.95cm] (rs_dp) at (1.0, 1.65) {\textbf{\texttt{data\_ptr}} (8B)};
+  \node[word, draw=targetgreen!85, fill=targetgreen!16, minimum width=2.05cm, right=0pt of rs_dp] (rs_vp) {\textbf{\texttt{vtable\_ptr}} (8B)};
+  \node[font=\tiny\bfseries, text=sourceblue!90!black, below=3pt of rs_dp.south] {16-byte fat pointer};
+  \node[word, draw=sourceblue!80, fill=sourceblue!10, minimum width=2.45cm] (rs_val) at (6.6, 1.65) {\texttt{cents: 25} (8B raw)};
+  \node[sub, text=sourceblue!90!black, below=3pt of rs_val.south] {\texttt{FlatCentsFee} \emph{or} raw \texttt{i64}};
+  \node[vtrow] (rs_vt0) at (11.5, 2.34) {drop\_in\_place fn ptr};
+  \node[vtrow, below=0pt of rs_vt0] (rs_vt1) {size: 8, align: 8};
+  \node[vtrow, below=0pt of rs_vt1] (rs_vt2) {fee\_in\_cents fn ptr};
+  \node[vtrow, below=0pt of rs_vt2] (rs_vt3) {net\_settlement\_cents fn};
+  \node[font=\tiny\bfseries, text=targetgreen!85!black, below=3pt of rs_vt3.south] {\texttt{.rodata} vtable for \texttt{(FlatCentsFee, FeePolicy)}};
+  \draw[->, thick, sourceblue!85!black] (rs_dp.north) -- ++(0,0.3) -| (rs_val.north);
+  \draw[->, thick, targetgreen!85!black] (rs_vp.south) -- ++(0,-0.62) -| ([xshift=-0.35cm]rs_vt2.west) -- (rs_vt2.west);
+\end{tikzpicture}
+\caption{Where the vtable pointer lives. C++ and Java embed a vtable/class pointer inside \emph{every} object instance, inflating object size and barring primitive scalars or external structs from implementing new interfaces. Rust keeps values completely bare (8~bytes) and pairs \texttt{(data\_ptr, vtable\_ptr)} into a 16-byte fat pointer \emph{only} when coerced to \texttt{dyn Trait}.}
+\label{ch06:fig-vptr-vs-fat-pointer}
+\end{figure}
+
+\subsection{Tracing a \texttt{dyn} Call and a \texttt{Box<dyn Trait>} Drop by Hand}
+
+We can spell out exactly what \texttt{rustc} generates for a borrowed or boxed trait object. The listing below checks the sizes and builds both kinds:
+
+\begin{lstlisting}[language=Rust, caption={What \&dyn FeePolicy and Box<dyn FeePolicy> do at the machine-word level.}]
+use std::mem::size_of;
+
+pub fn demo_fat_pointers() {
+    let flat = FlatCentsFee::new(25);
+    let raw_bps: i64 = 30;
+
+    // Regular thin references are 1 machine word (8 bytes on 64-bit):
+    assert_eq!(size_of::<&FlatCentsFee>(), 8);
+    assert_eq!(size_of::<&i64>(), 8);
+
+    // Trait-object references are 2 machine words (16 bytes):
+    assert_eq!(size_of::<&dyn FeePolicy>(), 16);
+    assert_eq!(size_of::<Box<dyn FeePolicy>>(), 16);
+
+    // Heterogeneous slice on the stack -- zero heap allocations!
+    // Even raw_bps (a plain stack i64!) participates directly:
+    let rules: [&dyn FeePolicy; 2] = [&flat, &raw_bps];
+    let total: i64 = rules.iter().map(|r| r.fee_in_cents(100_000)).sum();
+    assert_eq!(total, 25 + 300);
+
+    // Owned heterogeneous collection on the heap:
+    let owned_rules: Vec<Box<dyn FeePolicy>> = vec![
+        Box::new(FlatCentsFee::new(25)),
+        Box::new(30_i64),
+        Box::new(TieredBpsFee {
+            threshold_cents: 50_000,
+            low_bps: 20,
+            high_bps: 10,
+        }),
+    ];
+    assert_eq!(owned_rules.len(), 3);
+} // <-- When owned_rules drops here, how does Box free 3 differently
+  //     sized heap allocations? Through the vtable!
+\end{lstlisting}
+
+Now consider the closing brace on the last line. \texttt{owned\_rules[0]} points to an 8-byte heap block; \texttt{owned\_rules[2]} points to a 24-byte heap block; another element might own an internal \texttt{String} whose destructor must free a second buffer. At the closing brace, the compiler only sees \texttt{Box<dyn FeePolicy>}---how does \texttt{Box::drop} know which destructor to run and how many bytes to hand back to the global allocator?
+
+Look back at the four rows inside Rust's \texttt{.rodata} vtable in Figure~\ref{ch06:fig-vptr-vs-fat-pointer}:
+\begin{enumerate}
+  \item \texttt{drop\_in\_place: unsafe fn(*mut ())}: a pointer to the concrete type's destructor (a no-op for \texttt{i64} or \texttt{FlatCentsFee}, or field-by-field cleanup if the struct owns a \texttt{String} or socket).
+  \item \texttt{size: usize} and \texttt{align: usize}: the exact byte size and alignment of the concrete value (\texttt{8, 8} for \texttt{FlatCentsFee}; \texttt{24, 8} for \texttt{TieredBpsFee}).
+  \item One function pointer slot per trait method (\texttt{fee\_in\_cents}, \texttt{net\_settlement\_cents}).
+\end{enumerate}
+
+When \texttt{r.fee\_in\_cents(100\_000)} executes on \texttt{r: \&dyn FeePolicy}, the CPU loads the function pointer from \texttt{r.vtable\_ptr} and invokes \texttt{fn\_ptr(r.data\_ptr, 100\_000)}---passing the thin \texttt{data\_ptr} in register \texttt{rdi} and \texttt{100\_000} in \texttt{rsi}. When \texttt{Box<dyn FeePolicy>} goes out of scope, \texttt{Drop} invokes \texttt{drop\_in\_place(data\_ptr)} from the vtable, reads \texttt{vtable.size} and \texttt{vtable.align}, and if \texttt{size > 0}, passes that exact \texttt{Layout} to \texttt{dealloc(data\_ptr, layout)}.
+
+\begin{intuitionbox}
+Notice the resemblance to Chapter~3's slices. In Rust, there are two classic kinds of \textbf{16-byte fat pointers} you meet constantly:
+\begin{itemize}
+  \item \textbf{Slices (\texttt{\&[T]}, \texttt{\&str}, \texttt{Box<[T]>}):} \texttt{(data\_ptr: *const T, len: usize)} --- word~1 tells you \emph{how many elements} live at \texttt{data\_ptr}.
+  \item \textbf{Trait objects (\texttt{\&dyn Trait}, \texttt{Box<dyn Trait>}):} \texttt{(data\_ptr: *const (), vtable\_ptr: *const Vtable)} --- word~1 tells you \emph{how to operate on and drop} the erased bytes at \texttt{data\_ptr}.
+\end{itemize}
+Both solve the exact same physical problem: taking an unsized (\texttt{!Sized}) view and attaching the one extra machine word of metadata needed to use it safely without bloating the underlying data.
+\end{intuitionbox}
+
+\section{\texttt{dyn}-Compatibility (Object Safety) Derived from the Vtable Layout}
+\label{ch06:object-safety}
+
+Sooner or later, every Rust programmer tries to write \texttt{Box<dyn Clone>} or \texttt{\&dyn PartialEq} or adds a generic method to a trait, and meets a compiler diagnostic saying: \emph{``the trait \texttt{...} is not \texttt{dyn} compatible''} (historically called \emph{object safety} prior to Rust~1.83).
+
+You do not need to memorize the rules. Look at our 16-byte fat pointer and static \texttt{.rodata} vtable from Figure~\ref{ch06:fig-vptr-vs-fat-pointer} and ask \emph{``could the compiler actually build a vtable slot and call instruction for this method?''}, and each rule follows. Here are the three core rules directly from hardware mechanics:
+
+\begin{enumerate}
+  \item \textbf{Methods cannot return bare \texttt{Self} by value (nor accept bare \texttt{Self} arguments).}
+  Consider \texttt{Clone}, whose signature is \texttt{fn clone(\&self) -> Self}. Suppose you hold \texttt{p: \&dyn Clone} and write \texttt{let copy = p.clone();}. Before the CPU executes the \texttt{call} instruction, the caller's stack frame must reserve space for \texttt{copy}. \emph{How many stack bytes should the caller reserve?} Eight bytes for \texttt{FlatCentsFee}? Twenty-four bytes for \texttt{String}? Four kilobytes for an array? At compile time, \texttt{p} could point to anything. Worse, for \texttt{PartialEq::eq(\&self, other: \&Self)}, if you hold two \texttt{\&dyn PartialEq} pointers, nothing guarantees \texttt{a.data\_ptr} and \texttt{b.data\_ptr} even point to the same concrete type.
+  \item \textbf{Methods cannot carry generic type parameters, such as \texttt{fn encode<W: Write>(\&self, w: \&mut W)}.}
+  Remember how generics compile in Rust: instantiations for \texttt{File}, \texttt{Vec<u8>}, and \texttt{TcpStream} are three distinct machine-code functions, potentially compiled months later in downstream crates. A \texttt{.rodata} vtable is a fixed, finite array of function pointers emitted at compile time. You cannot pack an open-ended family of monomorphized functions into one vtable slot.
+  \item \textbf{Methods dispatched through \texttt{dyn} must take a receiver} (such as \texttt{\&self}, \texttt{\&mut self}, \texttt{Box<Self>}, \texttt{Rc<Self>}, \texttt{Arc<Self>}, or \texttt{Pin<P>}).
+  Consider \texttt{Default::default() -> Self}. There is no \texttt{self} argument at all---which means the caller has \emph{no fat pointer} from which to read a \texttt{vtable\_ptr}.
+\end{enumerate}
+
+\subsection{Two Practical Patterns When You Hit \texttt{dyn}-Compatibility}
+
+What do you do in real production code when you have \texttt{Box<dyn FeePolicy>} and genuinely need to clone it, or want a convenience generic method on the trait? Rust gives you clean patterns for both:
+
+\begin{lstlisting}[language=Rust, caption={Making a trait object cloneable via Box, and keeping generic helpers off the vtable with 'where Self: Sized'.}]
+use std::io::Write;
+
+pub trait CloneFeePolicy {
+    fn clone_box(&self) -> Box<dyn FeePolicy>;
+}
+
+// Blanket implementation: EVERY type T that is 'static + FeePolicy + Clone
+// automatically knows how to clone itself into a fresh Box<dyn FeePolicy>!
+impl<T> CloneFeePolicy for T
+where
+    T: 'static + FeePolicy + Clone,
+{
+    fn clone_box(&self) -> Box<dyn FeePolicy> {
+        Box::new(self.clone()) // Here T is known and Sized!
+    }
+}
+
+pub trait ReportableFee: FeePolicy {
+    // 1. Vtable-safe core method takes a trait object (&mut dyn Write):
+    fn write_audit_line(&self, out: &mut dyn Write) -> std::io::Result<()>;
+
+    // 2. 'where Self: Sized' opts this generic helper OUT of the vtable!
+    //    Static callers get full generic convenience, while
+    //    '&dyn ReportableFee' remains fully dyn-compatible!
+    fn format_with<F>(&self, amt: i64, f: F) -> String
+    where
+        Self: Sized,
+        F: FnOnce(i64) -> String,
+    {
+        f(self.fee_in_cents(amt))
+    }
+}
+\end{lstlisting}
+
+Look at \texttt{where Self: Sized} on \texttt{format\_with}: because \texttt{dyn ReportableFee} is \emph{not} \texttt{Sized}, adding \texttt{where Self: Sized} tells \texttt{rustc} ``omit this method from the vtable; only allow calling it when the concrete type is statically known.'' That exact clause is how Rust's own \texttt{std::iter::Iterator} trait offers seventy generic adapter methods (\texttt{map}, \texttt{filter}, \texttt{collect}) and \emph{still} lets you pass \texttt{\&mut dyn Iterator<Item = i64>} dynamically.
+
+\section{Associated Types, Coherence, Supertraits, and Blanket Impls}
+\label{ch06:assoc-coherence-blanket}
+
+Once you start designing your own traits for domain services and storage layers, four structural questions come up right away:
+\begin{enumerate}
+  \item When should a trait use an \textbf{associated type} (\texttt{type Output;}) instead of a \textbf{generic parameter} (\texttt{Trait<T>})?
+  \item Why does \texttt{rustc} forbid implementing someone else's trait on someone else's struct (\textbf{coherence} and the \textbf{orphan rule})?
+  \item How do traits build on other traits (\textbf{supertraits}) and grant methods across thousands of types at once (\textbf{blanket implementations})?
+  \item When does a closed \texttt{enum} beat \texttt{Box<dyn Trait>}?
+\end{enumerate}
+
+\subsection{Associated Types (\texttt{type Item}) vs Generic Type Parameters (\texttt{From<T>})}
+
+Compare two standard library traits side by side:
+
+\begin{lstlisting}[language=Rust, caption={Generic type parameter (1-to-many input) vs Associated type (1-to-1 output).}]
+// Generic parameter T: ONE type can implement From<T> for MANY T's!
+pub trait From<T>: Sized {
+    fn from(value: T) -> Self;
+}
+
+// Associated type Item: ONE cursor type yields ONE specific Item type!
+pub trait Iterator {
+    type Item;
+    fn next(&mut self) -> Option<Self::Item>;
+}
+\end{lstlisting}
+
+Why wasn't \texttt{Iterator} written as \texttt{pub trait GenericIter<Item>}? Imagine what happens to a caller if \texttt{GenericIter<Item>} uses a type parameter. In theory, a single struct \texttt{CsvLines} \emph{could} implement \texttt{GenericIter<String>} \emph{and} \texttt{GenericIter<Vec<u8>>} \emph{and} \texttt{GenericIter<i64>} at the same time. Because multiple implementations could exist, every caller writing \texttt{let x = iter.next();} would suffer type-inference ambiguity unless they annotated which \texttt{Item} they wanted, and every generic function taking \texttt{C: GenericIter<Row>} would have to drag extra type parameters through its \texttt{<...>} list.
+
+The design rule is clean and memorable:
+\begin{itemize}
+  \item \textbf{Use a generic parameter \texttt{Trait<In>} for \emph{inputs} (many implementations per \texttt{Self}):} An \texttt{AccountId} can legitimately be constructed \texttt{From<u64>} \emph{and} \texttt{From<u32>}. An arithmetic type \texttt{Money} might implement \texttt{Mul<i64>} (scaling money by an integer count) \emph{and} \texttt{Mul<BasisPoints>}.
+  \item \textbf{Use an associated type \texttt{type Out;} for \emph{outputs} determined uniquely by \texttt{Self} (at most one implementation per \texttt{Self}):} Given a \texttt{PostgresPostingCursor}, the row type \texttt{Item = PostingRecord} and error type \texttt{Error = SqlError} are uniquely fixed by the cursor itself.
+\end{itemize}
+
+Notice that \texttt{std::ops::Add} combines \emph{both} ideas with a default type parameter: \texttt{trait Add<Rhs = Self>} declares an associated \texttt{type Output;} and \texttt{fn add(self, rhs: Rhs) -> Self::Output}. You can add \texttt{Timestamp + Duration} (\texttt{Rhs = Duration}, input parameter), and once \texttt{Self} and \texttt{Rhs} are chosen, the result type (\texttt{Output = Timestamp}, associated output type) is uniquely locked in.
+
+\subsection{Coherence and the Orphan Rule: Saving Your \texttt{HashMap} from Silent Corruption}
+
+Try compiling this snippet in your own crate:
+
+\begin{lstlisting}[language=Rust]
+// COMPILE ERROR E0117: only traits defined in the current crate
+// can be implemented for arbitrary types!
+impl std::fmt::Display for Vec<i64> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "len={}", self.len())
+    }
+}
+\end{lstlisting}
+
+Here \texttt{Display} lives in \texttt{std}, and \texttt{Vec<T>} also lives in \texttt{std}---neither belongs to your crate. Rust rejects the implementation under its \textbf{coherence} law, enforced by the \textbf{orphan rule}:
+
+\begin{definition}[Coherence and the Orphan Rule]
+\label{ch06:def-coherence}
+A trait system satisfies \textbf{coherence} if, for any trait \texttt{Trait} and concrete types $T_0, T_1, \dots, T_k$, there exists \emph{at most one} implementation of \texttt{Trait} for those types across the entire dependency graph of a compiled program. To check coherence modularly (one crate at a time, without peeking into downstream crates), Rust enforces the \textbf{orphan rule}: a crate may write \texttt{impl Trait for Type} only if either \texttt{Trait} or \texttt{Type} (subject to precise parameter coverage rules for generic traits) is defined inside the current crate.
+\end{definition}
+
+\begin{whybox}
+\textbf{Why does coherence matter so deeply?} Imagine Rust \emph{did} allow orphan implementations. Crate~\texttt{alpha} (your fraud-scoring dependency) implements \texttt{Hash} for an external \texttt{CurrencyPair} struct using little-endian byte order and builds a \texttt{HashMap<CurrencyPair, Rate>}. Crate~\texttt{beta} (your reporting dependency) independently implements \texttt{Hash} for \texttt{CurrencyPair} using ASCII uppercase hashing. Now your \texttt{main} binary receives the \texttt{HashMap} built by \texttt{alpha} and passes it into \texttt{beta}, which calls \texttt{map.get(\&eur\_usd)}.
+
+Because \texttt{beta} hashes \texttt{eur\_usd} with a \emph{different} \texttt{Hash} implementation than the one that inserted the bucket in \texttt{alpha}, \texttt{map.get} probes the wrong bucket and returns \texttt{None} for a key sitting right inside the map. Haskell actually permits ``orphan instances'' (with a compiler warning) and calls this exact bug the \emph{HashMap coherence hazard}. Rust eliminates it unconditionally at compile time. Whenever you want \texttt{Display} or \texttt{Serialize} on an external \texttt{Vec<i64>}, you wrap it in a zero-cost local \textbf{Newtype} \texttt{pub struct LedgerAmounts(pub Vec<i64>);}---a flagship pattern we develop thoroughly in Chapter~8.
+\end{whybox}
+
+\subsection{Supertraits and Blanket Implementations}
+
+Instead of class inheritance (\texttt{class Sub extends Base}), Rust composes contracts cleanly through \textbf{supertraits} and \textbf{blanket implementations}:
+
+\begin{lstlisting}[language=Rust, caption={Supertraits require prerequisite contracts; blanket impls grant behavior to every type meeting a bound.}]
+use std::fmt::{Debug, Display};
+
+// Supertrait: any type implementing AuditableFee MUST also implement
+// both FeePolicy and Debug. Inside AuditableFee methods, self can call
+// methods from all three traits!
+pub trait AuditableFee: FeePolicy + Debug {
+    fn audit_entry(&self, amount_cents: i64) -> String {
+        format!(
+            "policy={:?} amount={} fee={}",
+            self,
+            amount_cents,
+            self.fee_in_cents(amount_cents)
+        )
+    }
+}
+
+// Extension trait + Blanket implementation:
+// Define our own trait SummaryExt and implement it in ONE stroke for
+// every type P anywhere in the universe that implements FeePolicy!
+pub trait FeeBatchExt: FeePolicy {
+    fn max_fee_in_batch(&self, batch: &[i64]) -> i64 {
+        batch
+            .iter()
+            .copied()
+            .map(|amt| self.fee_in_cents(amt))
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+impl<P: FeePolicy + ?Sized> FeeBatchExt for P {}
+\end{lstlisting}
+
+Look at that single line at the bottom: \texttt{impl<P: FeePolicy + ?Sized> FeeBatchExt for P \{\}}. Two gems sit right inside those forty-five characters:
+
+\begin{enumerate}
+  \item \textbf{Blanket reach.} Because \texttt{FeeBatchExt} is a local trait in our crate, the orphan rule is completely happy. Immediately, \texttt{FlatCentsFee}, \texttt{TieredBpsFee}, \texttt{i64}, and every future type implementing \texttt{FeePolicy} gain \texttt{.max\_fee\_in\_batch(slice)}. Rust's standard library uses this exact mechanism everywhere: \texttt{impl<T: Display + ?Sized> ToString for T} gives \texttt{.to\_string()} to every printable type, and \texttt{impl<T, U> Into<U> for T where U: From<T>} automatically provides \texttt{Into} whenever you implement \texttt{From}.
+  \item \textbf{The \texttt{?Sized} relaxation.} By default, every generic type parameter \texttt{<P>} in Rust carries an implicit bound \texttt{P: Sized} (meaning \texttt{P}'s byte size is known at compile time), because 95\% of generic functions pass or store values on the stack. Writing \texttt{+ ?Sized} (``might or might not be \texttt{Sized}'') lifts that default so \texttt{FeeBatchExt} \emph{also} works on unsized trait objects like \texttt{dyn FeePolicy}.
+\end{enumerate}
+
+\subsection{Choosing Your Polymorphism Tool: Generics vs \texttt{dyn Trait} vs \texttt{enum}}
+
+Before reaching for \texttt{Box<dyn FeePolicy>} out of Java habit, always ask one architectural question: \emph{is the set of concrete implementations open to downstream crates, or closed and known inside my system?} When the set of fee schedules in your financial backend has three or four known variants (\texttt{Flat}, \texttt{Bps}, \texttt{Tiered}), a plain Chapter~5 \texttt{enum FeeSchedule} beats \texttt{Box<dyn FeePolicy>} on every axis: zero heap allocation, contiguous \texttt{Vec<FeeSchedule>} cache locality, \texttt{Copy}/\texttt{Clone}/\texttt{Serialize} via one \texttt{\#[derive(...)]} line, and branch-predicted \texttt{match} arms that inline completely. Figure~\ref{ch06:fig-dispatch-architecture-map} summarizes all three tools side by side.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\scriptsize, >=Stealth,
+  card/.style={draw, rounded corners=3pt, minimum width=4.35cm, minimum height=4.25cm, align=left, inner sep=5pt}
+]
+  % Card 1: Bounded Generics
+  \node[card, draw=sourceblue!85, fill=sourceblue!8] (c1) at (0, 0) {};
+  \node[font=\bfseries\footnotesize, text=sourceblue!95!black, anchor=north west] at ([xshift=4pt, yshift=-4pt]c1.north west) {1. Bounded Generics};
+  \node[font=\ttfamily\tiny, text=sourceblue!90!black, anchor=north west] at ([xshift=4pt, yshift=-17pt]c1.north west) {fn run<P: FeePolicy>(p: \&P)};
+  \node[align=left, text width=4.0cm, anchor=north west] at ([xshift=4pt, yshift=-31pt]c1.north west) {
+    \textbf{Open set?} Yes (any crate).\\[2pt]
+    \textbf{Heterogeneous \texttt{Vec}?} No (\texttt{Vec<P>} holds 1 concrete \texttt{P}).\\[2pt]
+    \textbf{Heap alloc:} 0 bytes.\\[2pt]
+    \textbf{Dispatch:} Static + full LLVM inlining.\\[2pt]
+    \textbf{Tradeoff:} Binary size if large body instantiated many times.
+  };
+
+  % Card 2: Closed Enum
+  \node[card, draw=targetgreen!85, fill=targetgreen!8] (c2) at (4.85, 0) {};
+  \node[font=\bfseries\footnotesize, text=targetgreen!90!black, anchor=north west] at ([xshift=4pt, yshift=-4pt]c2.north west) {2. Closed \texttt{enum} Dispatch};
+  \node[font=\ttfamily\tiny, text=targetgreen!85!black, anchor=north west] at ([xshift=4pt, yshift=-17pt]c2.north west) {enum AnyFee \{ Flat(..), .. \}};
+  \node[align=left, text width=4.0cm, anchor=north west] at ([xshift=4pt, yshift=-31pt]c2.north west) {
+    \textbf{Open set?} No (variants fixed in defining module).\\[2pt]
+    \textbf{Heterogeneous \texttt{Vec}?} Yes! Flat contiguous \texttt{Vec<AnyFee>}.\\[2pt]
+    \textbf{Heap alloc:} 0 bytes per item.\\[2pt]
+    \textbf{Dispatch:} Tag switch + inlined arms; easy \texttt{Clone}/\texttt{Serde}.\\[2pt]
+    \textbf{Tradeoff:} Sized to largest variant.
+  };
+
+  % Card 3: Trait Object
+  \node[card, draw=structurepurple!85, fill=structurepurple!8] (c3) at (9.7, 0) {};
+  \node[font=\bfseries\footnotesize, text=structurepurple!95!black, anchor=north west] at ([xshift=4pt, yshift=-4pt]c3.north west) {3. Trait Objects (\texttt{dyn})};
+  \node[font=\ttfamily\tiny, text=structurepurple!90!black, anchor=north west] at ([xshift=4pt, yshift=-17pt]c3.north west) {Box<dyn FeePolicy> / \&dyn ..};
+  \node[align=left, text width=4.0cm, anchor=north west] at ([xshift=4pt, yshift=-31pt]c3.north west) {
+    \textbf{Open set?} Yes (plugins, test mocks, runtime-loaded types).\\[2pt]
+    \textbf{Heterogeneous \texttt{Vec}?} Yes (\texttt{Vec<Box<dyn FeePolicy>>}).\\[2pt]
+    \textbf{Pointer:} 16B \texttt{(data, vtable)}.\\[2pt]
+    \textbf{Dispatch:} Indirect call via \texttt{.rodata} vtable; blocks inlining.\\[2pt]
+    \textbf{Tradeoff:} Must be \texttt{dyn}-safe.
+  };
+\end{tikzpicture}
+\caption{Choosing the right polymorphism mechanism in Rust. Default to bounded generics for single-type fast paths, closed \texttt{enum}s when a known set of variants must live together in a \texttt{Vec}, and \texttt{dyn Trait} fat pointers when an open set of types must mix at runtime or compile times demand erasing a boundary.}
+\label{ch06:fig-dispatch-architecture-map}
+\end{figure}
+
+\section{The Everyday Standard Library Trait Vocabulary}
+\label{ch06:std-traits}
+
+In Java~6, \texttt{java.lang.Object} forces five behaviors onto every object whether they make sense or not: \texttt{equals}, \texttt{hashCode}, \texttt{toString}, \texttt{clone} (which notoriously throws \texttt{CloneNotSupportedException} unless you also implement the empty marker \texttt{Cloneable}), and \texttt{wait}/\texttt{notify} monitor locks. Calling \texttt{equals} on two open \texttt{Socket}s or using a mutable \texttt{ArrayList} as a \texttt{HashMap} key compiles without complaint and misbehaves at runtime.
+
+In Rust, a fresh \texttt{struct LedgerEntry} implements \emph{none} of those operations until you opt in---often via a one-line \texttt{\#[derive(Debug, Clone, PartialEq, Eq)]} macro that inspects every field and generates the boilerplate only if every field supports it. Let us walk through the core standard traits you will read and implement every day, highlighting the subtle design wins over Java~6 and C++.
+
+\subsection{\texttt{Debug} vs \texttt{Display}, and \texttt{Default}}
+
+\begin{itemize}
+  \item \textbf{\texttt{Debug} (\texttt{\{:?\}}, derivable):} Developer diagnostic formatting in \texttt{std::fmt} for logs, \texttt{assert\_eq!}, and error traces. Almost every public type in Rust derives \texttt{Debug} (except types holding raw keys or passwords, where a custom \texttt{Debug} prints \texttt{"[REDACTED]"} so secrets never leak into logs).
+  \item \textbf{\texttt{Display} (\texttt{\{\}}, never auto-derived):} User-facing text output in \texttt{std::fmt}. Rust deliberately refuses to provide \texttt{\#[derive(Display)]} because how an end user should see a \texttt{Money} value (\texttt{"\$12.50"}) or an error message is a domain contract, never an accidental dump of internal field names like Java's \texttt{Order@6d06d69c}.
+  \item \textbf{\texttt{Default} (\texttt{Default::default()}, derivable):} Provides a canonical baseline value (\texttt{0} for numbers, \texttt{""} for \texttt{String}, empty \texttt{Vec}, \texttt{false} for \texttt{bool}). Combined with struct update syntax (\texttt{PoolConfig \{ max\_conns: 32, ..Default::default() \}}), it replaces telescoping constructor overloads cleanly.
+\end{itemize}
+
+\subsection{\texttt{PartialEq}/\texttt{Eq} and \texttt{PartialOrd}/\texttt{Ord}: Why \texttt{f64} Cannot Corrupt Your \texttt{BTreeMap}}
+
+Why does Rust split equality into \emph{two} traits (\texttt{PartialEq} and \texttt{Eq}) and ordering into \emph{two} traits (\texttt{PartialOrd} and \texttt{Ord})? Because of IEEE-754 floating-point \texttt{NaN} (``Not a Number'', such as \texttt{0.0 / 0.0}).
+
+Recall from discrete mathematics that a true \textbf{equivalence relation} requires three laws: symmetry ($a = b \implies b = a$), transitivity ($a = b \land b = c \implies a = c$), and \textbf{reflexivity} ($a = a$ for \emph{every} $a$). Under IEEE-754 hardware rules, \texttt{f64::NAN == f64::NAN} evaluates to \texttt{false}---violating reflexivity. Similarly, \texttt{1.0 < f64::NAN} and \texttt{1.0 >= f64::NAN} are \emph{both} \texttt{false}, violating a total ordering.
+
+In Java~6 or C++, nothing stops you from sorting floats containing \texttt{NaN} or inserting weird comparators into a tree map, corrupting binary search invariants at runtime. Rust encodes the exact mathematical truth in traits:
+\begin{itemize}
+  \item \texttt{PartialEq} requires symmetry and transitivity (\texttt{f64} implements \texttt{PartialEq}, so \texttt{x == y} works on floats).
+  \item \texttt{pub trait Eq: PartialEq \{\}} is a zero-method marker subtrait promising \textbf{reflexivity} ($x == x$ always). Integers, \texttt{String}, and structs of integers implement \texttt{Eq}; \texttt{f32} and \texttt{f64} \textbf{do not}.
+  \item \texttt{HashMap<K, V>} requires \texttt{K: Eq + Hash}, whereas \texttt{BTreeMap<K, V>} and \texttt{slice::sort} require \texttt{Ord} (total ordering returning \texttt{Less}, \texttt{Equal}, or \texttt{Greater}; by contrast, \texttt{partial\_cmp} returns \texttt{Option} because comparing with \texttt{NaN} yields \texttt{None}). Try writing \texttt{HashMap<f64, Order>} or sorting an \texttt{f64} slice in Rust and the compiler stops you before a single broken search can ship---nudging you directly toward fixed-point integer cents and basis points, which implement \texttt{Eq + Ord + Hash} cleanly.
+\end{itemize}
+
+\subsection{Conversions: \texttt{From}/\texttt{Into} and \texttt{TryFrom}/\texttt{TryInto}}
+
+C and C++ silently convert \texttt{int64\_t} to \texttt{int32\_t} or \texttt{double} to \texttt{int}, truncating upper bits without a murmur. Rust forbids all implicit numeric coercions (even widening \texttt{i32} to \texttt{i64} must be explicit) and organizes type conversions into two symmetric trait pairs:
+
+\begin{lstlisting}[language=Rust, caption={Lossless infallible From/Into vs fallible range-checked TryFrom/TryInto.}]
+use std::convert::{TryFrom, TryInto};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BasisPoints(u16);
+
+// 1. Infallible lossless widening: u16 always fits inside i64!
+//    Implementing From<BasisPoints> for i64 AUTOMATICALLY gives
+//    BasisPoints::into(self) -> i64 via std's blanket impl!
+impl From<BasisPoints> for i64 {
+    fn from(bp: BasisPoints) -> Self {
+        i64::from(bp.0)
+    }
+}
+
+// 2. Fallible domain conversion: not every i64 is valid [0..=10_000] bps!
+#[derive(Debug, PartialEq, Eq)]
+pub struct InvalidBps(pub i64);
+
+impl TryFrom<i64> for BasisPoints {
+    type Error = InvalidBps;
+
+    fn try_from(raw: i64) -> Result<Self, Self::Error> {
+        let small = u16::try_from(raw).map_err(|_| InvalidBps(raw))?;
+        if small <= 10_000 {
+            Ok(BasisPoints(small))
+        } else {
+            Err(InvalidBps(raw))
+        }
+    }
+}
+
+pub fn conversion_demo() -> Result<i64, InvalidBps> {
+    let bp = BasisPoints::try_from(250_i64)?;
+    let widened: i64 = bp.into(); // lossless!
+    let _also_works: BasisPoints = 75_i64.try_into()?;
+    Ok(widened)
+}
+\end{lstlisting}
+
+\textbf{Golden rule:} Always implement \texttt{From<A> for B} (or \texttt{TryFrom<A> for B}), never \texttt{Into} directly---because the standard library's blanket implementation automatically grants \texttt{Into<B> for A} (and \texttt{TryInto<B> for A}) for free, and Chapter~5's \texttt{?} operator uses \texttt{From::from} to convert inner error types automatically.
+
+\subsection{Pointer-Like Views and Cleanup: \texttt{AsRef}, \texttt{Borrow}, \texttt{Deref}, and \texttt{Drop}}
+
+Four final traits tie Rust's ownership model (Chapters~3--4) into everyday API ergonomics:
+
+\begin{itemize}
+  \item \textbf{\texttt{AsRef<U>} (\texttt{fn as\_ref(\&self) -> \&U}):} Cheap, zero-cost reference-to-reference view conversion. Both \texttt{String} and \texttt{\&str} implement \texttt{AsRef<[u8]>} and \texttt{AsRef<Path>}, letting functions accept any path-like or byte-slice-like caller cleanly.
+  \item \textbf{\texttt{Borrow<Borrowed>}:} Looks identical to \texttt{AsRef} in its method signature, with one strict semantic law: \textbf{the borrowed view must produce the exact same \texttt{Eq}, \texttt{Ord}, and \texttt{Hash} results as the owned value.} That law is why a \texttt{HashMap<String, Account>} lets you call \texttt{map.get("ACCT-01")} passing a stack \texttt{\&str} without allocating a temporary heap \texttt{String} just to look up a key.
+  \item \textbf{\texttt{Deref} (\texttt{type Target; fn deref(\&self) -> \&Self::Target}):} Powers the \texttt{*x} dereference operator on smart pointers (\texttt{Box<T>}, \texttt{Rc<T>}, \texttt{Arc<T>}, \texttt{MutexGuard<T>}) and owned buffers (\texttt{String -> str}, \texttt{Vec<T> -> [T]}). Whenever you pass \texttt{\&my\_string} to a function expecting \texttt{\&str}, the compiler automatically applies \textbf{\texttt{Deref} coercion} (\texttt{\&String -> \&str}).
+  \item \textbf{\texttt{Drop} (\texttt{fn drop(\&mut self)}):} Deterministic RAII cleanup executed automatically when an owned value goes out of scope (closing sockets, unlocking a \texttt{MutexGuard}, rolling back an uncommitted \texttt{sqlx::Transaction}). Notice how \texttt{rustc} forbids implementing both \texttt{Copy} and \texttt{Drop} on the same type: if copying a value duplicated it via raw \texttt{memcpy}, both copies would run \texttt{Drop} at scope exit and double-free the resource.
+\end{itemize}
+
+\begin{trapbox}
+\textbf{Never abuse \texttt{Deref} to fake Java \texttt{extends} class inheritance.} Newcomers from OOP occasionally wrap \texttt{struct SavingsAccount \{ base: Account, rate\_bps: u16 \}} and implement \texttt{Deref<Target = Account>} so \texttt{savings.balance()} auto-forwards to \texttt{base.balance()}. Resist that temptation. \texttt{Deref} is exclusively for \emph{smart pointers and buffer wrappers} where the wrapper conceptually \emph{points to} the target (so \texttt{*wrapper} makes physical sense). Using \texttt{Deref} between distinct domain structs creates baffling method-resolution priorities, breaks generic trait bounds (\texttt{SavingsAccount} still does \emph{not} implement traits implemented on \texttt{Account}), and confuses readers. Prefer explicit composition (\texttt{savings.account().balance()}) or shared domain traits.
+\end{trapbox}
+
+\begin{table}[H]
+\centering
+\caption{Summary of Rust's core standard traits compared with Java~6 and C++.}
+\label{ch06:tab-std-traits}
+\footnotesize
+\begin{tabular}{@{}llp{7.8cm}@{}}
+\toprule
+\textbf{Rust Trait} & \textbf{Derivable?} & \textbf{Contract \& Contrast with Java 6 / C++} \\
+\midrule
+\texttt{Debug} / \texttt{Display} & Yes / No & Developer \texttt{\{:?\}} dump vs explicit user-facing \texttt{\{\}}; replaces universal \texttt{Object.toString()}. \\
+\texttt{Clone} / \texttt{Copy} & Yes / Yes & Explicit \texttt{.clone()} code vs implicit bitwise \texttt{memcpy} marker (\texttt{Copy: Clone}, mutually exclusive with \texttt{Drop}). \\
+\texttt{PartialEq} / \texttt{Eq} & Yes / Yes & Partial vs reflexive equivalence; keeps \texttt{f64::NAN} out of \texttt{HashMap} keys at compile time. \\
+\texttt{PartialOrd} / \texttt{Ord} & Yes / Yes & Partial vs total order; prevents broken \texttt{NaN} sorting and \texttt{BTreeMap} corruption. \\
+\texttt{From<T>} / \texttt{TryFrom<T>} & No / No & Explicit lossless vs fallible conversions; replaces silent C/C++ narrowing casts. \\
+\texttt{AsRef<T>} / \texttt{Borrow<T>} & No / No & Zero-cost borrowed views; \texttt{Borrow} additionally guarantees matching \texttt{Hash}/\texttt{Eq}/\texttt{Ord}. \\
+\texttt{Deref} / \texttt{Drop} & No / No & Smart-pointer dereferencing (\texttt{\&String -> \&str}) and deterministic scope-exit RAII cleanup. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Exercises}
+\label{ch06:exercises}
+
+\begin{exercise}[Counting Stack, Heap, and Vtable Bytes]
+\label{ch06:ex-byte-counts}
+Assume a 64-bit target (\texttt{usize} = 8~bytes). Given \texttt{struct FlatCentsFee \{ cents: i64 \}} and \texttt{struct TieredBpsFee \{ threshold: i64, low\_bps: i64, high\_bps: i64 \}}, both implementing \texttt{FeePolicy}:
+\begin{enumerate}
+  \item What is the exact stack size (\texttt{size\_of}) and total heap byte footprint of \texttt{Vec<FlatCentsFee>} holding $1{,}000$ elements with capacity $1{,}000$?
+  \item What is the exact stack size and minimum heap byte footprint of \texttt{Vec<Box<dyn FeePolicy>>} holding $500$ \texttt{FlatCentsFee} items and $500$ \texttt{TieredBpsFee} items with capacity $1{,}000$? How many \texttt{.rodata} vtables exist in the binary for those two types?
+  \item Compare both answers against a Java~6 \texttt{ArrayList<FeePolicy>} backed by an \texttt{Object[1000]} array on a 64-bit JVM without compressed OOPs (16-byte object header, 8-byte references, 8-byte alignment).
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Diagnosing and Fixing \texttt{dyn}-Compatibility]
+\label{ch06:ex-dyn-safety}
+A teammate migrating from Java~6 writes the following trait for pluggable ledger serializers and attempts to store them in a \texttt{Vec<Box<dyn LedgerFormat>>}:
+\begin{lstlisting}[language=Rust]
+pub trait LedgerFormat {
+    fn format_name() -> &'static str;
+    fn clone_format(&self) -> Self;
+    fn write_entry<W: std::io::Write>(
+        &self,
+        entry_id: u64,
+        cents: i64,
+        out: &mut W,
+    ) -> std::io::Result<()>;
+}
+\end{lstlisting}
+\begin{enumerate}
+  \item Explain from first principles (stack frame layout and \texttt{.rodata} vtable structure) why \emph{all three} methods prevent \texttt{LedgerFormat} from being used as \texttt{dyn LedgerFormat}.
+  \item Refactor \texttt{LedgerFormat} so a \texttt{Vec} of \texttt{Box<dyn LedgerFormat>} compiles cleanly, supports cloning boxed formatters, exposes the format name on a trait object, \emph{and} still offers a generic \texttt{write\_to} helper when the concrete formatter type is statically known.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Associated Types vs Generic Parameters in a Rate Engine]
+\label{ch06:ex-assoc-vs-generic}
+You are designing two traits for a multi-currency settlement service:
+\begin{itemize}
+  \item \texttt{QuoteSource}: given a base currency code and quote currency code, fetches the latest spot rate, returning an implementation-specific error type on failure (for example, \texttt{RedisError} for a cache source or \texttt{HttpError} for a live feed).
+  \item \texttt{ApplyAdjustment<Adj>}: adjusts a \texttt{Money} value by either a \texttt{FlatDiscount}, a \texttt{BasisPointMarkup}, or a \texttt{TaxRule}---all supported on the \emph{same} \texttt{Money} struct.
+\end{itemize}
+Write the idiomatic Rust trait definitions for \texttt{QuoteSource} and \texttt{ApplyAdjustment}, justifying where you chose an associated type versus a generic type parameter.
+\end{exercise}
+
+\begin{exercise}[De-Bloating Monomorphized APIs]
+\label{ch06:ex-debloat}
+Consider a generic function \texttt{parse\_swift<P>} bounded by \texttt{P: AsRef<Path>} and returning an \texttt{io::Result<Vec<i64>>}. Its body contains 180 lines of file reading, line splitting, and SWIFT tag parsing, and it is called across 12 modules with \texttt{\&str}, \texttt{String}, \texttt{PathBuf}, \texttt{\&Path}, and \texttt{Cow<'\_, str>}.
+\begin{enumerate}
+  \item How many copies of the 180-line parser body does \texttt{rustc} emit before Link-Time Optimization, and how can this hurt runtime throughput even if RAM is plentiful?
+  \item Rewrite \texttt{parse\_swift} using the standard library's non-generic inner-function pattern so the 180-line parser is compiled \emph{once} while preserving identical caller ergonomics.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Total Ordering Without \texttt{NaN} Bugs]
+\label{ch06:ex-ord-wrapper}
+Explain why \texttt{BTreeMap<f64, Vec<OrderId>>} fails to compile in Rust, and construct a small concrete sequence of three \texttt{BTreeMap} insertions and lookups that would break binary search if \texttt{f64::NAN} were permitted as a key. Then implement a validated wrapper struct \texttt{FiniteRate(f64)} whose constructor \texttt{try\_new(x: f64) -> Option<Self>} rejects \texttt{NaN} (and normalizes \texttt{-0.0} to \texttt{+0.0}), manually implementing \texttt{PartialEq}, \texttt{Eq}, \texttt{PartialOrd}, and \texttt{Ord} safely.
+\end{exercise}
