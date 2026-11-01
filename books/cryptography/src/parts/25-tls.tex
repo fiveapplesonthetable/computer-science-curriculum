@@ -395,6 +395,15 @@ and the server starts using its key right away. After the handshake completes, t
 is zeros) yields the application traffic keys that protect real data, plus a
 resumption secret for next time.
 
+How does one stage hand off to the next? Through the boxes marked
+$\operatorname{Derive-Secret}(\cdot, \text{"derived"})$ in Figure~\ref{ch25:fig-keyschedule}.
+$\operatorname{Derive-Secret}(S, \text{label}, \text{msgs})$ is just
+$\operatorname{HKDF-Expand-Label}(S, \text{label}, \Hash(\text{msgs}), 32)$. With the
+label \texttt{"derived"} and an empty message list, it turns the Early Secret into
+$\text{Salt}_1$, which becomes the salt for the next Extract that absorbs $Z$; the
+Handshake Secret is turned into $\text{Salt}_2$ the same way. Each stage's output is
+thus the key that seeds the next.
+
 \begin{whybox}
 Why a chain instead of one Expand from $Z$? There are three reasons, each learned
 from older protocols. \textbf{(1) Domain separation:} distinct labels make the handshake
@@ -434,16 +443,17 @@ def derive_secret(secret, label, transcript_hash):
     return hkdf_expand_label(secret, label, transcript_hash)
 
 zeros     = b"\x00" * 32
+empty_th  = hashlib.sha256(b"").digest()                  # Hash("") for "derived"
 dh_shared = b"...the g^{ab} bytes go here..."             # from the (EC)DHE step
 th = hashlib.sha256(b"ClientHello||ServerHello").digest() # toy transcript hash
 
-early_secret     = hkdf_extract(b"\x00", zeros)           # no PSK -> zeros
+early_secret     = hkdf_extract(zeros, zeros)             # no PSK -> zeros
 handshake_secret = hkdf_extract(
-    derive_secret(early_secret, b"derived", b""), dh_shared)
+    derive_secret(early_secret, b"derived", empty_th), dh_shared)
 c_hs_traffic     = derive_secret(handshake_secret, b"c hs traffic", th)
 s_hs_traffic     = derive_secret(handshake_secret, b"s hs traffic", th)
 master_secret    = hkdf_extract(
-    derive_secret(handshake_secret, b"derived", b""), zeros)
+    derive_secret(handshake_secret, b"derived", empty_th), zeros)
 # Application keys come from master_secret once the transcript is final.
 print("client handshake key:", c_hs_traffic.hex())
 \end{lstlisting}
@@ -568,14 +578,16 @@ record. The per-record nonce is that counter XORed into a fixed random
 \texttt{iv} derived from the traffic secret in the key schedule.
 
 \begin{focusbox}
-\textbf{Nonce $=$ static\_iv $\xor$ (sequence number).} Because the sequence number
+\textbf{Nonce $=$ static\_iv $\xor$ (sequence number).} The 64-bit sequence number is
+left-padded with zeros to the 96-bit \texttt{iv} length before the XOR. Because the sequence number
 never repeats within a connection and the \texttt{iv} is unique per direction per
 key, no (key, nonce) pair ever recurs. The counter is implicit --- never sent --- so
 it also costs zero bytes on the wire. Tiny example: with the last two bytes of the
 $\mathtt{static\_iv}$ equal to $\mathtt{A5C3}$ and record numbers $0,1,2$, the
 nonces end in $\mathtt{A5C3}, \mathtt{A5C2}, \mathtt{A5C1}$ --- distinct by
-construction. When the sequence number would overflow, TLS forces a key update
-(re-keying) rather than risk a repeat.
+construction. The counter itself will never wrap in practice; long before that,
+AES-GCM's usage limit (about $2^{24.5}$ full-size records per key) tells
+implementations to send a \texttt{KeyUpdate} and ratchet to a fresh traffic key.
 \end{focusbox}
 
 \subsection{What the record header authenticates}
@@ -761,9 +773,12 @@ previous record}, so it was predictable to an attacker watching the wire. Recall
 CBC encrypts block $i$ as $C_i = \Enc_k(P_i \xor C_{i-1})$. If Eve can predict
 $C_{i-1}$ \emph{and} influence the plaintext $P_i$ (she can, via malicious
 JavaScript making the browser send chosen data alongside a secret cookie), she can
-test guesses of a secret byte: choose $P_i$ so that $P_i \xor C_{i-1}$ equals a
-value she wants to probe, and watch whether the resulting ciphertext block collides
-with one she has seen for a known plaintext. Byte by byte she recovers the cookie.
+test guesses of a secret byte. Suppose she captured an earlier block
+$C^* = \Enc_k(S \xor C^*_{\text{prev}})$ whose plaintext $S$ holds one unknown
+cookie byte (the rest she has arranged to be known). For a guess $G$ she sends
+$P_i = G \xor C^*_{\text{prev}} \xor C_{i-1}$; the $C_{i-1}$ cancels, so the browser
+computes $\Enc_k(G \xor C^*_{\text{prev}})$, which equals $C^*$ exactly when $G = S$.
+At most $256$ guesses per byte, and byte by byte she recovers the cookie.
 \emph{Fix:} TLS 1.1 made the IV random and unpredictable per record; TLS 1.3
 abandons CBC entirely for AEAD, where this whole class of chosen-plaintext games
 against the mode does not exist.

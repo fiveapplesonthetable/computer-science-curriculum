@@ -50,11 +50,50 @@ let where = '';
 const warn = (msg) => warnings.push(`${where}: ${msg}`);
 
 function stripComments(s) {
+  let verbEnd = null;
   return s
     .split('\n')
     .map((l) => {
+      if (verbEnd) {
+        if (l.includes(verbEnd)) verbEnd = null;
+        return l;
+      }
+      const bm = /\\begin\{(lstlisting|verbatim|Verbatim|minted)\}/.exec(l);
+      if (bm && !l.includes(`\\end{${bm[1]}}`)) {
+        for (let i = 0; i < bm.index; i++) {
+          if (l[i] === '\\') { i++; continue; }
+          if (l[i] === '%') return l.slice(0, i);
+        }
+        verbEnd = `\\end{${bm[1]}}`;
+        return l;
+      }
       for (let i = 0; i < l.length; i++) {
-        if (l[i] === '\\') { i++; continue; }
+        if (l[i] === '\\') {
+          const vm = /^\\(verb\*?|lstinline)\b/.exec(l.slice(i));
+          if (vm) {
+            let j = i + vm[0].length;
+            if (vm[1] === 'lstinline' && l[j] === '[') {
+              const closeOpt = l.indexOf(']', j + 1);
+              if (closeOpt > 0) j = closeOpt + 1;
+            }
+            if (l[j] === '{') {
+              let d = 0;
+              for (; j < l.length; j++) {
+                if (l[j] === '\\') { j++; continue; }
+                if (l[j] === '{') d++;
+                else if (l[j] === '}' && --d === 0) break;
+              }
+              i = j;
+              continue;
+            } else if (j < l.length) {
+              const delim = l[j];
+              const endD = l.indexOf(delim, j + 1);
+              if (endD > 0) { i = endD; continue; }
+            }
+          }
+          i++;
+          continue;
+        }
         if (l[i] === '%') return l.slice(0, i);
       }
       return l;
@@ -151,7 +190,7 @@ function readPreamble(text) {
       i = skipWs(s, i);
       const [body, e3] = group(s, i);
       re.lastIndex = e3;
-      if (['\\chapterline'].includes(name)) continue;
+      if (['\\chapterline', '\\chaptermark', '\\headrulewidth'].includes(name)) continue;
       if (dflt !== null) warn(`macro ${name} has an optional argument; default ignored`);
       macros[name] = body;
       textMacros[name] = { n: n ? +n : 0, body };
@@ -242,7 +281,7 @@ function tikzPreamble(pre) {
     buf += line + '\n';
     for (const ch of line) { if (ch === '{') depth++; else if (ch === '}') depth--; }
     if (depth <= 0) {
-      if (!/\\usepackage(\[[^\]]*\])?\{(geometry|hyperref|fancyhdr|titlesec|tcolorbox|needspace|float|longtable|multicol|listings|enumitem|algorithm2e)\}/.test(buf) && !/\\tcbuselibrary|\\chapterline|\\headrulewidth/.test(buf))
+      if (!/\\usepackage(\[[^\]]*\])?\{(geometry|hyperref|fancyhdr|truncate|titlesec|tcolorbox|needspace|float|longtable|multicol|listings|enumitem|algorithm2e)\}/.test(buf) && !/\\tcbuselibrary|\\chapterline|\\chaptermark|\\headrulewidth/.test(buf))
         keep.push(buf.trimEnd());
       buf = '';
       depth = 0;
@@ -317,10 +356,10 @@ const SIMPLE = {
   '%': '%', '&': '&amp;', '#': '#', '_': '_', '{': '{', '}': '}', '$': '$', ' ': ' ', ',': '&thinsp;', ';': ' ', '!': '', '/': '', '-': '&shy;', '@': '',
   ldots: '…', dots: '…', textendash: '–', textemdash: '—', LaTeX: 'LaTeX', TeX: 'TeX', '\\': '<br>', newline: '<br>', linebreak: ' ',
   S: '§', P: '¶', checkmark: '✓', textbullet: '•', quad: '&emsp;', qquad: '&emsp;&emsp;', enspace: '&ensp;', thinspace: '&thinsp;', textasciitilde: '~', textbackslash: '\\',
-  times: '×', copyright: '©', dag: '†', textdegree: '°', textmu: 'μ', ss: 'ß', ae: 'æ', o: 'ø', aa: 'å', i: 'ı', today: '', par: ' ', relax: '', textquotesingle: "'",
+  times: '×', copyright: '©', dag: '†', textdegree: '°', textmu: 'μ', ss: 'ß', ae: 'æ', o: 'ø', aa: 'å', i: 'ı', today: '', par: ' ', relax: '', textquotesingle: "'", textasciicircum: '^',
 };
 const IGNORE_TEXT = new Set(['small', 'footnotesize', 'scriptsize', 'tiny', 'large', 'Large', 'LARGE', 'huge', 'Huge', 'normalsize', 'centering', 'raggedright', 'raggedleft', 'noindent', 'indent', 'hfill', 'vfill', 'protect', 'medskip', 'bigskip', 'smallskip', 'newpage', 'clearpage', 'pagebreak', 'nopagebreak', 'chapterline', 'bfseries', 'itshape', 'em', 'normalfont', 'ttfamily', 'sffamily', 'rmfamily', 'upshape', 'mdseries', 'selectfont', 'break', 'allowbreak', 'nobreak', 'qed', 'hline', 'toprule', 'midrule', 'bottomrule', 'item', 'maketitle', 'tableofcontents', 'frontmatter', 'mainmatter', 'backmatter', 'appendix', 'null', 'leavevmode', 'strut', 'displaystyle', 'sloppy', 'qedhere', 'DontPrintSemicolon', 'LinesNumbered', 'BlankLine', 'Indp', 'Indm', 'textwidth']);
-const DROP_ARGS = { vspace: 1, hspace: 1, label: 1, addcontentsline: 3, needspace: 1, setlength: 2, addtocontents: 2, phantomsection: 0, markboth: 2, markright: 1, index: 1, rule: 2, color: 1, pagestyle: 1, thispagestyle: 1, setcounter: 2, addtocounter: 2, enlargethispage: 1, vskip: 0, fontsize: 2 };
+const DROP_ARGS = { vspace: 1, hspace: 1, label: 1, addcontentsline: 3, needspace: 1, setlength: 2, addtocontents: 2, phantomsection: 0, markboth: 2, markright: 1, index: 1, rule: 2, color: 1, pagestyle: 1, thispagestyle: 1, setcounter: 2, addtocounter: 2, enlargethispage: 1, vskip: 0, fontsize: 2, addlinespace: 0 };
 
 let footnotes = [];
 
@@ -479,6 +518,12 @@ function textToHtml(s) {
       if (bare === 'href') {
         const [[url, lab], e] = args(s, j, 2);
         out += `<a href="${escAttr(url)}" rel="noopener">${textToHtml(lab)}</a>`;
+        i = e;
+        continue;
+      }
+      if (bare === 'path') {
+        const [[p], e] = args(s, j, 1);
+        out += `<code>${esc(p)}</code>`;
         i = e;
         continue;
       }
@@ -751,9 +796,19 @@ function parseEnv(name, inner, level) {
   }
   if (bare === 'quote' || bare === 'quotation' || bare === 'verse') return { t: 'quote', blocks: parseBlocks(inner, level) };
   if (bare === 'verbatim' || bare === 'lstlisting' || bare === 'Verbatim' || bare === 'minted') {
+    const LANG_NAMES = {
+      rust: 'Rust', 'c++': 'C++', cpp: 'C++', c: 'C', java: 'Java',
+      typescript: 'TypeScript', javascript: 'JavaScript', kotlin: 'Kotlin',
+      go: 'Go', golang: 'Go', ocaml: 'OCaml', haskell: 'Haskell',
+      sql: 'SQL', python: 'Python', toml: 'TOML', json: 'JSON', bash: 'Shell', sh: 'Shell',
+    };
     const [opts, e0] = optArg(inner, 0);
     let anchor = null;
+    let lang = null;
     if (opts) {
+      const langM = /\blanguage\s*=\s*(?:\{([^}]*)\}|([^,\s\]}]+))/.exec(opts);
+      const rawLang = langM ? (langM[1] || langM[2]).trim().replace(/^\[[^\]]*\]/, '').toLowerCase() : '';
+      if (rawLang && LANG_NAMES[rawLang]) lang = LANG_NAMES[rawLang];
       const lm = /label\s*=\s*(?:\{([^}]*)\}|([^,\s\]}]+))|\\label\{([^}]*)\}/.exec(opts);
       const lab = lm ? (lm[1] || lm[2] || lm[3]).trim() : null;
       if (lab || /\bcaption\s*=/.test(opts)) {
@@ -764,7 +819,7 @@ function parseEnv(name, inner, level) {
       }
     }
     let body = inner.slice(e0).replace(/^\{[^}]*\}/, '');
-    return { t: 'pre', text: body.replace(/^\r?\n/, '').replace(/\s+$/, ''), anchor };
+    return { t: 'pre', text: body.replace(/^\r?\n/, '').replace(/\s+$/, ''), anchor, lang };
   }
   if (bare === 'algorithm' || bare === 'algorithm2e') {
     let [, e0] = optArg(inner, 0);
@@ -1221,7 +1276,7 @@ function render(b) {
       return `<${tag}${id}>${b.number ? `<span class="secnum">${b.number}</span> ` : ''}${b.html}</${tag}>`;
     }
     case 'math': return mathHtml(b.src, true);
-    case 'pre': return `<pre${b.anchor ? ` id="${b.anchor}"` : ''}><code>${esc(b.text)}</code></pre>`;
+    case 'pre': return `<pre${b.anchor ? ` id="${b.anchor}"` : ''}${b.lang ? ` data-lang="${escAttr(b.lang)}"` : ''}><code>${esc(b.text)}</code></pre>`;
     case 'algorithm':
       return `<section class="env env-algorithm" id="${b.anchor}"><p class="env-label">Algorithm ${b.number}${b.title ? ` (${b.title})` : ''}</p><div class="alg-body">${b.html}</div></section>`;
     case 'quote': return `<blockquote>${b.blocks.map(render).join('')}</blockquote>`;

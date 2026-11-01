@@ -15,7 +15,7 @@ export default defineConfig({
       manifest: {
         name: 'Algorithms From the Ground Up',
         short_name: 'Algorithms',
-        description: 'An interactive web edition of Algorithms, Graph Algorithms, Cryptography, and Signal Processing From the Ground Up.',
+        description: 'An interactive web edition of Algorithms, Graph Algorithms, Cryptography, Signal Processing, Programming Languages, and Databases From the Ground Up.',
         start_url: './',
         scope: './',
         display: 'standalone',
@@ -36,7 +36,7 @@ export default defineConfig({
           {
             urlPattern: ({ url }) => url.pathname.includes('/figures/'),
             handler: 'CacheFirst',
-            options: { cacheName: 'book-figures', expiration: { maxEntries: 1000 } },
+            options: { cacheName: 'book-figures', expiration: { maxEntries: 1500 } },
           },
         ],
       },

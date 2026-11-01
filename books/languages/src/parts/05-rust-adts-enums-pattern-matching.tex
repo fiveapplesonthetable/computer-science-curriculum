@@ -1,0 +1,970 @@
+\chapter{Algebraic Data Types: Making Illegal States Unrepresentable}
+\label{ch05:adts}
+
+Chapters~3 and~4 tracked \emph{who owns} a block of memory and \emph{how long} a borrow may point into it. Ownership and lifetimes rule out dangling pointers, double frees, and iterator invalidation, yet a memory-safe program can still wire money twice, settle a canceled trade, or panic at three in the morning when an unexpected \texttt{null} reaches a report generator. Those bugs live one level up: in the gap between the bit patterns a data structure \emph{can} hold in RAM and the states that actually make sense in the problem domain.
+
+If you grew up in Java~6 and C++, your reflexes for modeling domain data were shaped by mutable classes full of nullable references and boolean flags, plus open \texttt{extends} hierarchies on the heap. Rust drops both \texttt{extends} implementation inheritance and implicit \texttt{null}. In their place, it gives you \emph{algebraic data types} (\texttt{struct} and data-carrying \texttt{enum}) paired with exhaustive pattern matching (\texttt{match}). This chapter counts how many nonsensical states each design allows, and then inspects the exact bytes the compiler emits for the safer design.
+
+We will study Rust's data model from two angles: first from above, using simple counting algebra to measure how tightly a type fits its domain, and then down to the metal, counting exact bytes, alignment padding, discriminant tags, and bit-pattern niches on a 64-bit machine.
+
+\chapterline
+
+\section{Why Rust Dropped \texttt{extends} and \texttt{null}: The Algebra of Cardinality}
+\label{ch05:cardinality}
+
+Every type defines the set of values a variable of that type can hold at runtime. Before asking what methods a type offers, a Rust engineer asks a simpler counting question: \emph{how many distinct values inhabit this type?}
+
+\begin{definition}[Cardinality of a type]
+\label{ch05:def-cardinality}
+For any type \texttt{T}, its \emph{cardinality}, written $\abs{\texttt{T}}$, is the number of distinct valid values of type \texttt{T} (ignoring finite RAM limits on heap containers).
+\end{definition}
+
+Count the inhabitants of Rust's smallest built-in primitives:
+\begin{itemize}
+  \item \textbf{Booleans and fixed-width integers.} A \texttt{bool} has $\abs{\texttt{bool}} = 2$ (\texttt{false}, \texttt{true}); a \texttt{u8} has $\abs{\texttt{u8}} = 2^8 = 256$; a \texttt{u64} has $\abs{\texttt{u64}} = 2^{64}$.
+  \item \textbf{The unit type \texttt{()}: $\abs{\texttt{()}} = 1$.} Its sole value is also written \texttt{()}. Where C and Java use \texttt{void} for ``returns nothing,'' creating an awkward split between \texttt{void} methods and generic functions returning \texttt{T}, Rust functions without a return arrow return \texttt{()}. Because only one value exists, carrying a \texttt{()} conveys zero runtime bits of information, so \texttt{core::mem::size\_of::<()>() == 0}.
+  \item \textbf{The never type \texttt{!}: $\abs{\texttt{!}} = 0$.} Rust also has a type with \emph{zero} inhabitants, written \texttt{!}. Expressions that diverge before producing a value --- \texttt{return}, \texttt{break}, \texttt{continue}, \texttt{panic!(...)}, \texttt{std::process::abort()}, and an infinite \texttt{loop \{\}} --- all have type \texttt{!}.
+\end{itemize}
+
+A zero-inhabitant type is useful every time a \texttt{match} mixes value-producing arms with early exits:
+
+\begin{lstlisting}[language=Rust]
+fn unwrap_or_abort<T>(opt: Option<T>) -> T {
+    match opt {
+        Some(value) => value,            // produces T
+        None => std::process::abort(),   // produces !, which coerces to any T
+    }
+}
+\end{lstlisting}
+
+Every arm of a \texttt{match} must agree on one result type \texttt{T}. Because \texttt{abort()} has type \texttt{!} ($\abs{\texttt{!}} = 0$), control never reaches the end of the second arm. Just as the empty set $\emptyset$ is a subset of every set $S$, the uninhabited type \texttt{!} coerces soundly to any type \texttt{T}.
+
+\subsection{Product Types: \texttt{struct} Multiplies Possibilities}
+\label{ch05:product-types}
+
+Bundling fields \texttt{a: A} and \texttt{b: B} into a record lets every value of \texttt{A} pair independently with every value of \texttt{B}. That set is the Cartesian product $A \times B$, so cardinalities multiply:
+\[
+  \abs{\texttt{struct \{ a: A, b: B \}}} = \abs{A \times B} = \abs{A} \cdot \abs{B}.
+\]
+Because their cardinalities multiply, structs and tuples are \emph{product types}. Rust provides three forms:
+\begin{enumerate}
+  \item \textbf{Named-field structs}, such as \texttt{struct Point \{ x: i32, y: i32 \}}, with cardinality $2^{32} \cdot 2^{32} = 2^{64}$.
+  \item \textbf{Tuple structs}, such as \texttt{pub struct BasisPoints(pub u16);}, with cardinality $65{,}536$. Wrapping a primitive in a single-field tuple struct --- the \emph{newtype} idiom --- creates a distinct compile-time type with \emph{zero} heap boxing or object header: in machine code it is an unboxed 2-byte \texttt{u16} in a register, yet the compiler rejects passing a bare \texttt{u16} where \texttt{BasisPoints} are expected.
+  \item \textbf{Unit structs}, such as \texttt{pub struct Usd;}, an empty product ($\abs{\texttt{Usd}} = 1$, zero runtime bytes) used as type-level markers in Chapter~6.
+\end{enumerate}
+
+Multiplication is how flag-and-nullable classes end up allowing far more states than the domain has. Here is a typical settlement record from a Java~6 back-office service:
+
+\begin{lstlisting}[language=Java]
+// Java 6: A four-field product of booleans and nullable references
+public final class SettlementRecord {
+    private final boolean isSettled;
+    private final boolean isFailed;
+    private final Long settledAtEpochMs; // null until settled
+    private final Integer failureCode;   // null unless failed
+
+    public SettlementRecord(
+            boolean isSettled, boolean isFailed,
+            Long settledAtEpochMs, Integer failureCode) {
+        this.isSettled = isSettled;
+        this.isFailed = isFailed;
+        this.settledAtEpochMs = settledAtEpochMs;
+        this.failureCode = failureCode;
+    }
+}
+\end{lstlisting}
+
+Count the domain states first. A transfer is in \emph{one} of three mutually exclusive stages: \textbf{Pending} ($1$ state), \textbf{Settled} at a 64-bit timestamp ($2^{64}$ states), or \textbf{Failed} with a 32-bit code ($2^{32}$ states) --- a total of $1 + 2^{64} + 2^{32}$ meaningful states.
+
+Now count what \texttt{SettlementRecord} actually represents. Because every Java object reference includes \texttt{null}, $\abs{\texttt{Long}} = 1 + 2^{64}$ and $\abs{\texttt{Integer}} = 1 + 2^{32}$. Multiplying the four fields yields:
+\[
+  2 \cdot 2 \cdot (1 + 2^{64}) \cdot (1 + 2^{32}) \;=\; 4 \cdot (1 + 2^{32} + 2^{64} + 2^{96}) \;\approx\; 2^{98}.
+\]
+Fewer than \emph{one in ten billion} representable configurations of \texttt{SettlementRecord} are valid. All the rest --- setting both flags to \texttt{true}, marking \texttt{isSettled} while leaving \texttt{settledAtEpochMs} as \texttt{null} (which throws on unboxing), or leaving a stale \texttt{failureCode} on a pending transfer --- force defensive \texttt{if} checks into every method.
+
+\subsection{Sum Types: \texttt{enum} Adds Possibilities}
+\label{ch05:sum-types}
+
+Look back at the true domain count: $1 + 2^{64} + 2^{32}$. Those are \emph{plus} signs, not multiplication signs. What the domain describes is a disjoint union where each alternative carries \emph{only} its own payload. In Rust, an \texttt{enum} defines a closed \emph{sum type} whose variants may be unit-like, tuple-like, or struct-like:
+
+\begin{lstlisting}[language=Rust]
+pub enum SettlementStatus {
+    Pending,
+    Settled { settled_at_epoch_ms: u64 },
+    Failed { failure_code: u32 },
+}
+\end{lstlisting}
+
+Its cardinality is the exact sum $\abs{\texttt{()}} + \abs{\texttt{u64}} + \abs{\texttt{u32}} = 1 + 2^{64} + 2^{32}$. None of the illegal states can be represented: a value holds only one tag at a time, \texttt{Settled} cannot be built without a \texttt{u64} timestamp, and \texttt{failure\_code} does not even exist on \texttt{Settled}. Figure~\ref{ch05:fig-product-vs-sum} compares the Cartesian grid of a flag product against the disjoint union of a sum type.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex]
+  % Left panel: Product Type (x = 0 .. 5.8)
+  \begin{scope}[shift={(0,0)}]
+    \node[font=\bfseries,sourceblue] at (2.95,4.15) {Product: $|A \times B| = |A| \cdot |B|$};
+    \node[font=\footnotesize,black!75] at (2.95,3.72) {Flags \texttt{(settled, failed)}: $2 \times 2 = 4$ cells};
+
+    \node[font=\scriptsize\ttfamily] at (2.05,3.15) {failed=false};
+    \node[font=\scriptsize\ttfamily] at (4.55,3.15) {failed=true};
+    \node[font=\scriptsize\ttfamily,anchor=east] at (0.85,2.25) {settled=false};
+    \node[font=\scriptsize\ttfamily,anchor=east] at (0.85,1.05) {settled=true};
+
+    \draw[thick,sourceblue!70,fill=sourceblue!7,rounded corners=3pt] (0.95,1.70) rectangle (3.15,2.80);
+    \node[font=\footnotesize\bfseries] at (2.05,2.42) {Pending};
+    \node[font=\scriptsize,black!75] at (2.05,2.00) {valid};
+
+    \draw[thick,sourceblue!70,fill=sourceblue!7,rounded corners=3pt] (3.35,1.70) rectangle (5.75,2.80);
+    \node[font=\footnotesize\bfseries] at (4.55,2.42) {Failed};
+    \node[font=\scriptsize\ttfamily,black!75] at (4.55,2.00) {code != null};
+
+    \draw[thick,sourceblue!70,fill=sourceblue!7,rounded corners=3pt] (0.95,0.50) rectangle (3.15,1.60);
+    \node[font=\footnotesize\bfseries] at (2.05,1.22) {Settled};
+    \node[font=\scriptsize\ttfamily,black!75] at (2.05,0.80) {time != null};
+
+    \draw[very thick,trapred,fill=trapred!12,rounded corners=3pt] (3.35,0.50) rectangle (5.75,1.60);
+    \node[font=\footnotesize\bfseries,trapred] at (4.55,1.22) {Both true};
+    \node[font=\scriptsize,trapred] at (4.55,0.80) {illegal state!};
+  \end{scope}
+
+  % Divider
+  \draw[dashed,gray!60,thick] (6.30,0.40) -- (6.30,4.35);
+
+  % Right panel: Sum Type (x = 6.80 .. 13.30)
+  \begin{scope}[shift={(6.80,0)}]
+    \node[font=\bfseries,targetgreen!85!black] at (3.25,4.15) {Sum: $|A + B + C| = |A| + |B| + |C|$};
+    \node[font=\footnotesize,black!75] at (3.25,3.72) {\texttt{enum SettlementStatus}: disjoint variants};
+
+    \draw[thick,targetgreen!80!black,fill=targetgreen!8,rounded corners=4pt] (0.10,2.60) rectangle (6.40,3.30);
+    \node[font=\footnotesize\ttfamily,anchor=west] at (0.30,2.95) {Pending};
+    \node[font=\scriptsize,targetgreen!75!black,anchor=east] at (6.20,2.95) {$1$ value};
+
+    \draw[thick,targetgreen!80!black,fill=targetgreen!8,rounded corners=4pt] (0.10,1.55) rectangle (6.40,2.35);
+    \node[font=\footnotesize\ttfamily,anchor=west] at (0.30,1.95) {Settled \{ settled\_at: u64 \}};
+    \node[font=\scriptsize,targetgreen!75!black,anchor=east] at (6.20,1.95) {$2^{64}$ values};
+
+    \draw[thick,targetgreen!80!black,fill=targetgreen!8,rounded corners=4pt] (0.10,0.50) rectangle (6.40,1.30);
+    \node[font=\footnotesize\ttfamily,anchor=west] at (0.30,0.90) {Failed \{ code: u32 \}};
+    \node[font=\scriptsize,targetgreen!75!black,anchor=east] at (6.20,0.90) {$2^{32}$ values};
+  \end{scope}
+\end{tikzpicture}
+\caption{Product types multiply fields into a Cartesian grid with illegal cells such as \texttt{(settled=true, failed=true)}, whereas sum types add disjoint variants carrying only their own non-null fields.}
+\label{ch05:fig-product-vs-sum}
+\end{figure}
+
+\begin{intuitionbox}
+Reading $\times$ as \texttt{struct}/tuple, $+$ as \texttt{enum}, $1$ as \texttt{()}, and $0$ as \texttt{!} turns ordinary algebra into type isomorphisms:
+\begin{itemize}
+  \item $T \times 1 = T$: \texttt{(u64, ())} carries the exact same $2^{64}$ states and 8 bytes as \texttt{u64}.
+  \item $T + 0 = T$: \texttt{Result<u64, !>} has $2^{64} + 0 = 2^{64}$ inhabitants because \texttt{Err(!)} is unconstructible.
+  \item $T \times 0 = 0$: \texttt{struct Impossible \{ id: u64, proof: ! \}} has $2^{64} \cdot 0 = 0$ inhabitants; nobody can ever construct it without first producing a value of \texttt{!}.
+  \item $1 + T$: \texttt{Option<T>} adds \emph{one} explicit absence state (\texttt{None}) only to types that ask for it.
+\end{itemize}
+\end{intuitionbox}
+
+\subsection{Why Java~6 Subclasses and C \texttt{union}s Fall Short}
+\label{ch05:java-c-contrast}
+
+Java~6 and C each offer half of what Rust's \texttt{enum} provides:
+\begin{itemize}
+  \item \textbf{Java~6 \texttt{enum} + \texttt{abstract class}.} Java's \texttt{enum} constants are fixed singletons allocated at class load time, so \texttt{SETTLED} cannot hold a per-transfer timestamp. Modeling per-case data in Java~6 forces an \texttt{abstract class SettlementStatus} with heap-allocated subclasses (\texttt{PendingStatus}, \texttt{SettledStatus}, \texttt{FailedStatus}). Every field now chases a pointer to a separate GC object with a 12-to-16-byte header, the reference can still be \texttt{null}, and open subclassing across packages defeats compiler-checked exhaustiveness unless you write clunky Visitor boilerplate. (Chapter~10 examines how Kotlin's \texttt{sealed} classes modernize the JVM side of this story.)
+  \item \textbf{C's unchecked \texttt{union}.} A C \texttt{struct} pairing an \texttt{enum} tag with a \texttt{union \{ uint64\_t settled\_at; uint32\_t failure\_code; \}} sits flat inline in memory with zero pointer indirection, just like systems code demands:
+\end{itemize}
+
+\begin{lstlisting}[language=C]
+enum StatusTag { TAG_PENDING, TAG_SETTLED, TAG_FAILED };
+struct SettlementC {
+    enum StatusTag tag;
+    union {
+        uint64_t settled_at_epoch_ms;
+        uint32_t failure_code;
+    } payload;
+};
+\end{lstlisting}
+
+Reading \texttt{rec.payload.settled\_at\_epoch\_ms} while \texttt{rec.tag} holds \texttt{TAG\_FAILED} compiles in C and silently reinterprets an error code plus four uninitialized bytes as a timestamp. Rust's \texttt{enum} compiles down to that same flat tagged-union layout while making it impossible in safe code to touch a variant's payload without matching its tag first.
+
+\begin{historybox}
+Closed sum types with exhaustive pattern matching come from the Edinburgh functional-programming tradition. \textbf{Robin Milner}'s \textbf{ML} (1973) was built as the scripting language of the LCF theorem prover, and the related language \textbf{Hope} (Burstall, MacQueen, and Sannella, 1980) introduced user-defined algebraic data types with pattern matching, which Standard ML then adopted. Mainstream systems languages followed a different path. In 1965 \textbf{Tony Hoare} added a \texttt{null} reference to \textbf{ALGOL~W}, by his own account ``simply because it was so easy to implement,'' and C, C++, and Java inherited the idea. At QCon London in 2009 he called it his ``billion-dollar mistake.'' Rust joins the two traditions: ML-style algebraic types, compiled down to C-style flat memory and bit-pattern niches.
+\end{historybox}
+
+\section{Exact Byte Layout: Struct Reordering, Tagged Unions, and Niche Optimization}
+\label{ch05:memory-layout}
+
+Every sized type \texttt{T} in Rust has two compile-time constants, which you can read with the functions \texttt{size\_of} and \texttt{align\_of} from \texttt{core::mem}:
+\begin{itemize}
+  \item \textbf{Alignment (\texttt{align\_of::<T>()}):} a power of two ($1, 2, 4, 8, \dots$) dictating that every valid address of \texttt{T} must be a multiple of that byte count. On 64-bit targets, \texttt{u8}/\texttt{bool} have alignment~$1$, \texttt{u16} has~$2$, \texttt{u32} has~$4$, and \texttt{u64}, \texttt{usize}, \texttt{\&T}, and \texttt{Box<T>} have~$8$.
+  \item \textbf{Size (\texttt{size\_of::<T>()}):} the byte stride between elements in \texttt{[T; N]}, always rounded up to a multiple of \texttt{align\_of::<T>()}.
+\end{itemize}
+
+\subsection{Struct Field Reordering: \texttt{repr(Rust)} vs.\ \texttt{\#[repr(C)]}}
+\label{ch05:struct-reordering}
+
+C and C++ require struct fields to sit in memory in the exact order written in source code. Alternating small and wide fields forces dead alignment padding between them. Compare \texttt{\#[repr(C)]} against Rust's default \texttt{repr(Rust)} on 64-bit hardware:
+
+\begin{lstlisting}[language=Rust]
+use core::mem::{align_of, size_of};
+
+#[repr(C)]
+pub struct PaddedHeaderC {
+    pub version: u8,   // byte 0   (1B) + 7B padding so tx_id lands on byte 8
+    pub tx_id: u64,    // bytes 8..=15  (8B)
+    pub flags: u8,     // byte 16  (1B) + 7B tail padding so stride % 8 == 0
+}
+
+pub struct CompactHeaderRust {
+    pub version: u8,
+    pub tx_id: u64,
+    pub flags: u8,
+}
+
+const _: () = assert!(size_of::<PaddedHeaderC>() == 24);
+const _: () = assert!(align_of::<PaddedHeaderC>() == 8);
+const _: () = assert!(size_of::<CompactHeaderRust>() == 16);
+const _: () = assert!(align_of::<CompactHeaderRust>() == 8);
+\end{lstlisting}
+
+Because \texttt{size\_of} and \texttt{align\_of} are \texttt{const fn}s, \texttt{const \_: () = assert!(...);} checks layouts at compile time at zero runtime cost. Under \texttt{\#[repr(C)]}, 10 bytes of actual payload expand to 24 bytes (14 bytes of padding) so \texttt{tx\_id} aligns to 8 bytes in every element of \texttt{[PaddedHeaderC; N]}. Under default \texttt{repr(Rust)}, field offsets are intentionally unspecified so \texttt{rustc} can place \texttt{tx\_id: u64} first at bytes \texttt{0..=7}, followed by \texttt{version} at byte~8, \texttt{flags} at byte~9, and 6 tail-padding bytes (\texttt{10..=15}) --- saving 33\% of cache space without forcing you to reorder source fields for the machine. Add \texttt{\#[repr(C)]} only at C FFI or kernel ABI boundaries.
+
+\subsection{How a General \texttt{enum} Sits in Memory: The Tagged Union}
+\label{ch05:tagged-union-layout}
+
+Now examine how \texttt{rustc} lays out a multi-variant domain enum:
+
+\begin{lstlisting}[language=Rust]
+use core::mem::{align_of, size_of};
+
+#[repr(C, u8)]
+pub enum LedgerEvent {
+    Heartbeat,                                             // tag = 0
+    WirePosted { tx_id: u64, fee_bps: u16 },               // tag = 1
+    BatchClosed { batch_id: u64, count: u32, flags: u32 }, // tag = 2
+}
+
+const _: () = assert!(size_of::<LedgerEvent>() == 24);
+const _: () = assert!(align_of::<LedgerEvent>() == 8);
+\end{lstlisting}
+
+Adding \texttt{\#[repr(C, u8)]} pins a 1-byte discriminant tag at byte~0 followed by a C-compatible union of the variant structs (omitting the attribute produces the same 24-byte size here). Figure~\ref{ch05:fig-enum-byte-layout} maps all 24 bytes (\texttt{0..=23}): byte~\texttt{0} holds tag \texttt{0}, \texttt{1}, or \texttt{2}; bytes \texttt{1..=7} pad out to an 8-byte boundary for the \texttt{u64} fields; and bytes \texttt{8..=23} overlay whichever variant is active, sized to the 16-byte \texttt{BatchClosed} payload.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\footnotesize,>=Latex]
+  \def\xzero{2.55}
+  \def\bw{0.48}
+
+  \node[font=\scriptsize\bfseries,black!70,anchor=east] at (\xzero-0.15,3.55) {Byte offset:};
+  \node[font=\scriptsize\ttfamily] at ({\xzero+0.5*\bw},3.55) {0};
+  \node[font=\scriptsize\ttfamily] at ({\xzero+4.0*\bw},3.55) {1..7};
+  \node[font=\scriptsize\ttfamily] at ({\xzero+12.0*\bw},3.55) {8..15};
+  \node[font=\scriptsize\ttfamily] at ({\xzero+20.0*\bw},3.55) {16..23};
+
+  % Row 1: Heartbeat
+  \node[font=\footnotesize\ttfamily\bfseries,anchor=east] at (\xzero-0.15,2.80) {Heartbeat};
+  \draw[thick,sourceblue,fill=sourceblue!18] (\xzero,2.45) rectangle ({\xzero+1*\bw},3.15);
+  \node[font=\scriptsize\ttfamily\bfseries,sourceblue!85!black] at ({\xzero+0.5*\bw},2.80) {0};
+  \draw[thick,gray!65,fill=gray!12] ({\xzero+1*\bw},2.45) rectangle ({\xzero+24*\bw},3.15);
+  \node[font=\scriptsize,black!65] at ({\xzero+12.5*\bw},2.80) {unused / padding (23 bytes)};
+
+  % Row 2: WirePosted
+  \node[font=\footnotesize\ttfamily\bfseries,anchor=east] at (\xzero-0.15,1.80) {WirePosted};
+  \draw[thick,sourceblue,fill=sourceblue!18] (\xzero,1.45) rectangle ({\xzero+1*\bw},2.15);
+  \node[font=\scriptsize\ttfamily\bfseries,sourceblue!85!black] at ({\xzero+0.5*\bw},1.80) {1};
+  \draw[thick,gray!65,fill=gray!12] ({\xzero+1*\bw},1.45) rectangle ({\xzero+8*\bw},2.15);
+  \node[font=\scriptsize,black!65] at ({\xzero+4.5*\bw},1.80) {align pad (7 B)};
+  \draw[thick,targetgreen!85!black,fill=targetgreen!14] ({\xzero+8*\bw},1.45) rectangle ({\xzero+16*\bw},2.15);
+  \node[font=\scriptsize\ttfamily,targetgreen!65!black] at ({\xzero+12.0*\bw},1.80) {tx\_id: u64 (8 B)};
+  \draw[thick,quotientorange!90!black,fill=quotientorange!16] ({\xzero+16*\bw},1.45) rectangle ({\xzero+18*\bw},2.15);
+  \node[font=\scriptsize\ttfamily,quotientorange!70!black] at ({\xzero+17.0*\bw},1.80) {u16};
+  \draw[thick,gray!65,fill=gray!12] ({\xzero+18*\bw},1.45) rectangle ({\xzero+24*\bw},2.15);
+  \node[font=\scriptsize,black!65] at ({\xzero+21.0*\bw},1.80) {tail pad (6 B)};
+
+  % Row 3: BatchClosed
+  \node[font=\footnotesize\ttfamily\bfseries,anchor=east] at (\xzero-0.15,0.80) {BatchClosed};
+  \draw[thick,sourceblue,fill=sourceblue!18] (\xzero,0.45) rectangle ({\xzero+1*\bw},1.15);
+  \node[font=\scriptsize\ttfamily\bfseries,sourceblue!85!black] at ({\xzero+0.5*\bw},0.80) {2};
+  \draw[thick,gray!65,fill=gray!12] ({\xzero+1*\bw},0.45) rectangle ({\xzero+8*\bw},1.15);
+  \node[font=\scriptsize,black!65] at ({\xzero+4.5*\bw},0.80) {align pad (7 B)};
+  \draw[thick,targetgreen!85!black,fill=targetgreen!14] ({\xzero+8*\bw},0.45) rectangle ({\xzero+16*\bw},1.15);
+  \node[font=\scriptsize\ttfamily,targetgreen!65!black] at ({\xzero+12.0*\bw},0.80) {batch\_id: u64 (8 B)};
+  \draw[thick,structurepurple,fill=structurepurple!14] ({\xzero+16*\bw},0.45) rectangle ({\xzero+20*\bw},1.15);
+  \node[font=\scriptsize\ttfamily,structurepurple!85!black] at ({\xzero+18.0*\bw},0.80) {count: u32};
+  \draw[thick,quotientorange!90!black,fill=quotientorange!16] ({\xzero+20*\bw},0.45) rectangle ({\xzero+24*\bw},1.15);
+  \node[font=\scriptsize\ttfamily,quotientorange!70!black] at ({\xzero+22.0*\bw},0.80) {flags: u32};
+
+  \draw[decorate,decoration={brace,mirror,amplitude=5pt},thick,black!75]
+    (\xzero,0.32) -- ({\xzero+24*\bw},0.32)
+    node[midway,below=6pt,font=\scriptsize]
+    {\texttt{size\_of::<LedgerEvent>() == 24} bytes (\texttt{0..=23}), \texttt{align\_of::<LedgerEvent>() == 8}};
+\end{tikzpicture}
+\caption{Byte layout of \texttt{\#[repr(C, u8)] enum LedgerEvent}. Byte \texttt{0} stores the tag; bytes \texttt{1..=7} align the 8-byte payload region; bytes \texttt{8..=23} overlay variant fields (\texttt{u16} in \texttt{WirePosted} is \texttt{fee\_bps}).}
+\label{ch05:fig-enum-byte-layout}
+\end{figure}
+
+What if \texttt{BatchClosed} carried \texttt{region: u16} instead of \texttt{flags: u32}, shrinking its payload to $8 + 4 + 2 = 14$ bytes? Under \texttt{\#[repr(C, u8)]}, the enum still takes 24 bytes because the C layout insists on a whole 8-byte-aligned union after the tag. Under default \texttt{repr(Rust)}, \texttt{rustc} is free to lay out each variant around the tag. It keeps the tag at byte~0, slides \texttt{region} into bytes \texttt{2..=3} and \texttt{count} into bytes \texttt{4..=7} (the slots that used to be padding), and puts \texttt{batch\_id} at bytes \texttt{8..=15}. The whole enum fits in \textbf{16 bytes}. Dumping the raw bytes of \texttt{BatchClosed \{ batch\_id: 0x1111..., count: 0x2222\_2222, region: 0x3333 \}} on x86-64 shows exactly that: \texttt{02 00 33 33 22 22 22 22 11 11 11 11 11 11 11 11}.
+
+\subsection{Niche Optimization: Zero-Overhead \texttt{Option<T>}}
+\label{ch05:niche}
+
+Why did C and Java put \texttt{NULL} / \texttt{null} inside every pointer type in the first place? Because systems programmers refused to pay 16 bytes (an 8-byte pointer plus a 1-byte tag plus 7 padding bytes) for every nullable pointer in a tree or hash table. Rust achieves \emph{both} static non-null references \emph{and} an 8-byte \texttt{Option<\&T>} through \emph{niche optimization}.
+
+\begin{definition}[Bit-pattern niche]
+\label{ch05:def-niche}
+Let \texttt{T} occupy $k = \texttt{size\_of::<T>()}$ bytes ($8k$ bits). Any $8k$-bit pattern that is never a valid inhabitant of \texttt{T} under Rust's validity invariants is a \emph{niche} of \texttt{T}.
+\end{definition}
+
+Compare \texttt{Option<u64>} against types that possess at least one niche:
+\begin{itemize}
+  \item \textbf{\texttt{u64} has zero niches.} Every 64-bit pattern from \texttt{0} through \texttt{u64::MAX} is a valid integer. Distinguishing \texttt{None} from \texttt{Some(0)} requires an extra tag byte plus 7 alignment padding bytes, making \texttt{Option<u64>} 16 bytes wide.
+  \item \textbf{\texttt{\&T}, \texttt{\&mut T}, \texttt{Box<T>}, \texttt{NonNull<T>}, and \texttt{fn()} forbid \texttt{0x0}.} Because safe references, \texttt{Box}es, and function pointers are never null, the all-zero bit pattern is a niche. Thus \texttt{Option<\&u64>} and \texttt{Option<Box<u64>>} store \texttt{None} as zero and \texttt{Some(p)} as the raw address in \textbf{8 bytes total} --- matching a C pointer at machine level with static null checking on top.
+  \item \textbf{\texttt{NonZeroU64} and newtypes.} Ruling out zero with \texttt{core::num::NonZeroU64} creates the same \texttt{0x0} niche for integers (\texttt{size\_of::<Option<NonZeroU64>>() == 8}), and niches propagate through wrapper structs such as \texttt{struct Cents(NonZeroU64)}.
+  \item \textbf{\texttt{bool} has 254 niches.} Only \texttt{0x00} and \texttt{0x01} are valid \texttt{bool}s, so \texttt{Option<bool>} encodes \texttt{None} as \texttt{0x02} in \textbf{1 byte}.
+\end{itemize}
+
+\begin{lstlisting}[language=Rust]
+use core::mem::size_of;
+use core::num::NonZeroU64;
+
+const _: () = assert!(size_of::<u64>() == 8);
+const _: () = assert!(size_of::<Option<u64>>() == 16);
+
+const _: () = assert!(size_of::<Option<&u64>>() == 8);
+const _: () = assert!(size_of::<Option<&mut u64>>() == 8);
+const _: () = assert!(size_of::<Option<Box<u64>>>() == 8);
+const _: () = assert!(size_of::<Option<NonZeroU64>>() == 8);
+const _: () = assert!(size_of::<Option<fn()>>() == 8);
+const _: () = assert!(size_of::<Option<bool>>() == 1);
+\end{lstlisting}
+
+Figure~\ref{ch05:fig-niche-layout} contrasts the 16-byte layout of \texttt{Option<u64>} with the 8-byte niche layout of \texttt{Option<\&u64>} and \texttt{Option<NonZeroU64>}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\footnotesize,>=Latex]
+  % Top panel: Option<u64> = 16 bytes
+  \node[font=\bfseries,sourceblue,anchor=west] at (0,3.50) {A. \texttt{Option<u64>} --- 16 bytes (all $2^{64}$ patterns of \texttt{u64} are valid; no niche)};
+
+  \node[font=\scriptsize\ttfamily,anchor=east] at (1.65,2.85) {None};
+  \draw[thick,sourceblue,fill=sourceblue!18] (1.80,2.55) rectangle (2.45,3.15);
+  \node[font=\scriptsize\ttfamily\bfseries,sourceblue!85!black] at (2.125,2.85) {0};
+  \draw[thick,gray!65,fill=gray!12] (2.45,2.55) rectangle (6.95,3.15);
+  \node[font=\scriptsize,black!65] at (4.70,2.85) {align pad (1..=7)};
+  \draw[thick,gray!65,fill=gray!12] (6.95,2.55) rectangle (12.35,3.15);
+  \node[font=\scriptsize,black!65] at (9.65,2.85) {unused payload (8..=15)};
+
+  \node[font=\scriptsize\ttfamily,anchor=east] at (1.65,2.05) {Some(0)};
+  \draw[thick,sourceblue,fill=sourceblue!18] (1.80,1.75) rectangle (2.45,2.35);
+  \node[font=\scriptsize\ttfamily\bfseries,sourceblue!85!black] at (2.125,2.05) {1};
+  \draw[thick,gray!65,fill=gray!12] (2.45,1.75) rectangle (6.95,2.35);
+  \node[font=\scriptsize,black!65] at (4.70,2.05) {align pad (1..=7)};
+  \draw[thick,targetgreen!85!black,fill=targetgreen!14] (6.95,1.75) rectangle (12.35,2.35);
+  \node[font=\scriptsize\ttfamily,targetgreen!65!black] at (9.65,2.05) {0x0000\_0000\_0000\_0000 (8..=15)};
+
+  % Bottom panel: Option<&u64> / Option<NonZeroU64> = 8 bytes
+  \node[font=\bfseries,targetgreen!80!black,anchor=west] at (0,1.10) {B. \texttt{Option<\&u64>} or \texttt{Option<NonZeroU64>} --- 8 bytes (niche at \texttt{0x0})};
+
+  \node[font=\scriptsize\ttfamily,anchor=east] at (1.65,0.45) {None};
+  \draw[thick,quotientorange!90!black,fill=quotientorange!16] (1.80,0.15) rectangle (7.40,0.75);
+  \node[font=\scriptsize\ttfamily,quotientorange!70!black] at (4.60,0.45) {0x0000\_0000\_0000\_0000 (0..=7)};
+  \node[font=\scriptsize,black!70,anchor=west] at (7.65,0.45) {forbidden for \texttt{\&u64} / \texttt{NonZeroU64}};
+
+  \node[font=\scriptsize\ttfamily,anchor=east] at (1.65,-0.35) {Some(x)};
+  \draw[thick,targetgreen!85!black,fill=targetgreen!14] (1.80,-0.65) rectangle (7.40,-0.05);
+  \node[font=\scriptsize\ttfamily,targetgreen!65!black] at (4.60,-0.35) {non-zero ptr or int (0..=7)};
+  \node[font=\scriptsize,black!70,anchor=west] at (7.65,-0.35) {zero tag bytes; fits in 1 register};
+\end{tikzpicture}
+\caption{Tag-beside-payload layout of \texttt{Option<u64>} (16 bytes) versus niche-encoded \texttt{Option<\&u64>} and \texttt{Option<NonZeroU64>} (8 bytes), where \texttt{None} occupies the forbidden all-zero bit pattern.}
+\label{ch05:fig-niche-layout}
+\end{figure}
+
+\begin{trapbox}
+\textbf{The Giant Variant Trap.} Because an \texttt{enum} is sized to its \emph{largest} variant inline, one cold diagnostic variant carrying a 512-byte buffer inflates \emph{every} \texttt{Result} returning that error:
+\begin{lstlisting}[language=Rust]
+pub enum WireError {
+    Timeout,
+    InvalidRoutingNumber(u32),
+    DiagnosticDump([u8; 512]),        // inline 512-byte array!
+}
+pub enum SlimWireError {
+    Timeout,
+    InvalidRoutingNumber(u32),
+    DiagnosticDump(Box<[u8; 512]>),   // 8-byte heap pointer on cold path
+}
+const _: () = assert!(size_of::<Result<u64, WireError>>() == 520);
+const _: () = assert!(size_of::<Result<u64, SlimWireError>>() == 16);
+\end{lstlisting}
+Returning \texttt{Result<u64, WireError>} copies a 520-byte stack slot even when 99.999\% of calls return \texttt{Ok(n)}. Boxing the cold payload shrinks \texttt{Result<u64, SlimWireError>} to 16 bytes --- two CPU registers (\texttt{rax}, \texttt{rdx}) and zero heap allocation on the happy path. Clippy flags oversized error types automatically via \texttt{clippy::result\_large\_err}.
+\end{trapbox}
+
+\section{\texttt{Option<T>}, \texttt{Result<T, E>}, and \texttt{?} vs.\ Java~6 \texttt{null} and Checked Exceptions}
+\label{ch05:option-result}
+
+Neither \texttt{Option<T>} nor \texttt{Result<T, E>} relies on special compiler privilege for its definition; both are five-line standard-library \texttt{enum}s in \texttt{core}:
+
+\begin{lstlisting}[language=Rust]
+pub enum Option<T> {
+    None,
+    Some(T),
+}
+
+#[must_use]
+pub enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+\end{lstlisting}
+
+\subsection{\texttt{Option<T>} and Combinator Pipelines}
+\label{ch05:option-combinators}
+
+In Java~6, \texttt{Map.get(id)} returns \texttt{Account} whether the key exists or not; calling a getter such as \texttt{getDailyLimitCents()} on the result compiles without warning, and when the key is absent it fails at runtime with a \texttt{NullPointerException}. In Rust, \texttt{HashMap::get} returns \texttt{Option<\&Account>}, which is a different type from \texttt{\&Account}. You unpack the \texttt{Option} once at the lookup boundary, and downstream functions take plain \texttt{\&Account}.
+
+Rather than nesting four-line \texttt{match} blocks for every optional step, idiomatic Rust chains combinator methods:
+
+\begin{lstlisting}[language=Rust]
+use std::collections::HashMap;
+
+pub struct Account {
+    pub daily_limit_cents: Option<u64>,
+    pub frozen: bool,
+}
+
+pub fn effective_limit_cents(
+    accounts: &HashMap<String, Account>,
+    owner_id: &str,
+    default_limit: u64,
+) -> u64 {
+    accounts
+        .get(owner_id)                           // Option<&Account>
+        .filter(|acct| !acct.frozen)             // None if account is frozen
+        .and_then(|acct| acct.daily_limit_cents) // flatten Option<Option<u64>>
+        .map(|cents| cents.min(1_000_000))       // cap at $10,000.00
+        .unwrap_or(default_limit)                // fallback u64 on None
+}
+\end{lstlisting}
+
+Five combinators handle almost every pipeline you will write:
+\begin{itemize}
+  \item \texttt{.map(f)} transforms \texttt{Some(x)} into \texttt{Some(f(x))} and leaves \texttt{None} untouched.
+  \item \texttt{.and\_then(f)} flat-maps when \texttt{f} \emph{itself} returns \texttt{Option<U>}, avoiding nested \texttt{Option<Option<U>>}.
+  \item \texttt{.filter(pred)} keeps \texttt{Some(x)} when \texttt{pred(\&x)} is true and turns it into \texttt{None} otherwise.
+  \item \texttt{.unwrap\_or(val)} vs.\ \texttt{.unwrap\_or\_else(|| compute())}: function arguments evaluate eagerly, so \texttt{opt.unwrap\_or(load\_default())} executes \texttt{load\_default()} \emph{even when \texttt{opt} is \texttt{Some}}. Use \texttt{unwrap\_or} for cheap constants and \texttt{unwrap\_or\_else} whenever the fallback allocates or computes.
+  \item \texttt{.ok\_or(err)} and \texttt{.ok\_or\_else(|| make\_err())} promote \texttt{Option<T>} into \texttt{Result<T, E>}, mapping \texttt{None} to \texttt{Err(err)} so you can propagate it with \texttt{?}.
+\end{itemize}
+
+\begin{trapbox}
+\textbf{Calling \texttt{.unwrap()} in request handlers re-invites \texttt{NullPointerException}.} Calling \texttt{None.unwrap()} or \texttt{Err(e).unwrap()} triggers a \texttt{panic!}, crashing the current thread or Tokio task. Using \texttt{.unwrap()} on network payloads, query parameters, or database lookups throws away static error handling. Save \texttt{.expect("invariant reason")} for invariants proven true at startup or by an immediately preceding check.
+\end{trapbox}
+
+\subsection{\texttt{Result<T, E>} vs.\ C \texttt{errno} and Java~6 Checked Exceptions}
+\label{ch05:result-vs-exceptions}
+
+Recoverable error handling in C and Java~6 sits at opposite extremes:
+\begin{enumerate}
+  \item \textbf{C's \texttt{-1} and \texttt{errno}} return in a single CPU register at zero allocation cost, yet nothing in C's type system warns when a caller ignores the return code and reads an uninitialized output buffer. Rust's \texttt{Result<T, E>} carries \texttt{\#[must\_use]}, so dropping a \texttt{Result} unread triggers an immediate compiler warning.
+  \item \textbf{Java~6 checked exceptions (\texttt{throws IOException, SQLException})} put failure in the method signature, yet couple static checking to \emph{stack unwinding} and \emph{stack-trace allocation}. Constructing \texttt{new Exception()} walks every active stack frame inside \texttt{Throwable.fillInStackTrace()}, turning a burst of bad client requests or downstream timeouts into microsecond-scale heap allocation storms.
+\end{enumerate}
+
+Rust decouples static error checking from unwinding: \texttt{Result<T, E>} is returned through the exact same register/stack calling convention as any other value, executing a normal \texttt{ret} instruction with zero unwinding tables or heap allocation on the error path.
+
+\subsection{Desugaring the \texttt{?} Operator Step by Step}
+\label{ch05:question-mark}
+
+To propagate \texttt{Result} values without repetitive \texttt{if err != nil} blocks, postfix \texttt{?} unwraps \texttt{Ok(v)} inline or returns \texttt{Err} early:
+
+\begin{lstlisting}[language=Rust]
+use std::collections::HashMap;
+use std::num::ParseIntError;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConfigError {
+    MissingKey(&'static str),
+    InvalidInt(ParseIntError),
+    PortZeroOrReserved(u16),
+}
+
+impl From<ParseIntError> for ConfigError {
+    fn from(err: ParseIntError) -> Self {
+        ConfigError::InvalidInt(err)
+    }
+}
+
+pub fn parse_service_port(
+    env_map: &HashMap<String, String>,
+) -> Result<u16, ConfigError> {
+    let raw = env_map
+        .get("LISTEN_PORT")
+        .ok_or(ConfigError::MissingKey("LISTEN_PORT"))?;
+    let port: u16 = raw.trim().parse()?;
+    if port < 1024 {
+        return Err(ConfigError::PortZeroOrReserved(port));
+    }
+    Ok(port)
+}
+\end{lstlisting}
+
+Notice how \texttt{raw.trim().parse()?} produces a \texttt{ParseIntError}, yet returns cleanly from a function returning \texttt{Result<u16, ConfigError>}. Ignoring trait plumbing (\texttt{core::ops::Try}), \texttt{expr?} on a \texttt{Result} expands to:
+
+\begin{lstlisting}[language=Rust]
+match expr {
+    Ok(val) => val,
+    Err(err) => return Err(core::convert::From::from(err)),
+}
+\end{lstlisting}
+
+Because we implemented \texttt{From<ParseIntError> for ConfigError}, \texttt{From::from(err)} wraps the low-level parse error into \texttt{ConfigError::InvalidInt(err)} automatically; when the error already has type \texttt{ConfigError}, the standard identity \texttt{impl<T> From<T> for T} compiles to a no-op. Figure~\ref{ch05:fig-question-mark-flow} traces both value tracks.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\footnotesize,>=Latex]
+  % Top track: 4 boxes with generous 1.15 cm gaps (total width ~14.2 cm)
+  \node[draw,thick,sourceblue,fill=sourceblue!8,rounded corners=3pt,minimum width=2.25cm,minimum height=0.85cm,align=center] (get) at (1.15,2.10)
+    {\texttt{env\_map.get}\\$\to$ \texttt{Option}};
+  \node[draw,thick,sourceblue,fill=sourceblue!8,rounded corners=3pt,minimum width=2.35cm,minimum height=0.85cm,align=center] (okor) at (4.75,2.10)
+    {\texttt{.ok\_or(...)}\\$\to$ \texttt{Result}};
+  \node[draw,thick,sourceblue,fill=sourceblue!8,rounded corners=3pt,minimum width=2.55cm,minimum height=0.85cm,align=center] (parse) at (8.55,2.10)
+    {\texttt{raw.parse::<u16>()}\\$\to$ \texttt{Result}};
+  \node[draw,thick,targetgreen!85!black,fill=targetgreen!12,rounded corners=3pt,minimum width=2.35cm,minimum height=0.85cm,align=center] (done) at (12.35,2.10)
+    {\texttt{port >= 1024}\\$\to$ \texttt{Ok(port)}};
+
+  % Bottom early-return collector bar spanning beneath okor and parse
+  \node[draw,thick,trapred,fill=trapred!10,rounded corners=3pt,minimum width=7.2cm,minimum height=0.78cm,align=center] (errbar) at (6.85,0.30)
+    {Early return \texttt{Err(ConfigError)} in registers (zero stack unwinding)};
+
+  % Ok track horizontal arrows
+  \draw[->,thick,targetgreen!80!black] (get) -- node[above=2pt,font=\scriptsize\ttfamily] {Some} (okor);
+  \draw[->,thick,targetgreen!80!black] (okor) -- node[above=2pt,font=\scriptsize\ttfamily] {Ok(raw)} (parse);
+  \draw[->,thick,targetgreen!80!black] (parse) -- node[above=2pt,font=\scriptsize\ttfamily] {Ok(port)} (done);
+
+  % Err drop arrows straight down into errbar
+  \draw[->,thick,trapred] (okor.south) -- (4.75,0.69)
+    node[midway,left=3pt,font=\scriptsize\ttfamily,trapred] {? on Err};
+  \draw[->,thick,quotientorange!90!black] (parse.south) -- (8.55,0.69)
+    node[midway,right=3pt,font=\scriptsize\ttfamily,quotientorange!75!black] {? via From::from};
+\end{tikzpicture}
+\caption{Two-track control flow of \texttt{?} inside \texttt{parse\_service\_port}. Each \texttt{?} unwraps \texttt{Ok} rightward or converts \texttt{Err} via \texttt{From::from} into a normal register return.}
+\label{ch05:fig-question-mark-flow}
+\end{figure}
+
+The \texttt{?} operator also works on \texttt{Option<T>} inside functions returning \texttt{Option<U>}:
+
+\begin{lstlisting}[language=Rust]
+pub fn header_fee_bps(lines: &[&str]) -> Option<u16> {
+    let first = lines.first()?;                  // None -> early return None
+    let digits = first.strip_prefix("FEE_BPS=")?; // None -> early return None
+    digits.trim().parse::<u16>().ok()            // Result<u16, _> -> Option<u16>
+}
+\end{lstlisting}
+
+Rust intentionally rejects mixing \texttt{?} on \texttt{Option} directly inside a \texttt{Result}-returning function because \texttt{None} carries no error value \texttt{E}; bridge explicitly with \texttt{.ok\_or(...)} or \texttt{.ok()}.
+
+\section{Exhaustive Pattern Matching as Compiler-Enforced Case Analysis}
+\label{ch05:pattern-matching}
+
+Pattern matching is the exact dual of data construction: it inspects a composite value's shape and binds variables to its interior pieces in one checked step.
+
+\subsection{\texttt{match} Expressions, Destructuring, \texttt{@} Bindings, and Guards}
+\label{ch05:match-anatomy}
+
+Unlike C and Java~6 \texttt{switch} statements --- limited to primitive integers or enum constants, prone to accidental fallthrough without \texttt{break;}, and unable to produce a value --- Rust's \texttt{match} is an expression with zero fallthrough that destructures arbitrary nested shapes:
+
+\begin{lstlisting}[language=Rust]
+#[derive(Debug, Clone)]
+pub struct WireFrame {
+    pub channel: u8,
+    pub sender: String,
+    pub payload: Vec<u8>,
+}
+
+pub fn classify_frame(frame: &WireFrame, fast_limit: usize) -> String {
+    match frame {
+        WireFrame {
+            channel: ch @ 1..=9,
+            sender,
+            payload,
+        } if payload.len() <= fast_limit => match payload.as_slice() {
+            [] => format!("priority ch {ch} ({sender}): keepalive"),
+            [opcode] => format!("priority ch {ch} ({sender}): ctrl 0x{opcode:02x}"),
+            [opcode, body @ ..] => format!(
+                "priority ch {ch} ({sender}): op 0x{opcode:02x}, {}B",
+                body.len()
+            ),
+        },
+        WireFrame { channel: 0, sender, .. } => format!("sys ({sender})"),
+        WireFrame { channel, sender, payload } => {
+            format!("std ch {channel} ({sender}): {}B", payload.len())
+        }
+    }
+}
+\end{lstlisting}
+
+Four pattern tools work together in \texttt{classify\_frame}:
+\begin{enumerate}
+  \item \textbf{Ranges and \texttt{@} bindings (\texttt{channel: ch @ 1..=9}):} \texttt{1..=9} tests inclusive range membership while \texttt{ch @} binds the matched byte so the arm body can print \texttt{ch}.
+  \item \textbf{Exhaustive slice patterns (\texttt{[]}, \texttt{[opcode]}, \texttt{[opcode, body @ ..]}):} destructure slices of length $0$, $1$, and $\ge 2$ without manual index bounds checks.
+  \item \textbf{Rest patterns (\texttt{..}):} ignore remaining struct fields (\texttt{WireFrame \{ channel: 0, sender, .. \}}) or bind remaining slice elements (\texttt{body @ ..} as \texttt{\&[u8]}).
+  \item \textbf{Match guards (\texttt{if payload.len() <= fast\_limit}):} attach a runtime boolean filter. Because the compiler cannot prove an arbitrary runtime boolean is always true, a guarded arm never satisfies exhaustiveness by itself; frames failing the guard continue to later arms.
+\end{enumerate}
+
+\subsection{Match Ergonomics: Borrowing Without Moving}
+\label{ch05:match-ergonomics}
+
+Trace ownership in \texttt{classify\_frame} using Chapters~3 and~4: \texttt{frame} has type \texttt{\&WireFrame}, and \texttt{sender: String} is not \texttt{Copy}. Why didn't \texttt{WireFrame \{ sender, .. \}} fail to move \texttt{sender} out of a shared reference? Under \emph{match ergonomics}, matching a value pattern against \texttt{\&T} (or \texttt{\&mut T}) pushes the reference inward so every variable binds as \texttt{\&Field} (or \texttt{\&mut Field}) automatically: \texttt{sender} gets type \texttt{\&String} and \texttt{payload} gets \texttt{\&Vec<u8>}. You only need explicit \texttt{ref} or \texttt{ref mut} when matching on an \emph{owned} value where you wish to borrow one field without consuming the rest (e.g., \texttt{Some(ref s)} on an owned \texttt{Option<String>}).
+
+\subsection{Exhaustiveness Across Codebase Evolution and Control-Flow Shortcuts}
+\label{ch05:exhaustiveness}
+
+Suppose \texttt{enum OrderStatus \{ Pending, Settled, Failed \}} is matched in forty files across a service. Six months later, a teammate adds \texttt{Disputed \{ dispute\_id: u64 \}}. In Java~6, existing \texttt{switch (status)} blocks with a \texttt{default:} branch compile cleanly and silently misroute disputed orders in production. In Rust, \texttt{cargo check} immediately flags \texttt{non-exhaustive patterns: `OrderStatus::Disputed \{ .. \}` not covered} at every single unhandled \texttt{match} across all forty files, which gives you a list of every place that must decide how to handle the new state.
+
+\begin{trapbox}
+\textbf{Avoid wildcard \texttt{\_ => ...} arms on your own domain enums.} A catch-all \texttt{\_} arm disables future exhaustiveness errors on that \texttt{match}. Group shared cases with an explicit or-pattern instead (\texttt{OrderStatus::Settled | OrderStatus::Failed => false}), reserving \texttt{\_} for scalars (\texttt{u8}, \texttt{\&str}) or external \texttt{\#[non\_exhaustive]} enums.
+\end{trapbox}
+
+When a full multi-arm \texttt{match} is more ceremony than a single check needs, reach for \texttt{let-else} guard clauses or \texttt{matches!}:
+
+\begin{lstlisting}[language=Rust]
+pub fn parse_bearer_token(header: Option<&str>) -> Result<&str, &'static str> {
+    let Some(raw) = header else {
+        return Err("missing Authorization header");
+    };
+    let Some(token) = raw.strip_prefix("Bearer ") else {
+        return Err("Authorization scheme must be Bearer");
+    };
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("empty bearer token");
+    }
+    Ok(token)
+}
+
+pub fn is_retryable_http(code: Option<u16>) -> bool {
+    matches!(code, Some(429 | 500..=599))
+}
+\end{lstlisting}
+
+In \texttt{let Some(raw) = header else \{ return ...; \};}, \texttt{raw} stays bound at the outer indentation level with zero rightward drift because the compiler verifies that the \texttt{else} block diverges to type \texttt{!}.
+
+\begin{focusbox}
+\textbf{Choosing the right pattern construct:}
+\begin{itemize}
+  \item \textbf{\texttt{match expr \{ ... \}}}: multi-variant dispatch and domain enums where future variant additions must trigger compiler errors.
+  \item \textbf{\texttt{let Pat = expr else \{ return ...; \};}}: flat guard clauses unpacking the happy path into outer scope.
+  \item \textbf{\texttt{if let Pat = expr \{ ... \}}}: optional side effect on a single pattern when all other cases truly do nothing.
+  \item \textbf{\texttt{matches!(expr, Pat)}}: concise boolean test supporting ranges, destructuring, and \texttt{|} alternatives.
+\end{itemize}
+\end{focusbox}
+
+\section{Case Study: Refactoring a Legacy Java~6 \texttt{PaymentOrder} into a Rust State Machine}
+\label{ch05:case-study}
+
+Let us combine cardinality algebra, niche newtypes, \texttt{Result}, and exhaustive \texttt{match} to refactor a buggy Java~6 payment order class into a compile-time-checked Rust state machine.
+
+\subsection{Four Silent Bugs in the Legacy Java~6 \texttt{PaymentOrder}}
+\label{ch05:java-payment-bugs}
+
+\begin{lstlisting}[language=Java]
+// Java 6: Mutable product class with nullable lifecycle fields
+public class PaymentOrder {
+    public enum Status { CREATED, AUTHORIZED, CAPTURED, SETTLED, REFUNDED, FAILED }
+
+    private final long orderId;
+    private Status status;
+    private long requestedCents, authorizedCents, capturedCents, settledCents;
+    private String authCode;        // null in CREATED, FAILED
+    private String captureTxId;     // null until CAPTURED
+    private Long settledAtEpochMs;  // null until SETTLED
+    private String refundReason;    // null unless REFUNDED
+    private String failureCode;     // null unless FAILED
+
+    public PaymentOrder(long orderId, long requestedCents) {
+        this.orderId = orderId;
+        this.status = Status.CREATED;
+        this.requestedCents = requestedCents;
+    }
+
+    public void capture(long amountCents, String txId) {
+        this.capturedCents = amountCents;
+        this.status = Status.CAPTURED;
+        // Bug 1: forgot this.captureTxId = txId -> NPE in nightly settlement!
+        // Bug 2: forgot status == AUTHORIZED and amountCents <= authorizedCents!
+    }
+
+    public void refund(long amountCents, String reason) {
+        if (amountCents > this.settledCents) {
+            throw new IllegalArgumentException("refund exceeds settled");
+        }
+        this.refundReason = reason;
+        this.status = Status.REFUNDED; // Bug 3: refund(0, "x") succeeds on CREATED!
+    }
+}
+\end{lstlisting}
+
+Java's compiler accepts all four failure modes here without complaint: (1)~moving to \texttt{CAPTURED} while leaving \texttt{captureTxId == null}, which surfaces hours later as a \texttt{NullPointerException} in the nightly settlement job; (2)~capturing an order that was never authorized, or capturing more than was authorized, because \texttt{capture} checks neither \texttt{status} nor \texttt{authorizedCents}; (3)~calling \texttt{refund(0, "x")} on an uncharged \texttt{CREATED} order, which passes the guard because \texttt{settledCents} defaulted to \texttt{0L}; and (4)~accepting zero or negative amounts, since every amount is a signed \texttt{long}. On top of that, a method that throws halfway through leaves a half-mutated object behind.
+
+\subsection{Step-by-Step Refactoring into an Algebraic State Machine}
+\label{ch05:rust-payment-machine}
+
+\textbf{Step 1: Validate leaf primitives with niche-preserving newtypes.} Wrapping \texttt{NonZeroU64} in \texttt{Cents} rules out zero and negative amounts at construction while keeping \texttt{Option<Cents>} at 8 bytes:
+
+\begin{lstlisting}[language=Rust]
+use core::num::NonZeroU64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cents(NonZeroU64);
+
+impl Cents {
+    pub fn new(raw: u64) -> Option<Self> { NonZeroU64::new(raw).map(Cents) }
+    pub fn get(self) -> u64 { self.0.get() }
+}
+const _: () = assert!(core::mem::size_of::<Option<Cents>>() == 8);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthCode(String);
+impl AuthCode {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let s = raw.trim();
+        (!s.is_empty()).then(|| AuthCode(s.to_owned()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureTxId(String);
+impl CaptureTxId {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let s = raw.trim();
+        (!s.is_empty()).then(|| CaptureTxId(s.to_owned()))
+    }
+}
+\end{lstlisting}
+
+\textbf{Step 2: Model the lifecycle as a sum of exact per-stage payloads.} Each variant of \texttt{PaymentState} carries \emph{only} the data that exists in that stage, matching Figure~\ref{ch05:fig-payment-state-machine}:
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\scriptsize,>=Latex]
+  % Two-row spacious layout (total width ~13.8 cm, generous 1.7 cm arrows!)
+  \node[draw,thick,sourceblue,fill=sourceblue!8,rounded corners=3pt,minimum width=2.4cm,minimum height=1.1cm,align=center] (created) at (1.5,2.35)
+    {\textbf{\texttt{Created}}\\ \texttt{requested}};
+
+  \node[draw,thick,sourceblue,fill=sourceblue!8,rounded corners=3pt,minimum width=2.6cm,minimum height=1.1cm,align=center] (auth) at (5.9,2.35)
+    {\textbf{\texttt{Authorized}}\\ \texttt{authorized, auth\_code}};
+
+  \node[draw,thick,sourceblue,fill=sourceblue!8,rounded corners=3pt,minimum width=2.8cm,minimum height=1.1cm,align=center] (cap) at (10.6,2.35)
+    {\textbf{\texttt{Captured}}\\ \texttt{captured, capture\_tx\_id}};
+
+  % Bottom row: Failed on left, Settled under Captured, Refunded on right
+  \node[draw,thick,trapred,fill=trapred!10,rounded corners=3pt,minimum width=2.8cm,minimum height=1.0cm,align=center] (fail) at (3.7,0.35)
+    {\textbf{\texttt{Failed}}\\ \texttt{failure\_code}};
+
+  \node[draw,thick,targetgreen!85!black,fill=targetgreen!10,rounded corners=3pt,minimum width=2.8cm,minimum height=1.0cm,align=center] (set) at (8.5,0.35)
+    {\textbf{\texttt{Settled}}\\ \texttt{settled, settled\_at\_ms}};
+
+  \node[draw,thick,structurepurple,fill=structurepurple!10,rounded corners=3pt,minimum width=2.6cm,minimum height=1.0cm,align=center] (ref) at (13.0,0.35)
+    {\textbf{\texttt{Refunded}}\\ \texttt{refunded, reason}};
+
+  % Transitions with generous arrow clearance
+  \draw[->,thick,sourceblue!90!black] (created) -- node[above=2pt,font=\scriptsize\ttfamily] {authorize} (auth);
+  \draw[->,thick,sourceblue!90!black] (auth) -- node[above=2pt,font=\scriptsize\ttfamily] {capture} (cap);
+  \draw[->,thick,targetgreen!80!black] (cap.south) -- (8.9,0.85) node[midway,right=4pt,font=\scriptsize\ttfamily] {settle};
+  \draw[->,thick,structurepurple] (set) -- node[above=2pt,font=\scriptsize\ttfamily] {refund} (ref);
+
+  % Failure transitions ONLY from Created and Authorized
+  \draw[->,thick,trapred] (created.south) -- (2.9,0.85) node[midway,left=3pt,font=\scriptsize\ttfamily] {fail};
+  \draw[->,thick,trapred] (auth.south) -- (4.5,0.85) node[midway,right=3pt,font=\scriptsize\ttfamily] {fail};
+\end{tikzpicture}
+\caption{Lifecycle graph of \texttt{PaymentOrder}. Each variant owns only the fields valid in that state, and \texttt{fail} is reachable only before funds are captured.}
+\label{ch05:fig-payment-state-machine}
+\end{figure}
+
+\textbf{Step 3: Implement ownership-consuming transitions with explicit exhaustive arms.} Bringing variants into scope with \texttt{use PaymentState::*;} keeps each \texttt{match} arm concise while spelling out rejected states via or-patterns (rather than \texttt{\_}) so adding a new state later triggers compiler errors across every transition:
+
+\begin{lstlisting}[language=Rust]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaymentState {
+    Created { requested: Cents },
+    Authorized { authorized: Cents, auth_code: AuthCode },
+    Captured { authorized: Cents, captured: Cents, capture_tx_id: CaptureTxId },
+    Settled { settled: Cents, capture_tx_id: CaptureTxId, settled_at_ms: u64 },
+    Refunded { refunded: Cents, capture_tx_id: CaptureTxId, reason: String },
+    Failed { failure_code: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentOrder {
+    pub order_id: u64,
+    pub state: PaymentState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderTransitionError {
+    InvalidState { attempted: &'static str },
+    CaptureExceedsAuth { authorized: u64, requested: u64 },
+    RefundExceedsSettled { settled: u64, requested: u64 },
+    EmptyReason,
+}
+
+use PaymentState::*;
+
+impl PaymentOrder {
+    pub fn new(order_id: u64, requested: Cents) -> Self {
+        Self { order_id, state: Created { requested } }
+    }
+
+    pub fn authorize(self, auth_code: AuthCode) -> Result<Self, OrderTransitionError> {
+        match self.state {
+            Created { requested } => Ok(Self {
+                order_id: self.order_id,
+                state: Authorized { authorized: requested, auth_code },
+            }),
+            Authorized { .. } | Captured { .. } | Settled { .. }
+            | Refunded { .. } | Failed { .. } => {
+                Err(OrderTransitionError::InvalidState { attempted: "authorize" })
+            }
+        }
+    }
+
+    pub fn capture(
+        self,
+        amount: Cents,
+        capture_tx_id: CaptureTxId,
+    ) -> Result<Self, OrderTransitionError> {
+        match self.state {
+            Authorized { authorized, .. } => {
+                if amount.get() > authorized.get() {
+                    return Err(OrderTransitionError::CaptureExceedsAuth {
+                        authorized: authorized.get(),
+                        requested: amount.get(),
+                    });
+                }
+                Ok(Self {
+                    order_id: self.order_id,
+                    state: Captured { authorized, captured: amount, capture_tx_id },
+                })
+            }
+            Created { .. } | Captured { .. } | Settled { .. }
+            | Refunded { .. } | Failed { .. } => {
+                Err(OrderTransitionError::InvalidState { attempted: "capture" })
+            }
+        }
+    }
+
+    pub fn settle(self, settled_at_ms: u64) -> Result<Self, OrderTransitionError> {
+        match self.state {
+            Captured { captured, capture_tx_id, .. } => Ok(Self {
+                order_id: self.order_id,
+                state: Settled { settled: captured, capture_tx_id, settled_at_ms },
+            }),
+            Created { .. } | Authorized { .. } | Settled { .. }
+            | Refunded { .. } | Failed { .. } => {
+                Err(OrderTransitionError::InvalidState { attempted: "settle" })
+            }
+        }
+    }
+
+    pub fn refund(self, amount: Cents, reason: String) -> Result<Self, OrderTransitionError> {
+        if reason.trim().is_empty() {
+            return Err(OrderTransitionError::EmptyReason);
+        }
+        match self.state {
+            Settled { settled, capture_tx_id, .. } => {
+                if amount.get() > settled.get() {
+                    return Err(OrderTransitionError::RefundExceedsSettled {
+                        settled: settled.get(),
+                        requested: amount.get(),
+                    });
+                }
+                Ok(Self {
+                    order_id: self.order_id,
+                    state: Refunded { refunded: amount, capture_tx_id, reason },
+                })
+            }
+            Created { .. } | Authorized { .. } | Captured { .. }
+            | Refunded { .. } | Failed { .. } => {
+                Err(OrderTransitionError::InvalidState { attempted: "refund" })
+            }
+        }
+    }
+
+    pub fn fail(self, failure_code: String) -> Result<Self, OrderTransitionError> {
+        match self.state {
+            Created { .. } | Authorized { .. } => Ok(Self {
+                order_id: self.order_id,
+                state: Failed { failure_code },
+            }),
+            Captured { .. } | Settled { .. } | Refunded { .. } | Failed { .. } => {
+                Err(OrderTransitionError::InvalidState { attempted: "fail" })
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+Each of the four Java~6 bugs is now either unrepresentable or rejected by a checked transition: \texttt{Captured} cannot be constructed without a non-empty \texttt{CaptureTxId}; \texttt{capture} only accepts an \texttt{Authorized} order and returns \texttt{CaptureExceedsAuth} instead of over-capturing; \texttt{refund} can only read a balance out of \texttt{PaymentState::Settled}; and \texttt{Cents} cannot hold zero or a negative number. Because each transition consumes \texttt{self} and builds a fresh value, there is no half-mutated object to leave behind, and callers cannot keep using a stale pre-transition variable. Moving \texttt{capture\_tx\_id} from \texttt{Captured} into \texttt{Settled} copies 24 stack bytes without cloning the heap characters.
+
+\begin{connectionbox}
+\textbf{Recovering \texttt{self} on error, and compile-time typestate.} If a caller needs the un-transitioned \texttt{PaymentOrder} back when a transition fails without cloning up front, return \texttt{Result<Self, (Self, OrderTransitionError)>}. The standard library uses the same ownership-recovery idea: \texttt{String::from\_utf8} hands the bytes back inside its \texttt{FromUtf8Error}, and \texttt{mpsc::Sender::send} hands the unsent value back inside its \texttt{SendError}. In Chapter~8 we will also meet the \emph{typestate} pattern (\texttt{PaymentOrder<Created>}, \texttt{PaymentOrder<Authorized>}), which encodes known states in generic type parameters; runtime sum enums (\texttt{PaymentState}, essential when loading rows dynamically from PostgreSQL in Chapter~13) and compile-time typestates work side by side in production Rust.
+\end{connectionbox}
+
+In Chapter~6 we move from modeling the \emph{shape} of a single type to abstracting \emph{shared behavior} across types: traits, generics, monomorphization, and \texttt{dyn Trait} vtables --- the machinery behind \texttt{From::from} and \texttt{?} in this chapter, built without a single \texttt{extends} superclass.
+
+\section{Exercises}
+\label{ch05:exercises}
+
+\begin{exercise}[Counting inhabitants vs.\ domain states]
+\label{ch05:ex-cardinality}
+A Java~6 \texttt{Subscription} class stores \texttt{boolean isTrial; boolean isCanceled; Integer cancelCode;}, whereas in the domain a subscription is either in a free trial, active paid, or canceled with a 16-bit code (\texttt{0..=65535}).
+(a) Compute the exact representable cardinality of the Java~6 class (remembering \texttt{null} inside \texttt{Integer}).
+(b) Compute the exact cardinality of valid domain states.
+(c) Write a Rust \texttt{enum SubscriptionState} whose cardinality equals~(b) \emph{exactly}.
+\end{exercise}
+
+\begin{exercise}[Algebraic identities with \texttt{!} and \texttt{()}]
+\label{ch05:ex-never-algebra}
+Compute $\abs{\texttt{T}}$ for (a)~\texttt{Result<bool, !>}, (b)~\texttt{(u8, ())}, (c)~\texttt{(u64, !)}, and (d)~\texttt{Option<Option<bool>>}, giving a simpler isomorphic Rust type for each. Then explain why \texttt{fn witness(x: (u64, !)) -> String \{ match x.1 \{\} \}} compiles with zero \texttt{match} arms and can never be called at runtime.
+\end{exercise}
+
+\begin{exercise}[Struct padding by hand and with \texttt{rustc}]
+\label{ch05:ex-struct-padding}
+Given fields \texttt{a: u8, b: u32, c: u16, d: u64} on a 64-bit target:
+(a) Under \texttt{\#[repr(C)]} in order \texttt{(a, b, c, d)}, list every field offset, padding range, \texttt{align\_of}, and \texttt{size\_of}.
+(b) Reorder the fields manually under \texttt{\#[repr(C)]} to minimize \texttt{size\_of}, and verify both structs with compile-time \texttt{assert!}s in \texttt{rustc}.
+\end{exercise}
+
+\begin{exercise}[Tagged union byte layout and tag tucking]
+\label{ch05:ex-tagged-union}
+Define \texttt{MarketTick} with three variants: \texttt{Halted}, \texttt{Quote \{ symbol\_id: u32, bid: u64, ask: u64 \}}, and \texttt{Trade \{ symbol\_id: u32, price: u64, lots: u16 \}}.
+(a) Find \texttt{align\_of} and \texttt{size\_of} under \texttt{\#[repr(C, u8)]} and give every field's byte offset.
+(b) Under default \texttt{repr(Rust)}, \texttt{MarketTick} shrinks from 32 bytes to 24 bytes. Explain where inside those 24 bytes \texttt{rustc} tucks the discriminant tag, and verify with \texttt{rustc}.
+\end{exercise}
+
+\begin{exercise}[Hunting for niches]
+\label{ch05:ex-niches}
+Predict \texttt{size\_of} on 64-bit Rust before checking with \texttt{rustc}, justifying each answer via niches:
+(a)~\texttt{Option<Option<bool>>};
+(b)~\texttt{Option<\&[u8]>} (recall from Chapter~3 that \texttt{\&[u8]} is a 16-byte \texttt{(ptr, len)} pair);
+(c)~\texttt{Option<Option<NonZeroU64>>};
+(d)~\texttt{Result<\&u64, ()>}.
+Explain why (c) grows to 16 bytes while (a) stays 1 byte and (d) stays 8 bytes.
+\end{exercise}
+
+\begin{exercise}[Diagnosing and curing a Giant Variant Trap]
+\label{ch05:ex-giant-variant}
+A middleware returns \texttt{Result<UserId, AuthError>}, where \texttt{UserId} wraps a \texttt{NonZeroU64}. The \texttt{AuthError} variants are \texttt{MissingCookie}, \texttt{Expired \{ at\_s: u64 \}}, and \texttt{InvalidJwt \{ raw: [u8; 1024], pos: usize \}}.
+(a) Find the size of \texttt{Result<UserId, AuthError>} and explain why it slows down the 99.99\% \texttt{Ok} fast path.
+(b) Refactor \texttt{AuthError} so the \texttt{Result} drops to 16 bytes while keeping all diagnostic data, and prove it with a \texttt{const} assertion.
+\end{exercise}
+
+\begin{exercise}[Flattening nested matches with \texttt{?}, \texttt{From}, and \texttt{let-else}]
+\label{ch05:ex-desugar-refactor}
+Write a function \texttt{parse\_\allowbreak{}ledger\_\allowbreak{}line} that takes \texttt{raw: Option<\&str>} and returns a \texttt{Result} whose success value is the pair \texttt{(NonZeroU64, i64)} and whose error type is your own \texttt{LineParseError}. Reject \texttt{None}, split once on \texttt{':'}, parse the left side as \texttt{NonZeroU64} and the right as \texttt{i64}, and use \texttt{let-else}, \texttt{?}, and \texttt{From} with \emph{zero} nested \texttt{match} blocks. Write out the manual \texttt{match} expansion of one \texttt{?} in your solution.
+\end{exercise}
+
+\begin{exercise}[Match ergonomics and accidental moves]
+\label{ch05:ex-match-ergonomics}
+Let \texttt{JobOutcome} have variants \texttt{Done(u64)} and \texttt{Aborted(String)}, and let \texttt{out} have type \texttt{\&mut JobOutcome}. Explain why matching on \texttt{*out} with arm \texttt{JobOutcome::Aborted(r) => r.len()} fails to compile whereas matching on \texttt{out} directly succeeds. Give the exact type of \texttt{r} in the working code and two ways to obtain \texttt{\&String} instead.
+\end{exercise}
+
+\begin{exercise}[Extending the \texttt{PaymentOrder} state machine]
+\label{ch05:ex-extend-payment-order}
+Extend \texttt{PaymentState} from Section~\ref{ch05:case-study} with two new variants: \texttt{PartiallyRefunded} (carrying \texttt{settled}, \texttt{refunded\_so\_far}, and \texttt{capture\_tx\_id} while $0 < R < S$, moving to \texttt{Refunded} once $R == S$) and \texttt{Disputed} (carrying \texttt{dispute\_id: u64} and \texttt{capture\_tx\_id}, entered from \texttt{Settled} or \texttt{PartiallyRefunded} via \texttt{open\_dispute} and blocking manual refunds). Compile before editing any methods to watch exhaustiveness flag all five transitions, then implement \texttt{refund} and \texttt{open\_dispute} with unit assertions.
+\end{exercise}

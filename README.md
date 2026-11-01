@@ -39,13 +39,15 @@ Requires a TeX Live install with `algorithm2e`, `tcolorbox`, `tikz`, and
 
 ## Companion books
 
-Three companion computer-science readers live under `books/`, each merged with its full history (`git subtree`) from its original repository:
+Five companion computer-science readers live under `books/`:
 
 | Book | Source | Build | PDF |
 |---|---|---|---|
 | Graph Algorithms From the Ground Up | `books/graph-algorithms/src/main.tex` | `books/graph-algorithms/build.sh` | `books/graph-algorithms/dist/graph-algorithms-from-the-ground-up.pdf` |
 | Cryptography From the Ground Up | `books/cryptography/src/main.tex` | `books/cryptography/build.sh` | `books/cryptography/dist/cryptography-from-the-ground-up.pdf` |
 | Signal Processing From the Ground Up | `books/signal-processing/src/main.tex` | `books/signal-processing/build.sh` | `books/signal-processing/dist/signal-processing-from-the-ground-up.pdf` |
+| Programming Languages From the Ground Up | `books/languages/src/main.tex` | `books/languages/build.sh` | `books/languages/dist/languages-from-the-ground-up.pdf` |
+| Databases and PostgreSQL From the Ground Up | `books/databases/src/main.tex` | `books/databases/build.sh` | `books/databases/dist/databases-from-the-ground-up.pdf` |
 
 Each `build.sh` runs from its own directory (`cd books/graph-algorithms && ./build.sh`).
 

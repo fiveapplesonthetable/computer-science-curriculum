@@ -1,0 +1,876 @@
+\chapter{The Relational Model and True SQL Semantics}
+\label{ch:relational-sql}
+
+Suppose you are building the storage engine for a bank in 1968. You have magnetic disks divided into fixed-size blocks, a C or COBOL compiler, and three kinds of facts to store: customers, accounts, and ledger postings. How do you organize those records on disk so you can find all postings belonging to a customer?
+
+If you think like a systems programmer accustomed to in-memory structs, the natural answer is \emph{pointers}. Inside each customer record on disk, you store the disk address (cylinder, track, and record offset) of that customer's first account. Inside each account record, you store a pointer to the customer's next account, plus a pointer to that account's first ledger posting. Inside each posting, you store a pointer to the next posting in chronological order, and perhaps a back-pointer to the owning account. To read a customer's monthly statement, your application program chases disk pointers around a linked ring, one block seek at a time.
+
+If you have written Java~6, you have written this kind of program. A loop such as
+\begin{lstlisting}[language=Java]
+for (Account a : customer.getAccounts())
+    for (Posting p : a.getPostings())
+        total += p.getCents();
+\end{lstlisting}
+follows object references, and the JVM stores each reference as a pointer to a heap address. The 1968 databases did the same thing, but on disk, and the pointers were part of the file format. Any query that did not follow the chains the designer had built in advance needed new chains, a file reorganization, and new application code.
+
+For twenty years, that was how commercial databases worked. IBM's Information Management System (IMS, built for the Apollo space program in 1966) arranged records into physical parent--child trees. Charles Bachman's Integrated Data Store (IDS) and the CODASYL standard generalized trees into arbitrary pointer networks, earning Bachman the 1973 Turing Award for casting the programmer as a ``navigator'' steering a cursor through a web of disk addresses.
+
+Then, in June 1970, an IBM mathematician named Edgar~F.\ Codd published an eleven-page paper titled \emph{A Relational Model of Data for Large Shared Data Banks}, and argued that application programs should never follow disk pointers at all.
+
+This chapter builds Codd's alternative from the ground up and connects it directly to the SQL that PostgreSQL parses and executes today. We will trace relational algebra on small ledger tables, map those operators onto SQL's true ten-stage logical evaluation order, uncover the traps hidden inside Kleene's three-valued \texttt{NULL} logic (including why a single \texttt{NULL} turns a \texttt{NOT IN} query into an empty result), and master window frames and recursive fixpoint queries before descending into physical 8~KB pages in Chapter~2.
+
+\chapterline
+
+\section{Codd's idea: physical data independence}
+\label{sec:ch01-codd}
+
+To see why Codd wanted to ban user-visible pointers from databases, watch what happens to a pointer-based banking system the moment requirements change.
+
+In our 1968 pointer network, every posting chain runs forward from \texttt{Account} $\to$ \texttt{Posting\_1} $\to$ \texttt{Posting\_2} $\to \cdots \to$ \texttt{Posting\_k}. Answering ``list all postings for Account~102'' is fast: jump to Account~102 and follow \texttt{next\_posting} links until the chain loops back to the owner.
+
+Now Monday morning arrives, and the fraud desk asks the inverse question: ``Which accounts sent a posting of more than \$5,000 to Merchant~88 yesterday?''
+
+Nothing in your disk layout wires Merchant~88 to its incoming postings, and nothing wires yesterday's date to a starting address. Worse, the application code that reads existing reports is coupled line-by-line to the physical pointer topology:
+
+\begin{enumerate}
+  \item \textbf{Asymmetric query cost and brittle code:} Every query has to be hand-written as imperative nested loops (\texttt{FIND FIRST}, \texttt{FIND NEXT WITHIN SET}) that know which pointer chains exist. If an engineer later replaces a linked list of postings with a sorted B-tree array or partitions postings by month, every existing application program that called \texttt{FIND NEXT} breaks and must be rewritten.
+  \item \textbf{Dangling and corrupt pointer chains:} Inserting one posting requires updating up to four physical disk pointers across different blocks (previous sibling, next sibling, account head/tail, merchant ring). If a program bug or crash leaves one pointer half-updated, traversing the ring loops forever or lands inside an unrelated account's records.
+\end{enumerate}
+
+\begin{historybox}
+Edgar~F.\ Codd joined IBM after serving as a flight lieutenant in the Royal Air Force and completing a doctorate in mathematics at the University of Michigan. Watching IBM customers rewrite thousands of lines of application code every time a file layout or index changed on System/360 mainframes, Codd proposed separating the \emph{logical representation of facts} completely from \emph{physical access paths}. Inside IBM, defenders of IMS initially dismissed Codd's model as an academic toy that could never match hand-tuned pointer navigation. Two research prototypes proved otherwise: IBM's System~R in San Jose (which invented the SEQUEL language --- later shortened to SQL --- and cost-based dynamic programming query optimization) and Michael Stonebraker's Ingres project at UC~Berkeley (whose successor, Postgres, became modern PostgreSQL). Codd received the 1981 Turing Award once it became clear that an algebraic optimizer choosing indexes automatically beat hand-navigated pointer rings on maintainability and, soon enough, throughput as well.
+\end{historybox}
+
+Codd's design rests on one clean separation, known as \textbf{physical data independence}:
+
+\begin{itemize}
+  \item \textbf{Logical layer (what your SQL sees):} All information in the database is represented in exactly one way --- as explicit \emph{values} sitting inside two-dimensional mathematical \emph{relations}. An account does not hold a disk pointer to its owner; it holds the value \texttt{customer\_id = 42}, matching the value \texttt{id = 42} in the \texttt{customers} relation.
+  \item \textbf{Physical layer (what the storage engine hides):} Underneath the logical interface, PostgreSQL is completely free to store rows in unsorted 8~KB heap pages (Chapter~2), maintain Lehman--Yao B-link trees or BRIN block summaries (Chapter~3), compress oversized columns out-of-line, or partition a billion-row ledger across monthly files (Chapter~8). You can add or drop five indexes at noon without changing a single character of any \texttt{SELECT} query, and without changing a single answer those queries return.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  >=Stealth,
+  font=\small,
+  navnode/.style={draw=trapred!80!black, fill=trapred!8, rounded corners=2pt, font=\scriptsize\ttfamily, inner sep=3.5pt, align=left},
+  relbox/.style={draw=sourceblue!80!black, fill=sourceblue!7, rounded corners=2pt, font=\scriptsize\ttfamily, inner sep=4pt, align=left},
+  physbox/.style={draw=targetgreen!80!black, fill=targetgreen!8, rounded corners=2pt, font=\scriptsize, inner sep=4pt, align=center}
+]
+  % Left panel: Navigational pointer network
+  \node[font=\footnotesize\bfseries, text=trapred!85!black] at (3.1, 4.55)
+    {1968: Navigational (disk pointer chains)};
+  \draw[draw=trapred!45, fill=trapred!3, rounded corners=3pt] (0, 0.2) rectangle (6.2, 4.25);
+
+  \node[navnode] (acct) at (1.5, 3.45) {Acct \#102\\head: blk 9, off 4};
+  \node[navnode] (p1)   at (4.7, 3.45) {Post +500\\next: blk 41, off 2};
+  \node[navnode] (p2)   at (4.7, 1.95) {Post -120\\next: blk 3, off 9};
+  \node[navnode] (p3)   at (1.5, 1.95) {Post -80\\owner: blk 1, off 1};
+
+  \draw[->, thick, trapred!80!black] (acct.east) -- (p1.west);
+  \draw[->, thick, trapred!80!black] (p1.south) -- (p2.north);
+  \draw[->, thick, trapred!80!black] (p2.west) -- (p3.east);
+  \draw[->, thick, dashed, trapred!75!black] (p3.north) -- (acct.south);
+
+  \node[font=\scriptsize, text=gray!80!black, text width=5.6cm, align=center] at (3.1, 0.78)
+    {App code chases physical addresses.\\Reorganizing disk blocks breaks queries.};
+
+  % Right panel: Relational value-based model + independence line
+  \node[font=\footnotesize\bfseries, text=sourceblue!90!black] at (10.35, 4.55)
+    {1970: Relational (values)};
+  \draw[draw=sourceblue!45, fill=sourceblue!3, rounded corners=3pt] (6.7, 0.2) rectangle (14.0, 4.25);
+
+  \node[relbox] (racct) at (8.25, 3.25) {
+    \textbf{accounts}\\
+    id \ | owner\\
+    102 | 'Ada'\\
+    105 | 'Ben'
+  };
+  \node[relbox] (rpost) at (12.35, 3.25) {
+    \textbf{postings}\\
+    id | acct\_id | cents\\
+     1 |  102    | +500\\
+     2 |  102    | -120
+  };
+
+  \draw[<->, thick, quotientorange!90!black] (racct.east) -- (rpost.west);
+  \node[font=\scriptsize\bfseries, text=quotientorange!85!black, fill=sourceblue!3, inner sep=1pt]
+    at ($(racct.east)!0.5!(rpost.west) + (0, 0.30)$) {value match};
+
+  % Data independence boundary
+  \draw[very thick, dashed, structurepurple!85!black] (6.9, 1.90) -- (13.8, 1.90);
+  \node[fill=sourceblue!3, inner sep=2pt, font=\scriptsize\bfseries, text=structurepurple!90!black] at (10.35, 1.90)
+    {Physical Data Independence Boundary};
+
+  \node[physbox, minimum width=2.1cm] at (8.0, 0.95) {8~KB Heap\\Pages (Ch~2)};
+  \node[physbox, minimum width=2.1cm] at (10.35, 0.95) {B-Link / BRIN\\Indexes (Ch~3)};
+  \node[physbox, minimum width=2.1cm] at (12.7, 0.95) {Hash / Merge\\Joins (Ch~7)};
+\end{tikzpicture}
+\caption{Navigational databases expose physical disk pointer rings directly to application code (left). Codd's relational model represents relationships purely through matching data values above a strict data-independence boundary (right), freeing PostgreSQL to swap physical storage layouts and indexes underneath unchanged SQL queries.}
+\label{ch01:fig-codd-independence}
+\end{figure}
+
+\begin{intuitionbox}
+Pointers still exist inside PostgreSQL --- millions of them. Every B-tree leaf entry holds a 6-byte \texttt{ctid} pointing to an 8~KB heap block and slot, and every updated heap tuple points forward to its newer version. Codd did not abolish pointers from the \emph{machine}; he moved them \emph{below the abstraction line} where the storage engine maintains them automatically and the query optimizer chooses whether to follow them or scan sequentially.
+\end{intuitionbox}
+
+\section{Relations versus SQL tables: sets, bags, and keys}
+\label{sec:ch01-sets-bags}
+
+To reason sharply about queries, we need both Codd's mathematical definition of a relation and the one pragmatic compromise that real SQL engines make for speed.
+
+\begin{formalbox}
+Let $D_1, D_2, \dots, D_k$ be sets of atomic values called \textbf{domains} (for instance, 64-bit integers $\Z_{2^{64}}$, UTF-8 text strings, or UTC microsecond timestamps).
+\begin{enumerate}
+  \item A \textbf{relation schema} $R(A_1 : D_1, \dots, A_k : D_k)$ names a relation $R$ together with $k$ distinct \textbf{attributes} (columns) $A_i$, each constrained to domain $D_i$. The integer $k$ is the \textbf{degree} (or \textbf{arity}) of $R$.
+  \item A \textbf{tuple} $t$ conforming to $R$ assigns each attribute $A_i$ an element $t[A_i] \in D_i$ (or, in SQL, the missing-information marker \texttt{NULL}).
+  \item A \textbf{pure mathematical relation} (or \textbf{relation instance}) over $R$ is a finite subset
+  \[
+    r \subseteq D_1 \times D_2 \times \cdots \times D_k.
+  \]
+  Because $r$ is a \emph{set}, two consequences hold immediately: tuples have \textbf{no inherent top-to-bottom order}, and \textbf{duplicate tuples cannot exist} in $r$.
+\end{enumerate}
+\end{formalbox}
+
+If you open \texttt{psql}, create a table without a \texttt{PRIMARY KEY}, and run \texttt{INSERT INTO logs VALUES ('login')} twice, PostgreSQL stores two identical rows. And if you run \texttt{SELECT currency FROM accounts} on a table with ten thousand \texttt{'USD'} accounts, PostgreSQL returns \texttt{'USD'} ten thousand times rather than collapsing it to a single row. Why does SQL depart from pure set theory here?
+
+The answer is pure algorithmic cost. Suppose a table has $N = 50{,}000{,}000$ rows and you project two non-unique columns: \texttt{SELECT merchant\_id, amount\_cents FROM postings}. Eliminating duplicates across $50$ million projected pairs requires either sorting all $50$ million tuples in $\Oh(N \log N)$ time across gigabytes of temporary disk spill or building a hash table with one entry per distinct pair in RAM. Most callers streaming rows into an application aggregate or report do not want to pay an $\Oh(N \log N)$ deduplication tax on every projection unless they explicitly ask for it.
+
+In Java terms, Codd's relation behaves like a \texttt{HashSet<Row>}: adding an equal row a second time changes nothing, and iteration order is unspecified. A SQL table without a key behaves like an \texttt{ArrayList<Row>} whose order you are not allowed to rely on: duplicates are kept, and \texttt{SELECT} hands them all back.
+
+Consequently, an unconstrained SQL table or query result is not a mathematical set; it is a \textbf{bag} (a \textbf{multiset}), modeled formally by attaching a non-negative integer multiplicity $\mu_R(t) \in \N$ to every possible tuple $t$:
+
+\begin{center}
+{\small
+\begin{tabular}{llp{6.1cm}}
+\toprule
+SQL Operator & Multiset Multiplicity & Physical Consequence in PostgreSQL \\
+\midrule
+\texttt{SELECT a, b FROM R} & Sums $\mu_R(t)$ over matches & $\Oh(N)$ streaming pass; zero memory overhead \\
+\texttt{SELECT DISTINCT a, b} & $\min(1, \sum \mu_R(t))$ & Requires \texttt{HashAggregate} or \texttt{Sort + Unique} \\
+\texttt{R UNION ALL S} & $\mu_R(t) + \mu_S(t)$ & $\Oh(1)$-memory \texttt{Append} streaming $R$ then $S$ \\
+\texttt{R UNION S} & $\min(1, \mu_R(t) + \mu_S(t))$ & Concatenates, then hashes or sorts to deduplicate \\
+\texttt{R INTERSECT ALL S} & $\min(\mu_R(t), \mu_S(t))$ & Pairs up matching multiplicities via hash counters \\
+\texttt{R EXCEPT ALL S} & $\max(0, \mu_R(t) - \mu_S(t))$ & Subtracts $S$'s count of $t$ from $R$'s count of $t$ \\
+\bottomrule
+\end{tabular}}
+\end{center}
+
+\begin{trapbox}
+Writing \texttt{UNION} when you actually know the two branches are disjoint (for example, combining active orders from 2025 with archived orders from 2024) is one of the most common self-inflicted performance wounds in SQL. Bare \texttt{UNION} forces PostgreSQL to buffer and hash or sort the combined output just to prove there are no duplicates. Whenever two subqueries are already disjoint --- or duplicates are harmless --- write \texttt{UNION ALL} so PostgreSQL can stream both inputs directly through a zero-overhead \texttt{Append} operator.
+\end{trapbox}
+
+How do we bring a base SQL table back into Codd's clean set world where every row represents a distinct, addressable fact? By declaring a \textbf{key}:
+
+\begin{itemize}
+  \item A \textbf{superkey} of schema $R$ is any subset of attributes $K \subseteq \{A_1, \dots, A_k\}$ such that no two legal tuples in $R$ may agree on all attributes of $K$: if $t_1[K] = t_2[K]$, then $t_1 = t_2$.
+  \item A \textbf{candidate key} is a \emph{minimal} superkey --- removing any attribute from $K$ destroys uniqueness. For example, on an \texttt{accounts} table, $\{\texttt{id}\}$ might be one candidate key and $\{\texttt{iban}\}$ a second candidate key, whereas $\{\texttt{id}, \texttt{currency}\}$ is a superkey that is not minimal.
+  \item A \textbf{primary key} (\texttt{PRIMARY KEY}) is the candidate key chosen as the canonical identifier of rows in $R$, with the additional SQL guarantee that none of its columns may ever be \texttt{NULL}. PostgreSQL enforces every \texttt{PRIMARY KEY} and \texttt{UNIQUE} constraint physically by maintaining a unique B-tree index (Chapter~3).
+  \item A \textbf{foreign key} (\texttt{REFERENCES}) on child relation $S$ asserts \emph{referential integrity} against a candidate key of parent relation $R$: every non-\texttt{NULL} key value appearing in $S$ must currently exist in $R$.
+\end{itemize}
+
+\subsection{Why normalization matters: functional dependencies in one picture}
+
+Even with a primary key on every table, a poorly factored schema can rot from the inside. Suppose an engineer designs one wide ledger table \texttt{postings\_denorm} with columns \texttt{(posting\_id, account\_id, owner\_email, account\_tier, amount\_cents)}, where \texttt{posting\_id} is the primary key. Because \texttt{account\_id = 102} belongs to \texttt{'ada@example.org'} on tier \texttt{'pro'}, those two strings are repeated across all $40{,}000$ postings for Account~102.
+
+Mathematically, the table contains a \textbf{functional dependency}, written
+\[
+  \texttt{account\_id} \;\to\; \{\texttt{owner\_email},\; \texttt{account\_tier}\},
+\]
+meaning that knowing \texttt{account\_id} uniquely determines \texttt{owner\_email} and \texttt{account\_tier}, even though \texttt{account\_id} is \emph{not} a superkey of \texttt{postings\_denorm}. Whenever a non-superkey attribute determines another attribute, three classic anomalies appear immediately:
+
+\begin{enumerate}
+  \item \textbf{Update anomaly (physical write amplification + inconsistency):} When Ada changes her email address, PostgreSQL cannot update one row; it must rewrite $40{,}000$ heap tuples across hundreds of 8~KB pages (Chapter~2). Worse, without a separate \texttt{accounts} table, nothing stops a bug from updating $39{,}999$ rows and leaving one row with her old email.
+  \item \textbf{Insertion anomaly:} You cannot open Account~109 for a brand-new customer who has zero postings yet without inventing a fake dummy posting or permitting \texttt{posting\_id} to be \texttt{NULL}.
+  \item \textbf{Deletion anomaly:} If a test account's lone posting is reversed and deleted, the fact that the account ever existed --- along with its owner's email and tier --- vanishes with it.
+\end{enumerate}
+
+\begin{whybox}
+\textbf{Boyce--Codd Normal Form (BCNF) in one sentence.} A relation schema $R$ is in Boyce--Codd Normal Form if and only if for every non-trivial functional dependency $X \to Y$ holding on $R$ (meaning $Y \not\subseteq X$), $X$ is a \emph{superkey} of $R$. Colloquially: \emph{every fact in $R$ depends on the key, the whole key, and nothing but the key}. Splitting \texttt{postings\_denorm} into \texttt{accounts(account\_id, owner\_email, account\_tier)} and \texttt{postings(posting\_id, account\_id, amount\_cents)} puts both relations in BCNF: each fact lives in one place, Ada's email update touches exactly one 8~KB page, and no update, insertion, or deletion anomaly can ever occur.
+\end{whybox}
+
+\section{Relational algebra: the engine underneath SQL}
+\label{sec:ch01-relational-algebra}
+
+When PostgreSQL receives a SQL query, it does not execute the English words directly. Its parser and analyzer translate your SQL text into a tree of algebraic operators whose inputs are relations and whose outputs are relations. Because every operator produces a relation, operators \emph{compose} cleanly --- the output of a join feeds straight into a filter, which feeds into a grouping operator, which feeds into a projection.
+
+Let us fix a concrete miniature dataset that we can trace by hand across the entire chapter: a four-row \texttt{accounts} table $A$ and a six-row \texttt{postings} table $P$, with amounts stored in integer cents.
+
+\begin{center}
+\begin{minipage}[t]{0.44\textwidth}
+\centering
+\textbf{Relation $A$ (\texttt{accounts})}\\[4pt]
+{\footnotesize
+\begin{tabular}{rll}
+\toprule
+\texttt{id} & \texttt{owner} & \texttt{tier} \\
+\midrule
+101 & \texttt{'Ada'}  & \texttt{'pro'} \\
+102 & \texttt{'Ben'}  & \texttt{'free'} \\
+103 & \texttt{'Cara'} & \texttt{'pro'} \\
+104 & \texttt{'Dan'}  & \texttt{'pro'} \\
+\bottomrule
+\end{tabular}}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.53\textwidth}
+\centering
+\textbf{Relation $P$ (\texttt{postings})}\\[4pt]
+{\footnotesize
+\begin{tabular}{rrrl}
+\toprule
+\texttt{pid} & \texttt{acct\_id} & \texttt{cents} & \texttt{posted\_on} \\
+\midrule
+1 & 101 & $+10000$ & \texttt{'2026-10-01'} \\
+2 & 101 &  $-2500$ & \texttt{'2026-10-02'} \\
+3 & 102 &  $+4000$ & \texttt{'2026-10-02'} \\
+4 & 103 & $+15000$ & \texttt{'2026-10-01'} \\
+5 & 103 &  $-3000$ & \texttt{'2026-10-03'} \\
+6 & 103 &  $+2000$ & \texttt{'2026-10-03'} \\
+\bottomrule
+\end{tabular}}
+\end{minipage}
+\end{center}
+
+Notice Account~\texttt{104} (\texttt{'Dan'}): he opened a \texttt{'pro'} account, so he sits in $A$, yet he has zero rows in $P$. Watching what happens to Dan across joins and filters will expose half of the bugs people write in production SQL.
+
+Five core relational operators (plus outer, semi-, and anti-join variants) form the algebra we need:
+
+\begin{enumerate}
+  \item \textbf{Selection $\sigma_\theta(R)$ (horizontal slice):} Keeps every tuple $t \in R$ satisfying predicate $\theta$, preserving $R$'s exact column schema. On our dataset, $\sigma_{\texttt{tier = 'pro'}}(A)$ keeps rows \texttt{101}, \texttt{103}, and \texttt{104}, dropping Ben (\texttt{102}).
+  \item \textbf{Projection $\pi_{e_1 \to b_1, \dots, e_m \to b_m}(R)$ (vertical slice \& column expressions):} Evaluates expressions $e_1, \dots, e_m$ on each tuple of $R$ to produce an $m$-column output schema. In pure set algebra $\pi$ deduplicates automatically; in SQL's bag algebra (often written $\pi^b$), multiplicities are preserved unless \texttt{DISTINCT} ($\delta$) is applied on top.
+  \item \textbf{Cartesian Product $R \times S$ and Join $R \bowtie_\theta S$:} The cross product $A \times P$ pairs \emph{every} row of $A$ with \emph{every} row of $P$, yielding $\abs{A}\cdot\abs{P} = 4 \times 6 = 24$ wide tuples of $3 + 4 = 7$ columns. An \textbf{inner theta-join} is defined logically as a cross product followed by selection:
+  \[
+    A \bowtie_{\theta} P \;\coloneqq\; \sigma_{\theta}(A \times P).
+  \]
+  When $\theta$ is an equality such as $A.\texttt{id} = P.\texttt{acct\_id}$, we have an \textbf{equi-join}: of the $24$ possible pairs in $A \times P$, only the $6$ pairs where \texttt{id} matches \texttt{acct\_id} survive (two for Ada, one for Ben, three for Cara, and \emph{zero} for Dan, whose account \texttt{104} has no matching rows in $P$).
+  \item \textbf{Outer, Semi-, and Anti-Joins:}
+  \begin{itemize}
+    \item \textbf{Left Outer Join} ($A \mathbin{\texttt{LEFT JOIN}} P$): Returns all pairs from $A \bowtie_\theta P$, \emph{plus} one tuple for each unmatched row of $A$ padded with \texttt{NULL} in every attribute of $P$. Here Dan (\texttt{104}) survives as $(\texttt{104}, \texttt{'Dan'}, \texttt{'pro'}, \texttt{NULL}, \texttt{NULL}, \texttt{NULL}, \texttt{NULL})$.
+    \item \textbf{Semi-Join} ($A \ltimes_\theta P$, SQL \texttt{WHERE EXISTS (...)}): Returns tuples of $A$ that match \emph{at least one} tuple in $P$, without duplicating $A$'s row when $P$ has multiple matches. Whereas $A \bowtie P$ produces three rows for Cara (\texttt{103}), $A \ltimes P$ returns Cara \emph{once} (\texttt{101}, \texttt{102}, \texttt{103}).
+    \item \textbf{Anti-Join} ($A \triangleright_\theta P$, SQL \texttt{WHERE NOT EXISTS (...)}): Returns tuples of $A$ that match \emph{zero} tuples in $P$ --- here returning solely $(\texttt{104}, \texttt{'Dan'}, \texttt{'pro'})$.
+  \end{itemize}
+  \item \textbf{Grouping and Aggregation $\gamma_{G;\, f_1(c_1) \to s_1, \dots}(R)$:} Partitions the tuples of $R$ into equivalence classes that agree on all grouping attributes $G$, then collapses each bucket into a \emph{single} output tuple carrying $G$ and the aggregate results $f_j(c_j)$ (\texttt{COUNT}, \texttt{SUM}, \texttt{MIN}, \texttt{MAX}, \texttt{AVG}). Applying $\gamma_{\texttt{acct\_id};\, \texttt{SUM(cents)} \to \texttt{bal}}(P)$ partitions $P$'s six rows into three buckets:
+  \[
+    (101,\, 7500), \qquad (102,\, 4000), \qquad (103,\, 14000).
+  \]
+\end{enumerate}
+
+\subsection{Why algebraic laws make declarative SQL fast}
+
+Why did defining queries in this small algebra defeat hand-coded pointer loops? Because relational operators obey exact \textbf{algebraic identities} that let an optimizer transform a slow expression into an equivalent fast one before touching a single disk block.
+
+Suppose a user asks for the posting amounts of all \texttt{'pro'} accounts on or after October~2:
+\[
+  E_{\text{naive}} \;=\; \pi_{\texttt{owner}, \texttt{cents}}\!\Bigl(\sigma_{A.\texttt{tier}=\texttt{'pro'} \;\land\; P.\texttt{posted\_on} \ge \texttt{'2026-10-02'}\;\land\; A.\texttt{id}=P.\texttt{acct\_id}}(A \times P)\Bigr).
+\]
+Executed as written on a production bank with $\abs{A} = 10^6$ accounts and $\abs{P} = 10^8$ postings, forming $A \times P$ first would materialize $10^{14}$ intermediate tuples --- crashing the server long before finishing.
+
+Instead, PostgreSQL's planner applies three equivalence laws automatically:
+\begin{align*}
+  \sigma_{p_1 \land p_2}(R) &= \sigma_{p_1}(\sigma_{p_2}(R)) &&\text{(cascade of selections)}, \\
+  \sigma_{p_A}(A \bowtie_\theta P) &= \bigl(\sigma_{p_A}(A)\bigr) \bowtie_\theta P &&\text{(selection pushdown when $p_A$ mentions only $A$)}, \\
+  \sigma_{\theta}(A \times P) &= A \bowtie_{\theta} P &&\text{(cross product + equality $\to$ hash/index equi-join)}.
+\end{align*}
+Pushing $\sigma_{\texttt{tier='pro'}}$ down onto $A$ and $\sigma_{\texttt{posted\_on}\ge\texttt{'2026-10-02'}}$ down onto $P$ \emph{before} joining shrinks both inputs dramatically, and replacing $\times$ with an indexed or hash equi-join drops the work from $10^{14}$ comparisons to linear in the surviving rows.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  >=Stealth,
+  font=\footnotesize,
+  op/.style={draw=#1!85!black, fill=#1!10, rounded corners=2pt, inner sep=4pt, align=center},
+  leaf/.style={draw=gray!70!black, fill=gray!8, rounded corners=2pt, font=\scriptsize\ttfamily, inner sep=3.5pt},
+  arr/.style={->, thick, gray!75!black}
+]
+  % Left tree: Naive unoptimized
+  \node[font=\footnotesize\bfseries, text=trapred!85!black] at (2.4, 4.7)
+    {Literal Tree ($10^{14}$ Pairs)};
+  \node[op=sourceblue] (pi1) at (2.4, 3.95) {$\pi_{\texttt{owner, cents}}$};
+  \node[op=trapred]    (sig1) at (2.4, 2.75) {$\sigma_{\texttt{tier='pro'} \land \texttt{posted}\ge\texttt{10-02} \land \texttt{id=acct\_id}}$};
+  \node[op=trapred]    (cp)   at (2.4, 1.45) {$A \times P$ \scriptsize ($10^6 \times 10^8$)};
+  \node[leaf] (a1) at (1.3, 0.35) {accounts ($10^6$)};
+  \node[leaf] (p1) at (3.5, 0.35) {postings ($10^8$)};
+
+  \draw[arr] (a1) -- (cp);
+  \draw[arr] (p1) -- (cp);
+  \draw[arr] (cp) -- (sig1);
+  \draw[arr] (sig1) -- (pi1);
+
+  % Equivalence arrow
+  \draw[->, ultra thick, structurepurple!85!black] (5.35, 2.55) --
+    node[above=2pt, font=\scriptsize\bfseries, text=structurepurple!90!black] {Pushdown}
+    node[below=2pt, font=\scriptsize, text=structurepurple!90!black] {Rewrites} (6.65, 2.55);
+
+  % Right tree: Pushed-down equi-join
+  \node[font=\footnotesize\bfseries, text=targetgreen!85!black] at (9.9, 4.7)
+    {Rewritten Tree (Only Matching Survivors)};
+  \node[op=sourceblue]  (pi2)  at (9.9, 3.95) {$\pi_{\texttt{owner, cents}}$};
+  \node[op=targetgreen] (jn)   at (9.9, 2.80) {$\bowtie_{A.\texttt{id} = P.\texttt{acct\_id}}$};
+  \node[op=quotientorange] (sa) at (8.1, 1.55) {$\sigma_{\texttt{tier='pro'}}$};
+  \node[op=quotientorange] (sp) at (11.7, 1.55) {$\sigma_{\texttt{posted}\ge\texttt{10-02}}$};
+  \node[leaf] (a2) at (8.1, 0.35) {accounts ($10^6$)};
+  \node[leaf] (p2) at (11.7, 0.35) {postings ($10^8$)};
+
+  \draw[arr] (a2) -- (sa);
+  \draw[arr] (p2) -- (sp);
+  \draw[arr] (sa) -- (jn);
+  \draw[arr] (sp) -- (jn);
+  \draw[arr] (jn) -- (pi2);
+\end{tikzpicture}
+\caption{Relational algebra optimization in miniature: pushing single-table selections below the join and converting $\sigma_{A.\texttt{id}=P.\texttt{acct\_id}}(A \times P)$ into an equi-join produces the exact same output relation while avoiding trillions of useless tuple pairs.}
+\label{ch01:fig-algebra-pushdown}
+\end{figure}
+
+\section{SQL's true logical evaluation pipeline}
+\label{sec:ch01-evaluation-order}
+
+If you ask a programmer why the query below fails in PostgreSQL with an unknown-column error (\texttt{column "net\_cents" does not exist}), they are often momentarily baffled:
+
+\begin{lstlisting}[language=SQL]
+-- BROKEN: net_cents was written on line 1, so why can't line 3 see it?
+SELECT acct_id, SUM(cents) AS net_cents
+  FROM postings
+ WHERE net_cents > 5000
+ GROUP BY acct_id;
+\end{lstlisting}
+
+PostgreSQL rejects it at parse time:
+\begin{lstlisting}
+ERROR:  column "net_cents" does not exist
+LINE 3:  WHERE net_cents > 5000
+               ^
+\end{lstlisting}
+After all, \texttt{net\_cents} is defined right there on line~1, two lines \emph{above} \texttt{WHERE}. Why can \texttt{WHERE} not see it, while \texttt{ORDER BY net\_cents DESC} at the bottom of the query \emph{can} see it?
+
+Because the \emph{lexical order} in which SQL clauses are written on the page (designed in the 1970s to mimic an English sentence: ``Select these columns from these tables where\dots'') is \textbf{not} the order in which SQL defines the meaning of a query. Logically, every \texttt{SELECT} block is a ten-stage pipeline, and \texttt{SELECT} itself does not run until \textbf{Stage~7}.
+
+\begin{formalbox}
+\textbf{The Ten-Stage Logical Evaluation Pipeline of a SQL Query.} Given a single query block, its exact output bag of rows is defined by executing these ten transformations in sequence, where each stage consumes the virtual table produced by the stage immediately before it:
+\begin{enumerate}
+  \item \textbf{\texttt{FROM}}: Materialize base tables, views, CTE references, or \texttt{LATERAL} table functions into initial virtual relations.
+  \item \textbf{\texttt{JOIN} / \texttt{ON}}: Combine input relations via cross product, filter pairs by the \texttt{ON} predicate, and (for \texttt{LEFT}, \texttt{RIGHT}, or \texttt{FULL OUTER} joins) add back unmatched preserved-side rows padded with \texttt{NULL}s.
+  \item \textbf{\texttt{WHERE}}: Apply row-level selection $\sigma_{\theta}$; keep \emph{only} rows for which $\theta$ evaluates to \texttt{TRUE} (discarding both \texttt{FALSE} and \texttt{UNKNOWN}).
+  \item \textbf{\texttt{GROUP BY}}: Partition surviving rows into buckets sharing equal values across the grouping columns (treating two \texttt{NULL}s as belonging to the same bucket), and collapse each bucket into a group representative ready for aggregation.
+  \item \textbf{\texttt{HAVING}}: Filter the collapsed groups; keep \emph{only} groups whose aggregate predicate evaluates to \texttt{TRUE}.
+  \item \textbf{\texttt{WINDOW}}: Evaluate every \texttt{OVER (...)} window function across the surviving rows (or collapsed groups) \emph{without} collapsing rows further.
+  \item \textbf{\texttt{SELECT}}: Project output expressions and bind column aliases (\texttt{AS alias}). Only from this stage onward do \texttt{SELECT}-list aliases exist.
+  \item \textbf{\texttt{DISTINCT}} (or \texttt{DISTINCT ON (...)}): Deduplicate projected rows.
+  \item \textbf{\texttt{ORDER BY}}: Sort the resulting rows (may reference \texttt{SELECT} aliases, and if \texttt{DISTINCT} was not used, may even reference input columns not projected in \texttt{SELECT}).
+  \item \textbf{\texttt{LIMIT} / \texttt{OFFSET}} (\texttt{FETCH FIRST ... ROWS ONLY}): Discard leading \texttt{OFFSET} rows and truncate after \texttt{LIMIT} rows.
+\end{enumerate}
+\end{formalbox}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  >=Stealth,
+  font=\scriptsize,
+  stage/.style={draw=#1!85!black, fill=#1!10, rounded corners=2pt, minimum width=2.25cm, minimum height=0.92cm, align=center, inner sep=3pt},
+  arr/.style={->, thick, gray!75!black},
+  note/.style={font=\tiny, text=gray!75!black, align=center}
+]
+  % Row 1: Stages 1..5 (left to right)
+  \node[stage=sourceblue]     (s1) at (0.0, 2.2) {\textbf{1. FROM}\\Base relations};
+  \node[stage=sourceblue]     (s2) at (2.7, 2.2) {\textbf{2. JOIN + ON}\\Pairs + outer \texttt{NULL}s};
+  \node[stage=quotientorange] (s3) at (5.4, 2.2) {\textbf{3. WHERE}\\Row filter (\texttt{TRUE})};
+  \node[stage=structurepurple](s4) at (8.1, 2.2) {\textbf{4. GROUP BY}\\Collapse buckets};
+  \node[stage=quotientorange] (s5) at (10.8, 2.2){\textbf{5. HAVING}\\Group filter};
+
+  \draw[arr] (s1) -- (s2);
+  \draw[arr] (s2) -- (s3);
+  \draw[arr] (s3) -- (s4);
+  \draw[arr] (s4) -- (s5);
+
+  % Wrap connector down to Row 2
+  \draw[arr, rounded corners=4pt] (s5.south) -- (10.8, 1.35) -- (0.0, 1.35) -- (0.0, 0.90);
+
+  % Row 2: Stages 6..10 (left to right)
+  \node[stage=structurepurple](s6) at (0.0, 0.42) {\textbf{6. WINDOW}\\\texttt{OVER (...)} frames};
+  \node[stage=targetgreen]    (s7) at (2.7, 0.42) {\textbf{7. SELECT}\\Bind \texttt{AS} aliases!};
+  \node[stage=targetgreen]    (s8) at (5.4, 0.42) {\textbf{8. DISTINCT}\\Eliminate dupes};
+  \node[stage=sourceblue]     (s9) at (8.1, 0.42) {\textbf{9. ORDER BY}\\Sort output};
+  \node[stage=trapred]        (s10)at (10.8, 0.42){\textbf{10. LIMIT}\\Slice top $k$};
+
+  \draw[arr] (s6) -- (s7);
+  \draw[arr] (s7) -- (s8);
+  \draw[arr] (s8) -- (s9);
+  \draw[arr] (s9) -- (s10);
+
+  % Scope callout bar below
+  \draw[thick, decorate, decoration={brace, mirror, amplitude=4pt}, targetgreen!80!black]
+    (1.58, -0.18) -- (11.92, -0.18)
+    node[midway, below=5pt, font=\scriptsize\bfseries, text=targetgreen!80!black]
+    {\texttt{SELECT}-list column aliases are visible only in Stages 8--9 (never in \texttt{WHERE}, \texttt{GROUP BY}\textsuperscript{*}, \texttt{HAVING}, or \texttt{WINDOW})};
+\end{tikzpicture}
+\caption{SQL's ten-stage logical evaluation pipeline. Notice why \texttt{WHERE} cannot reference aggregates (Stage~3 runs before Stage~4), why \texttt{WHERE} cannot filter on \texttt{ROW\_NUMBER()} (Stage~3 runs before Stage~6), and why \texttt{SELECT} aliases appear only at Stage~7. (\textsuperscript{*}PostgreSQL extends the SQL standard slightly by letting \texttt{GROUP BY} and \texttt{ORDER BY} refer to simple \texttt{SELECT} output column names when unambiguous, but never inside expressions or \texttt{WHERE}/\texttt{HAVING}.)}
+\label{ch01:fig-sql-pipeline}
+\end{figure}
+
+Once you know this order, several confusing SQL rules follow directly from the stage numbers. Each comes with the error PostgreSQL actually prints:
+
+\begin{enumerate}
+  \item \textbf{Why \texttt{WHERE} rejects \texttt{SUM(cents) > 5000} and requires \texttt{HAVING}:} At Stage~3 (\texttt{WHERE}), rows have not been grouped yet --- PostgreSQL is looking at one individual posting row at a time, so \texttt{SUM(cents)} does not exist yet. Individual postings are filtered at Stage~3 (\texttt{WHERE}); collapsed account buckets are filtered at Stage~5 (\texttt{HAVING}). Writing \texttt{WHERE SUM(cents) > 5000} fails with:
+\begin{lstlisting}
+ERROR:  aggregate functions are not allowed in WHERE
+\end{lstlisting}
+  \item \textbf{Why \texttt{WHERE rn = 1} fails on \texttt{ROW\_NUMBER() OVER (...) AS rn}:} Window functions are not computed until Stage~6, three stages \emph{after} \texttt{WHERE}. To keep only the latest posting per account using \texttt{ROW\_NUMBER()}, wrap the query in a CTE or subquery so Stage~6 finishes inside the inner block, and filter \texttt{WHERE rn = 1} in the outer block's Stage~3 (or use PostgreSQL's \texttt{DISTINCT ON (acct\_id) ... ORDER BY acct\_id, posted\_on DESC}). Referring to the alias gives \texttt{column "rn" does not exist}; inlining the window call into \texttt{WHERE} gives:
+\begin{lstlisting}
+ERROR:  window functions are not allowed in WHERE
+\end{lstlisting}
+  \item \textbf{Why \texttt{ORDER BY random()} after \texttt{SELECT DISTINCT} errors out:} At Stage~8, \texttt{DISTINCT} collapses multiple input rows into one output row. If Stage~9 (\texttt{ORDER BY}) then asks to sort by a column or expression that was \emph{not} part of the deduplicated \texttt{SELECT} list (say, \texttt{SELECT DISTINCT tier FROM accounts ORDER BY owner}), which \texttt{owner} among Ada, Cara, and Dan should represent the single \texttt{'pro'} row? The question is ill-defined, so PostgreSQL rejects it at parse time:
+\begin{lstlisting}
+ERROR:  for SELECT DISTINCT, ORDER BY expressions must appear in select list
+\end{lstlisting}
+\end{enumerate}
+
+\subsection{The \texttt{LEFT JOIN}: \texttt{ON} predicate versus \texttt{WHERE} predicate}
+
+Nothing illustrates Stage~2 versus Stage~3 more starkly than filtering the nullable side of a \texttt{LEFT JOIN}. Suppose you want a report listing \emph{every} \texttt{'pro'} account --- including zero-activity accounts like Dan (\texttt{104}) --- together with how many postings that account made on or after \texttt{'2026-10-02'}. Compare these two queries that differ by a single keyword (\texttt{AND} versus \texttt{WHERE}):
+
+\begin{lstlisting}[language=SQL]
+-- Query A (WRONG for zero-activity accounts): puts date filter in Stage 3 (WHERE)
+SELECT a.id, a.owner, COUNT(p.pid) AS oct2_or_later_cnt
+  FROM accounts a
+  LEFT JOIN postings p ON p.acct_id = a.id
+ WHERE a.tier = 'pro'
+   AND p.posted_on >= DATE '2026-10-02'
+ GROUP BY a.id, a.owner;
+
+-- Query B (CORRECT): puts right-table date filter in Stage 2 (JOIN ... ON)
+SELECT a.id, a.owner, COUNT(p.pid) AS oct2_or_later_cnt
+  FROM accounts a
+  LEFT JOIN postings p
+    ON p.acct_id = a.id
+   AND p.posted_on >= DATE '2026-10-02'
+ WHERE a.tier = 'pro'
+ GROUP BY a.id, a.owner;
+\end{lstlisting}
+
+Trace Dan (\texttt{id = 104}) through both pipelines by hand:
+
+\begin{itemize}
+  \item In \textbf{Query~A}, Stage~2 (\texttt{LEFT JOIN}) finds no postings for Dan and emits the padded row $(\texttt{104}, \texttt{'Dan'}, \texttt{'pro'}, \texttt{NULL}, \texttt{NULL}, \texttt{NULL}, \texttt{NULL})$. Then Stage~3 (\texttt{WHERE}) evaluates \texttt{NULL >= DATE '2026-10-02'}, which yields \texttt{UNKNOWN}. Because \texttt{WHERE} keeps only \texttt{TRUE}, \textbf{Dan's row is discarded} --- your \texttt{LEFT JOIN} silently turned into an \texttt{INNER JOIN}.
+  \item In \textbf{Query~B}, Stage~2 evaluates \texttt{p.acct\_id = a.id AND p.posted\_on >= '2026-10-02'} \emph{during the join match itself}. Dan matches zero rows under that combined condition, so the \texttt{LEFT JOIN}'s outer-padding step emits Dan padded with \texttt{NULL}s. Stage~3 checks only \texttt{a.tier = 'pro'} (\texttt{TRUE}), Stage~4 groups Dan's single padded row, and \texttt{COUNT(p.pid)} (which counts non-\texttt{NULL} values of \texttt{p.pid}, unlike \texttt{COUNT(*)}) returns \texttt{0}.
+\end{itemize}
+
+\begin{trapbox}
+Whenever you write \texttt{A LEFT JOIN P}, check two things before hitting enter:
+\begin{enumerate}
+  \item Any filter on columns of the optional table \texttt{P} belongs in \texttt{ON}, never in \texttt{WHERE} (unless your explicit goal is an anti-join \texttt{WHERE p.pid IS NULL} to find unmatched rows).
+  \item In \texttt{SELECT}, write \texttt{COUNT(p.pid)}, \emph{never} \texttt{COUNT(*)}. For Dan's \texttt{NULL}-padded outer-join row, \texttt{COUNT(*)} counts rows in the bucket and reports \texttt{1} posting for an account with zero postings, whereas \texttt{COUNT(p.pid)} counts non-\texttt{NULL} \texttt{pid}s and accurately reports \texttt{0}.
+\end{enumerate}
+\end{trapbox}
+
+\begin{intuitionbox}
+\textbf{Logical order is a specification, not a physical straitjacket.} PostgreSQL promises that the \emph{result} of every query equals what the ten-stage pipeline produces. Physically, its planner (Chapter~7) reorders aggressively whenever the output is guaranteed identical: in Query~B above, PostgreSQL pushes \texttt{WHERE a.tier = 'pro'} all the way down into the scan of \texttt{accounts} \emph{before} Stage~2 ever runs, because filtering the preserved left side of a \texttt{LEFT JOIN} early never changes which right-side rows match. By contrast, PostgreSQL knows it \emph{cannot} push \texttt{WHERE p.posted\_on >= ...} in Query~A into \texttt{ON} without noticing that the \texttt{NULL}-rejecting \texttt{WHERE} clause actually permits simplifying the entire \texttt{LEFT JOIN} into a faster \texttt{INNER JOIN}.
+\end{intuitionbox}
+
+\section{\texttt{NULL} and Kleene's three-valued logic}
+\label{sec:ch01-null-3vl}
+
+Codd's 1970 paper assumed every tuple cell contained a known element of its attribute's domain. Real databases quickly ran into messy facts: a pending wire transfer does not have a \texttt{settled\_at} timestamp yet; a cash deposit has no \texttt{counterparty\_iban}. SQL models missing or inapplicable data with a special marker called \texttt{NULL}.
+
+Start with one rule: \textbf{\texttt{NULL} is not a value}. It is a \emph{marker} meaning ``unknown or missing.''
+
+Suppose Alice's age is unknown (\texttt{NULL}) and Bob's age is also unknown (\texttt{NULL}). Are Alice and Bob the same age? \emph{You do not know.} Alice might be $29$ and Bob $44$, or both might be $31$. Asking \texttt{NULL = NULL} cannot honestly return \texttt{TRUE}, and asking \texttt{NULL <> NULL} cannot honestly return \texttt{TRUE} either. Both comparisons must return a third truth value: \textbf{\texttt{UNKNOWN}} (which PostgreSQL displays in \texttt{BOOLEAN} output columns as blank/\texttt{NULL}).
+
+Java~6 programmers need to unlearn one habit here. In Java, \texttt{null == null} is \texttt{true}, and a \texttt{Boolean} field holding \texttt{null} throws \texttt{NullPointerException} the moment you unbox it in \texttt{if (flag)}. SQL does neither. A comparison involving \texttt{NULL} does not throw and does not return \texttt{FALSE}; it returns \texttt{UNKNOWN}, and the clause that consumes it decides what \texttt{UNKNOWN} means.
+
+Arithmetic and scalar functions propagate unknownness immediately: \texttt{NULL + 500} is \texttt{NULL}, \texttt{'USD-' || NULL} is \texttt{NULL}, and \texttt{ABS(NULL)} is \texttt{NULL}, because adding \$5.00 to an unknown balance produces an unknown balance.
+
+What happens when \texttt{UNKNOWN} enters boolean connectives \texttt{NOT}, \texttt{AND}, and \texttt{OR}? SQL uses the three-valued logic formulated by logician Stephen Cole Kleene in 1938. You never need to memorize Kleene's tables by rote; you can derive every single cell in two seconds by substituting ``maybe \texttt{TRUE}, maybe \texttt{FALSE}'' for \texttt{UNKNOWN}:
+
+\begin{itemize}
+  \item \textbf{\texttt{NOT UNKNOWN}} is \textbf{\texttt{UNKNOWN}}: flipping an unknown coin is still unknown.
+  \item \textbf{\texttt{FALSE AND UNKNOWN}} is \textbf{\texttt{FALSE}}: if the first half of an \texttt{AND} is already \texttt{FALSE}, the whole conjunction is guaranteed \texttt{FALSE} regardless of what the unknown half turns out to be. By contrast, \textbf{\texttt{TRUE AND UNKNOWN}} is \textbf{\texttt{UNKNOWN}}, because the outcome still hinges on the missing fact.
+  \item Symmetrically, \textbf{\texttt{TRUE OR UNKNOWN}} is \textbf{\texttt{TRUE}} (one \texttt{TRUE} suffices for \texttt{OR}), whereas \textbf{\texttt{FALSE OR UNKNOWN}} is \textbf{\texttt{UNKNOWN}}.
+\end{itemize}
+
+\begin{center}
+\begin{tabular}{cc|cccc|cccc}
+\toprule
+\multicolumn{2}{c|}{Negation} & \multicolumn{4}{c|}{\texttt{p AND q}} & \multicolumn{4}{c}{\texttt{p OR q}} \\
+$p$ & \texttt{NOT} $p$ & \texttt{AND} & \texttt{T} & \texttt{U} & \texttt{F} & \texttt{OR} & \texttt{T} & \texttt{U} & \texttt{F} \\
+\midrule
+\texttt{T} & \texttt{F} & \texttt{T} & \texttt{T} & \texttt{U} & \texttt{F} & \texttt{T} & \texttt{T} & \texttt{T} & \texttt{T} \\
+\texttt{U} & \texttt{U} & \texttt{U} & \texttt{U} & \texttt{U} & \texttt{F} & \texttt{U} & \texttt{T} & \texttt{U} & \texttt{U} \\
+\texttt{F} & \texttt{T} & \texttt{F} & \texttt{F} & \texttt{F} & \texttt{F} & \texttt{F} & \texttt{T} & \texttt{U} & \texttt{F} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Kleene's logic breaks the classical law of the excluded middle ($p \lor \neg p$): when \texttt{fee\_cents} is \texttt{NULL}, the tautology-looking filter
+\begin{lstlisting}[language=SQL]
+SELECT * FROM postings WHERE fee_cents = 100 OR fee_cents <> 100;
+\end{lstlisting}
+evaluates to \texttt{UNKNOWN OR UNKNOWN}, which is \texttt{UNKNOWN} --- and \texttt{WHERE} drops the row. To test for \texttt{NULL} explicitly, SQL provides two null-safe predicates that \emph{always} return two-valued \texttt{TRUE} or \texttt{FALSE} (never \texttt{UNKNOWN}):
+\begin{itemize}
+  \item \texttt{x IS NULL} and \texttt{x IS NOT NULL};
+  \item \texttt{x IS DISTINCT FROM y} and \texttt{x IS NOT DISTINCT FROM y}, which treat \texttt{NULL} as equal to \texttt{NULL} and distinct from every non-\texttt{NULL} value (\texttt{NULL IS NOT DISTINCT FROM NULL} evaluates to \texttt{TRUE}).
+\end{itemize}
+
+\begin{trapbox}
+\textbf{\texttt{WHERE} discards \texttt{UNKNOWN}, whereas \texttt{CHECK} constraints accept \texttt{UNKNOWN}.}
+This asymmetry catches experienced engineers off guard. In \texttt{WHERE} and \texttt{HAVING}, a row survives only if the predicate evaluates to \textbf{\texttt{TRUE}}. In a table \texttt{CHECK} constraint, however, the SQL standard specifies that a row is rejected only if the constraint evaluates to \textbf{\texttt{FALSE}}. Suppose you write:
+\begin{lstlisting}[language=SQL]
+CREATE TABLE transfers (
+  id           BIGINT PRIMARY KEY,
+  amount_cents BIGINT NOT NULL,
+  fee_cents    BIGINT,                  -- oops: forgot NOT NULL!
+  CHECK (fee_cents >= 0 AND fee_cents <= amount_cents)
+);
+\end{lstlisting}
+A negative fee is rejected as you would expect:
+\begin{lstlisting}
+INSERT INTO transfers VALUES (1, 5000, -10);
+ERROR:  new row for relation "transfers" violates check constraint "transfers_check"
+\end{lstlisting}
+But if a client inserts \texttt{(1, 5000, NULL)}, the expression \texttt{NULL >= 0 AND NULL <= 5000} evaluates to \texttt{UNKNOWN}. Because \texttt{UNKNOWN} is not \texttt{FALSE}, \textbf{PostgreSQL accepts the row}. Always mark constrained columns \texttt{NOT NULL} unless missingness is genuinely intended.
+\end{trapbox}
+
+\subsection{Why \texttt{NOT IN} returns nothing when the subquery contains \texttt{NULL}}
+
+The \texttt{AND} table explains a bug that reaches production regularly. Suppose you maintain a watchlist table \texttt{sanctioned\_watchlist} with columns \texttt{(id, acct\_id)}, where \texttt{acct\_id} is nullable because some entries come from external name-only feeds not yet matched to an internal account ID:
+\[
+  \texttt{sanctioned\_watchlist.acct\_id} \;=\; \{102,\; \text{\texttt{NULL}}\}.
+\]
+You want to list every clean account in \texttt{accounts} (\texttt{101}, \texttt{103}, \texttt{104}) that is \emph{not} on the watchlist. A developer writes:
+
+\begin{lstlisting}[language=SQL]
+-- BUG: returns zero rows whenever the subquery yields even one NULL
+SELECT a.id, a.owner
+  FROM accounts a
+ WHERE a.id NOT IN (SELECT w.acct_id FROM sanctioned_watchlist w);
+\end{lstlisting}
+
+What should this return? Accounts \texttt{101}, \texttt{103}, and \texttt{104}. What does PostgreSQL actually return? \textbf{Zero rows.}
+
+Let us expand SQL's definition of \texttt{IN} and \texttt{NOT IN} on Ada (\texttt{a.id = 101}) to see why:
+\begin{align*}
+  \texttt{101 IN (102, NULL)}
+    &\;\equiv\; (\texttt{101 = 102}) \;\texttt{OR}\; (\texttt{101 = NULL}) \\
+    &\;\equiv\; \texttt{FALSE} \;\texttt{OR}\; \texttt{UNKNOWN} \;=\; \texttt{UNKNOWN}.
+\end{align*}
+Now negate that expression with \texttt{NOT} (or equivalently apply De~Morgan's law):
+\begin{align*}
+  \texttt{101 NOT IN (102, NULL)}
+    &\;\equiv\; \texttt{NOT}\bigl(\texttt{101 IN (102, NULL)}\bigr) \;=\; \texttt{NOT UNKNOWN} \;=\; \texttt{UNKNOWN} \\
+    &\;\equiv\; (\texttt{101 <> 102}) \;\texttt{AND}\; (\texttt{101 <> NULL}) \\
+    &\;\equiv\; \texttt{TRUE} \;\texttt{AND}\; \texttt{UNKNOWN} \;=\; \texttt{UNKNOWN}.
+\end{align*}
+Because Stage~3 (\texttt{WHERE}) keeps \emph{only} \texttt{TRUE}, \texttt{UNKNOWN} eliminates Ada (\texttt{101}), Cara (\texttt{103}), and Dan (\texttt{104}). Meanwhile, for Ben (\texttt{102}), evaluating $(\texttt{102 <> 102}) \;\texttt{AND}\; (\texttt{102 <> NULL})$ yields $\texttt{FALSE AND UNKNOWN} = \texttt{FALSE}$, eliminating Ben too. A single \texttt{NULL} anywhere inside a 10-million-row \texttt{NOT IN} subquery empties the entire output set without warning.
+
+Now rewrite the exact same question using \texttt{NOT EXISTS}:
+
+\begin{lstlisting}[language=SQL]
+-- SAFE & IDIOMATIC ANTI-JOIN: immune to NULLs and plans as a true Hash/Index Anti-Join
+SELECT a.id, a.owner
+  FROM accounts a
+ WHERE NOT EXISTS (
+   SELECT 1
+     FROM sanctioned_watchlist w
+    WHERE w.acct_id = a.id
+ );
+\end{lstlisting}
+
+Trace Ada (\texttt{a.id = 101}) through \texttt{NOT EXISTS}:
+\begin{enumerate}
+  \item Inside the correlated subquery, \texttt{WHERE w.acct\_id = 101} tests \texttt{102 = 101} (\texttt{FALSE}, dropped) and \texttt{NULL = 101} (\texttt{UNKNOWN}, \emph{also dropped by the inner \texttt{WHERE}}).
+  \item The inner subquery therefore returns \textbf{zero rows}.
+  \item \texttt{EXISTS (empty set)} is a two-valued predicate that always returns boolean \texttt{FALSE} (never \texttt{UNKNOWN}).
+  \item In the outer \texttt{WHERE}, \texttt{NOT FALSE} evaluates to clean boolean \textbf{\texttt{TRUE}}, so Ada (\texttt{101}), Cara (\texttt{103}), and Dan (\texttt{104}) are all returned.
+\end{enumerate}
+
+Better still, PostgreSQL's query planner recognizes \texttt{NOT EXISTS} directly as the relational anti-join operator $A \triangleright P$ (\texttt{Hash Anti Join} or \texttt{Nested Loop Anti Join}), whereas \texttt{NOT IN} forces awkward null-tracking \texttt{hashed SubPlan} execution paths because of its weird \texttt{NULL} semantics. Make it a reflex: \textbf{never write \texttt{NOT IN (SELECT ...)}; always write \texttt{NOT EXISTS} (or \texttt{LEFT JOIN ... WHERE right.pk IS NULL})}.
+
+\begin{whybox}
+\textbf{Where SQL quietly switches from comparison equality to ``grouping equality.''} If \texttt{NULL = NULL} is \texttt{UNKNOWN}, what happens when two rows with \texttt{tier = NULL} hit \texttt{GROUP BY tier} or \texttt{SELECT DISTINCT tier}? If SQL used \texttt{WHERE} comparison rules, \texttt{NULL}s could never group together. Instead, the SQL standard defines a second notion --- \emph{grouping distinctness} (\texttt{IS NOT DISTINCT FROM}) --- for \texttt{GROUP BY}, \texttt{DISTINCT}, \texttt{UNION}, and window \texttt{PARTITION BY}: all \texttt{NULL}s land in a \textbf{single bucket}. Curiously, for \texttt{UNIQUE} indexes, standard SQL goes the opposite way: two \texttt{NULL}s are treated as distinct so a \texttt{UNIQUE(phone)} column allows multiple users without phone numbers (though PostgreSQL~15+ lets you override this via \texttt{UNIQUE NULLS NOT DISTINCT}). Finally, standard SQL aggregates (\texttt{SUM}, \texttt{AVG}, \texttt{MIN}, \texttt{MAX}, \texttt{COUNT(col)}) skip \texttt{NULL} inputs before folding --- with one classic edge case: \texttt{COUNT} of zero non-null values returns \texttt{0}, whereas \texttt{SUM} of zero non-null values returns \textbf{\texttt{NULL}} (wrap financial sums in \texttt{COALESCE(SUM(cents), 0)}).
+\end{whybox}
+
+\section{Window functions: aggregating without collapsing rows}
+\label{sec:ch01-windows}
+
+Suppose an auditor asks for a statement of Cara's postings (\texttt{acct\_id = 103}) showing each individual posting amount \emph{alongside the running account balance after that posting}, plus each posting's share of Cara's total volume.
+
+Look at why ordinary \texttt{GROUP BY} (Stage~4) hits a wall here: \texttt{GROUP BY acct\_id} crushes Cara's three posting rows into a single summary row, destroying the individual \texttt{pid}, \texttt{cents}, and \texttt{posted\_on} columns. Before SQL:2003 introduced window functions, engineers had to join \texttt{postings} back to a grouped subquery \emph{and} run a quadratic $\Oh(N^2)$ triangular self-join (\texttt{p2.pid <= p1.pid}) just to compute a running sum.
+
+In Java you would write the running balance as a loop over postings sorted by account and date, keeping a \texttt{long balance} that you reset to zero whenever \texttt{accountId} changes and that you add each posting to before printing the row. A window function is that loop written declaratively: \texttt{PARTITION BY} is the reset rule, \texttt{ORDER BY} is the sort, and the frame says which earlier rows feed the running total.
+
+\textbf{Window functions} (evaluated at Stage~6 of the logical pipeline) solve this in a single $\Oh(N \log N)$ sort pass (or $\Oh(N)$ streaming pass over an index). Every window call attaches an \texttt{OVER (...)} clause with three optional parts:
+
+\begin{lstlisting}[language=SQL]
+function_name(args) OVER (
+  PARTITION BY acct_id                                   -- 1. Independent sub-tables
+  ORDER BY posted_on ASC, pid ASC                        -- 2. Sort order inside partition
+  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW       -- 3. Sliding frame bounds
+)
+\end{lstlisting}
+
+\begin{enumerate}
+  \item \textbf{\texttt{PARTITION BY}}: Splits Stage~5's surviving rows into independent horizontal groups (just like \texttt{GROUP BY}), except \emph{zero rows are collapsed}. Window calculations never cross a partition boundary: Ada's running balance resets cleanly when the scan advances to Ben's partition.
+  \item \textbf{\texttt{ORDER BY}}: Defines the sequence of rows within each partition for ranking functions (\texttt{ROW\_NUMBER()}, \texttt{RANK()}, \texttt{DENSE\_RANK()}), offset navigation (\texttt{LAG(col, 1)}, \texttt{LEAD(col, 1)}), and cumulative frames.
+  \item \textbf{Frame specification (\texttt{ROWS}, \texttt{RANGE}, or \texttt{GROUPS})}: For each current row $r$, defines the exact sliding subset of rows inside $r$'s partition fed into the aggregate.
+\end{enumerate}
+
+\subsection{The silent \texttt{RANGE} versus \texttt{ROWS} trap on duplicate timestamps}
+
+The default frame produces a wrong running balance on Cara's postings (\texttt{pid = 4, 5, 6}) in our miniature dataset. Look back at Cara's three rows in $P$:
+\begin{itemize}
+  \item \texttt{pid = 4} on \texttt{2026-10-01}: $+15000$ cents;
+  \item \texttt{pid = 5} on \texttt{2026-10-03}: $-3000$ cents;
+  \item \texttt{pid = 6} on \texttt{2026-10-03}: $+2000$ cents.
+\end{itemize}
+Notice that postings \texttt{5} and \texttt{6} occurred on the \emph{exact same date} (\texttt{2026-10-03}). Now suppose an engineer writes a running balance query ordering only by \texttt{posted\_on}, omitting an explicit frame clause:
+
+\begin{lstlisting}[language=SQL]
+SELECT pid, posted_on, cents,
+       -- Subtle trap: omits ROWS/RANGE, so SQL defaults to RANGE!
+       SUM(cents) OVER (
+         PARTITION BY acct_id
+         ORDER BY posted_on
+       ) AS range_running_bal,
+       -- Explicit physical row-by-row running balance with deterministic tie-breaker:
+       SUM(cents) OVER (
+         PARTITION BY acct_id
+         ORDER BY posted_on, pid
+         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+       ) AS exact_running_bal
+  FROM postings
+ WHERE acct_id = 103
+ ORDER BY posted_on, pid;
+\end{lstlisting}
+
+What is SQL's default window frame when you omit the \texttt{ROWS/RANGE} clause?
+\begin{itemize}
+  \item If \texttt{OVER (...)} has \textbf{no \texttt{ORDER BY}}, the default frame spans the \textbf{entire partition} (\texttt{RANGE} from \texttt{UNBOUNDED PRECEDING} to \texttt{UNBOUNDED FOLLOWING}), so \texttt{SUM(cents) OVER (PARTITION BY acct\_id)} gives Cara's grand total ($14000$) on all three rows.
+  \item If \texttt{OVER (...)} \textbf{includes an \texttt{ORDER BY}}, the default frame silently switches to \texttt{RANGE} from \texttt{UNBOUNDED PRECEDING} to \texttt{CURRENT ROW}.
+\end{itemize}
+
+And what does \texttt{RANGE ... CURRENT ROW} mean? In \texttt{RANGE} mode, \texttt{CURRENT ROW} does \emph{not} stop at the physical row currently being visited; it includes \textbf{all peer rows tied on the \texttt{ORDER BY} key}. Because \texttt{pid = 5} and \texttt{pid = 6} tie on \texttt{posted\_on = '2026-10-03'}, \texttt{range\_running\_bal} sums $\{+15000, -3000, +2000\} = 14000$ for \emph{both} row~5 and row~6 --- Cara's intermediate balance of $12000$ after posting~5 completely disappears.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  >=Stealth,
+  font=\scriptsize,
+  cell/.style={draw=gray!65, fill=white, minimum height=0.64cm, font=\scriptsize\ttfamily, inner sep=3pt},
+  hdr/.style={draw=gray!75!black, fill=gray!15, minimum height=0.64cm, font=\scriptsize\bfseries, inner sep=3pt}
+]
+  % Column centers: pid(0.8), date(2.5), cents(4.4), RANGE(7.0), ROWS(10.0)
+  \node[hdr, minimum width=1.1cm] at (0.7, 2.7) {\texttt{pid}};
+  \node[hdr, minimum width=2.2cm] at (2.35, 2.7) {\texttt{posted\_on}};
+  \node[hdr, minimum width=1.6cm] at (4.25, 2.7) {\texttt{cents}};
+  \node[hdr, minimum width=2.7cm, fill=trapred!14, draw=trapred!75!black] at (6.65, 2.7) {Default \texttt{RANGE}};
+  \node[hdr, minimum width=2.8cm, fill=targetgreen!14, draw=targetgreen!75!black] at (9.65, 2.7) {Explicit \texttt{ROWS}};
+
+  % Row 1 (pid 4)
+  \node[cell, minimum width=1.1cm] at (0.7, 1.95) {4};
+  \node[cell, minimum width=2.2cm] at (2.35, 1.95) {2026-10-01};
+  \node[cell, minimum width=1.6cm] at (4.25, 1.95) {+15000};
+  \node[cell, minimum width=2.7cm] at (6.65, 1.95) {15000};
+  \node[cell, minimum width=2.8cm] at (9.65, 1.95) {15000};
+
+  % Row 2 (pid 5) -- highlight peer tie!
+  \node[cell, minimum width=1.1cm] at (0.7, 1.20) {5};
+  \node[cell, minimum width=2.2cm, fill=quotientorange!14] at (2.35, 1.20) {2026-10-03};
+  \node[cell, minimum width=1.6cm] at (4.25, 1.20) {-3000};
+  \node[cell, minimum width=2.7cm, fill=trapred!10, text=trapred!90!black] at (6.65, 1.20) {\textbf{14000} (skips 12000!)};
+  \node[cell, minimum width=2.8cm, fill=targetgreen!12, text=targetgreen!85!black] at (9.65, 1.20) {\textbf{12000} (4..5 only)};
+
+  % Row 3 (pid 6)
+  \node[cell, minimum width=1.1cm] at (0.7, 0.45) {6};
+  \node[cell, minimum width=2.2cm, fill=quotientorange!14] at (2.35, 0.45) {2026-10-03};
+  \node[cell, minimum width=1.6cm] at (4.25, 0.45) {+2000};
+  \node[cell, minimum width=2.7cm, fill=trapred!10] at (6.65, 0.45) {14000};
+  \node[cell, minimum width=2.8cm, fill=targetgreen!12] at (9.65, 0.45) {\textbf{14000} (4..6)};
+
+  % Brace explaining peer group on right
+  \draw[thick, decorate, decoration={brace, amplitude=4pt}, quotientorange!85!black]
+    (11.25, 1.50) -- (11.25, 0.15)
+    node[midway, right=5pt, font=\scriptsize, text width=2.4cm, text=quotientorange!90!black]
+    {Tied \texttt{posted\_on} peers merged by \texttt{RANGE}, separated by \texttt{ROWS}};
+\end{tikzpicture}
+\caption{Why explicit \texttt{ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW} plus a unique tie-breaker (\texttt{pid}) matters for financial running balances: default \texttt{RANGE} merges tied timestamps into a single peer step, hiding the intermediate balance of \texttt{12000} after posting \texttt{5}.}
+\label{ch01:fig-window-frames}
+\end{figure}
+
+\begin{trapbox}
+The exact same default-frame rule explains why \texttt{LAST\_VALUE(cents) OVER (PARTITION BY acct\_id ORDER BY pid)} surprises most people the first time they run it: instead of returning the final posting of the account, it returns \emph{each row's own \texttt{cents}}. Why? Because the default frame stops at \texttt{CURRENT ROW}, so the ``last value'' inside \texttt{UNBOUNDED PRECEDING .. CURRENT ROW} is always the current row itself. Whenever you use \texttt{LAST\_VALUE} (or \texttt{NTH\_VALUE}), widen the frame explicitly:
+\begin{lstlisting}[language=SQL]
+LAST_VALUE(cents) OVER (
+  PARTITION BY acct_id ORDER BY pid
+  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+)
+\end{lstlisting}
+\end{trapbox}
+
+\section{CTEs and fixpoint iteration with \texttt{WITH RECURSIVE}}
+\label{sec:ch01-ctes}
+
+Pure relational algebra ($\sigma, \pi, \times, \cup, -$) has a celebrated theoretical boundary proved by Alfred Aho and Jeffrey Ullman in 1979: \textbf{relational algebra cannot express transitive closure}. If a table \texttt{account\_hierarchy(id, parent\_id, name)} stores an arbitrarily deep tree of corporate sub-accounts (or a graph of wire-transfer hops between accounts), no fixed number of self-joins $H \bowtie H \bowtie \cdots \bowtie H$ can find all descendants when the depth is not known in advance.
+
+SQL bridges that expressiveness gap with \textbf{Common Table Expressions (CTEs)}, written with \texttt{WITH} for modular non-recursive subqueries and \texttt{WITH RECURSIVE} for iterative fixpoint computation.
+
+\subsection{Non-recursive \texttt{WITH}, planner inlining, and data-modifying CTEs}
+
+In ordinary queries, \texttt{WITH step1 AS (...), step2 AS (...) SELECT ...} lets you write complex pipelines top-to-bottom in the exact order you think about them, rather than burying subqueries four levels deep inside \texttt{FROM}.
+
+\begin{implementbox}
+\textbf{How PostgreSQL plans \texttt{WITH} (\texttt{MATERIALIZED} vs.\ inlined).} Before PostgreSQL~12, every CTE acted as a strict \emph{optimization fence}: PostgreSQL materialized the full CTE output into an in-memory/temp-file \texttt{Tuplestore} before running the outer query, preventing outer \texttt{WHERE} filters from pushing down inside the CTE. Starting in PostgreSQL~12, a non-recursive, side-effect-free CTE referenced at most once is \textbf{inlined automatically} into the outer query tree (just like a view) so predicates push straight down to indexes. When you \emph{want} single-evaluation materialization (for instance, calling an expensive function once and joining its result twice), write \texttt{WITH summary AS MATERIALIZED (...)}; to force pushdown even when referenced multiple times, write \texttt{WITH summary AS NOT MATERIALIZED (...)}.
+
+PostgreSQL also supports \textbf{data-modifying CTEs} (\texttt{INSERT}/\texttt{UPDATE}/\texttt{DELETE ... RETURNING} inside \texttt{WITH}), all executing atomically under a single statement snapshot --- ideal for moving archived rows from an active queue into an audit log in one round-trip:
+\begin{lstlisting}[language=SQL]
+WITH archived AS (
+  DELETE FROM outbox_events
+   WHERE processed_at < NOW() - INTERVAL '30 days'
+  RETURNING id, payload, processed_at
+)
+INSERT INTO outbox_events_archive (id, payload, processed_at)
+SELECT id, payload, processed_at FROM archived;
+\end{lstlisting}
+\end{implementbox}
+
+\subsection{How \texttt{WITH RECURSIVE} actually executes: two tables in a loop}
+
+The keyword \texttt{RECURSIVE} is slightly misleading to programmers trained in Java or C: PostgreSQL does \emph{not} push stack frames onto a call stack. Instead, PostgreSQL's \texttt{RecursiveUnion} executor node evaluates a \textbf{bottom-up breadth-first fixpoint loop} using two temporary buffers: a \textbf{Result Table} $R$ and a \textbf{Working Table} $W$. If you have written breadth-first search in Java~6 with an \texttt{ArrayDeque<Long>} frontier and a \texttt{HashSet<Long>} of visited nodes, you already know this loop: $W$ is the frontier, $R$ is everything found so far, and \texttt{UNION} (as opposed to \texttt{UNION ALL}) plays the role of the visited set.
+
+Every \texttt{WITH RECURSIVE} definition has the shape $B \;\texttt{UNION [ALL]}\; F(W)$, where $B$ is the non-recursive \emph{base query} (anchor) and $F(W)$ is the \emph{recursive step} referencing the CTE's own name:
+
+\begin{enumerate}
+  \item \textbf{Step 0 (Seed):} Evaluate the base query $B$ once. Copy its rows into both the Result Table $R$ and the Working Table $W$.
+  \item \textbf{Loop while $W$ is non-empty:}
+  \begin{enumerate}
+    \item Evaluate the recursive query $F(W)$, substituting the \emph{current Working Table $W$} (not all of $R$!) wherever the CTE's self-reference appears. Put the newly produced rows into an Intermediate Table $I$.
+    \item If the connector is \texttt{UNION} (rather than \texttt{UNION ALL}), discard from $I$ any row already present in $R$ (and deduplicate $I$ itself).
+    \item Append all surviving rows of $I$ to $R$, replace $W \gets I$, and repeat.
+  \end{enumerate}
+  \item \textbf{Terminate:} As soon as $W$ becomes empty ($I = \emptyset$), return $R$. Mathematically, $R = \bigcup_{k \ge 0} F^k(B)$ is the \emph{least fixpoint} of the monotone relational operator $T(X) = B \cup F(X)$.
+\end{enumerate}
+
+Let us trace a concrete four-node corporate ledger hierarchy starting from root treasury account \texttt{1} (\texttt{'Treasury'}), with children \texttt{10} (\texttt{'US Ops'}) and \texttt{20} (\texttt{'EU Ops'}), and grandchild \texttt{101} (\texttt{'US Payroll'} under \texttt{10}):
+
+\begin{lstlisting}[language=SQL]
+WITH RECURSIVE acct_tree AS (
+  -- Base term B: start at the root Treasury account
+  SELECT id, parent_id, name, 0 AS depth, ARRAY[id] AS path
+    FROM ledger_accounts
+   WHERE id = 1
+  UNION ALL
+  -- Iterative step F(W): join current Working Table W to child rows
+  SELECT c.id, c.parent_id, c.name, w.depth + 1, w.path || c.id
+    FROM acct_tree w
+    JOIN ledger_accounts c ON c.parent_id = w.id
+   WHERE NOT (c.id = ANY(w.path))   -- cycle guard!
+)
+SELECT id, depth, name, path FROM acct_tree ORDER BY path;
+\end{lstlisting}
+
+Watch the contents of $W$ and $R$ across each iteration:
+\begin{itemize}
+  \item \textbf{Iteration 0 (Base $B$):} $W_0 = \{(1, \text{\texttt{NULL}}, \text{\texttt{'Treasury'}}, 0, [1])\}$. $R = W_0$.
+  \item \textbf{Iteration 1 ($F(W_0)$):} Joining $W_0$ (\texttt{id = 1}) to \texttt{ledger\_accounts.parent\_id} finds children \texttt{10} and \texttt{20}. Now $W_1 = \{(10, \dots, 1, [1,10]),\; (20, \dots, 1, [1,20])\}$, and $R$ holds $\{1, 10, 20\}$.
+  \item \textbf{Iteration 2 ($F(W_1)$):} Joining $W_1$ (\texttt{10} and \texttt{20}) finds \texttt{101} under \texttt{10} and nothing under \texttt{20}. Now $W_2 = \{(101, \dots, 2, [1,10,101])\}$, and $R$ holds $\{1, 10, 20, 101\}$.
+  \item \textbf{Iteration 3 ($F(W_2)$):} Joining $W_2$ (\texttt{101}) finds zero children. $W_3 = \emptyset$, the loop halts, and PostgreSQL outputs all four rows of $R$!
+\end{itemize}
+
+Line~11, \texttt{WHERE NOT (c.id = ANY(w.path))}, is the cycle guard. What if corrupt upstream data accidentally set \texttt{parent\_id = 101} on root account \texttt{1}, creating a cycle $1 \to 10 \to 101 \to 1$? Without a cycle guard under \texttt{UNION ALL} (where \texttt{depth} increments every turn, making every row distinct even under \texttt{UNION}), $W_k$ would never empty. PostgreSQL does not detect this as an error: the query keeps appending rows to temporary files until \texttt{statement\_timeout} cancels it (\texttt{ERROR:\ \ canceling statement due to statement timeout}) or the disk fills. Tracking \texttt{ARRAY[id] AS path} --- or using PostgreSQL~14+'s built-in SQL standard clause \texttt{CYCLE id SET is\_cycle USING path} right after the \texttt{UNION ALL} body --- guarantees termination on arbitrary directed graphs.
+
+\begin{connectionbox}
+\textbf{How Rust's \texttt{SQLx} turns SQL's three-valued \texttt{NULL}s into compile-time types.} In the companion \emph{Programming Languages From the Ground Up} reader, we connect a Rust financial backend to PostgreSQL using \texttt{sqlx::query}. Rather than silently deserializing SQL \texttt{NULL} into a null pointer reference (Tony Hoare's ``billion-dollar mistake'' in Java~6), \texttt{SQLx} asks PostgreSQL's own query analyzer at \emph{Rust compile time} which output columns of your \texttt{SELECT} pipeline can ever be \texttt{NULL}. Non-null columns become plain \texttt{i64} or \texttt{String}; columns from the nullable right side of a \texttt{LEFT JOIN} or an unguarded \texttt{SUM(cents)} automatically become \texttt{Option<i64>}, forcing your Rust code to handle missingness before the binary will even compile.
+\end{connectionbox}
+
+\begin{labbox}
+Paste this self-contained session into \texttt{psql} to verify all three subtleties from this chapter --- \texttt{LEFT JOIN} filter placement, the \texttt{NOT IN} \texttt{NULL} wipeout versus \texttt{NOT EXISTS}, and \texttt{RANGE} versus \texttt{ROWS} window running balances --- on our exact miniature ledger:
+
+\begin{lstlisting}[language=SQL]
+CREATE TEMP TABLE accounts (id BIGINT PRIMARY KEY, owner TEXT NOT NULL, tier TEXT NOT NULL);
+CREATE TEMP TABLE postings (pid BIGINT PRIMARY KEY, acct_id BIGINT REFERENCES accounts(id),
+                            cents BIGINT NOT NULL, posted_on DATE NOT NULL);
+CREATE TEMP TABLE watchlist (id INT PRIMARY KEY, acct_id BIGINT);
+
+INSERT INTO accounts VALUES (101,'Ada','pro'), (102,'Ben','free'), (103,'Cara','pro'), (104,'Dan','pro');
+INSERT INTO postings VALUES
+  (1,101, 10000,'2026-10-01'), (2,101,-2500,'2026-10-02'), (3,102,4000,'2026-10-02'),
+  (4,103, 15000,'2026-10-01'), (5,103,-3000,'2026-10-03'), (6,103,2000,'2026-10-03');
+INSERT INTO watchlist VALUES (1, 102), (2, NULL);
+
+-- 1. Watch NOT IN return 0 rows while NOT EXISTS returns 101, 103, 104:
+SELECT id FROM accounts WHERE id NOT IN (SELECT acct_id FROM watchlist);
+SELECT id FROM accounts a WHERE NOT EXISTS (SELECT 1 FROM watchlist w WHERE w.acct_id = a.id);
+
+-- 2. Compare default RANGE (14000 on pid 5!) vs explicit ROWS (12000 then 14000):
+SELECT pid, posted_on, cents,
+       SUM(cents) OVER (PARTITION BY acct_id ORDER BY posted_on) AS range_bal,
+       SUM(cents) OVER (PARTITION BY acct_id ORDER BY posted_on, pid
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rows_bal
+  FROM postings WHERE acct_id = 103 ORDER BY posted_on, pid;
+\end{lstlisting}
+\end{labbox}
+
+\section{Exercises}
+\label{sec:ch01-exercises}
+
+\begin{exercise}[Bag multiplicities by hand]
+Suppose single-column bag $R$ contains $\texttt{'USD'} \times 3$, $\texttt{'EUR'} \times 2$, and $\texttt{'GBP'} \times 1$, while bag $S$ contains $\texttt{'USD'} \times 1$, $\texttt{'EUR'} \times 4$, and $\texttt{'JPY'} \times 2$. Compute the exact row count and per-currency multiplicity of: (a) \texttt{R UNION ALL S}, (b) \texttt{R UNION S}, (c) \texttt{R INTERSECT ALL S}, (d) \texttt{R EXCEPT ALL S}, and (e) \texttt{R EXCEPT S}.
+\end{exercise}
+
+\begin{exercise}[Relational algebra pushdown cost]
+Relation $A$ has $200{,}000$ account tuples (of which $5{,}000$ have \texttt{country = 'NG'}) and relation $P$ has $40{,}000{,}000$ posting tuples (of which $80{,}000$ occurred today, $2{,}000$ belonging to \texttt{'NG'} accounts). Count how many tuple pairs enter the join comparison in:
+\begin{align*}
+  \text{(a)}\quad &\sigma_{A.\texttt{country}=\texttt{'NG'} \;\land\; P.\texttt{day}=\texttt{today}}(A \times P), \\
+  \text{(b)}\quad &\bigl(\sigma_{\texttt{country}=\texttt{'NG'}}(A)\bigr) \;\bowtie_{A.\texttt{id}=P.\texttt{acct\_id}}\; \bigl(\sigma_{\texttt{day}=\texttt{today}}(P)\bigr),
+\end{align*}
+assuming the equi-join builds an in-memory hash table on the filtered $A$ rows and probes once per filtered $P$ row.
+\end{exercise}
+
+\begin{exercise}[Diagnosing the ten-stage pipeline]
+For each SQL query below over our \texttt{accounts} and \texttt{postings} tables, state whether PostgreSQL executes it or rejects it with an error; if rejected, identify the exact two stage numbers from Figure~\ref{ch01:fig-sql-pipeline} that are out of order, and rewrite the query cleanly:
+\begin{lstlisting}[language=SQL]
+-- (1)
+SELECT acct_id, COUNT(*) AS cnt FROM postings GROUP BY acct_id HAVING cnt >= 2;
+-- (2)
+SELECT pid, cents, LAG(cents) OVER (PARTITION BY acct_id ORDER BY pid) AS prev
+  FROM postings WHERE prev < 0;
+-- (3)
+SELECT DISTINCT acct_id FROM postings ORDER BY posted_on DESC;
+\end{lstlisting}
+\end{exercise}
+
+\begin{exercise}[Outer join predicate placement]
+Using our four-row \texttt{accounts} table $A$ and six-row \texttt{postings} table $P$, write down the exact set of rows returned by:
+\begin{lstlisting}[language=SQL]
+SELECT a.id, COUNT(*), COUNT(p.pid), COALESCE(SUM(p.cents), 0)
+  FROM accounts a
+  LEFT JOIN postings p ON p.acct_id = a.id AND p.cents < 0
+ GROUP BY a.id
+ ORDER BY a.id;
+\end{lstlisting}
+Explain why \texttt{COUNT(*)} and \texttt{COUNT(p.pid)} disagree on two of the four accounts.
+\end{exercise}
+
+\begin{exercise}[Three-valued truth table proof]
+In classical two-valued boolean algebra, De~Morgan's law $\neg(p \lor q) \equiv (\neg p) \land (\neg q)$ and the distributive law $p \land (q \lor r) \equiv (p \land q) \lor (p \land r)$ hold identically, as does $p \lor \neg p \equiv \texttt{TRUE}$. Check all three identities across Kleene's three-valued truth tables $\{\texttt{T}, \texttt{U}, \texttt{F}\}$: prove that De~Morgan's law and distributivity \emph{still hold identically} for every combination of $(\texttt{T}, \texttt{U}, \texttt{F})$, whereas $p \lor \neg p$ fails specifically when $p = \texttt{U}$.
+\end{exercise}
+
+\begin{exercise}[Designing a leak-proof \texttt{CHECK} constraint]
+A payments table \texttt{refunds} with columns \texttt{(id BIGINT PRIMARY KEY, charge\_cents BIGINT NOT NULL, refund\_cents BIGINT, reason\_code TEXT)} must enforce two business rules: (1) if \texttt{refund\_cents} is present, it must satisfy $0 < \texttt{refund\_cents} \le \texttt{charge\_cents}$ \emph{and} \texttt{reason\_code} must be non-\texttt{NULL}; (2) if \texttt{refund\_cents} is \texttt{NULL}, \texttt{reason\_code} must also be \texttt{NULL}. Write a single \texttt{CHECK (...)} expression that cannot be bypassed by \texttt{UNKNOWN}, and verify all four null/non-null combinations of \texttt{(refund\_cents, reason\_code)}.
+\end{exercise}
+
+\begin{exercise}[Sliding 7-day rolling volume vs.\ 7-row rolling volume]
+An account has postings on October~1 ($+100$), October~2 ($+200$), October~2 ($+50$), and October~10 ($+300$), with zero postings on October~3 through~9. Contrast what PostgreSQL computes on each of the four rows for:
+\begin{lstlisting}[language=SQL]
+-- Window 1: physical row count frame
+SUM(cents) OVER (ORDER BY posted_on, pid ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+-- Window 2: calendar interval range frame (PostgreSQL 11+!)
+SUM(cents) OVER (ORDER BY posted_on RANGE BETWEEN INTERVAL '7 days' PRECEDING AND CURRENT ROW)
+\end{lstlisting}
+When do you want \texttt{ROWS}, and when is \texttt{RANGE BETWEEN INTERVAL ...} genuinely the right tool?
+\end{exercise}
+
+\begin{exercise}[Tracing \texttt{WITH RECURSIVE} on a cyclic transfer graph]
+Suppose \texttt{wires(from\_acct, to\_acct)} contains edges $(1 \to 2)$, $(2 \to 3)$, $(3 \to 1)$, and $(2 \to 4)$. Trace the contents of the Working Table $W_k$ and Result Table $R_k$ at steps $k = 0, 1, 2, 3$ starting from \texttt{from\_acct = 1} for: (a) a query using \texttt{UNION} projecting only \texttt{to\_acct}, and (b) a query using \texttt{UNION ALL} projecting \texttt{(to\_acct, depth)} \emph{without} a cycle guard. Why does (a) terminate while (b) runs forever, and how does adding \texttt{CYCLE to\_acct SET is\_cycle USING path} stop (b) cleanly?
+\end{exercise}
+
+In this chapter we stayed deliberately above Codd's data-independence line: relations were sets and bags of abstract tuples, and PostgreSQL promised to evaluate our ten-stage pipeline faithfully. Now it is time to cross below that line, open \texttt{\$PGDATA/base} on an actual Linux filesystem, and look inside the 8,192-byte slotted pages and \texttt{shared\_buffers} frames where every tuple physically lives.
+
+\chapterline

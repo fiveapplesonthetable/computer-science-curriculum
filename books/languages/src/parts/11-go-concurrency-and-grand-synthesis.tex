@@ -1,0 +1,874 @@
+\chapter{Go and the Grand Language Synthesis: Memory, Types, and Concurrency Compared}
+\label{ch:go-grand-synthesis}
+
+Chapters~9 and~10 showed two very different ways to move past Java~6. TypeScript keeps JavaScript's runtime and adds a rich, set-theoretic type checker that disappears at compile time. Kotlin keeps the JVM and fixes the language on top of it: nullable types, sealed hierarchies, inline value classes, and compiler-generated coroutine state machines.
+
+Go answers a third question. In 2007, Robert Griesemer, Rob Pike, and Ken Thompson were writing large C++ and Java servers at Google, and three problems kept slowing them down: 45-minute C++ builds, deep class hierarchies that nobody could change safely, and thread-per-request servers that ran out of memory long before they ran out of CPU. They asked what a language would look like if it were designed for that environment from scratch: fast to compile, easy to read in a code review by someone who did not write it, and able to run a hundred thousand concurrent network connections in one process.
+
+The answer they shipped is deliberately small. Go has no classes, no inheritance, no exceptions, no operator overloading, and (until 2022) no generics. What it does have is a short list of carefully chosen mechanisms: flat value structs, slices, implicit interfaces, explicit error values, \texttt{defer}, a garbage collector tuned for low pause times, and a runtime scheduler that multiplexes millions of cheap \emph{goroutines} onto a handful of operating-system threads.
+
+This chapter has two halves. In the first half we take Go apart the same way we took Kotlin apart: for every construct, we look at what it costs in memory and what the runtime actually does. In the second half we step back and line up all eight languages in this book---Java~6, modern C++, Rust, TypeScript, Kotlin, Go, OCaml, and Haskell---across seven axes, so that you leave with one coherent map instead of eight separate mental models.
+
+\chapterline
+
+\section{Go's Design Trade-off: Values, Slices, Errors, and Fast Builds}
+\label{ch11:go-design-tradeoff}
+
+\begin{historybox}
+Go was sketched on a whiteboard at Google in September 2007, open-sourced in November 2009, and reached version 1.0 in March 2012 with a written compatibility promise: code that compiles under Go~1.0 should keep compiling under every later Go~1.x release. That promise has held for over a decade, which is part of why so much cloud infrastructure (Docker, Kubernetes, etcd, Prometheus, Terraform) is written in Go. The concurrency model comes from Tony Hoare's 1978 paper \emph{Communicating Sequential Processes} (CSP), by way of Pike's earlier languages Newsqueak and Limbo.
+\end{historybox}
+
+\subsection{Why Go Compiles So Fast}
+
+A Java~6 developer is used to \texttt{javac} being fast, because it only produces bytecode and leaves the heavy optimization to the JIT at runtime. A C++ developer is used to builds being slow, because every \texttt{\#include} pastes thousands of header lines into every translation unit, and templates are re-instantiated and re-optimized in each one.
+
+Go produces native machine code like C++, yet compiles large programs in seconds. Three design rules make that possible:
+\begin{enumerate}
+  \item \textbf{No header files and no textual inclusion.} When package \texttt{ledger} imports package \texttt{money}, the compiler reads a compact export-data summary of \texttt{money} that was written when \texttt{money} itself was compiled. It never re-parses \texttt{money}'s source.
+  \item \textbf{Unused imports are a compile error, and import cycles are forbidden.} The dependency graph is a DAG that the build tool can compile in parallel, bottom-up, with no wasted work.
+  \item \textbf{A simple grammar and a modest optimizer.} Go's compiler does inlining, escape analysis, and bounds-check elimination, but nothing like the whole-program template expansion and link-time optimization that dominate C++ and Rust release builds. Go knowingly gives up some peak performance in exchange for a tight edit-compile-test loop.
+\end{enumerate}
+
+\subsection{Flat Value Structs and Escape Analysis}
+
+Here is the first place where Go feels more like C than like Java~6. In Java~6, every \texttt{new Posting(...)} lives on the garbage-collected heap behind a 16-byte object header, and an \texttt{ArrayList<Posting>} is an array of pointers to scattered objects. In Go, a \texttt{struct} is a plain value: its fields are laid out contiguously, it has no header, and a slice of structs is one contiguous block of memory, exactly like a C array or a Rust \texttt{Vec<Posting>}.
+
+\begin{lstlisting}[language=Go]
+package ledger
+
+type Posting struct {
+    AccountID int64 // offset 0
+    Cents     int64 // offset 8
+}                   // sizeof(Posting) == 16 bytes, no header
+
+// []Posting with 1,000,000 elements = one 16 MB contiguous block.
+// Java 6 ArrayList<Posting> = 8 MB of pointers + 1,000,000 separate
+// 32-byte heap objects scattered across the heap.
+func TotalCents(ps []Posting) int64 {
+    var total int64
+    for i := range ps {
+        total += ps[i].Cents // sequential, cache-friendly loads
+    }
+    return total
+}
+\end{lstlisting}
+
+Go still has a garbage collector, though. So which values live on the stack, and which on the heap? You never write \texttt{new} versus stack allocation explicitly. Instead, the compiler runs \textbf{escape analysis}: for every variable, it asks whether any pointer to that variable can outlive the function call that created it. If not, the variable stays in the function's stack frame and costs nothing to free. If a pointer might escape (it is returned, stored in a heap object, captured by a goroutine, or converted to an interface whose lifetime the compiler cannot bound), the variable is moved to the heap.
+
+\begin{lstlisting}[language=Go]
+func sumFees(n int) int64 {
+    var total int64
+    for i := 0; i < n; i++ {
+        p := Posting{AccountID: int64(i), Cents: 150} // stays on the stack
+        total += p.Cents
+    }
+    return total
+}
+
+func newPosting(id int64) *Posting {
+    p := Posting{AccountID: id, Cents: 150}
+    return &p // pointer outlives the call: p is moved to the heap
+}
+
+// $ go build -gcflags=-m ./ledger
+// ./ledger.go:14:2: moved to heap: p
+\end{lstlisting}
+
+Look at \texttt{newPosting}. In C, returning \texttt{\&p} for a local \texttt{p} is the classic dangling-pointer bug. In Rust, the borrow checker rejects it at compile time (Chapter~4). In Go, it is perfectly safe: the compiler sees the escape and quietly allocates \texttt{p} on the heap instead. You get C's value layout when the compiler can prove it is safe and Java's heap safety when it cannot, with \texttt{-gcflags=-m} telling you which one you got.
+
+\begin{intuitionbox}
+Rust and Go both ask ``does this reference outlive its referent?'' at compile time. They do opposite things with the answer. Rust treats an escaping reference as a \emph{bug} and refuses to compile, which forces you to choose an owner (\texttt{Box}, \texttt{Arc}, a returned value). Go treats an escaping reference as a \emph{fact} and silently promotes the value to the garbage-collected heap. Rust's approach gives you full control and zero GC; Go's approach gives you simpler code and a GC that has to clean up afterwards.
+\end{intuitionbox}
+
+\subsection{Slices: A 24-Byte Header Over a Shared Backing Array}
+
+A Go slice \texttt{[]T} is not an object. It is a three-word value, 24 bytes on a 64-bit machine, that describes a window into some backing array:
+\begin{lstlisting}[language=Go]
+// What the runtime actually stores for a []T (runtime/slice.go):
+type slice struct {
+    array unsafe.Pointer // pointer to element 0 of the window
+    len   int            // number of elements you may index
+    cap   int            // elements available before reallocation
+}
+\end{lstlisting}
+That is the same three words as Rust's \texttt{Vec<T>} (pointer, length, capacity), and the same idea as Rust's \texttt{\&[T]} fat pointer with a capacity field added. Passing a slice to a function copies those 24 bytes, never the elements. Slicing an existing slice (\texttt{ps[2:5]}) creates a new header pointing into the same backing array, again without copying.
+
+The built-in \texttt{append(s, x)} writes \texttt{x} into slot \texttt{len} if \texttt{len < cap}, and returns a header with \texttt{len+1}. If the backing array is full, it allocates a larger array (roughly doubling for small slices, growing about 1.25$\times$ for large ones), copies the elements, and returns a header pointing at the new array. That rule creates the most common Go aliasing bug, shown in Figure~\ref{ch11:fig-slice-aliasing}:
+
+\begin{lstlisting}[language=Go]
+base := make([]int64, 3, 4) // len 3, cap 4: one free slot
+a := append(base, 100)      // fits in cap: writes slot 3 of SHARED array
+b := append(base, 200)      // also fits: overwrites the same slot 3!
+fmt.Println(a[3], b[3])     // prints "200 200", not "100 200"
+\end{lstlisting}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,
+  hdr/.style={draw=sourceblue!85,fill=sourceblue!8,rounded corners=2pt,thick,align=left,inner sep=3pt,font=\scriptsize},
+  cell/.style={draw=gray!70,fill=white,minimum width=1.05cm,minimum height=0.62cm,font=\scriptsize},
+  hot/.style={cell,draw=trapred!85,fill=trapred!12,very thick}]
+
+  % Backing array
+  \node[font=\bfseries\footnotesize] at (6.1, 1.35) {shared backing array (cap 4)};
+  \node[cell] (c0) at (4.5, 0.6) {0};
+  \node[cell,right=0pt of c0] (c1) {0};
+  \node[cell,right=0pt of c1] (c2) {0};
+  \node[hot,right=0pt of c2] (c3) {200};
+  \node[font=\tiny,text=gray] at (c0.south) [below=1pt] {[0]};
+  \node[font=\tiny,text=gray] at (c1.south) [below=1pt] {[1]};
+  \node[font=\tiny,text=gray] at (c2.south) [below=1pt] {[2]};
+  \node[font=\tiny,text=trapred] at (c3.south) [below=1pt] {[3]};
+
+  % Headers
+  \node[hdr] (hb) at (0, 1.4)  {\textbf{base}\\ \texttt{ptr, len=3, cap=4}};
+  \node[hdr] (ha) at (0, 0.2)  {\textbf{a}\\ \texttt{ptr, len=4, cap=4}};
+  \node[hdr] (hbb) at (0, -1.0) {\textbf{b}\\ \texttt{ptr, len=4, cap=4}};
+
+  \draw[->,thick,sourceblue!80!black] (hb.east) -- (c0.north west);
+  \draw[->,thick,sourceblue!80!black] (ha.east) -- (c0.west);
+  \draw[->,thick,sourceblue!80!black] (hbb.east) -- (c0.south west);
+
+  \node[align=left,font=\scriptsize,text=trapred!85!black] at (10.6, 0.6)
+    {\texttt{a := append(base, 100)}\\ wrote 100 into [3]\\ \texttt{b := append(base, 200)}\\ overwrote [3] with 200};
+\end{tikzpicture}
+\caption{Three slice headers, one backing array. Because \texttt{base} had spare capacity, both \texttt{append} calls wrote into the same slot~3, so \texttt{a[3]} and \texttt{b[3]} both read 200. Rust's borrow checker rejects the equivalent code, because two live mutable views of the same buffer violate aliasing-XOR-mutability.}
+\label{ch11:fig-slice-aliasing}
+\end{figure}
+
+\begin{trapbox}
+\textbf{Rule of thumb for slices you did not create:} if a function receives a slice and wants to append to it and keep the result separately, copy first (\texttt{out := append([]int64(nil), in...)}) or use a full slice expression \texttt{in[:len(in):len(in)]}, which caps the capacity so the next \texttt{append} is forced to reallocate. The Go race detector (\texttt{go test -race}) catches concurrent versions of this bug at runtime; nothing catches the single-goroutine version except careful reading.
+\end{trapbox}
+
+Strings get the same treatment: a Go \texttt{string} is a 16-byte (pointer, length) header over immutable bytes, exactly like Rust's \texttt{\&str}. Substring slicing \texttt{s[4:10]} is free and shares memory.
+
+\subsection{Errors Are Values, and \texttt{defer} Runs Cleanup}
+
+Go has no \texttt{try}/\texttt{catch}. A function that can fail returns an extra result of the built-in interface type \texttt{error}, and the caller checks it explicitly:
+
+\begin{lstlisting}[language=Go]
+var ErrInsufficientFunds = errors.New("insufficient funds")
+
+func PostBatch(db *sql.DB, batch []Posting) (err error) {
+    tx, err := db.Begin()
+    if err != nil {
+        return fmt.Errorf("begin tx: %w", err) // %w wraps, keeping the cause
+    }
+    // Deferred calls run when PostBatch returns, in LIFO order,
+    // whether it returns normally or with an error.
+    defer func() {
+        if err != nil {
+            _ = tx.Rollback()
+        }
+    }()
+
+    for _, p := range batch {
+        _, err = tx.Exec(
+            "INSERT INTO postings (account_id, cents) VALUES ($1, $2)",
+            p.AccountID, p.Cents)
+        if err != nil {
+            return fmt.Errorf("insert posting for account %d: %w", p.AccountID, err)
+        }
+    }
+    return tx.Commit()
+}
+
+// Caller inspects the chain of wrapped errors:
+if err := PostBatch(db, batch); errors.Is(err, ErrInsufficientFunds) {
+    // map to HTTP 422
+}
+\end{lstlisting}
+
+Compare this with the other error models we have seen. Java~6 checked exceptions force callers to acknowledge failure but make the failing path invisible at the call site (any line inside the \texttt{try} could have thrown). Rust's \texttt{Result<T, E>} plus \texttt{?} makes every failing call visible with one character and forces you to handle the error type. Go sits between them: every failing call is visible (\texttt{if err != nil}), but the compiler does not force you to look at \texttt{err}, and \texttt{error} is a single open interface type rather than a precise enum of failure cases. The \texttt{\%w} verb, \texttt{errors.Is}, and \texttt{errors.As} give you a linked chain of causes that you can query, which plays the role of Java's \texttt{getCause()}.
+
+\begin{trapbox}
+\textbf{The compiler errors you will see in your first hour of Go.} Go turns several things that are warnings elsewhere into hard errors, so that unused code never accumulates:
+\begin{lstlisting}[language=Plain]
+./ledger.go:4:2: "strings" imported and not used
+./ledger.go:9:2: declared and not used: total
+./ledger.go:15:1: missing return
+\end{lstlisting}
+What the compiler does \emph{not} reject is ignoring an error result: \texttt{tx.Exec(...)} on a line by itself compiles, and the error vanishes. Linters such as \texttt{errcheck} (included in \texttt{golangci-lint}) catch that; Rust's equivalent is the built-in \texttt{\#[must\_use]} warning on \texttt{Result}.
+\end{trapbox}
+
+Go does have \texttt{panic} and \texttt{recover}, which unwind the stack like an exception. By convention they are reserved for programmer bugs (index out of range, nil map write) and for a top-level safety net in HTTP servers, the same role Rust gives to \texttt{panic!}.
+
+\texttt{defer} deserves its own note. It is Go's answer to C++ RAII destructors and Java's \texttt{finally}: \texttt{defer f.Close()} schedules the call to run at function exit. Since Go~1.14, most \texttt{defer} statements are compiled ``open-coded'' straight into the function's exit paths, so they cost about as much as a direct call. Two details trip people up: the deferred call's \emph{arguments} are evaluated when the \texttt{defer} statement runs, not when the function exits; and \texttt{defer} is scoped to the function, not the block, so a \texttt{defer} inside a loop over ten thousand files keeps ten thousand files open until the function returns.
+
+\section{Implicit Interfaces: 16-Byte Fat Pointers and the Typed-Nil Trap}
+\label{ch11:interfaces-itab}
+
+In Chapter~9 we met structural typing in TypeScript, where it exists only at compile time. Go interfaces are also structural---a type satisfies an interface simply by having the right methods, with no \texttt{implements} clause---but unlike TypeScript, Go interfaces have a concrete runtime representation, and you need to understand it.
+
+\begin{lstlisting}[language=Go]
+type Notifier interface {
+    Notify(accountID int64, msg string) error
+}
+
+type EmailNotifier struct{ From string }
+
+// No "implements Notifier" anywhere. Having this method is enough.
+func (e *EmailNotifier) Notify(accountID int64, msg string) error {
+    return sendMail(e.From, accountID, msg)
+}
+
+var n Notifier = &EmailNotifier{From: "ledger@bank.example"}
+\end{lstlisting}
+
+This is how Go lets you define an interface in the package that \emph{consumes} it, after the fact, and have types from third-party packages satisfy it automatically---something Java~6 could never do, because Java needs the \texttt{implements} clause on the class declaration.
+
+\subsection{What an Interface Value Looks Like in Memory}
+
+A variable of a non-empty interface type like \texttt{Notifier} is a two-word value, 16 bytes on a 64-bit machine:
+\begin{lstlisting}[language=Go]
+// runtime/runtime2.go (simplified)
+type iface struct {
+    tab  *itab          // which concrete type, plus its method table
+    data unsafe.Pointer // pointer to the concrete value
+}
+
+type itab struct {
+    inter *interfacetype // the interface (Notifier)
+    _type *_type         // the concrete type (*EmailNotifier)
+    hash  uint32         // copy of _type.hash, used by type switches
+    _     [4]byte
+    fun   [1]uintptr     // method pointers; variable length, starts at offset 24
+}
+\end{lstlisting}
+
+Calling \texttt{n.Notify(42, "hi")} loads \texttt{n.tab}, loads the function pointer at \texttt{tab.fun[0]}, and calls it with \texttt{n.data} as the receiver. That is two dependent loads and an indirect call---the same cost as a C++ virtual call or a Rust \texttt{dyn Trait} call. In fact the layout is the same as Rust's \texttt{\&dyn Notifier}, which is also a (data pointer, vtable pointer) pair; Go just puts the type pointer first. When both the concrete type and the interface are known at compile time (as in the assignment to \texttt{n} above), the compiler emits the \texttt{itab} as a static read-only symbol. Only dynamic conversions---a type assertion to an interface type, or converting one interface to another---have to look up or build the \texttt{itab} at runtime, using a global cache keyed by the (interface, concrete type) pair.
+
+The empty interface \texttt{any} (spelled \texttt{interface\{\}} before Go~1.18) uses a slightly smaller header, \texttt{eface}, with a bare \texttt{\_type} pointer instead of an \texttt{itab}, since there are no methods to look up. Storing a non-pointer value larger than a machine word (such as a 16-byte \texttt{Posting}) in an interface usually copies it to the heap so that \texttt{data} has something to point at. That boxing is invisible in the source, and it is the main reason hot Go loops avoid \texttt{any}.
+
+\subsection{The Typed-Nil Interface Trap}
+
+Now we can explain a well-known Go bug. Read this function carefully:
+
+\begin{lstlisting}[language=Go]
+type LedgerError struct{ Code string }
+
+func (e *LedgerError) Error() string { return e.Code }
+
+func validate(cents int64) error {
+    var lerr *LedgerError // a nil *LedgerError pointer
+    if cents < 0 {
+        lerr = &LedgerError{Code: "NEGATIVE_AMOUNT"}
+    }
+    return lerr // BUG: converts a typed nil pointer to a non-nil error
+}
+
+func main() {
+    if err := validate(500); err != nil {
+        fmt.Println("rejected:", err) // runs, and prints "rejected: <nil>"
+    }
+}
+\end{lstlisting}
+
+The amount is positive, \texttt{lerr} is \texttt{nil}, and yet \texttt{err != nil} is true. Figure~\ref{ch11:fig-typed-nil} shows why. An interface value is \texttt{nil} only when \emph{both} words are zero. When \texttt{return lerr} converts the \texttt{*LedgerError} into an \texttt{error}, Go fills in \texttt{tab} with the \texttt{itab} for \texttt{(error, *LedgerError)}, because the static type of \texttt{lerr} is known, and copies the nil pointer into \texttt{data}. The result is an interface that says ``I hold a \texttt{*LedgerError}, and that pointer happens to be nil.'' The comparison \texttt{err != nil} compares against an interface with both words zero, so it reports \emph{not equal}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,
+  word/.style={draw,thick,minimum width=3.1cm,minimum height=0.66cm,font=\scriptsize,align=center},
+  zero/.style={word,draw=targetgreen!80!black,fill=targetgreen!9},
+  set/.style={word,draw=trapred!85,fill=trapred!10},
+  itab/.style={draw=structurepurple!85,fill=structurepurple!9,rounded corners=3pt,thick,align=left,font=\scriptsize,inner sep=4pt}]
+
+  % Left: true nil
+  \node[font=\bfseries\footnotesize,text=targetgreen!75!black] at (1.55, 2.3) {\texttt{var err error = nil}};
+  \node[zero] (l1) at (1.55, 1.45) {\texttt{tab  = 0x0}};
+  \node[zero,below=0pt of l1] (l2) {\texttt{data = 0x0}};
+  \node[font=\scriptsize,text=targetgreen!75!black,align=center] at (1.55, -0.35) {both words zero\\ \texttt{err == nil} is \textbf{true}};
+
+  % Right: typed nil
+  \node[font=\bfseries\footnotesize,text=trapred!85!black] at (7.3, 2.3) {\texttt{return lerr} \ (\texttt{lerr} is a nil \texttt{*LedgerError})};
+  \node[set] (r1) at (6.2, 1.45) {\texttt{tab  = \&itab}};
+  \node[zero,below=0pt of r1] (r2) {\texttt{data = 0x0}};
+  \node[font=\scriptsize,text=trapred!85!black,align=center] at (6.2, -0.35) {\texttt{tab} is set\\ \texttt{err == nil} is \textbf{false}};
+
+  \node[itab] (it) at (11.4, 1.15)
+    {\textbf{itab}\\ \texttt{inter: error}\\ \texttt{\_type: *LedgerError}\\ \texttt{fun[0]: (*LedgerError).Error}};
+  \draw[->,thick,structurepurple!85] (r1.east) -- (it.west |- r1.east);
+\end{tikzpicture}
+\caption{The typed-nil trap. A Go interface value is a (\texttt{tab}, \texttt{data}) pair, and it equals \texttt{nil} only when both words are zero. Converting a nil \texttt{*LedgerError} to \texttt{error} fills in \texttt{tab}, so the result is a non-nil interface holding a nil pointer.}
+\label{ch11:fig-typed-nil}
+\end{figure}
+
+The compiler accepts this code. The \texttt{staticcheck} linter flags some forms of it (check SA4023, ``impossible comparison of interface value with untyped nil''), but the reliable fix is a habit: functions that return \texttt{error} should return the literal \texttt{nil} on success, never a typed pointer variable that might be nil.
+\begin{lstlisting}[language=Go]
+func validate(cents int64) error {
+    if cents < 0 {
+        return &LedgerError{Code: "NEGATIVE_AMOUNT"}
+    }
+    return nil // untyped nil: both interface words are zero
+}
+\end{lstlisting}
+
+\begin{connectionbox}
+Compare the same situation in the other languages. In Rust, a function returning \texttt{Result<(), LedgerError>} cannot accidentally return ``an error that is not there'': \texttt{Ok(())} and \texttt{Err(e)} are different enum variants. In Kotlin, \texttt{LedgerError?} is one nullable reference with no hidden type word. In TypeScript, interfaces are erased, so there is nothing to fill in. Go's trap exists because its interfaces are structural \emph{and} carry a runtime type word, and because \texttt{nil} is allowed for both pointers and interfaces.
+\end{connectionbox}
+
+\subsection{No Sum Types: Interfaces Plus Type Switches}
+
+Go has no \texttt{enum} with payloads, no \texttt{sealed} keyword, and no exhaustive \texttt{match}. The idiomatic substitute is an interface with an unexported marker method (so only types in the same package can satisfy it) plus a \texttt{type switch}:
+
+\begin{lstlisting}[language=Go]
+type AuthOutcome interface{ isAuthOutcome() }
+
+type Approved struct{ AuthCode string; Cents int64 }
+type Declined struct{ Reason string }
+
+func (Approved) isAuthOutcome() {}
+func (Declined) isAuthOutcome() {}
+
+func HTTPStatus(o AuthOutcome) int {
+    switch v := o.(type) { // compares o's type word against each case
+    case Approved:
+        _ = v.AuthCode
+        return 200
+    case Declined:
+        return 422
+    default:
+        panic("unhandled AuthOutcome") // compiler cannot prove exhaustiveness
+    }
+}
+\end{lstlisting}
+
+The \texttt{default: panic(...)} line is the giveaway. Kotlin's \texttt{sealed interface} and Rust's \texttt{enum} let the compiler reject a \texttt{when} or \texttt{match} that forgets a variant. Go cannot, so teams that rely on this pattern add a linter (such as \texttt{exhaustive} or \texttt{go-sumtype}) to their CI.
+
+\subsection{Generics Since Go 1.18: GC-Shape Stenciling}
+
+Go added type parameters in Go~1.18 (2022). The syntax is familiar:
+\begin{lstlisting}[language=Go]
+type Number interface{ ~int64 | ~float64 }
+
+type Cents int64 // ~int64 means "any type whose underlying type is int64"
+
+func Sum[T Number](xs []T) T {
+    var total T
+    for _, x := range xs {
+        total += x
+    }
+    return total
+}
+
+var fees = []Cents{150, 250, 99}
+var total = Sum(fees) // T = Cents
+\end{lstlisting}
+
+The implementation is a deliberate middle ground between Java's erasure and Rust's monomorphization. The Go compiler generates one copy of \texttt{Sum} per \emph{GC shape}: all type arguments with the same size, alignment, and pointer layout share one compiled body. So \texttt{Sum[int64]} and \texttt{Sum[Cents]} share code, and every pointer type (\texttt{*Account}, \texttt{*Posting}) shares one body too. Where the shared body needs type-specific behaviour (calling a method, or comparing values), it receives a hidden \emph{dictionary} argument with the necessary function pointers, much like Haskell's type-class dictionaries. The result: compile times and binary sizes stay close to non-generic Go, at the cost of an extra indirection in some generic calls that Rust or C++ would have specialized away.
+
+\section{Go's M:N Runtime Scheduler: Goroutines, Channels, and Context}
+\label{ch11:gmp-scheduler}
+
+\subsection{Goroutines: 2 KB Stacks That Grow by Copying}
+
+Writing \texttt{go settle(id)} starts a new goroutine. It looks like Java~6's \texttt{new Thread(r).start()}, but the cost is completely different. Let us redo the arithmetic from Chapter~10 for one hundred thousand concurrent requests:
+
+\begin{itemize}
+  \item \textbf{Java~6 threads:} each \texttt{java.lang.Thread} is a kernel thread with a fixed stack reservation of about 1~MB. $100{,}000 \times 1\text{ MB} \approx 100\text{ GB}$ of reserved stack address space. Long before that, the process hits the operating system's per-process thread limit and thread creation fails.
+  \item \textbf{Go goroutines:} each goroutine starts with a \textbf{2~KB} stack plus a few hundred bytes of runtime bookkeeping (the \texttt{g} struct). $100{,}000 \times 2\text{ KB} \approx 200\text{ MB}$, and most real goroutines that just wait on a socket never grow beyond that.
+\end{itemize}
+
+How can a stack start at 2~KB without overflowing on the first deep call chain? Every Go function begins with a short prologue that compares the stack pointer against a guard value stored in the goroutine's \texttt{g} struct. If the next frame would not fit, the prologue calls \texttt{runtime.morestack}, which allocates a new stack twice the size, copies the old stack into it, fixes up every pointer that points into the old stack, and resumes. Stacks can grow to 1~GB on 64-bit systems.
+
+That copy step is only possible because of a guarantee Go's design maintains everywhere: the runtime knows the exact location of every pointer into a goroutine's stack, and escape analysis guarantees that no heap object ever points into a stack. Rust cannot do this. Rust references can point anywhere on the stack, raw pointers can be cast to integers, and there is no runtime to fix them up---which is a big part of why Rust removed its green-thread runtime before 1.0 (in 2014) and later chose stackless \texttt{async} state machines instead (Chapter~12).
+
+\subsection{The G-M-P Model}
+
+The Go runtime schedules goroutines with three kinds of objects:
+\begin{itemize}
+  \item \textbf{G (goroutine):} a stack, an instruction pointer, and status. Millions can exist.
+  \item \textbf{M (machine):} an operating-system thread. The runtime creates them as needed.
+  \item \textbf{P (processor):} a scheduling context with a local run queue of up to 256 runnable Gs. There are exactly \texttt{GOMAXPROCS} Ps, which defaults to the number of CPU cores. An M must hold a P to run Go code.
+\end{itemize}
+
+Figure~\ref{ch11:fig-gmp} shows how they fit together. Each M takes its P's local queue and runs Gs one after another. When a P's queue runs dry, its M first checks the global run queue, then the network poller, and then \emph{steals half} of another P's queue. Every 61st scheduling decision, a P also checks the global queue first so that goroutines parked there cannot starve.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,
+  pbox/.style={draw=sourceblue!85,fill=sourceblue!8,rounded corners=3pt,thick,minimum width=1.25cm,minimum height=0.7cm,font=\scriptsize\bfseries},
+  mbox/.style={draw=quotientorange!90,fill=quotientorange!10,rounded corners=3pt,thick,minimum width=1.25cm,minimum height=0.7cm,font=\scriptsize\bfseries},
+  gq/.style={draw=targetgreen!80!black,fill=targetgreen!12,circle,minimum size=0.48cm,inner sep=0pt,font=\tiny},
+  grun/.style={gq,fill=targetgreen!45,very thick},
+  side/.style={draw=structurepurple!85,fill=structurepurple!9,rounded corners=3pt,thick,align=center,font=\scriptsize,inner sep=4pt},
+  core/.style={draw=gray!70,fill=gray!10,rounded corners=2pt,minimum width=1.25cm,minimum height=0.55cm,font=\scriptsize}]
+
+  % Three P columns
+  \foreach \x/\i in {0/0, 3.4/1, 6.8/2} {
+    \node[core] (cpu\i) at (\x, 3.6) {CPU \i};
+    \node[mbox] (m\i) at (\x, 2.7) {M\i};
+    \node[pbox] (p\i) at (\x, 1.8) {P\i};
+    \draw[thick,gray!60] (cpu\i) -- (m\i);
+    \draw[thick,gray!60] (m\i) -- (p\i);
+  }
+  % Running Gs next to Ms
+  \node[grun,right=4pt of m0] {G1};
+  \node[grun,right=4pt of m1] {G5};
+  \node[grun,right=4pt of m2] {G9};
+
+  % Local run queues
+  \node[gq] (q00) at (-0.45, 0.95) {G2};
+  \node[gq] (q01) at (0.05, 0.95) {G3};
+  \node[gq] (q02) at (0.55, 0.95) {G4};
+  \node[gq] (q10) at (3.4, 0.95) {G6};
+  \node[font=\scriptsize,text=gray] at (6.8, 0.95) {(empty)};
+  \node[font=\tiny,text=gray] at (0.05, 0.5) {local queue};
+  \node[font=\tiny,text=gray] at (3.4, 0.5) {local queue};
+
+  % Steal arrow
+  \draw[->,thick,dashed,trapred!80] (q02.south) .. controls (2.5,-0.2) and (5.4,-0.2) .. node[below,font=\scriptsize,text=trapred!80!black]{P2 steals half of P0's queue} (6.6, 0.75);
+
+  % Global queue and netpoller
+  \node[side] (glob) at (11.0, 2.9) {\textbf{global run queue}\\ checked every 61 ticks};
+  \node[side] (net) at (11.0, 1.55) {\textbf{netpoller}\\ epoll / kqueue\\ parked Gs: G20 \dots G99k};
+  \node[side,draw=trapred!80,fill=trapred!8] (sys) at (11.0, 0.1) {\textbf{M3 in syscall}\\ P handed to a new M};
+\end{tikzpicture}
+\caption{The G-M-P scheduler with \texttt{GOMAXPROCS=3}. Each OS thread (M) holds one P and runs goroutines (G) from that P's local queue. Idle Ps steal work from busy ones. Goroutines blocked on network I/O wait in the netpoller and cost no thread; a thread blocked in a system call gives up its P so the other goroutines keep running.}
+\label{ch11:fig-gmp}
+\end{figure}
+
+Three more mechanisms complete the picture:
+\begin{enumerate}
+  \item \textbf{Network I/O never blocks a thread.} When a goroutine calls \texttt{conn.Read} and no data is ready, the runtime registers the socket with the operating system's \texttt{epoll} (Linux) or \texttt{kqueue} (macOS/BSD), parks the goroutine, and the M picks another G. When data arrives, the netpoller marks the goroutine runnable again. You write blocking-style code; the runtime does the event loop for you.
+  \item \textbf{Blocking system calls hand off the P.} File I/O and cgo calls really do block the OS thread. When that happens, a background monitor thread (\texttt{sysmon}) notices after about 20~microseconds and hands the P to another M, so the remaining goroutines keep running on all cores.
+  \item \textbf{Preemption.} Since Go~1.14, \texttt{sysmon} sends a signal to any goroutine that has run for more than about 10~ms without yielding, forcing it to stop at the next safe point. A tight CPU loop can no longer freeze a P, which is a real difference from Kotlin coroutines, where a loop without suspension points ignores cancellation and holds its thread.
+\end{enumerate}
+
+\begin{focusbox}
+\textbf{No function coloring.} In TypeScript, Kotlin, and Rust, a function that waits on I/O must be marked (\texttt{async}, \texttt{suspend}, \texttt{async fn}), and only marked functions can call other marked functions directly. This splits every codebase into two ``colors.'' Go has one color. Every function can block, because blocking just parks a goroutine with its whole stack. The price is a runtime that owns your threads and a stack per goroutine; the payoff is that a library written in plain synchronous style works unchanged inside a server handling a hundred thousand connections.
+\end{focusbox}
+
+\subsection{Channels and \texttt{select}: Communicating Sequential Processes}
+
+Go's motto is ``Do not communicate by sharing memory; instead, share memory by communicating.'' A channel \texttt{chan T} is a typed, thread-safe queue. Internally it is a heap object (\texttt{runtime.hchan}) containing a circular buffer, send and receive indices, a lock, and two wait queues of parked goroutines.
+
+\begin{itemize}
+  \item \textbf{Unbuffered channel} (\texttt{make(chan T)}): a send blocks until a receiver takes the value. The two goroutines meet at that point, so the send also acts as a synchronization point. If every goroutine in the program ends up blocked on a channel, the runtime detects it and exits with \texttt{fatal error: all goroutines are asleep - deadlock!}. (It only detects the case where \emph{all} goroutines are stuck; a partial deadlock in a server just looks like a hang.)
+  \item \textbf{Buffered channel} (\texttt{make(chan T, 64)}): a send blocks only when the buffer is full; a receive blocks only when it is empty. The buffer size is a built-in backpressure limit.
+  \item \textbf{Closing:} \texttt{close(ch)} tells receivers that no more values are coming. Receiving from a closed, drained channel returns the zero value immediately, and \texttt{v, ok := <-ch} reports \texttt{ok == false}. Sending on a closed channel panics, so by convention only the sender closes.
+  \item \textbf{nil channels block forever}, which sounds useless until you use it in \texttt{select} to switch off a case dynamically.
+\end{itemize}
+
+The \texttt{select} statement waits on several channel operations at once and runs whichever becomes ready first. If several are ready, it picks one \emph{uniformly at random}, so no case can be starved:
+
+\begin{lstlisting}[language=Go]
+func bestQuote(ctx context.Context, primary, backup <-chan Quote) (Quote, error) {
+    timeout := time.NewTimer(150 * time.Millisecond)
+    defer timeout.Stop()
+    select {
+    case q := <-primary:
+        return q, nil
+    case q := <-backup:
+        return q, nil
+    case <-timeout.C:
+        return Quote{}, errors.New("fx quote timed out")
+    case <-ctx.Done(): // caller gave up (client disconnected, deadline hit)
+        return Quote{}, ctx.Err()
+    }
+}
+\end{lstlisting}
+
+Channels are not always the right tool. For protecting a small piece of shared state (a balance map, a counter), a mutex is simpler and faster:
+
+\begin{lstlisting}[language=Go]
+type Ledger struct {
+    mu       sync.Mutex
+    balances map[int64]int64 // guarded by mu (by convention only!)
+}
+
+func (l *Ledger) Transfer(from, to, cents int64) error {
+    l.mu.Lock()
+    defer l.mu.Unlock()
+    if l.balances[from] < cents {
+        return ErrInsufficientFunds
+    }
+    l.balances[from] -= cents
+    l.balances[to] += cents
+    return nil
+}
+\end{lstlisting}
+
+Note the comment on \texttt{balances}: ``guarded by \texttt{mu}, by convention only.'' Nothing stops another method from reading \texttt{l.balances} without taking the lock. This is the same detached-lock design as Java~6's \texttt{synchronized}, and it is exactly what Rust's \texttt{Mutex<HashMap<i64, i64>>} prevents (Chapter~3): in Rust the map lives \emph{inside} the mutex, and the only way to reach it is through the guard returned by \texttt{lock()}.
+
+\begin{trapbox}
+\textbf{Data races in Go are not just logic bugs.} Go is memory-safe in single-goroutine code, but a data race on a multi-word value can corrupt memory. If one goroutine writes an interface variable (two words: \texttt{tab} and \texttt{data}) while another reads it, the reader can see the new \texttt{tab} with the old \texttt{data}, and then call a method of one type on the bytes of another. The same applies to slice headers (three words) and maps (concurrent map writes crash the process with a fatal error). Rust rules out these races at compile time through the \texttt{Send} and \texttt{Sync} traits; Go relies on the race detector (\texttt{go test -race}) and code review. Run your tests with \texttt{-race} in CI.
+\end{trapbox}
+
+\subsection{\texttt{context.Context}: Cancellation Down a Tree of Goroutines}
+
+In Chapter~10 we saw Kotlin's structured concurrency: every coroutine has a parent \texttt{Job}, and cancelling the parent cancels the children. Go has no built-in parent-child relation between goroutines. A goroutine started with \texttt{go f()} runs until \texttt{f} returns, and nothing else can stop it. Go achieves the same discipline by convention, with \texttt{context.Context} passed as the first argument to every function that does I/O or might take a while:
+
+\begin{lstlisting}[language=Go]
+func SettleAll(ctx context.Context, ids []int64, workers int) error {
+    ctx, cancel := context.WithCancel(ctx) // child context
+    defer cancel()                         // always release it
+
+    jobs := make(chan int64)
+    errc := make(chan error, workers) // each worker sends at most one error
+    var wg sync.WaitGroup
+
+    for w := 0; w < workers; w++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            for id := range jobs { // loop ends when jobs is closed
+                if err := settleOne(ctx, id); err != nil {
+                    errc <- err
+                    cancel() // tell the producer and other workers to stop
+                    return
+                }
+            }
+        }()
+    }
+
+    go func() { // producer
+        defer close(jobs)
+        for _, id := range ids {
+            select {
+            case jobs <- id:
+            case <-ctx.Done():
+                return
+            }
+        }
+    }()
+
+    wg.Wait()
+    close(errc)
+    return <-errc // first error, or nil if the channel is empty
+}
+\end{lstlisting}
+
+A \texttt{Context} carries a \texttt{Done()} channel that is closed when the context is cancelled or its deadline passes. Contexts form a tree: \texttt{WithCancel}, \texttt{WithTimeout}, and \texttt{WithDeadline} create children, and cancelling a parent closes every descendant's \texttt{Done()} channel. Every well-behaved blocking call (\texttt{http.Client}, \texttt{database/sql}, gRPC) takes a context and returns early with \texttt{ctx.Err()} when it fires.
+
+The difference from Kotlin is enforcement. In Kotlin, \texttt{coroutineScope} cannot return while a child is still running, so leaks are structurally impossible. In Go, if you forget to pass \texttt{ctx} down, or start a goroutine that never checks \texttt{ctx.Done()}, it keeps running after its caller has returned: a \emph{goroutine leak}. The \texttt{golang.org/x/sync/errgroup} package packages the pattern above (start goroutines, cancel all on first error, wait for all) into a few lines, and it is the closest Go equivalent of Kotlin's \texttt{coroutineScope}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,
+  col/.style={draw,rounded corners=3pt,thick,align=center,font=\scriptsize,inner sep=3pt,minimum width=2.65cm},
+  lbl/.style={font=\bfseries\footnotesize,align=center}]
+
+  % baseline
+  \draw[thick,gray!60] (-0.2, 0) -- (14.4, 0);
+
+  % Java 6 thread: tall
+  \node[col,draw=trapred!85,fill=trapred!10,minimum height=3.4cm,anchor=south] (j) at (1.25, 0)
+    {\textbf{1 MB}\\ fixed stack\\ per OS thread\\[2pt] kernel schedules\\ $\sim$2--3 $\mu$s switch};
+  \node[lbl,text=trapred!85!black,anchor=north] at (1.25, -0.1) {Java 6 thread};
+
+  % Go goroutine
+  \node[col,draw=sourceblue!85,fill=sourceblue!8,minimum height=1.9cm,anchor=south] (g) at (4.15, 0)
+    {\textbf{2 KB} start\\ stack grows\\ by copying\\[2pt] Go runtime (M:N)};
+  \node[lbl,text=sourceblue!85!black,anchor=north] at (4.15, -0.1) {Go goroutine};
+
+  % Kotlin coroutine
+  \node[col,draw=structurepurple!85,fill=structurepurple!9,minimum height=1.35cm,anchor=south] (k) at (7.05, 0)
+    {heap object per\\ suspended frame\\ (tens of bytes)};
+  \node[lbl,text=structurepurple!85!black,anchor=north] at (7.05, -0.1) {Kotlin coroutine};
+
+  % Rust future
+  \node[col,draw=targetgreen!80!black,fill=targetgreen!10,minimum height=1.0cm,anchor=south] (r) at (9.95, 0)
+    {one flat struct,\\ size fixed at build};
+  \node[lbl,text=targetgreen!75!black,anchor=north] at (9.95, -0.1) {Rust \texttt{Future}};
+
+  % Node event loop
+  \node[col,draw=quotientorange!90,fill=quotientorange!10,minimum height=1.35cm,anchor=south] (n) at (12.85, 0)
+    {one JS thread;\\ pending work =\\ Promise + closure};
+  \node[lbl,text=quotientorange!85!black,anchor=north] at (12.85, -0.1) {Node / TypeScript};
+
+  \node[font=\scriptsize,text=gray!75!black,align=left,anchor=west] at (2.7, 3.15)
+    {memory held by one task waiting on a socket (not to scale)};
+  \draw[->,thick,gray!60] (2.6, 2.95) -- (13.8, 2.95) node[midway,below,font=\tiny,text=gray]{stackful \hspace{4.5cm} stackless};
+\end{tikzpicture}
+\caption{What one waiting task costs in each concurrency model. Java~6 pays for a full kernel thread stack. Go keeps a small growable stack per goroutine, so any function can block without being marked. Kotlin and Rust compile waiting functions into state machines that keep only live variables; Node runs all JavaScript on one thread and stores pending work as promise callbacks.}
+\label{ch11:fig-concurrency-spectrum}
+\end{figure}
+
+\section{The Grand Synthesis: Eight Languages on Seven Axes}
+\label{ch11:grand-synthesis}
+
+We have now looked inside eight languages. This section lines them up so you can compare them directly. The goal is not to pick a winner; each language is a set of trade-offs that made sense for the problems its designers had. The goal is that when you meet a new codebase in any of them, you can predict where its bugs and its costs will come from.
+
+\subsection{One Task, Five Languages}
+
+Start with one concrete task that every backend does: load an account, and \emph{in parallel} fetch its fraud-risk score and a currency rate. If either fetch fails, cancel the other and return the error. Here is the same task in five of our languages, from Java~6 to Rust.
+
+\begin{lstlisting}[language=Java]
+// Java 6: thread pool + Future. No structured cancellation.
+ExecutorService pool = Executors.newFixedThreadPool(16);
+Future<Integer> risk = pool.submit(new Callable<Integer>() {
+    public Integer call() throws Exception { return fetchRisk(accountId); }
+});
+Future<BigDecimal> fx = pool.submit(new Callable<BigDecimal>() {
+    public BigDecimal call() throws Exception { return fetchFx("USD", "EUR"); }
+});
+try {
+    return new Enriched(fetchAccount(accountId), risk.get(), fx.get());
+} catch (ExecutionException e) {
+    risk.cancel(true); // you must remember to cancel the sibling yourself
+    fx.cancel(true);
+    throw e;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=TypeScript]
+// TypeScript: Promise.all fails fast but does NOT cancel the other request.
+const ctrl = new AbortController();
+try {
+  const [account, risk, fx] = await Promise.all([
+    fetchAccount(accountId, ctrl.signal),
+    fetchRisk(accountId, ctrl.signal),
+    fetchFx('USD', 'EUR', ctrl.signal),
+  ]);
+  return { account, risk, fx };
+} catch (e: unknown) {
+  ctrl.abort(); // explicit: tell the losers to stop
+  throw e;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=Kotlin]
+// Kotlin: coroutineScope cancels the siblings and waits for them automatically.
+suspend fun enrich(id: Long): Enriched = coroutineScope {
+    val risk = async { fetchRisk(id) }
+    val fx = async { fetchFx("USD", "EUR") }
+    Enriched(fetchAccount(id), risk.await(), fx.await())
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=Go]
+// Go: errgroup cancels ctx on the first error; each call must honor ctx.
+func enrich(ctx context.Context, id int64) (Enriched, error) {
+    g, ctx := errgroup.WithContext(ctx)
+    var risk int
+    var fx float64
+    g.Go(func() (err error) { risk, err = fetchRisk(ctx, id); return })
+    g.Go(func() (err error) { fx, err = fetchFx(ctx, "USD", "EUR"); return })
+    acct, err := fetchAccount(ctx, id)
+    if werr := g.Wait(); werr != nil {
+        return Enriched{}, werr
+    }
+    if err != nil {
+        return Enriched{}, err
+    }
+    return Enriched{acct, risk, fx}, nil
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=Rust]
+// Rust: try_join! polls all three futures; on the first Err, it drops the
+// others, and dropping a future cancels it (Chapter 12).
+async fn enrich(id: i64) -> Result<Enriched, Error> {
+    let (account, risk, fx) =
+        tokio::try_join!(fetch_account(id), fetch_risk(id), fetch_fx("USD", "EUR"))?;
+    Ok(Enriched { account, risk, fx })
+}
+\end{lstlisting}
+
+Read the five versions for \emph{where cancellation lives}. In Java~6 and TypeScript, it is your job, and forgetting it leaks work. In Go, it is a convention (\texttt{ctx}) that every callee must follow. In Kotlin, the scope enforces it. In Rust, it falls out of ownership: a future that is dropped simply never gets polled again, and its destructor runs. The tables below make the same kind of comparison along each axis.
+
+\subsection{Axes 1 and 2: Memory and Ownership, Dispatch and Polymorphism}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{1.9cm}p{6.1cm}p{6.3cm}@{}}
+\toprule
+\textbf{Language} & \textbf{Who frees memory, and where values live} & \textbf{What goes wrong in practice} \\
+\midrule
+Java 6 & Tracing GC. Every object on the heap with a 12--16 B header; only primitives are inline. & GC pauses, pointer-chasing cache misses, \texttt{Integer} boxing in collections. \\
+C++ & You do, via RAII: destructors run at scope exit; \texttt{unique\_ptr}, \texttt{shared\_ptr}. & Use-after-free and dangling references after a move or a \texttt{vector} reallocation. \\
+Rust & Ownership: exactly one owner; the compiler inserts \texttt{drop}. Borrows checked at compile time. & Fighting the borrow checker on graphs and callbacks; reaching for \texttt{Rc<RefCell<T>>} or arenas. \\
+TypeScript & V8's generational GC. All objects on the heap, shaped by hidden classes. & Megamorphic property access; retained closures leaking memory in long-lived Node processes. \\
+Kotlin & JVM tracing GC. \texttt{@JvmInline value class} removes the header for one-field wrappers. & Hidden boxing of \texttt{Long?}, value classes in generic collections. \\
+Go & Concurrent, non-moving tracing GC; escape analysis keeps non-escaping structs on the stack. & Hidden heap escapes (\texttt{-gcflags=-m}); GC CPU cost at high allocation rates; slice aliasing. \\
+OCaml & Generational GC; 63-bit integers unboxed via a tag bit; immutable by default. & Floats in polymorphic code are boxed; 63-bit \texttt{int} surprises when porting 64-bit arithmetic. \\
+Haskell & Generational GC; lazy evaluation allocates thunks for unevaluated expressions. & Space leaks from thunk chains (\texttt{foldl} vs \texttt{foldl'}). \\
+\bottomrule
+\end{tabular}
+\caption{Axis 1: memory and ownership.}
+\label{ch11:tab-memory}
+\end{table}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{1.9cm}p{6.1cm}p{6.3cm}@{}}
+\toprule
+\textbf{Language} & \textbf{How a call on an abstract type finds its code} & \textbf{Consequence} \\
+\midrule
+Java 6 & Nominal classes and interfaces; \texttt{invokevirtual} through a vtable in the class, found via the object's \texttt{klass} pointer. & Must declare \texttt{implements} up front; JIT inlines monomorphic call sites. \\
+C++ & \texttt{virtual} functions through a vptr stored in each object; templates for static dispatch. & Two separate worlds (OOP vs templates) with different error messages and costs. \\
+Rust & Traits. Generics are monomorphized (static); \texttt{dyn Trait} is a 16 B (data, vtable) fat pointer. & No vptr inside objects; you choose static or dynamic per call site. \\
+TypeScript & Structural at compile time; at runtime, JS property lookup via prototype chain and inline caches. & Any object with the right shape fits; nothing checks it at runtime. \\
+Kotlin & JVM virtual dispatch for members; extension functions are \emph{static} calls. & Extensions do not override: the declared type picks the function. \\
+Go & Implicit structural interfaces; 16 B (\texttt{itab}, data) value; no inheritance, struct embedding instead. & Interfaces defined by the consumer; typed-nil trap; no exhaustiveness. \\
+OCaml & Modules and functors (static); structural object types and polymorphic variants. & Very fast static code; functors replace most uses of interfaces. \\
+Haskell & Type classes, compiled to dictionary arguments (often specialized away). & Ad-hoc polymorphism resolved by types, including on the return type. \\
+\bottomrule
+\end{tabular}
+\caption{Axis 2: dispatch and polymorphism.}
+\label{ch11:tab-dispatch}
+\end{table}
+
+\subsection{Axes 3 and 4: Absence, Alternatives, and Failure}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{1.9cm}p{6.1cm}p{6.3cm}@{}}
+\toprule
+\textbf{Language} & \textbf{Nullability and sum types} & \textbf{Error handling} \\
+\midrule
+Java 6 & Every reference may be \texttt{null}. No sum types; Visitor pattern or \texttt{instanceof} chains. & Checked and unchecked exceptions; \texttt{finally} for cleanup. \\
+C++ & \texttt{nullptr}; \texttt{std::optional}, \texttt{std::variant} (C++17) with \texttt{std::visit}. & Exceptions or error codes; \texttt{std::expected} (C++23). \\
+Rust & No null. \texttt{Option<T>}; \texttt{enum} with exhaustive \texttt{match}; niche optimization. & \texttt{Result<T, E>} and \texttt{?}; \texttt{panic!} for bugs. \\
+TypeScript & \texttt{T | null} under \texttt{strictNullChecks}; discriminated unions with \texttt{never} checks. & \texttt{throw} any value; \texttt{catch (e: unknown)}; Result-style libraries. \\
+Kotlin & \texttt{T} vs \texttt{T?}; \texttt{sealed} hierarchies with exhaustive \texttt{when}. & Unchecked exceptions only; \texttt{Result} and \texttt{runCatching}. \\
+Go & \texttt{nil} pointers, maps, slices, channels, interfaces. No sum types; interface plus type switch. & \texttt{error} values returned alongside results; \texttt{panic}/\texttt{recover} for bugs. \\
+OCaml & No null; \texttt{option}; variants with exhaustiveness warnings (the model Rust copied). & Exceptions (cheap) and \texttt{result}; both idiomatic. \\
+Haskell & No null; \texttt{Maybe}; algebraic data types with pattern matching. & \texttt{Either}, \texttt{Maybe}, monad transformers; IO exceptions. \\
+\bottomrule
+\end{tabular}
+\caption{Axes 3 and 4: absence and alternatives, and how failure is reported.}
+\label{ch11:tab-null-errors}
+\end{table}
+
+\subsection{Axes 5 and 6: Generics Implementation and Concurrency Runtime}
+
+Generics and memory management each fall on a spectrum. Figure~\ref{ch11:fig-spectra} places the languages on both.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,
+  tick/.style={circle,fill=#1,inner sep=0pt,minimum size=5pt},
+  lab/.style={font=\scriptsize,align=center,text width=2.3cm}]
+
+  % Generics spectrum
+  \node[font=\bfseries\footnotesize,anchor=west] at (0, 3.3) {Generics: how much type information reaches the machine code};
+  \draw[->,very thick,gray!60] (0.3, 2.55) -- (14.6, 2.55);
+  \node[tick=quotientorange] at (1.2, 2.55) {};
+  \node[lab,above=3pt] at (1.2, 2.55) {TypeScript};
+  \node[lab,below=3pt] at (1.2, 2.55) {erased entirely};
+  \node[tick=sourceblue] at (3.9, 2.55) {};
+  \node[lab,above=3pt] at (3.9, 2.55) {Java 6, Kotlin};
+  \node[lab,below=3pt] at (3.9, 2.55) {erased to \texttt{Object} + \texttt{checkcast}};
+  \node[tick=structurepurple] at (6.6, 2.55) {};
+  \node[lab,above=3pt] at (6.6, 2.55) {OCaml, Haskell};
+  \node[lab,below=3pt] at (6.6, 2.55) {boxed values,\\ dictionaries};
+  \node[tick=sourceblue] at (9.3, 2.55) {};
+  \node[lab,above=3pt] at (9.3, 2.55) {Go};
+  \node[lab,below=3pt] at (9.3, 2.55) {one body per GC shape + dictionary};
+  \node[tick=targetgreen] at (12.0, 2.55) {};
+  \node[lab,above=3pt] at (12.0, 2.55) {C++, Rust};
+  \node[lab,below=3pt] at (12.0, 2.55) {monomorphized per type};
+
+  % Memory spectrum
+  \node[font=\bfseries\footnotesize,anchor=west] at (0, 0.55) {Memory: who decides when a value is freed};
+  \draw[->,very thick,gray!60] (0.3, -0.2) -- (14.6, -0.2);
+  \node[tick=trapred] at (1.2, -0.2) {};
+  \node[lab,above=3pt] at (1.2, -0.2) {C};
+  \node[lab,below=3pt] at (1.2, -0.2) {\texttt{free()} by hand};
+  \node[tick=quotientorange] at (3.9, -0.2) {};
+  \node[lab,above=3pt] at (3.9, -0.2) {C++};
+  \node[lab,below=3pt] at (3.9, -0.2) {RAII destructors, unchecked borrows};
+  \node[tick=targetgreen] at (6.6, -0.2) {};
+  \node[lab,above=3pt] at (6.6, -0.2) {Rust};
+  \node[lab,below=3pt] at (6.6, -0.2) {ownership, checked borrows};
+  \node[tick=sourceblue] at (9.3, -0.2) {};
+  \node[lab,above=3pt] at (9.3, -0.2) {Go};
+  \node[lab,below=3pt] at (9.3, -0.2) {GC + value structs on stack};
+  \node[tick=structurepurple] at (12.0, -0.2) {};
+  \node[lab,above=3pt] at (12.0, -0.2) {Java 6, Kotlin, TS, OCaml, Haskell};
+  \node[lab,below=3pt] at (12.0, -0.2) {GC, most values on heap};
+\end{tikzpicture}
+\caption{Two spectra. Top: how much of a generic type parameter survives into compiled code, from TypeScript (nothing) to C++ and Rust (a separate copy of the code per type). Bottom: who decides when memory is freed, from C (the programmer, unchecked) through Rust (the compiler, checked) to fully garbage-collected languages (the runtime).}
+\label{ch11:fig-spectra}
+\end{figure}
+
+Moving right on the generics line buys speed (each copy is specialized and inlinable) at the cost of compile time and binary size. Moving right on the memory line gives up control over when memory is freed in exchange for not having to think about it. Rust is unusual in sitting near the ``control'' end of the memory line while still being checked; Go is unusual in being garbage-collected while still laying out structs and slices flat, like C.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{1.9cm}p{6.1cm}p{6.3cm}@{}}
+\toprule
+\textbf{Language} & \textbf{Concurrency runtime} & \textbf{Shared-state safety} \\
+\midrule
+Java 6 & 1:1 OS threads ($\sim$1 MB stack each); \texttt{synchronized}, \texttt{java.util.concurrent}. (Java 21 later added virtual threads.) & Java Memory Model defines races; nothing prevents them. \\
+C++ & 1:1 \texttt{std::thread}; C++20 stackless coroutines without a standard scheduler. & Data races are undefined behaviour. \\
+Rust & 1:1 threads plus stackless \texttt{async} futures run by a library executor (Tokio). & \texttt{Send}/\texttt{Sync} reject data races at compile time. \\
+TypeScript & One JS thread per isolate; event loop; libuv thread pool for file and DNS work. & No shared memory between JS callbacks; Workers communicate by message. \\
+Kotlin & Stackless CPS coroutines on JVM thread pools; structured concurrency. & Same JVM memory model; \texttt{Mutex}, \texttt{Channel}, confinement to one dispatcher. \\
+Go & M:N stackful goroutines (2 KB start); channels and \texttt{select}; netpoller. & Races detectable at runtime with \texttt{-race}; multi-word races can corrupt memory. \\
+OCaml & OCaml 5: multicore domains plus effect handlers for lightweight fibers. & Data races are bounded (no crashes), but still logic bugs. \\
+Haskell & GHC M:N green threads; software transactional memory (STM). & Immutability by default; \texttt{TVar} transactions compose. \\
+\bottomrule
+\end{tabular}
+\caption{Axes 5 and 6: generics implementation is summarized in Figure~\ref{ch11:fig-spectra}; this table covers the concurrency runtime and what protects shared state.}
+\label{ch11:tab-concurrency}
+\end{table}
+
+\subsection{Axis 7: Where Each Language Is Used, and Why}
+
+Languages win in production when their trade-offs match a problem's constraints. The examples below are real and well documented.
+
+\begin{itemize}
+  \item \textbf{Java (and the JVM generally):} large enterprise systems and data infrastructure (Kafka, Hadoop, Spark, Elasticsearch). The JIT and mature GCs give good throughput on long-running servers, and the tooling for profiling and monitoring is the deepest of any platform.
+  \item \textbf{C++:} anything where latency or memory control is the product: game engines, browsers (Chrome, Firefox's older parts), database engines, high-frequency trading. Decades of libraries, and it runs everywhere.
+  \item \textbf{Rust:} infrastructure that must be both fast and memory-safe: AWS Firecracker (the microVM behind Lambda), Cloudflare's proxies, parts of Firefox and Android, and increasingly the Linux kernel. Discord moved a latency-sensitive Go service to Rust in 2020 because GC pauses caused regular latency spikes.
+  \item \textbf{TypeScript:} browser front ends and Node.js back-end-for-frontend services, where sharing types between client and server removes a whole class of API mismatches.
+  \item \textbf{Kotlin:} Android (Google's preferred language since 2019) and JVM back ends that want null safety and coroutines while keeping every Java library.
+  \item \textbf{Go:} cloud infrastructure and network services: Docker, Kubernetes, etcd, Prometheus, Terraform, CockroachDB. Fast builds, single static binaries, and goroutines fit services that mostly wait on the network.
+  \item \textbf{OCaml:} Jane Street runs its trading systems on it; it is also a favourite for compilers and proof tools (the first Rust compiler was written in OCaml, as are the Rocq/Coq proof assistant and Meta's Flow and Hack type checkers).
+  \item \textbf{Haskell:} domains where correctness arguments matter more than hiring pool: Meta's Sigma anti-abuse rule engine (via the Haxl library), Standard Chartered's internal financial modeling, the Cardano blockchain, and the pandoc document converter.
+\end{itemize}
+
+\subsection{Putting It Together: Choosing Languages for the Financial Backend}
+
+Part~V builds a financial ledger service in Rust with Axum, SQLx, and PostgreSQL. A real company running that ledger would rarely use one language for everything. Here is how the trade-offs in this chapter map onto a typical architecture, and the reason behind each choice:
+
+\begin{enumerate}
+  \item \textbf{Ledger core (posting, balance checks, double-entry invariants): Rust.} This is where a bug costs money. Ownership rules out data races on balances, \texttt{enum} plus exhaustive \texttt{match} rules out unhandled transaction states, newtypes like \texttt{UsdCents(i64)} rule out unit mix-ups at zero cost, and there are no GC pauses in the hot path. Chapters~12--14 build this.
+  \item \textbf{Internal platform services (rate limiting, webhook fan-out, job schedulers, Kubernetes operators): Go.} These services mostly wait on the network, need to be written and changed quickly by many teams, and benefit from fast builds and simple deployment. Use \texttt{context} everywhere, run tests with \texttt{-race}, and keep money arithmetic out of them.
+  \item \textbf{Web dashboard and API gateway: TypeScript.} Share request and response types between browser and Node, but validate every untrusted payload at the boundary with a runtime schema (Chapter~9), and never move money amounts through JavaScript \texttt{number}.
+  \item \textbf{Mobile app: Kotlin} on Android. Sealed classes model screen states; coroutines and \texttt{Flow} handle network calls without blocking the UI thread.
+  \item \textbf{Batch analytics and reconciliation: the JVM} (Java or Kotlin with Spark), where throughput on large datasets matters more than latency.
+\end{enumerate}
+
+The boundaries between these components are network APIs, so the type system of one language does not protect another. That is why every boundary needs an explicit schema (OpenAPI, Protocol Buffers, or a shared JSON schema) and why amounts should cross every boundary as integer minor units or decimal strings, never as floating-point numbers.
+
+\section{Exercises}
+\label{ch11:exercises}
+
+\begin{exercise}[Escape Analysis by Hand]
+\label{ex:ch11-escape}
+For each function below, predict whether \texttt{p} stays on the stack or moves to the heap, then check with \texttt{go build -gcflags=-m}: (a) a function that creates a \texttt{Posting} and returns \texttt{p.Cents}; (b) one that returns \texttt{\&p}; (c) one that appends \texttt{p} (by value) to a slice parameter; (d) one that stores \texttt{\&p} in a package-level variable; (e) one that passes \texttt{p} to \texttt{fmt.Println}. Explain case (e) using what you know about converting a value to an interface.
+\end{exercise}
+
+\begin{exercise}[Slice Aliasing in a Batch Splitter]
+\label{ex:ch11-slices}
+A function \texttt{split(batch []Posting) (debits, credits []Posting)} builds both results by appending to \texttt{batch[:0]}. Show with a concrete 4-element input why the returned slices can overwrite each other and the input. Rewrite it so the outputs never alias the input, and state the extra allocation cost in bytes for a batch of $n$ postings.
+\end{exercise}
+
+\begin{exercise}[The Typed-Nil Trap and Its Detector]
+\label{ex:ch11-typed-nil}
+Write a function \texttt{lookup(id int64) error} that returns a nil \texttt{*NotFoundError} variable on success. (a) Draw the two words of the returned interface. (b) Show that \texttt{errors.Is(err, nil)} and \texttt{err == nil} both report false. (c) Run \texttt{staticcheck} on your code and record the diagnostic it gives (check SA4023). (d) Explain why the equivalent Rust function returning \texttt{Result<(), NotFoundError>} cannot have this bug.
+\end{exercise}
+
+\begin{exercise}[Deadlock, Leak, and Race]
+\label{ex:ch11-concurrency-bugs}
+Write three tiny Go programs that produce, respectively: (a) \texttt{fatal error: all goroutines are asleep - deadlock!} using an unbuffered channel; (b) a goroutine leak where a sender blocks forever after its receiver returned early (detect it by printing \texttt{runtime.NumGoroutine()} in a loop); (c) \texttt{fatal error: concurrent map writes}. For each, write the fix, and for (c) also the output of \texttt{go run -race} before the fix.
+\end{exercise}
+
+\begin{exercise}[Cancellation Semantics Compared]
+\label{ex:ch11-cancellation}
+In the ``one task, five languages'' listings, suppose \texttt{fetchRisk} fails after 5~ms while \texttt{fetchFx} would take 300~ms. For each of the five languages, state (a) when the caller sees the error, (b) whether the FX request keeps running, and (c) what code change, if any, is needed to stop it. Then explain in two sentences why Rust and Kotlin get this right without extra code, and what each relies on (dropping futures, and the \texttt{Job} tree).
+\end{exercise}
+
+\begin{exercise}[Choosing a Language for a New Service]
+\label{ex:ch11-architecture}
+Your team must build a service that receives card-network authorization messages (about 20,000 per second at peak, p99 latency budget 15~ms), checks a balance held in memory, and writes an append-only log. Using the seven axes of this chapter, write a one-page design note comparing Rust, Go, and Kotlin for this service. Address GC pauses against the latency budget, how each language would represent the authorization outcome, how each protects the in-memory balance from data races, and how a newly hired Java~6 developer would ramp up on each.
+\end{exercise}

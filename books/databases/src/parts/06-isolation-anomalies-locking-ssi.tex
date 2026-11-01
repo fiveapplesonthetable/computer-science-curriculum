@@ -1,0 +1,637 @@
+\chapter{Isolation Anomalies, Row Locking, and Serializable Snapshot Isolation}
+
+In Chapter~5 we built PostgreSQL's snapshot engine: every query receives a frozen list of which transactions had already finished when its snapshot was captured, so readers and writers glide past each other without read locks. At first glance, snapshots look like the complete answer to concurrency. Every query sees a clean, self-consistent photograph of the database; nobody reads half-written bytes; rollbacks vanish cleanly.
+
+Now try running a bank on snapshots alone.
+
+Suppose Alice holds two sub-accounts under a single prime brokerage margin agreement: \texttt{Checking = \$80} and \texttt{Savings = \$80}, subject to the firm-wide rule that \emph{her combined balance across both sub-accounts may never drop below \$0}. At 10:00:00.000~AM, Alice submits two \$100 withdrawals from two browser tabs at the exact same millisecond---one from Checking, one from Savings. Both backend workers start transactions at PostgreSQL's \texttt{REPEATABLE READ} isolation level:
+\begin{itemize}
+  \item Worker~1 reads its snapshot: \texttt{Checking = \$80, Savings = \$80} (total \$160). Withdrawing \$100 leaves \$60 $\ge \$0$, so Worker~1 updates \texttt{Checking} to $-\$20$ and commits.
+  \item Worker~2 reads its identical 10:00:00.000~AM snapshot: \texttt{Checking = \$80, Savings = \$80} (total \$160). Withdrawing \$100 leaves \$60 $\ge \$0$, so Worker~2 updates \texttt{Savings} to $-\$20$ and commits.
+\end{itemize}
+Neither worker touched a single uncommitted byte. Neither worker overwrote the row the other worker modified. Both ran under \texttt{REPEATABLE READ} without a single error or lock wait---and Alice just walked out of the bank with \$200 in cash from \$160 of collateral, leaving a $-\$40$ combined balance that your code swore was impossible.
+
+Understanding \emph{why} that bug happens, which exact anomalies each SQL isolation level permits or forbids, how PostgreSQL's \texttt{EvalPlanQual} machinery behaves under \texttt{READ COMMITTED}, how \emph{Serializable Snapshot Isolation} (\emph{SSI}) catches multi-row anomalies without blocking readers, and when to reach for explicit row or advisory locks instead is one of the defining skills of a backend systems engineer. We will trace every anomaly on concrete two-transaction timelines so none of them ever catches you by surprise in production.
+
+\chapterline
+
+\section{What ``Isolation'' Actually Promises (and Why ANSI SQL-92 Missed Half the Story)}
+\label{ch06:isolation-contract}
+
+The ``I'' in ACID stands for \emph{Isolation}: even though hundreds of transactions execute concurrently on interleaved CPU cores, each transaction should appear to execute \emph{as if it had the entire database to itself}. Database theory calls this property \textbf{serializability}.
+
+\begin{definition}[Serializable Execution]
+\label{ch06:def-serializable}
+A concurrent execution (schedule) of committed transactions $T_1, T_2, \dots, T_k$ is \emph{serializable} if its final database state and every query result returned to each $T_i$ are identical to running those same transactions \textbf{strictly one after another with zero overlap} in some permutation $T_{\pi(1)} \to T_{\pi(2)} \to \dots \to T_{\pi(k)}$.
+\end{definition}
+
+Look back at Alice's two withdrawals above under Definition~\ref{ch06:def-serializable}. There are only two serial orders of $T_1$ (withdraw \$100 from Checking) and $T_2$ (withdraw \$100 from Savings):
+\begin{itemize}
+  \item \textbf{$T_1$ then $T_2$:} $T_1$ sees $\$80 + \$80 = \$160$, sets Checking to $-\$20$, and commits. Then $T_2$ starts, sees $-\$20 + \$80 = \$60 < \$100$, and \emph{rejects} the second withdrawal. Final combined balance: $+\$60$.
+  \item \textbf{$T_2$ then $T_1$:} Symmetrically, $T_2$ sets Savings to $-\$20$, and $T_1$ sees $\$80 + (-\$20) = \$60 < \$100$ and \emph{rejects} the first withdrawal. Final combined balance: $+\$60$.
+\end{itemize}
+In \emph{every} possible one-at-a-time execution, at most one withdrawal succeeds and the combined balance is $+\$60$. Any concurrent schedule that lets both commit and leaves $-\$40$ has violated serializability: no sequential universe could ever have produced that database state.
+
+\subsection{The ANSI SQL-92 Table vs.\ PostgreSQL Reality}
+
+When the ANSI SQL-92 committee standardized transaction isolation levels (\texttt{READ UNCOMMITTED}, \texttt{READ COMMITTED}, \texttt{REPEATABLE READ}, and \texttt{SERIALIZABLE}), the specification had two famous flaws uncovered in 1995 by Hal Berenson, Phil Bernstein, Jim Gray, Jim Melton, Elizabeth O'Neil, and Patrick O'Neil:
+\begin{enumerate}
+  \item The committee implicitly assumed every database used 1980s lock-based concurrency rather than MVCC snapshots; and
+  \item They defined isolation levels solely by listing \emph{three read phenomena} (Dirty Reads, Non-Repeatable Reads, and Phantom Reads), completely omitting \textbf{Lost Updates} and \textbf{Write Skew}.
+\end{enumerate}
+
+In PostgreSQL, MVCC snapshots change the table in ways every SQL developer needs to memorize:
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{PostgreSQL Level} & \textbf{Dirty} & \textbf{Non-Repeat.} & \textbf{Phantom} & \textbf{Lost Upd.\ / Write Skew} \\
+\midrule
+\texttt{READ UNCOMMITTED}$^{\dagger}$ & Impossible & Possible & Possible & Possible / Possible \\
+\texttt{READ COMMITTED} (default) & Impossible & Possible & Possible & \textbf{Possible.} / Possible \\
+\texttt{REPEATABLE READ} (SI) & Impossible & Impossible & \textbf{Impossible.} & Impossible$^{\ddagger}$ / \textbf{Possible.} \\
+\texttt{SERIALIZABLE} (SSI) & Impossible & Impossible & Impossible & Impossible / Impossible \\
+\bottomrule
+\end{tabular}
+\end{center}
+{\footnotesize $^{\dagger}$PostgreSQL accepts \texttt{READ UNCOMMITTED} syntax for SQL compatibility, mapping it identically to \texttt{READ COMMITTED}. $^{\ddagger}$Prevented via automatic \texttt{40001} conflict abort.}
+
+Notice two immediate surprises in that table:
+\begin{itemize}
+  \item \textbf{Dirty reads never happen in PostgreSQL} at any isolation level, because our Chapter~5 visibility check rejects uncommitted \texttt{t\_xmin} values unconditionally.
+  \item \textbf{PostgreSQL's \texttt{REPEATABLE READ} already blocks phantom reads} (unlike lock-based engines that lack gap locks), yet it is \emph{not} serializable because it implements pure \emph{Snapshot Isolation} (\emph{SI}), which still allows \textbf{Write Skew}.
+\end{itemize}
+
+Let us put each anomaly under the microscope on concrete timelines.
+
+\section{Read Anomalies: Dirty Reads, Read Skew, and Phantoms}
+\label{ch06:read-anomalies}
+
+\subsection{Dirty Read ($P_1$): Reading Uncommitted Bytes}
+
+A \emph{dirty read} occurs when transaction~$T_2$ reads a value written by concurrent transaction~$T_1$ \emph{before} $T_1$ commits. If $T_1$ subsequently executes \texttt{ROLLBACK}, $T_2$ has acted on a balance that never existed in committed history:
+
+\begin{lstlisting}[language=SQL]
+-- T1                                  -- T2
+BEGIN;                                 BEGIN;
+UPDATE accounts SET bal = 99999900
+ WHERE id = 1;
+                                       -- Under true READ UNCOMMITTED:
+                                       SELECT bal FROM accounts WHERE id = 1;
+                                       -- Sees 99999900 and wires cash out!
+ROLLBACK; -- T1 aborts!
+\end{lstlisting}
+
+In PostgreSQL, when $T_1$ runs its \texttt{UPDATE}, old tuple \texttt{(0,1)} gets \texttt{t\_xmax = xid(T1)} and new tuple \texttt{(0,2)} gets \texttt{t\_xmin = xid(T1)}. Because \texttt{xid(T1)} is still \texttt{IN\_PROGRESS} in \texttt{pg\_xact}, $T_2$'s visibility check sees that \texttt{(0,1)}'s deleter has not committed (so \texttt{(0,1)} stays visible.) and \texttt{(0,2)}'s inserter has not committed (so \texttt{(0,2)} stays hidden.). Dirty reads are ruled out by the storage format itself.
+
+\subsection{Non-Repeatable Read ($P_2$) and Read Skew Under \texttt{READ COMMITTED}}
+
+Remember from Chapter~5 how PostgreSQL's default isolation level---\texttt{READ COMMITTED}---chooses snapshots: \textbf{it captures a new snapshot at the start of every SQL statement inside the transaction}.
+
+Suppose Alice has \texttt{id = 1} (Checking, \texttt{5000} cents) and \texttt{id = 2} (Savings, \texttt{5000} cents). Transaction~$T_1$ transfers \texttt{4000} cents from Checking to Savings while Transaction~$T_2$ (a dashboard handler running at default \texttt{READ COMMITTED}) queries Alice's two accounts in two separate \texttt{SELECT} statements (Figure~\ref{ch06:fig-read-skew}):
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,scale=0.95,transform shape]
+  % Left: READ COMMITTED Read Skew
+  \begin{scope}[shift={(0,0)}]
+    \draw[thick,trapred!50,fill=trapred!4,rounded corners=5pt] (0,0) rectangle (6.8,6.2);
+    \node[font=\bfseries\scriptsize,trapred!85!black] at (3.4,5.88) {\texttt{READ COMMITTED}: Fresh Snapshot per Statement};
+
+    \node[font=\scriptsize\bfseries,sourceblue!90!black] at (1.7,5.42) {$T_1$ (Transfer \$40)};
+    \node[font=\scriptsize\bfseries,structurepurple!90!black] at (5.1,5.42) {$T_2$ (Dashboard Read)};
+    \draw[thick,gray!55,->] (0.22,5.15) -- (0.22,1.75);
+    \node[font=\tiny,gray!70!black,rotate=90] at (0.08,3.45) {time};
+
+    \node[draw=structurepurple!80,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,inner sep=2.5pt] at (5.1,4.72) {Snap S1: SELECT id=1\\-> returns 5000};
+
+    \node[draw=sourceblue!80,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,inner sep=2.5pt] at (1.7,3.68) {UPDATE id=1 -> 1000\\UPDATE id=2 -> 9000\\COMMIT};
+    \draw[->,thick,sourceblue!85!black,dashed] (3.05,3.35) -- node[above,font=\tiny,sloped] {visible to S2} (3.80,2.65);
+
+    \node[draw=structurepurple!80,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,inner sep=2.5pt] at (5.1,2.30) {Snap S2: SELECT id=2\\-> returns 9000};
+
+    \node[draw=trapred!85!black,fill=trapred!14,rounded corners=3pt,font=\scriptsize\bfseries,align=center,inner sep=3pt] at (3.4,0.95) {Read Skew: $T_2$ displays $5000 + 9000 = 14000$\\(the \$40 is counted twice)};
+  \end{scope}
+
+  % Right: REPEATABLE READ Transaction Snapshot
+  \begin{scope}[shift={(7.3,0)}]
+    \draw[thick,targetgreen!50,fill=targetgreen!4,rounded corners=5pt] (0,0) rectangle (6.8,6.2);
+    \node[font=\bfseries\scriptsize,targetgreen!80!black] at (3.4,5.88) {\texttt{REPEATABLE READ}: Single Transaction Snapshot};
+
+    \node[font=\scriptsize\bfseries,sourceblue!90!black] at (1.7,5.42) {$T_1$ (Transfer \$40)};
+    \node[font=\scriptsize\bfseries,targetgreen!85!black] at (5.1,5.42) {$T_2$ (Dashboard Read)};
+    \draw[thick,gray!55,->] (0.22,5.15) -- (0.22,1.75);
+    \node[font=\tiny,gray!70!black,rotate=90] at (0.08,3.45) {time};
+
+    \node[draw=targetgreen!80!black,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,inner sep=2.5pt] at (5.1,4.72) {Freeze Snap S1:\\SELECT id=1 -> 5000};
+
+    \node[draw=sourceblue!80,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,inner sep=2.5pt] at (1.7,3.68) {UPDATE id=1 -> 1000\\UPDATE id=2 -> 9000\\COMMIT (xid >= xmax\_S1)};
+
+    \node[draw=targetgreen!80!black,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,inner sep=2.5pt] at (5.1,2.30) {Reuse Snap S1:\\SELECT id=2 -> 5000};
+
+    \node[draw=targetgreen!85!black,fill=targetgreen!14,rounded corners=3pt,font=\scriptsize\bfseries,align=center,inner sep=3pt] at (3.4,0.95) {Consistent View: $T_2$ displays $5000 + 5000 = 10000$\\($T_1$'s commit stays invisible to $S_1$)};
+  \end{scope}
+\end{tikzpicture}
+\caption{Read skew across two statements inside one transaction. Left: Under default \texttt{READ COMMITTED}, $T_2$'s second \texttt{SELECT} takes a new snapshot $S_2$ after $T_1$ commits, seeing Checking \emph{before} the transfer (\texttt{5000}) and Savings \emph{after} the transfer (\texttt{9000}). Right: Under \texttt{REPEATABLE READ}, $T_2$ reuses $S_1$ for every statement until \texttt{COMMIT}, reading a consistent pre-transfer total of \texttt{10000}.}
+\label{ch06:fig-read-skew}
+\end{figure}
+
+If $T_2$ instead re-read \texttt{id = 1} in its second statement, it would see \texttt{5000} first and \texttt{1000} second---the classic \emph{non-repeatable read}. Reading two related rows across two statements and seeing an inconsistent cut between them is its multi-row twin, \textbf{read skew}.
+
+\subsection{Phantom Reads ($P_3$)}
+
+A \emph{phantom read} is the set-level version of a non-repeatable read: instead of modifying an existing row, concurrent transaction~$T_1$ \textbf{\texttt{INSERT}s a new row} (or \texttt{DELETE}s one) matching $T_2$'s \texttt{WHERE} predicate between two queries in $T_2$. Under \texttt{READ COMMITTED}:
+\begin{enumerate}
+  \item $T_2$ runs \texttt{SELECT COUNT(*) FROM postings WHERE entry\_id = 500;} and gets \texttt{2}.
+  \item $T_1$ inserts a third fee leg into \texttt{entry\_id = 500} and commits.
+  \item $T_2$ runs \texttt{SELECT amount\_minor FROM postings WHERE entry\_id = 500;} to render those ``two'' rows into a fixed-size PDF layout---and receives \textbf{three} rows.
+\end{enumerate}
+
+Switch $T_2$ to \texttt{BEGIN ISOLATION LEVEL REPEATABLE READ;} and both non-repeatable reads and phantom reads both disappear: the third posting's \texttt{t\_xmin} belongs to $T_1$, which was either in $\mathrm{xip}_{S_1}$ or $\ge \mathrm{xmax}_{S_1}$, so $S_1$ hides the newly inserted tuple just as cleanly as an updated tuple.
+
+\begin{trapbox}
+Many engineers believe wrapping two \texttt{SELECT} queries in \texttt{BEGIN; ... COMMIT;} automatically gives them a consistent multi-query snapshot. \textbf{At PostgreSQL's default \texttt{READ COMMITTED} level, \texttt{BEGIN ... COMMIT} around pure \texttt{SELECT}s does nothing to freeze your snapshot across statements.} Every \texttt{SELECT} inside a \texttt{READ COMMITTED} transaction still grabs a brand-new snapshot. Any multi-query report, export, or reconciliation job \emph{must} explicitly start with \texttt{BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;} (or collapse the two queries into a single SQL statement, which shares one snapshot).
+\end{trapbox}
+
+\section{Lost Updates and \texttt{EvalPlanQual} Re-Evaluation}
+\label{ch06:lost-updates-epq}
+
+Now let both concurrent transactions \emph{write} to the same account row \texttt{id = 1}, which starts with \texttt{bal = 10000} (\$100.00). Suppose two payment workers simultaneously process two separate \$80.00 (\texttt{8000}-cent) ATM withdrawals. The outcome depends on \emph{how} you write the SQL and \emph{which} isolation level you run.
+
+\subsection{Case 1: Read-Modify-Write in Application Code Under \texttt{READ COMMITTED}}
+
+In ORM-heavy codebases (Java Hibernate, naive ActiveRecord, or hand-rolled Rust structs), developers frequently load a row into application memory, subtract in application code, and write back the absolute number:
+
+\begin{lstlisting}[language=SQL]
+-- Worker 1 (READ COMMITTED)           -- Worker 2 (READ COMMITTED)
+BEGIN;                                 BEGIN;
+SELECT bal FROM accounts WHERE id = 1; SELECT bal FROM accounts WHERE id = 1;
+-- App computes: 10000 - 8000 = 2000   -- App computes: 10000 - 8000 = 2000
+
+UPDATE accounts SET bal = 2000
+ WHERE id = 1;
+                                       UPDATE accounts SET bal = 2000
+                                        WHERE id = 1;
+                                       -- Blocks waiting on Worker 1's XID!
+COMMIT;
+                                       -- Unblocks, writes 2000, and COMMITS!
+\end{lstlisting}
+
+The ATM dispensed \$80.00 \emph{twice} (\$160.00 cash handed out), yet \texttt{accounts.bal} sits at \texttt{2000} (\$20.00). Worker~2 overwrote Worker~1's \$80 debit with a value computed from a stale read: a \textbf{Lost Update}. This is exactly the bug you get in Java when two threads run \texttt{balance = balance - 80} on a shared field without \texttt{synchronized}: each thread reads, subtracts, and writes back, and one write erases the other.
+
+\subsection{Case 2: Atomic SQL \texttt{SET bal = bal - 8000} and \texttt{EvalPlanQual} (\texttt{EPQ})}
+
+Now move the arithmetic into the database and writes a single atomic SQL \texttt{UPDATE} with a guard predicate under \texttt{READ COMMITTED}:
+
+\begin{lstlisting}[language=SQL]
+UPDATE accounts
+   SET bal = bal - 8000
+ WHERE id = 1 AND bal >= 8000
+RETURNING bal;
+\end{lstlisting}
+
+Trace carefully what happens inside PostgreSQL's update executor (\texttt{ExecUpdate} in the source file \texttt{nodeModifyTable.c}) when Worker~1 and Worker~2 execute this exact statement at the same microsecond under \texttt{READ COMMITTED}:
+\begin{enumerate}
+  \item Both workers capture a statement snapshot seeing tuple \texttt{(0,1)} with \texttt{bal = 10000}. For both workers, \texttt{10000 >= 8000} evaluates to \texttt{true}.
+  \item Worker~1 reaches \texttt{heap\_update()} first, stamps its XID into \texttt{(0,1)}'s \texttt{t\_xmax}, inserts \texttt{(0,2)} with \texttt{bal = 2000}, and prepares to commit.
+  \item Worker~2 reaches \texttt{heap\_update()} on \texttt{(0,1)} a microsecond later, sees an active \texttt{t\_xmax} belonging to Worker~1, and \textbf{sleeps on Worker~1's transaction lock} (\texttt{XactLockTableWait}).
+  \item Worker~1 executes \texttt{COMMIT}. Worker~2 wakes up.
+  \item What does Worker~2 do now? Remember that Worker~2's original statement snapshot predated Worker~1. If Worker~2 evaluated \texttt{bal - 8000} against \texttt{(0,1)} (\texttt{bal = 10000}), it would write \texttt{2000} and lose Worker~1's update. If Worker~2 blindly updated \texttt{(0,2)} (\texttt{bal = 2000}) \emph{without} re-checking the \texttt{WHERE} clause, it would write $2000 - 8000 = -6000$, violating \texttt{WHERE bal >= 8000}.
+\end{enumerate}
+
+Instead, PostgreSQL invokes a specialized executor subsystem called \textbf{\texttt{EvalPlanQual}} (\textbf{\texttt{EPQ}}):
+\begin{itemize}
+  \item Worker~2 follows \texttt{(0,1)}'s forward \texttt{t\_ctid} chain to the latest committed version \texttt{(0,2)} (\texttt{bal = 2000}) and locks \texttt{(0,2)}.
+  \item \texttt{EvalPlanQual} substitutes \texttt{(0,2)} into the plan sub-tree and \textbf{re-evaluates the \texttt{WHERE} quals and \texttt{SET} expressions against \texttt{(0,2)}.}
+  \item Testing \texttt{bal >= 8000} on \texttt{bal = 2000} yields \textbf{false}. Worker~2 therefore skips the row cleanly, returns zero rows (\texttt{UPDATE 0}), and the second ATM withdrawal is safely declined. (Had there been no \texttt{bal >= 8000} guard, \texttt{EPQ} would have recomputed \texttt{bal - 8000} using \texttt{2000 - 8000 = -6000}, preserving both debits.)
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,scale=0.95,transform shape]
+  % Panel 1: App Read-Modify-Write under READ COMMITTED
+  \begin{scope}[shift={(0,0)}]
+    \draw[thick,trapred!55,fill=trapred!4,rounded corners=5pt] (0,0) rectangle (4.5,5.8);
+    \node[font=\bfseries\scriptsize,trapred!85!black,align=center] at (2.25,5.38) {1. App Read-Modify-Write\\(\texttt{READ COMMITTED})};
+
+    \node[draw=gray!60,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,minimum width=4.0cm] at (2.25,4.65) {T1 \& T2 both SELECT 10000};
+    \node[draw=sourceblue!80,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,minimum width=4.0cm] at (2.25,3.80) {T1: SET bal = 2000; COMMIT};
+    \node[draw=trapred!80,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,minimum width=4.0cm] at (2.25,2.80) {T2 wakes; EPQ re-runs\\SET bal = 2000 (literal!)\\COMMIT};
+    \node[draw=trapred!90!black,fill=trapred!16,rounded corners=3pt,font=\scriptsize\bfseries,align=center,minimum width=4.0cm,inner sep=3pt] at (2.25,1.15) {LOST UPDATE!\\\$160 paid out,\\bal = \$20!};
+  \end{scope}
+
+  % Panel 2: Atomic SQL UPDATE + EvalPlanQual under READ COMMITTED
+  \begin{scope}[shift={(4.9,0)}]
+    \draw[thick,quotientorange!75!black,fill=quotientorange!5,rounded corners=5pt] (0,0) rectangle (4.6,5.8);
+    \node[font=\bfseries\scriptsize,quotientorange!90!black,align=center] at (2.3,5.38) {2. Atomic \texttt{SET bal=bal-8000}\\(\texttt{READ COMMITTED} + \texttt{EPQ})};
+
+    \node[draw=gray!60,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,minimum width=4.1cm] at (2.3,4.65) {T1 \& T2 match (0,1): 10000};
+    \node[draw=sourceblue!80,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,minimum width=4.1cm] at (2.3,3.80) {T1 writes (0,2): 2000; COMMIT};
+    \node[draw=quotientorange!85!black,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,minimum width=4.1cm] at (2.3,2.72) {T2 wakes -> walks ctid (0,2)\\EPQ rechecks 2000 >= 8000\\-> FALSE!};
+    \node[draw=targetgreen!85!black,fill=targetgreen!14,rounded corners=3pt,font=\scriptsize\bfseries,align=center,minimum width=4.1cm,inner sep=3pt] at (2.3,1.15) {Safe single-row guard:\\T2 returns \texttt{UPDATE 0},\\bal = \$20};
+  \end{scope}
+
+  % Panel 3: REPEATABLE READ First-Updater-Wins
+  \begin{scope}[shift={(9.9,0)}]
+    \draw[thick,targetgreen!60!black,fill=targetgreen!4,rounded corners=5pt] (0,0) rectangle (4.5,5.8);
+    \node[font=\bfseries\scriptsize,targetgreen!80!black,align=center] at (2.25,5.38) {3. First-Updater-Wins\\(\texttt{REPEATABLE READ})};
+
+    \node[draw=gray!60,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,minimum width=4.0cm] at (2.25,4.65) {T1 \& T2 both SELECT 10000};
+    \node[draw=sourceblue!80,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,minimum width=4.0cm] at (2.25,3.80) {T1 updates row 1; COMMIT};
+    \node[draw=structurepurple!85!black,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,minimum width=4.0cm] at (2.25,2.72) {T2 wakes -> sees row 1\\modified after Snap(T2)!\\Refuses EPQ!};
+    \node[draw=targetgreen!85!black,fill=targetgreen!14,rounded corners=3pt,font=\scriptsize\bfseries,align=center,minimum width=4.0cm,inner sep=3pt] at (2.25,1.15) {Aborts T2 with \texttt{40001}!\\App retries T2 cleanly\\even for App R-M-W!};
+  \end{scope}
+\end{tikzpicture}
+\caption{Three outcomes when $T_1$ and $T_2$ concurrently withdraw \$80 from a \$100 row. (1) Application read-modify-write under \texttt{READ COMMITTED} silently overwrites $T_1$'s debit because \texttt{SET bal = 2000} contains a literal constant. (2) Self-relative \texttt{SET bal = bal - 8000 WHERE bal >= 8000} triggers \texttt{EvalPlanQual} to walk \texttt{t\_ctid} to \texttt{(0,2)} and re-evaluate the \texttt{WHERE} predicate. (3) \texttt{REPEATABLE READ} rejects any concurrent update to the target row with \texttt{SQLSTATE 40001}.}
+\label{ch06:fig-lost-update-epq}
+\end{figure}
+
+\begin{trapbox}
+\textbf{Even \texttt{EvalPlanQual} has a sharp edge on multi-table \texttt{UPDATE ... FROM} queries.}
+When \texttt{EvalPlanQual} wakes up under \texttt{READ COMMITTED}, it fetches the newest version \emph{only for locked/target rows}, while non-locked joined tables in \texttt{FROM} or subqueries keep the rows seen by the statement's \emph{original} snapshot. For single-row updates, atomic \texttt{SET bal = bal - \$1 WHERE bal >= \$1} (or \texttt{SELECT ... FOR NO KEY UPDATE} before reading) is safe; for multi-statement read-modify-write flows without explicit locks, \texttt{REPEATABLE READ} catches every single-row collision automatically via \textbf{First-Updater-Wins} (\texttt{SQLSTATE 40001}: \texttt{could not serialize access due to concurrent update}).
+\end{trapbox}
+
+\section{Write Skew: Why \texttt{REPEATABLE READ} Still Breaks Multi-Row Invariants}
+\label{ch06:write-skew}
+
+Look back at Panel~3 of Figure~\ref{ch06:fig-lost-update-epq}. Why did \texttt{REPEATABLE READ} catch the lost update? Because $T_1$ and $T_2$ tried to update \textbf{the exact same physical row} (\texttt{id = 1}). When $T_2$ tried to stamp \texttt{t\_xmax} on \texttt{id = 1}, it saw $T_1$'s committed \texttt{t\_xmax} and raised \texttt{40001}.
+
+Now return to Alice's two sub-accounts from the opening page of this chapter, or its classic sibling in hospital scheduling (``at least one doctor on the night shift must stay \texttt{on\_call = true}''). Look at the SQL executed by Worker~1 and Worker~2 under \texttt{REPEATABLE READ}:
+
+\begin{lstlisting}[language=SQL]
+-- Worker 1 (REPEATABLE READ)           -- Worker 2 (REPEATABLE READ)
+BEGIN ISOLATION LEVEL REPEATABLE READ;  BEGIN ISOLATION LEVEL REPEATABLE READ;
+
+SELECT SUM(bal) FROM sub_accounts       SELECT SUM(bal) FROM sub_accounts
+ WHERE user_id = 7;  -- returns 16000    WHERE user_id = 7;  -- returns 16000
+
+-- 16000 - 10000 = 6000 >= 0 (OK!)      -- 16000 - 10000 = 6000 >= 0 (OK!)
+UPDATE sub_accounts                     UPDATE sub_accounts
+   SET bal = bal - 10000                   SET bal = bal - 10000
+ WHERE user_id = 7 AND kind = 'chk';     WHERE user_id = 7 AND kind = 'sav';
+
+COMMIT; -- Succeeds!                    COMMIT; -- ALSO SUCCEEDS!
+-- Combined balance is now -2000 + (-2000) = -4000 (< 0)!
+\end{lstlisting}
+
+Database researchers call this anomaly \textbf{Write Skew}:
+\begin{enumerate}
+  \item $T_1$ and $T_2$ read \emph{overlapping} sets of rows ($R(T_1) = \{\texttt{chk}, \texttt{sav}\}$ and $R(T_2) = \{\texttt{chk}, \texttt{sav}\}$).
+  \item Based on that shared premise, $T_1$ and $T_2$ write to \emph{disjoint} sets of rows ($W(T_1) = \{\texttt{chk}\}$ and $W(T_2) = \{\texttt{sav}\}$, so $W(T_1) \cap W(T_2) = \emptyset$!).
+  \item Because their write sets do not intersect, neither transaction ever touches a tuple \texttt{t\_xmax} modified by the other. Snapshot Isolation's First-Updater-Wins check never fires, and the multi-row invariant ($\texttt{chk} + \texttt{sav} \ge 0$) shatters silently.
+\end{enumerate}
+
+Write skew also appears with \textbf{\texttt{INSERT}s} (\emph{insert write skew}):
+\begin{itemize}
+  \item \textbf{Meeting room double-booking} (without an exclusion constraint): Worker~1 checks \texttt{SELECT COUNT(*) FROM bookings WHERE room = 4 AND ts \&\& '[2pm, 3pm)'} (\texttt{0}) and \texttt{INSERT}s row~A; Worker~2 runs the identical check (\texttt{0}) and \texttt{INSERT}s row~B. Neither updated an existing row, so both \texttt{INSERT}s commit under \texttt{REPEATABLE READ} and Room~4 is double-booked.
+  \item \textbf{Ledger batch limit}: Two concurrent payouts check that today's outgoing wires for Merchant~99 total $< \$50{,}000$, and each \texttt{INSERT}s a new \$40,000 wire posting. Both commit under \texttt{REPEATABLE READ}, wiring \$80,000.
+\end{itemize}
+
+\section{Serializable Snapshot Isolation (SSI): True \texttt{SERIALIZABLE} Without Read Locks}
+\label{ch06:ssi}
+
+For thirty years after System~R, database textbooks taught a hard rule: if you wanted true \texttt{SERIALIZABLE} isolation that prevented write skew, you had to abandon lock-free MVCC reads and use \textbf{Strict Two-Phase Locking (S2PL)}---forcing every \texttt{SELECT} to acquire shared read locks and index-gap locks that blocked concurrent writers. Because S2PL destroyed concurrency, early PostgreSQL releases didn't even implement real \texttt{SERIALIZABLE} (prior to PostgreSQL~9.1, asking for \texttt{SERIALIZABLE} quietly gave you \texttt{REPEATABLE READ} Snapshot Isolation).
+
+In 2008, Michael Cahill, Uwe R\"ohm, and Alan Fekete proved (implemented in PostgreSQL~9.1 by Kevin Grittner and Dan Ports): you can keep \textbf{100\% non-blocking MVCC reads}, never stall a single reader or writer on read locks, and still achieve full mathematical serializability by tracking lightweight conflict edges called \textbf{$\mathrm{rw}$-antidependencies}. PostgreSQL calls this engine \textbf{Serializable Snapshot Isolation} (\textbf{SSI}).
+
+\subsection{Conflict Edges and the ``Dangerous Structure'' Theorem}
+
+Between any two transactions $T_1$ and $T_2$ touching a common datum $x$ (or predicate gap), three kinds of ordering dependencies can arise:
+\begin{enumerate}
+  \item \textbf{Write-Read ($T_1 \xrightarrow{\mathrm{wr}} T_2$):} $T_1$ writes a version of $x$ and commits; $T_2$'s snapshot sees that version. Clearly $T_1$ must precede $T_2$ in any equivalent serial schedule.
+  \item \textbf{Write-Write ($T_1 \xrightarrow{\mathrm{ww}} T_2$):} $T_1$ writes $x$ and commits; $T_2$ overwrites $T_1$'s version of $x$. Again $T_1$ must precede $T_2$ (and Snapshot Isolation already forbids concurrent $T_1, T_2$ from both overwriting $x$).
+  \item \textbf{Read-Write Antidependency ($T_1 \xrightarrow{\mathrm{rw}} T_2$):} $T_1$'s snapshot reads an \emph{older} state of $x$ (before $T_2$'s write), while concurrent transaction~$T_2$ writes a \emph{newer} version of $x$ (or inserts a tuple matching $T_1$'s \texttt{WHERE} predicate). Think carefully about which transaction must come first in an equivalent serial world: \textbf{$T_1$ MUST come before $T_2$}. Why? Because if $T_2$ had executed completely before $T_1$, then $T_1$'s read would have seen $T_2$'s new value instead of the old one.
+\end{enumerate}
+
+Now draw the dependency graph for Alice's Checking/Savings write skew:
+\begin{itemize}
+  \item $T_1$ read the old value of \texttt{sav} (\texttt{8000}), while concurrent $T_2$ updated \texttt{sav} to \texttt{-2000}: that creates an antidependency edge $T_1 \xrightarrow{\mathrm{rw}} T_2$ ($T_1$ must precede $T_2$).
+  \item Symmetrically, $T_2$ read the old value of \texttt{chk} (\texttt{8000}), while concurrent $T_1$ updated \texttt{chk} to \texttt{-2000}: that creates an antidependency edge $T_2 \xrightarrow{\mathrm{rw}} T_1$ ($T_2$ must precede $T_1$).
+\end{itemize}
+Put the two edges together and you get a cycle:
+\[
+  T_1 \;\xrightarrow{\;\mathrm{rw}\;}\; T_2 \;\xrightarrow{\;\mathrm{rw}\;}\; T_1.
+\]
+$T_1$ must come before $T_2$, and $T_2$ must come before $T_1$---no serial order exists. More generally, Fekete et al.\ proved the structural theorem that makes SSI fast:
+
+\begin{theorem}[Dangerous Structure Under Snapshot Isolation]
+\label{ch06:thm-ssi}
+In any non-serializable schedule produced by Snapshot Isolation, the serialization dependency graph contains a cycle, and \textbf{every minimal cycle contains a ``dangerous structure'' of two consecutive $\mathrm{rw}$-antidependency edges}:
+\[
+  T_{\mathrm{in}} \;\xrightarrow{\;\mathrm{rw}\;}\; T_{\mathrm{pivot}} \;\xrightarrow{\;\mathrm{rw}\;}\; T_{\mathrm{out}},
+\]
+where $T_{\mathrm{in}}$ and $T_{\mathrm{pivot}}$ ran concurrently, $T_{\mathrm{pivot}}$ and $T_{\mathrm{out}}$ ran concurrently, and $T_{\mathrm{out}}$ is the \textbf{first transaction among the cycle to commit} (note that in 2-party write skew, $T_{\mathrm{in}}$ and $T_{\mathrm{out}}$ are the very same transaction).
+\end{theorem}
+
+\begin{intuitionbox}
+Why does Theorem~\ref{ch06:thm-ssi} matter for performance? Checking arbitrary cycles across a giant distributed graph on every read is expensive. Theorem~\ref{ch06:thm-ssi} says PostgreSQL does \emph{not} even have to run full general graph search. It only has to watch for any \textbf{pivot transaction} $T_{\mathrm{pivot}}$ that acquires \emph{both} an incoming $\mathrm{rw}$-conflict ($T_{\mathrm{in}} \xrightarrow{\mathrm{rw}} T_{\mathrm{pivot}}$) and an outgoing $\mathrm{rw}$-conflict ($T_{\mathrm{pivot}} \xrightarrow{\mathrm{rw}} T_{\mathrm{out}}$) where $T_{\mathrm{out}}$ commits before $T_{\mathrm{pivot}}$! One local two-hop check in shared memory catches every Snapshot Isolation anomaly.
+\end{intuitionbox}
+
+\subsection{How \texttt{SIRead} Predicate Locks Work Inside PostgreSQL}
+
+How does PostgreSQL detect when $T_2$ writes to something $T_1$ already read (including an empty index gap where no row existed yet)? Through \textbf{\texttt{SIRead} predicate locks} managed inside \texttt{predicate.c} in PostgreSQL's lock manager:
+\begin{enumerate}
+  \item \textbf{\texttt{SIRead} locks never block anyone:} Despite the word ``lock,'' an \texttt{SIRead} tag is purely a passive sticky note in shared memory saying ``serializable transaction~$T_1$ inspected this tuple, index page, or table.'' Readers never wait on writers, and writers never wait on \texttt{SIRead} tags.
+  \item \textbf{Index gaps prevent phantom write skew:} When $T_1$ runs an index scan \texttt{WHERE room = 4 AND ...} and finds zero rows, PostgreSQL places an \texttt{SIRead} lock on the \textbf{B-tree leaf page} where \texttt{room = 4} keys belong. When concurrent $T_2$ inserts a new booking into that exact B-tree leaf page, $T_2$'s index insertion trips $T_1$'s page-level \texttt{SIRead} lock and records $T_1 \xrightarrow{\mathrm{rw}} T_2$! (If $T_1$ instead runs a full table \texttt{Seq Scan} because no index exists, PostgreSQL places a relation-level \texttt{SIRead} lock on the whole table---a huge practical reason to index predicates queried inside \texttt{SERIALIZABLE} transactions so unrelated writes do not trigger false-positive retries.)
+  \item \textbf{Bounded memory via lock promotion:} If one transaction touches thousands of tuples on a heap page, PostgreSQL automatically coarsens those tuple-level \texttt{SIRead} tags into a single page-level (or relation-level) \texttt{SIRead} tag controlled by \texttt{max\_pred\_locks\_per\_transaction}. Coarsening never misses a real bug (zero false negatives); at worst it causes an occasional conservative \texttt{40001} retry.
+  \item \textbf{Keep \texttt{SIRead} tags slightly past \texttt{COMMIT}:} Notice in Alice's example that $T_1$ commits \emph{first}, and only when $T_2$ tries to commit afterward does the dangerous structure $T_2 \xrightarrow{\mathrm{rw}} T_1 \xrightarrow{\mathrm{rw}} T_2$ complete with $T_1$ already committed. Therefore PostgreSQL retains a committed serializable transaction's \texttt{SIRead} summary in shared memory until all overlapping concurrent serializable transactions finish.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,scale=0.95,transform shape]
+  % Left: Timeline under SERIALIZABLE
+  \begin{scope}[shift={(0,0)}]
+    \draw[thick,sourceblue!50,fill=sourceblue!4,rounded corners=5pt] (0,0) rectangle (7.2,6.0);
+    \node[font=\bfseries\scriptsize,sourceblue!90!black] at (3.6,5.68) {\texttt{SERIALIZABLE} (SSI) Catching Write Skew};
+
+    \node[font=\scriptsize\bfseries,sourceblue!90!black] at (1.85,5.20) {$T_1$ (Debit Checking)};
+    \node[font=\scriptsize\bfseries,structurepurple!90!black] at (5.35,5.20) {$T_2$ (Debit Savings)};
+    \draw[thick,gray!55,->] (0.22,4.95) -- (0.22,0.45);
+    \node[font=\tiny,gray!70!black,rotate=90] at (0.08,2.7) {time};
+
+    \node[draw=sourceblue!80,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,inner sep=2.5pt] at (1.85,4.45) {SELECT chk, sav (16000)\\Stamps SIRead(chk, sav)};
+    \node[draw=structurepurple!80,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,inner sep=2.5pt] at (5.35,4.15) {SELECT chk, sav (16000)\\Stamps SIRead(chk, sav)};
+
+    \node[draw=sourceblue!80,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,inner sep=2.5pt] at (1.85,3.05) {UPDATE chk = -2000\\Trips T2's SIRead(chk)\\Records: T2 -rw-> T1};
+    \node[draw=structurepurple!80,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=center,inner sep=2.5pt] at (5.35,2.45) {UPDATE sav = -2000\\Trips T1's SIRead(sav)\\Records: T1 -rw-> T2};
+
+    \node[draw=targetgreen!85!black,fill=targetgreen!14,rounded corners=2pt,font=\tiny\ttfamily\bfseries,inner sep=2.5pt] at (1.85,1.55) {COMMIT (succeeds)};
+    \node[draw=trapred!90!black,fill=trapred!15,rounded corners=2pt,font=\tiny\ttfamily\bfseries,align=center,inner sep=2.5pt] at (5.35,0.85) {COMMIT -> ABORT 40001\\(dangerous structure)};
+  \end{scope}
+
+  % Right: Dependency Graph & Dangerous Structure
+  \begin{scope}[shift={(7.7,0)}]
+    \draw[thick,structurepurple!50,fill=structurepurple!4,rounded corners=5pt] (0,0) rectangle (6.5,6.0);
+    \node[font=\bfseries\scriptsize,structurepurple!90!black] at (3.25,5.68) {SSI Dependency Graph in Shared RAM};
+
+    % Data rows
+    \node[draw=gray!70,fill=white,rounded corners=2pt,font=\scriptsize\ttfamily,minimum width=2.4cm,minimum height=0.58cm] (rchk) at (1.65,4.65) {Row: chk};
+    \node[draw=gray!70,fill=white,rounded corners=2pt,font=\scriptsize\ttfamily,minimum width=2.4cm,minimum height=0.58cm] (rsav) at (4.85,4.65) {Row: sav};
+
+    \node[font=\tiny,sourceblue!90!black] at (1.65,4.12) {\texttt{SIRead}: $\{T_1, T_2\}$};
+    \node[font=\tiny,structurepurple!90!black] at (4.85,4.12) {\texttt{SIRead}: $\{T_1, T_2\}$};
+
+    % Transaction nodes
+    \node[circle,draw=sourceblue!90!black,fill=sourceblue!16,very thick,minimum size=1.15cm,font=\bfseries\small] (t1) at (1.65,2.55) {$T_1$};
+    \node[circle,draw=structurepurple!90!black,fill=structurepurple!16,very thick,minimum size=1.15cm,font=\bfseries\small] (t2) at (4.85,2.55) {$T_2$};
+
+    \draw[->,very thick,trapred!85!black] (t1) to[bend left=26] node[above,font=\scriptsize\bfseries] {$\mathrm{rw}$ (\texttt{sav})} (t2);
+    \draw[->,very thick,trapred!85!black] (t2) to[bend left=26] node[below,font=\scriptsize\bfseries] {$\mathrm{rw}$ (\texttt{chk})} (t1);
+
+    \node[draw=trapred!80!black,fill=white,rounded corners=3pt,font=\tiny,align=left,inner sep=3.5pt] at (3.25,0.92) {
+      \textbf{Dangerous Structure:} $T_2 \xrightarrow{\mathrm{rw}} T_1 \xrightarrow{\mathrm{rw}} T_2$\\
+      $\bullet$ $T_1$ has \texttt{inConflict} ($T_2$) and \texttt{outConflict} ($T_2$).\\
+      $\bullet$ $T_1$ commits first $\implies$ $T_2$ is aborted with\\
+      \quad \texttt{SQLSTATE 40001}; app retries $T_2$.
+    };
+  \end{scope}
+\end{tikzpicture}
+\caption{How PostgreSQL's Serializable Snapshot Isolation (SSI) defeats write skew without blocking readers. Left: Both $T_1$ and $T_2$ stamp passive \texttt{SIRead} predicate locks on \texttt{chk} and \texttt{sav}. Neither reader blocks. Right: When $T_1$ writes \texttt{chk} and $T_2$ writes \texttt{sav}, two consecutive $\mathrm{rw}$-antidependency edges form a dangerous structure; once $T_1$ commits, $T_2$ is aborted with \texttt{SQLSTATE 40001} and retries against the post-$T_1$ balance (\texttt{6000}), declining the overdraft.}
+\label{ch06:fig-write-skew-ssi}
+\end{figure}
+
+\begin{applicationbox}
+\textbf{Two rules every \texttt{SERIALIZABLE} production service lives by:}
+\begin{enumerate}
+  \item \textbf{Every \texttt{REPEATABLE READ} or \texttt{SERIALIZABLE} transaction MUST sit inside an idempotent retry loop} that catches \texttt{SQLSTATE 40001} (\texttt{serialization\_failure}) and \texttt{40P01} (\texttt{deadlock\_detected}), rolls back, and replays the unit of work from \texttt{BEGIN} (with small jittered backoff). Never perform irreversible external side effects (charging a Stripe webhook or sending an email) inside a retryable database transaction---write an \texttt{outbox} row inside the transaction instead.
+  \item \textbf{Mark long read-only analytics \texttt{SERIALIZABLE READ ONLY DEFERRABLE}:} If a 30-second reporting query runs at plain \texttt{SERIALIZABLE}, its \texttt{SIRead} locks can force concurrent OLTP writers or the report itself into \texttt{40001} retries. Starting the report with
+\begin{lstlisting}[language=SQL]
+BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE;
+\end{lstlisting}
+  waits briefly at \texttt{BEGIN} (if needed) until PostgreSQL can hand it a provably ``safe'' snapshot isolated from in-flight writers, and then runs the entire 30-second report with \textbf{zero \texttt{SIRead} locks and zero risk of \texttt{40001}}.
+\end{enumerate}
+\end{applicationbox}
+
+\section{Explicit Row Locks, Work Queues, Deadlocks, and Advisory Locks}
+\label{ch06:explicit-locks}
+
+SSI is optimistic: transactions race ahead without waiting and retry if a \texttt{40001} conflict fires. When contention on a single hot row is fierce---say, 200 concurrent checkout threads debiting the same flash-sale inventory SKU or settlement account---optimistic retries waste CPU re-running 199 aborted transactions. In high-contention hotspots, \textbf{pessimistic locking} (queuing writers cleanly in line on the first pass) is cheaper.
+
+\subsection{PostgreSQL's Four Row-Level Lock Strengths}
+
+Why does PostgreSQL have \emph{four} row-level \texttt{SELECT ... FOR ...} lock modes instead of just ``shared'' and ``exclusive''? Because of \textbf{foreign keys}.
+
+Suppose \texttt{postings.account\_id} has a foreign key \texttt{REFERENCES accounts(id)}. When a worker inserts a new posting for Account~42, PostgreSQL must ensure nobody concurrently \texttt{DELETE}s Account~42 (or changes \texttt{accounts.id = 42} to \texttt{99}) before the posting commits. Prior to PostgreSQL~9.3, inserting that child row acquired \texttt{FOR SHARE} on \texttt{accounts(id = 42)}, which \textbf{blocked every concurrent \texttt{UPDATE} to \texttt{accounts.balance\_minor}}---serializing the entire ledger even though \texttt{accounts.id} never changed.
+
+PostgreSQL solved that bottleneck permanently by splitting row locks into four strengths:
+\begin{enumerate}
+  \item \textbf{\texttt{FOR KEY SHARE}:} Weakest lock. Placed automatically on the parent row during foreign-key checks. Conflicts \emph{only} with \texttt{DELETE} and updates that modify key columns (\texttt{FOR UPDATE}).
+  \item \textbf{\texttt{FOR SHARE}:} Shared read lock ensuring the entire row does not change until commit. Conflicts with both \texttt{FOR NO KEY UPDATE} and \texttt{FOR UPDATE}, while allowing concurrent \texttt{FOR SHARE} readers.
+  \item \textbf{\texttt{FOR NO KEY UPDATE}:} Acquired automatically by any \texttt{UPDATE} that does \emph{not} modify a \texttt{PRIMARY KEY} or \texttt{UNIQUE} index column referenced by foreign keys. \textbf{Compatible with \texttt{FOR KEY SHARE}}, so child inserts and non-key parent updates run concurrently without blocking.
+  \item \textbf{\texttt{FOR UPDATE}:} Strongest exclusive row lock (acquired automatically by \texttt{DELETE} or key-changing \texttt{UPDATE}s). Blocks all four row-lock modes (while \emph{still} never blocking plain MVCC \texttt{SELECT}s).
+\end{enumerate}
+
+To prevent Alice's Checking/Savings write skew pessimistically even under default \texttt{READ COMMITTED}, lock \textbf{both} sub-account rows (or lock the parent \texttt{users} row) before summing:
+
+\begin{lstlisting}[language=SQL]
+BEGIN;
+-- Locks BOTH sub-accounts in deterministic ID order before summing!
+SELECT id, kind, bal
+  FROM sub_accounts
+ WHERE user_id = 7
+ ORDER BY id ASC
+   FOR NO KEY UPDATE;
+-- Worker 2 sleeps right here until Worker 1 commits, then sees bal = 6000!
+\end{lstlisting}
+
+\subsection{Non-Blocking Modifiers: \texttt{NOWAIT} and \texttt{SKIP LOCKED} Job Queues}
+
+By default, \texttt{FOR UPDATE} blocks until the lock holder finishes (or \texttt{lock\_timeout} expires). Two modifiers change what happens when the row is already locked:
+\begin{itemize}
+  \item \textbf{\texttt{FOR UPDATE NOWAIT}:} If the row is already locked by another transaction, fail \emph{immediately} in $< 0.1\text{ ms}$ with \texttt{SQLSTATE 55P03} (\texttt{could not obtain lock on row}) instead of parking an HTTP worker thread in a lock queue. Always set \texttt{SET LOCAL lock\_timeout = '2s';} or use \texttt{NOWAIT} in latency-sensitive APIs so a stuck lock cannot exhaust your entire connection pool.
+  \item \textbf{\texttt{FOR UPDATE SKIP LOCKED}:} Any row currently locked by another active worker is \emph{quietly skipped} during the scan. With six lines of SQL, \texttt{SKIP LOCKED} turns an ordinary PostgreSQL table into a high-throughput, ACID-compliant transactional work queue or outbox consumer where fifty concurrent Rust workers claim disjoint batches with zero lock waits and zero duplicate processing:
+\end{itemize}
+
+\begin{lstlisting}[language=SQL]
+WITH claimed AS (
+    SELECT id
+      FROM webhook_outbox
+     WHERE status = 'pending' AND next_attempt_at <= now()
+     ORDER BY next_attempt_at ASC
+     LIMIT 25
+       FOR UPDATE SKIP LOCKED
+)
+UPDATE webhook_outbox w
+   SET status = 'processing', attempts = attempts + 1
+  FROM claimed c
+ WHERE w.id = c.id
+RETURNING w.id, w.endpoint_url, w.payload_json;
+\end{lstlisting}
+
+\subsection{Deadlocks (\texttt{deadlock\_timeout}) and Deterministic Lock Ordering}
+
+Whenever transactions lock more than one row one at a time, lock waits can form a cycle:
+\begin{itemize}
+  \item $T_1$ transfers \$10 from Account~10 to Account~20: locks row~\texttt{10}, then tries to lock row~\texttt{20}.
+  \item At the same millisecond, $T_2$ transfers \$15 from Account~20 to Account~10: locks row~\texttt{20}, then tries to lock row~\texttt{10}!
+\end{itemize}
+Now $T_1$ waits for $T_2$ and $T_2$ waits for $T_1$; neither can ever advance on its own.
+
+PostgreSQL detects deadlocks lazily. Scanning the global wait-for graph on every microsecond lock wait would waste CPU when 99.99\% of row locks clear in under a millisecond. Instead, a sleeping backend sets a timer for \textbf{\texttt{deadlock\_timeout}} (default \texttt{1s}). Only if the backend is \emph{still} asleep after 1,000~ms does it wake up, build the wait-for graph in shared memory, detect the cycle $T_1 \to T_2 \to T_1$, and abort one transaction with \texttt{SQLSTATE 40P01: deadlock detected} so the survivor finishes immediately.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,scale=0.95,transform shape]
+  % Left: Row Lock Compatibility Matrix
+  \begin{scope}[shift={(0,0)}]
+    \draw[thick,sourceblue!45,fill=sourceblue!4,rounded corners=5pt] (0,0) rectangle (7.2,5.3);
+    \node[font=\bfseries\scriptsize,sourceblue!90!black] at (3.6,4.95) {PostgreSQL Row-Level Lock Compatibility Matrix};
+
+    % Headers
+    \node[font=\tiny\bfseries,align=right,anchor=east] at (2.35,3.80) {\texttt{KEY SHARE}};
+    \node[font=\tiny\bfseries,align=right,anchor=east] at (2.35,3.05) {\texttt{SHARE}};
+    \node[font=\tiny\bfseries,align=right,anchor=east] at (2.35,2.30) {\texttt{NO KEY UPD}};
+    \node[font=\tiny\bfseries,align=right,anchor=east] at (2.35,1.55) {\texttt{UPDATE}};
+
+    \node[font=\tiny\bfseries,align=center] at (2.95,4.38) {\texttt{KEY}\\\texttt{SHR}};
+    \node[font=\tiny\bfseries,align=center] at (4.05,4.38) {\texttt{SHR}};
+    \node[font=\tiny\bfseries,align=center] at (5.15,4.38) {\texttt{NO KEY}\\\texttt{UPD}};
+    \node[font=\tiny\bfseries,align=center] at (6.25,4.38) {\texttt{UPD}};
+
+    % Matrix cells: (col, row, ok/X)
+    \foreach \cx/\ry/\ok/\hi in {
+      2.95/3.80/OK/0, 4.05/3.80/OK/0, 5.15/3.80/OK/1, 6.25/3.80/WAIT/0,
+      2.95/3.05/OK/0, 4.05/3.05/OK/0, 5.15/3.05/WAIT/0, 6.25/3.05/WAIT/0,
+      2.95/2.30/OK/1, 4.05/2.30/WAIT/0, 5.15/2.30/WAIT/0, 6.25/2.30/WAIT/0,
+      2.95/1.55/WAIT/0, 4.05/1.55/WAIT/0, 5.15/1.55/WAIT/0, 6.25/1.55/WAIT/0
+    } {
+      \ifnum\hi=1
+        \node[draw=quotientorange!95!black,fill=quotientorange!20,very thick,rounded corners=2pt,minimum width=0.95cm,minimum height=0.58cm,font=\tiny\bfseries,text=targetgreen!75!black] at (\cx,\ry) {\ok!};
+      \else
+        \def\testok{\ok}\def\refok{OK}
+        \ifx\testok\refok
+          \node[draw=targetgreen!75!black,fill=targetgreen!12,rounded corners=2pt,minimum width=0.95cm,minimum height=0.58cm,font=\tiny\bfseries,text=targetgreen!80!black] at (\cx,\ry) {OK};
+        \else
+          \node[draw=trapred!75!black,fill=trapred!12,rounded corners=2pt,minimum width=0.95cm,minimum height=0.58cm,font=\tiny\bfseries,text=trapred!85!black] at (\cx,\ry) {WAIT};
+        \fi
+      \fi
+    }
+    \node[font=\tiny,align=center,gray!85!black] at (3.6,0.62) {Orange cells: \texttt{FOR KEY SHARE} (child FK insert) + \texttt{FOR NO KEY UPDATE}\\(parent non-key \texttt{UPDATE}) never block each other --- nor plain \texttt{SELECT}!};
+  \end{scope}
+
+  % Right: Deadlock Cycle vs Deterministic Lock Ordering
+  \begin{scope}[shift={(7.6,0)}]
+    \draw[thick,trapred!45,fill=trapred!4,rounded corners=5pt] (0,0) rectangle (6.6,5.3);
+    \node[font=\bfseries\scriptsize,trapred!85!black] at (3.3,4.95) {Deadlock Cycle vs.\ \texttt{ORDER BY id ASC}};
+
+    % Top sub-box: Deadlock
+    \draw[thick,trapred!65,fill=white,rounded corners=3pt] (0.3,2.75) rectangle (6.3,4.55);
+    \node[font=\tiny\bfseries,trapred!85!black] at (3.3,4.33) {Unordered Locks $\implies$ Cycle (\texttt{40P01} after 1s)};
+    \node[circle,draw=sourceblue!85!black,fill=sourceblue!14,thick,font=\scriptsize\bfseries,inner sep=2.5pt] (dt1) at (1.3,3.50) {$T_1$};
+    \node[draw=gray!75,fill=gray!10,rounded corners=2pt,font=\tiny\ttfamily] (r10) at (3.3,4.00) {id=10};
+    \node[draw=gray!75,fill=gray!10,rounded corners=2pt,font=\tiny\ttfamily] (r20) at (3.3,3.00) {id=20};
+    \node[circle,draw=structurepurple!85!black,fill=structurepurple!14,thick,font=\scriptsize\bfseries,inner sep=2.5pt] (dt2) at (5.3,3.50) {$T_2$};
+
+    \draw[->,thick,sourceblue!85!black] (r10) -- node[above,font=\tiny,sloped] {holds} (dt1);
+    \draw[->,thick,trapred!85!black,dashed] (dt1) -- node[below,font=\tiny,sloped] {waits} (r20);
+    \draw[->,thick,structurepurple!85!black] (r20) -- node[below,font=\tiny,sloped] {holds} (dt2);
+    \draw[->,thick,trapred!85!black,dashed] (dt2) -- node[above,font=\tiny,sloped] {waits} (r10);
+
+    % Bottom sub-box: Ordered
+    \draw[thick,targetgreen!70!black,fill=white,rounded corners=3pt] (0.3,0.35) rectangle (6.3,2.45);
+    \node[font=\tiny\bfseries,targetgreen!80!black] at (3.3,2.20) {Canonical Order: Always Lock Smaller \texttt{id} First!};
+    \node[font=\tiny\ttfamily,align=left,anchor=west] at (0.5,1.35) {
+      SELECT id FROM accounts\\
+      \ WHERE id IN (\$from, \$to)\\
+      \ ORDER BY id ASC FOR NO KEY UPDATE;
+    };
+    \node[draw=targetgreen!80!black,fill=targetgreen!12,rounded corners=2pt,font=\tiny\bfseries,align=center,inner sep=2.5pt] at (5.15,1.02) {DAG only!\\0 deadlocks};
+  \end{scope}
+\end{tikzpicture}
+\caption{Left: Compatibility among PostgreSQL's four row-level lock modes; highlighted orange cells show why child foreign-key inserts (\texttt{FOR KEY SHARE}) do not block non-key parent \texttt{UPDATE}s (\texttt{FOR NO KEY UPDATE}). Right: Acquiring row locks in arbitrary caller order permits a 2-cycle ($T_1$ holds 10 waiting for 20; $T_2$ holds 20 waiting for 10), whereas locking keys in strictly increasing order (\texttt{ORDER BY id ASC}) forces every wait edge $(u \to v)$ to point upward ($u < v$), making cycles mathematically impossible.}
+\label{ch06:fig-locks-deadlock}
+\end{figure}
+
+Here is the short proof behind Figure~\ref{ch06:fig-locks-deadlock}: if every transaction acquires locks in strictly increasing order of \texttt{account\_id}, then any transaction waiting for lock $k_2$ while holding lock $k_1$ satisfies $k_1 < k_2$. Around any hypothetical cycle $k_1 < k_2 < \dots < k_m < k_1$ we would get $k_1 < k_1$, a contradiction. In our Chapter~8 financial ledger, sorting account IDs before locking eliminates transfer deadlocks completely.
+
+\subsection{Transactional Advisory Locks (\texttt{pg\_advisory\_xact\_lock})}
+
+One puzzle remains: how do you pessimistically lock a resource \textbf{whose row does not exist yet}? Suppose two concurrent requests try to onboard a new merchant \texttt{tax\_id = 'US-98-7654321'} and run complex validation queries before inserting the first row. \texttt{SELECT ... FOR UPDATE WHERE tax\_id = ...} returns zero rows and locks nothing.
+
+PostgreSQL provides \textbf{advisory locks}---application-defined 64-bit integer locks stored purely in PostgreSQL's fast shared-memory lock table (zero heap writes, zero dead tuples, zero WAL):
+
+\begin{lstlisting}[language=SQL]
+BEGIN;
+-- Hash a namespace + business key to a 64-bit BIGINT lock ID;
+-- automatically released at COMMIT or ROLLBACK!
+SELECT pg_advisory_xact_lock(
+    hashtextextended('onboard_tax_id:' || $1, 0)
+);
+-- Now strictly one worker per tax_id executes this critical section at a time!
+COMMIT;
+\end{lstlisting}
+
+Always prefer transaction-scoped advisory locks (\texttt{pg\_advisory\_xact\_lock}) over session-scoped ones (\texttt{pg\_advisory\_lock}): if an application panics or sits behind a transaction-mode connection pooler like \texttt{PgBouncer} (Chapter~8), a session-scoped advisory lock stays leaked on the pooled backend connection and deadlocks unrelated tenants.
+
+We now understand how PostgreSQL keeps concurrent transactions both fast and correct. Yet before any transaction can lock or read a tuple, PostgreSQL has to decide \emph{how} to find that tuple among billions of rows and dozens of tables---sequential scan, B-tree index scan, bitmap heap scan, nested loop, hash join, or merge join. In Chapter~7 we step inside the PostgreSQL query planner and learn to read \texttt{EXPLAIN (ANALYZE, BUFFERS)} output line by line.
+
+\section{Exercises}
+\label{ch06:exercises}
+
+\begin{exercise}[Testing serializability by hand]
+Initially accounts \texttt{A = 100} and \texttt{B = 100}. Consider two committed transactions:
+\begin{itemize}
+  \item $T_1$: reads \texttt{A}, then updates \texttt{B = A + 50}.
+  \item $T_2$: reads \texttt{B}, then updates \texttt{A = B * 2}.
+\end{itemize}
+(a) Compute the final $(\texttt{A}, \texttt{B})$ pair produced by the two valid serial schedules ($T_1 \to T_2$ and $T_2 \to T_1$).
+(b) Compute the final $(\texttt{A}, \texttt{B})$ pair if $T_1$ and $T_2$ run concurrently from the same initial snapshot under PostgreSQL \texttt{REPEATABLE READ}. Does \texttt{REPEATABLE READ} raise an error? Is the outcome serializable?
+(c) Trace what happens when you change both transactions to \texttt{ISOLATION LEVEL SERIALIZABLE}.
+\end{exercise}
+
+\begin{exercise}[Read skew in pagination and reporting]
+An API endpoint running at default \texttt{READ COMMITTED} runs two queries inside \texttt{BEGIN; ... COMMIT;}: first counting rows via \texttt{SELECT COUNT(*) FROM invoices WHERE user\_id = 99 AND status = 'unpaid';} for a header badge, and 5~ms later fetching rows via \texttt{SELECT id, amount\_minor FROM invoices} with the same \texttt{WHERE} clause. Show a concrete interleaving with a concurrent payment transaction where the header badge says ``1 unpaid invoice'' while the table lists zero rows, and give two ways to eliminate the mismatch without blocking the payment writer.
+\end{exercise}
+
+\begin{exercise}[Tracing \texttt{EvalPlanQual} step by step]
+Table \texttt{wallets(id INT PRIMARY KEY, bal BIGINT)} holds a single row \texttt{(1, 10000)}. Transactions $T_1$ and $T_2$ both run at \texttt{READ COMMITTED} and simultaneously start executing:
+\begin{itemize}
+  \item $T_1$: \texttt{UPDATE wallets SET bal = bal - 7000 WHERE id = 1 AND bal >= 7000;}
+  \item $T_2$: \texttt{UPDATE wallets SET bal = bal - 5000 WHERE id = 1 AND bal >= 5000;}
+\end{itemize}
+Suppose $T_1$ acquires the tuple lock on \texttt{(0,1)} first.
+(a) Trace what happens to $T_2$ if $T_1$ commits after 20~ms: which physical tuple does \texttt{EvalPlanQual} inspect, what does \texttt{bal >= 5000} evaluate to, and what is the final balance?
+(b) Now repeat (a) if $T_2$'s query was \texttt{UPDATE wallets SET bal = bal - 2000 WHERE id = 1 AND bal >= 2000;}.
+(c) Contrast (b) with what happens if $T_2$ ran at \texttt{REPEATABLE READ}.
+\end{exercise}
+
+\begin{exercise}[Insert write skew and SSI index gaps]
+A table \texttt{on\_call\_shifts(shift\_date DATE, doctor\_id INT, PRIMARY KEY (shift\_date, doctor\_id))} starts with two doctors scheduled on \texttt{'2026-11-05'}. A hospital rule states at most \emph{three} doctors may claim overtime on the same \texttt{shift\_date}. Doctors~3 and~4 concurrently run \texttt{SELECT COUNT(*) FROM on\_call\_shifts WHERE shift\_date = '2026-11-05';} (both see \texttt{2 < 3}) and each executes \texttt{INSERT INTO on\_call\_shifts VALUES ('2026-11-05', ...)}.
+(a) Why do both \texttt{INSERT}s commit under \texttt{REPEATABLE READ} without violating the primary key?
+(b) Explain which B-tree structure receives an \texttt{SIRead} lock under \texttt{SERIALIZABLE} and why SSI aborts the second committer with \texttt{40001}.
+(c) Suppose \texttt{on\_call\_shifts} had \emph{no} index starting with \texttt{shift\_date}, forcing a \texttt{Seq Scan}. What happens under \texttt{SERIALIZABLE} when Doctor~5 concurrently books an unrelated shift on \texttt{'2026-12-25'}?
+\end{exercise}
+
+\begin{exercise}[Drawing the dangerous structure]
+Three concurrent transactions run under Snapshot Isolation (\texttt{REPEATABLE READ}) over variables $x=0, y=0, z=0$:
+\begin{itemize}
+  \item $T_1$ reads $y$ (sees $0$), writes $x \gets 1$, and commits at $t=3$.
+  \item $T_2$ reads $z$ (sees $0$), writes $y \gets 1$, and commits at $t=2$.
+  \item $T_3$ reads $x$ (sees $0$), writes $z \gets 1$, and commits at $t=1$.
+\end{itemize}
+Draw all $\mathrm{rw}$-antidependency edges among $\{T_1, T_2, T_3\}$, verify that no two transactions wrote the same variable, prove the resulting state $(x,y,z) = (1,1,1)$ cannot arise from any of the $3! = 6$ serial orders, and identify $T_{\mathrm{in}}, T_{\mathrm{pivot}}, T_{\mathrm{out}}$ in Theorem~\ref{ch06:thm-ssi}.
+\end{exercise}
+
+\begin{exercise}[\texttt{FOR UPDATE} vs.\ \texttt{FOR NO KEY UPDATE}]
+Consider parent table \texttt{accounts(id, bal)} and child table \texttt{transfers(id, account\_id, amount)}, where \texttt{account\_id} is a foreign key referencing \texttt{accounts(id)}.
+Explain precisely what lock contention occurs when Connection~A runs \texttt{SELECT bal FROM accounts WHERE id = 42 FOR UPDATE;} (holding the transaction open for 50~ms while computing fees) while 20 concurrent connections insert rows into \texttt{transfers} for \texttt{account\_id = 42}. What changes the instant you replace \texttt{FOR UPDATE} with \texttt{FOR NO KEY UPDATE} in Connection~A?
+\end{exercise}
+
+\begin{exercise}[Transactional outbox edge cases with \texttt{SKIP LOCKED}]
+Examine the \texttt{FOR UPDATE SKIP LOCKED} webhook queue query in Section~\ref{ch06:explicit-locks}.
+(a) Suppose Worker~A claims 25 rows, marks them \texttt{status = 'processing'}, commits that claim transaction, makes HTTP calls, and \textbf{crashes with \texttt{SIGKILL}} after delivering 10 of the 25 webhooks. What happens to the remaining 15 rows stuck in \texttt{'processing'} unless you add a lease column such as \texttt{leased\_until TIMESTAMPTZ}?
+(b) Write the complete crash-resilient claim query using \texttt{leased\_until} so dead workers' unfinished items automatically re-enter the pool after 60 seconds while live workers never double-claim active leases.
+\end{exercise}
+
+\begin{exercise}[Multi-row deadlock construction and prevention]
+A batch payroll endpoint transfers bonuses from one funding account $f$ to $k$ recipient accounts $r_1, \dots, r_k$ by looping in application code and running $k$ individual \texttt{UPDATE accounts SET bal = bal + \$1 WHERE id = \$2;} statements inside one transaction, followed by debiting $f$.
+(a) Construct a two-transaction deadlock between two concurrent batch runs that share funding account $f = 1$ and one recipient $r = 50$.
+(b) Rewrite the locking preamble as a single \texttt{SELECT ... WHERE id = ANY(\$1::bigint[]) ORDER BY id ASC FOR NO KEY UPDATE;} statement and prove why deadlocks between any number of concurrent batch runs become impossible.
+\end{exercise}
+
+\begin{exercise}[Advisory lock collision probability and pooling]
+(a) Suppose 100,000 concurrent tenants use \texttt{pg\_advisory\_xact\_lock(hashtext('tenant:' || id))} (which takes a \textbf{32-bit} \texttt{INT4} hash) vs.\ \texttt{pg\_advisory\_xact\_lock(hashtextextended('tenant:' || id, 0))} (which takes a \textbf{64-bit} \texttt{BIGINT} hash). Using the birthday paradox approximation $p \approx k^2 / (2M)$ for $k = 1{,}000$ simultaneously active locks, estimate the probability that two unrelated tenants block each other under 32-bit vs.\ 64-bit advisory keys.
+(b) Explain concretely what goes wrong if a developer calls \texttt{pg\_advisory\_lock(42)} (session level) through a transaction-mode connection pooler and forgets \texttt{pg\_advisory\_unlock(42)} on an early error return.
+\end{exercise}

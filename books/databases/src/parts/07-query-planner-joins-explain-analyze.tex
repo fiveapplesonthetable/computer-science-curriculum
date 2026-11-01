@@ -1,0 +1,830 @@
+\chapter{The Query Planner, Join Algorithms, and \texttt{EXPLAIN ANALYZE}}
+
+Here is a query that a payments dashboard runs every few seconds:
+
+\begin{lstlisting}[language=SQL]
+SELECT a.id, a.owner_name, SUM(p.amount_minor) AS total
+  FROM accounts a
+  JOIN postings p ON p.account_id = a.id
+ WHERE a.region = 'EU'
+   AND p.created_at >= '2026-10-01'
+ GROUP BY a.id, a.owner_name
+ ORDER BY total DESC
+ LIMIT 10;
+\end{lstlisting}
+
+The query says \emph{what} answer we want. It says nothing about \emph{how} to get it. Should PostgreSQL read all 20 million postings and throw most of them away? Should it find the EU accounts first through an index, and then look up each account's postings through a second index? Should it build a hash table of EU accounts in memory and stream the postings past it? Each of those is a correct way to compute the same ten rows. On one real table, the first plan took 45 seconds and the second took 0.2 seconds. Same SQL, same data, same hardware: a factor of two hundred.
+
+The piece of PostgreSQL that chooses among those plans is the \emph{query planner} (also called the optimizer). It never runs the candidates. It \emph{predicts} what each would cost using statistics about your data and a small set of cost constants, and then hands the cheapest prediction to the executor. When the prediction is right, you never think about it. When it is wrong, a query that ran in 3~ms yesterday runs for 40 seconds today, and the only way to see why is to read \texttt{EXPLAIN (ANALYZE, BUFFERS)} output.
+
+This chapter builds the planner's reasoning from the ground up: the statistics it collects, the units it measures cost in, the four ways it can read one table, the three ways it can join two tables, how it searches through join orders, and how to read its output line by line so you can tell exactly where a prediction went wrong.
+
+\chapterline
+
+\section{From SQL Text to a Running Plan}
+\label{ch07:pipeline}
+
+Every statement passes through four stages inside the backend process that owns your connection:
+
+\begin{enumerate}
+  \item \textbf{Parse.} The SQL text becomes a parse tree. Syntax errors are caught here. Nothing about tables has been checked yet.
+  \item \textbf{Analyze and rewrite.} Names are resolved against the system catalogs (\texttt{a.region} becomes ``column 4 of relation OID 16402''), types are checked, and views are expanded into their underlying queries. The result is a \emph{query tree}.
+  \item \textbf{Plan.} The planner turns the query tree into a \emph{plan tree}: a tree of physical operators such as \texttt{Seq Scan}, \texttt{Index Scan}, \texttt{Hash Join}, and \texttt{Sort}. This is the only stage that makes choices, and it is the subject of this chapter.
+  \item \textbf{Execute.} The executor runs the plan tree. Each node is an iterator: a parent asks its child for the next row, the child asks \emph{its} child, and rows flow upward one at a time. (This is the ``Volcano'' iterator model; PostgreSQL also batches some work, such as building hash tables, but the pull-one-row interface is the mental model to keep.)
+\end{enumerate}
+
+The relational algebra from Chapter~1 lives in stage~3. A join is commutative and associative, a selection $\sigma$ can be pushed below a join, and a projection $\pi$ can drop columns early. Those algebraic laws generate many logically equivalent trees. The planner's job is to attach a physical algorithm to every node of every reasonable tree, estimate the cost, and keep the cheapest.
+
+\begin{intuitionbox}
+Think of the planner as a travel agent who has never visited the city. It cannot drive each route to time it. Instead it owns a map (table and index sizes), a census (statistics about the values in each column), and a price list (cost constants per page read and per row processed). Every route it proposes is only as good as that map and census. Most bad plans are not caused by a stupid search; they are caused by a census that is stale or blind to some pattern in your data.
+\end{intuitionbox}
+
+\section{What the Planner Knows: \texttt{ANALYZE} and \texttt{pg\_stats}}
+\label{ch07:statistics}
+
+\subsection{Sampling a Table of Any Size}
+
+The \texttt{ANALYZE} command (run automatically by autovacuum after enough rows change) reads a \emph{random sample} of each table and stores a summary per column in the catalog \texttt{pg\_statistic}. The human-readable view of that catalog is \texttt{pg\_stats}.
+
+How big is the sample? PostgreSQL samples $300 \times \texttt{default\_statistics\_target}$ rows. With the default target of 100, that is \textbf{30,000 rows}, whether the table holds 50,000 rows or 5 billion. This can feel wrong at first. Why would 30,000 rows describe 5 billion?
+
+Because the questions the planner asks are about \emph{fractions}, not totals. ``What fraction of postings have \texttt{status = 'settled'}?'' is a proportion, and the error of an estimated proportion from a random sample of size $n$ shrinks like $1/\sqrt{n}$, regardless of population size. With $n = 30{,}000$, a value that occurs in 10\% of rows is estimated to within about $\pm 0.35$ percentage points (two standard errors of $\sqrt{0.1 \times 0.9 / 30000} \approx 0.0017$). That is plenty for choosing between a sequential scan and an index scan.
+
+What a small sample \emph{cannot} do well is count rare things. If a column has 40 million distinct values in 5 billion rows, the sample sees most values exactly once, and the estimate of \texttt{n\_distinct} is a statistical extrapolation that can be off by a factor of several. We will see how to fix that when it matters.
+
+\subsection{Reading One Row of \texttt{pg\_stats}}
+
+Here is what \texttt{pg\_stats} reports for two columns of a 20-million-row \texttt{postings} table:
+
+\begin{lstlisting}[language=SQL]
+SELECT attname, null_frac, avg_width, n_distinct,
+       most_common_vals, most_common_freqs,
+       histogram_bounds, correlation
+  FROM pg_stats
+ WHERE tablename = 'postings'
+   AND attname IN ('status', 'amount_minor');
+\end{lstlisting}
+
+\begin{lstlisting}
+-[ RECORD 1 ]-----+------------------------------------
+attname           | status
+null_frac         | 0
+avg_width         | 8
+n_distinct        | 5
+most_common_vals  | {settled,pending,failed}
+most_common_freqs | {0.82,0.12,0.04}
+histogram_bounds  |
+correlation       | 0.31
+-[ RECORD 2 ]-----+------------------------------------
+attname           | amount_minor
+null_frac         | 0.002
+avg_width         | 8
+n_distinct        | -0.21
+most_common_vals  |
+most_common_freqs |
+histogram_bounds  | {0,1000,2000,5000,20000}
+correlation       | 0.02
+\end{lstlisting}
+
+(The real histogram has 101 bounds, giving 100 buckets; we use five bounds and four buckets so we can do the arithmetic by hand.) Each field answers one question the planner will ask:
+
+\begin{itemize}
+  \item \textbf{\texttt{null\_frac}}: the fraction of rows where the column is \texttt{NULL}. A predicate like \texttt{amount\_minor > 0} can never match those rows, so the planner removes them first.
+  \item \textbf{\texttt{avg\_width}}: average stored bytes per value. The planner uses it to estimate how much memory a sort or hash table will need.
+  \item \textbf{\texttt{n\_distinct}}: the number of distinct non-null values. A \emph{positive} number is an absolute count: \texttt{status} has 5 distinct values. A \emph{negative} number is a fraction of the row count: $-0.21$ means ``about 21\% of rows have a distinct value,'' so the planner computes $0.21 \times 20{,}000{,}000 = 4.2$ million distinct amounts. The negative form is used when the number of distinct values seems to grow with the table, so the estimate stays sensible as the table grows. A value of $-1$ means every row is distinct, as for a primary key.
+  \item \textbf{\texttt{most\_common\_vals}} and \textbf{\texttt{most\_common\_freqs}} (the MCV list): the most frequent values and their frequencies, as observed in the sample. Only values that are noticeably more common than average make the list.
+  \item \textbf{\texttt{histogram\_bounds}}: boundaries of an \emph{equi-depth} histogram over the values that are \emph{not} in the MCV list. Equi-depth means each bucket holds the same number of rows, so buckets are narrow where values are dense and wide where they are sparse.
+  \item \textbf{\texttt{correlation}}: how closely the physical order of rows on disk follows the sorted order of this column, from $-1$ (perfectly reversed) through $0$ (random) to $+1$ (perfectly sorted). We will see in Section~\ref{ch07:access-paths} why this one number can swing an index scan's cost by a factor of forty.
+\end{itemize}
+
+\subsection{Turning Statistics into Selectivity}
+
+The planner's central quantity is \emph{selectivity}: the fraction of a table's rows that a predicate keeps. Multiply selectivity by the row count and you get the estimated \texttt{rows} you see in \texttt{EXPLAIN}. Let us compute several by hand from the statistics above.
+
+\begin{example}[Equality on a value in the MCV list]
+\label{ch07:ex-mcv-hit}
+For \texttt{WHERE status = 'pending'}, the value is in the MCV list with frequency $0.12$. The selectivity is simply $0.12$, and the estimate is $0.12 \times 20{,}000{,}000 = 2{,}400{,}000$ rows.
+\end{example}
+
+\begin{example}[Equality on a value not in the MCV list]
+\label{ch07:ex-mcv-miss}
+For \texttt{WHERE status = 'reversed'}, the value is not in the MCV list. The planner reasons: the MCVs account for $0.82 + 0.12 + 0.04 = 0.98$ of rows, and there are no \texttt{NULL}s, so $1 - 0.98 = 0.02$ of rows hold the \emph{other} values. There are $5 - 3 = 2$ other distinct values. Assume they split the remainder evenly:
+\[
+  \text{sel} \;=\; \frac{1 - \text{null\_frac} - \sum \text{mcv\_freqs}}{\text{n\_distinct} - |\text{MCV}|} \;=\; \frac{1 - 0 - 0.98}{5 - 3} \;=\; 0.01.
+\]
+Estimate: $0.01 \times 20{,}000{,}000 = 200{,}000$ rows.
+\end{example}
+
+\begin{example}[A range predicate using the histogram]
+\label{ch07:ex-histogram}
+For \texttt{WHERE amount\_minor < 3500}, there is no MCV list for this column, so every non-null row is covered by the histogram with bounds $\{0, 1000, 2000, 5000, 20000\}$. Each of the four buckets holds $\tfrac14$ of the non-null rows.
+
+The value $3500$ falls inside the third bucket $[2000, 5000)$. Buckets one and two lie entirely below $3500$: that is $\tfrac24$. Within bucket three, PostgreSQL assumes values are spread uniformly and interpolates linearly: $3500$ sits $\tfrac{3500 - 2000}{5000 - 2000} = 0.5$ of the way across, contributing $0.5 \times \tfrac14 = \tfrac18$. So the histogram fraction is $\tfrac24 + \tfrac18 = 0.625$. Finally, remove the $0.2\%$ of \texttt{NULL}s:
+\[
+  \text{sel} = 0.625 \times (1 - 0.002) \approx 0.624, \qquad \text{rows} \approx 12{,}475{,}000.
+\]
+A \texttt{BETWEEN 1500 AND 3500} predicate works the same way: compute the fraction below $3500$ ($0.625$), subtract the fraction below $1500$ ($\tfrac14 + 0.5 \times \tfrac14 = 0.375$), and get $0.25$ of non-null rows.
+\end{example}
+
+Figure~\ref{ch07:fig-stats} shows these three pictures together, along with what \texttt{correlation} measures.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex]
+  % ---------- Panel A: MCV list ----------
+  \draw[thick,sourceblue!45,fill=sourceblue!4,rounded corners=5pt] (0,0) rectangle (7.4,4.7);
+  \node[font=\bfseries\scriptsize,sourceblue!90!black] at (3.7,4.4) {A. MCV list for \texttt{status}};
+  \draw[->,thick,gray!70] (0.5,0.8) -- (7.0,0.8);
+  \draw[->,thick,gray!70] (0.5,0.8) -- (0.5,4.0);
+  \fill[sourceblue!70] (0.9,0.8) rectangle (1.9,3.42);
+  \fill[sourceblue!70] (2.3,0.8) rectangle (3.3,1.18);
+  \fill[sourceblue!70] (3.7,0.8) rectangle (4.7,0.93);
+  \draw[dashed,thick,quotientorange!90!black,fill=quotientorange!15] (5.1,0.8) rectangle (5.8,0.86);
+  \draw[dashed,thick,quotientorange!90!black,fill=quotientorange!15] (6.0,0.8) rectangle (6.7,0.86);
+  \node[font=\tiny] at (1.4,3.62) {0.82};
+  \node[font=\tiny] at (2.8,1.38) {0.12};
+  \node[font=\tiny] at (4.2,1.13) {0.04};
+  \node[font=\tiny,quotientorange!90!black] at (5.9,1.12) {0.01 each};
+  \node[font=\tiny\ttfamily] at (1.4,0.55) {settled};
+  \node[font=\tiny\ttfamily] at (2.8,0.55) {pending};
+  \node[font=\tiny\ttfamily] at (4.2,0.55) {failed};
+  \node[font=\tiny,align=center,quotientorange!90!black] at (5.9,0.42) {2 other values\\(not in list)};
+  \node[font=\tiny,align=left,anchor=west] at (2.4,2.9) {Listed value: use its frequency.};
+  \node[font=\tiny,align=left,anchor=west] at (2.4,2.5) {Unlisted value: split the leftover};
+  \node[font=\tiny,align=left,anchor=west] at (2.4,2.2) {$0.02$ evenly among 2 values.};
+
+  % ---------- Panel B: equi-depth histogram ----------
+  \draw[thick,targetgreen!45,fill=targetgreen!4,rounded corners=5pt] (7.8,0) rectangle (15.2,4.7);
+  \node[font=\bfseries\scriptsize,targetgreen!80!black] at (11.5,4.4) {B. Equi-depth histogram for \texttt{amount\_minor}};
+  \draw[->,thick,gray!70] (8.3,0.8) -- (14.9,0.8);
+  % buckets: equal area 1.8 each (schematic widths)
+  \fill[targetgreen!55] (8.5,0.8) rectangle (9.5,2.6);
+  \fill[targetgreen!55] (9.5,0.8) rectangle (10.5,2.6);
+  \fill[targetgreen!55] (10.5,0.8) rectangle (11.3,1.925);
+  \fill[targetgreen!20] (11.3,0.8) rectangle (12.1,1.925);
+  \fill[targetgreen!20] (12.1,0.8) rectangle (14.5,1.4);
+  \draw[thick,targetgreen!80!black] (8.5,0.8) rectangle (9.5,2.6);
+  \draw[thick,targetgreen!80!black] (9.5,0.8) rectangle (10.5,2.6);
+  \draw[thick,targetgreen!80!black] (10.5,0.8) rectangle (12.1,1.925);
+  \draw[thick,targetgreen!80!black] (12.1,0.8) rectangle (14.5,1.4);
+  \foreach \x/\l in {8.5/0, 9.5/1000, 10.5/2000, 12.1/5000, 14.5/20000} {
+    \node[font=\tiny] at (\x,0.55) {\l};
+  }
+  \draw[very thick,trapred!85!black,dashed] (11.3,0.8) -- (11.3,3.3);
+  \node[font=\tiny\bfseries,trapred!85!black] at (11.3,3.5) {\texttt{< 3500}};
+  \node[font=\tiny,align=center] at (9.5,2.95) {each bucket holds 25\% of rows};
+  \node[font=\tiny,align=center] at (13.3,2.45) {shaded: 25\% + 25\% + 12.5\%};
+  \node[font=\tiny,align=center] at (13.3,2.15) {= 62.5\% of rows};
+  \node[font=\tiny,gray!80!black] at (11.5,0.22) {(bucket widths schematic, not to scale)};
+
+  % ---------- Panel C: correlation ----------
+  \draw[thick,structurepurple!45,fill=structurepurple!4,rounded corners=5pt] (0,-4.6) rectangle (15.2,-0.4);
+  \node[font=\bfseries\scriptsize,structurepurple!90!black] at (7.6,-0.7) {C. \texttt{correlation}: does the heap's physical order follow the column's sorted order?};
+  % top row: ordered
+  \node[font=\tiny\bfseries,anchor=east,targetgreen!80!black] at (2.6,-1.55) {\texttt{created\_at}};
+  \node[font=\tiny,anchor=east,targetgreen!80!black] at (2.6,-1.85) {corr $= +0.99$};
+  \foreach \i/\v in {0/{1--5},1/{6--10},2/{11--15},3/{16--20},4/{21--25},5/{26--30},6/{31--35},7/{36--40}} {
+    \node[draw=targetgreen!75!black,fill=white,minimum width=1.25cm,minimum height=0.55cm,font=\tiny] at (3.4+1.45*\i,-1.7) {\v};
+  }
+  \node[font=\tiny,anchor=west] at (3.0,-2.3) {A range of 10 values touches 2 adjacent pages: cheap, nearly sequential reads.};
+  % bottom row: random
+  \node[font=\tiny\bfseries,anchor=east,trapred!85!black] at (2.6,-3.25) {\texttt{amount\_minor}};
+  \node[font=\tiny,anchor=east,trapred!85!black] at (2.6,-3.55) {corr $= 0.02$};
+  \foreach \i/\v in {0/{3,17,29,..},1/{8,22,40,..},2/{1,14,33,..},3/{6,19,25,..},4/{2,11,38,..},5/{9,27,31,..},6/{4,15,36,..},7/{7,20,30,..}} {
+    \node[draw=trapred!75!black,fill=white,minimum width=1.25cm,minimum height=0.55cm,font=\tiny] at (3.4+1.45*\i,-3.4) {\v};
+  }
+  \node[font=\tiny,anchor=west] at (3.0,-4.0) {A range of 10 values is scattered over every page: each match may cost a random read.};
+\end{tikzpicture}
+\caption{The three statistics that drive most row estimates. A: the MCV list gives exact frequencies for common values and an even split of the leftover for rare ones. B: an equi-depth histogram puts the same number of rows in every bucket, and the planner interpolates linearly inside the bucket containing the boundary value. C: \texttt{correlation} measures whether rows that are adjacent in sorted order are also adjacent on disk.}
+\label{ch07:fig-stats}
+\end{figure}
+
+\subsection{When Two Predicates Are Not Independent}
+
+With two predicates joined by \texttt{AND}, PostgreSQL by default assumes they are statistically independent and multiplies their selectivities:
+\[
+  \text{sel}(A \land B) = \text{sel}(A) \times \text{sel}(B).
+\]
+That is often fine. It is badly wrong when the columns are related. Consider a \texttt{transfers} table where 60\% of rows have \texttt{currency = 'USD'} and 55\% have \texttt{country = 'US'}. Independence predicts
+\[
+  0.60 \times 0.55 = 0.33,
+\]
+but almost every US transfer is in dollars, so the true fraction with both is about $0.54$. The planner underestimates by about 40\%. That is survivable. Now take \texttt{city = 'Lyon' AND postal\_code = '69001'}: if each has selectivity $0.001$, independence predicts $10^{-6}$, yet every row in that postal code is in Lyon, so the truth is close to $10^{-3}$. The estimate is \emph{a thousand times} too small, and a thousand-times-too-small row count is exactly what makes the planner pick a nested loop that runs for minutes (we will see why in Section~\ref{ch07:joins}).
+
+PostgreSQL cannot discover such relationships on its own, because \texttt{pg\_stats} describes each column separately. You can tell it to look at a group of columns together with \emph{extended statistics}:
+
+\begin{lstlisting}[language=SQL]
+CREATE STATISTICS addr_stats (dependencies, ndistinct, mcv)
+    ON city, postal_code FROM customers;
+ANALYZE customers;
+\end{lstlisting}
+
+The three kinds each fix a different mistake:
+\begin{itemize}
+  \item \textbf{\texttt{dependencies}} measures how strongly one column determines another. If \texttt{postal\_code} determines \texttt{city} with degree $f$ (from $0$ to $1$), the planner estimates $\text{sel}(A \land B) = \text{sel}(A) \times \big(f + (1 - f)\,\text{sel}(B)\big)$. With $f = 1$, the second predicate costs nothing extra, which is right: knowing the postal code already tells you the city.
+  \item \textbf{\texttt{ndistinct}} records the number of distinct \emph{combinations}, which fixes \texttt{GROUP BY city, postal\_code} estimates (otherwise the planner multiplies the two distinct counts and predicts far too many groups).
+  \item \textbf{\texttt{mcv}} keeps a most-common-values list over the \emph{pairs}, which gives exact frequencies for common combinations, including ones where the columns are anti-correlated.
+\end{itemize}
+
+\begin{trapbox}
+Statistics only exist for plain columns, and for expressions that have an index or an expression statistic built on them. If you write \texttt{WHERE date\_trunc('day', created\_at) = '2026-10-31'}, the planner has no histogram for that expression and falls back to a hard-coded default selectivity (0.5\% for equality). On a 20-million-row table that predicts 100,000 rows no matter whether the true answer is 60 or 6 million. Either rewrite the predicate as a range on the raw column (\texttt{created\_at >= '2026-10-31' AND created\_at < '2026-11-01'}), which also lets an ordinary index on \texttt{created\_at} be used, or create an expression index or \texttt{CREATE STATISTICS ... ON (date\_trunc('day', created\_at))} so \texttt{ANALYZE} collects a histogram for it.
+\end{trapbox}
+
+\section{The Planner's Currency: Cost Units}
+\label{ch07:cost-units}
+
+Once the planner knows how many rows each step touches, it needs a common unit to compare a plan that reads many pages sequentially against a plan that reads few pages randomly but does more CPU work. PostgreSQL measures everything in arbitrary \emph{cost units}, anchored so that reading one 8~KB page sequentially costs $1.0$:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrl@{}}
+\toprule
+\textbf{Parameter} & \textbf{Default} & \textbf{What it prices} \\
+\midrule
+\texttt{seq\_page\_cost} & 1.0 & Reading one page as part of a sequential run \\
+\texttt{random\_page\_cost} & 4.0 & Reading one page at an arbitrary location \\
+\texttt{cpu\_tuple\_cost} & 0.01 & Processing one heap row \\
+\texttt{cpu\_index\_tuple\_cost} & 0.005 & Processing one index entry \\
+\texttt{cpu\_operator\_cost} & 0.0025 & Evaluating one operator or function call \\
+\texttt{effective\_cache\_size} & 4GB & How much of the data the OS and \texttt{shared\_buffers} likely cache \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Two of these deserve a comment.
+
+\texttt{random\_page\_cost = 4.0} dates from spinning disks, where a random read cost a seek of several milliseconds while sequential reads streamed. The default is already a compromise: on a real hard drive a random read is closer to 40 times the cost of a sequential one, but most random reads hit cache. On NVMe SSDs, random and sequential reads cost nearly the same, and most teams set \texttt{random\_page\_cost = 1.1}. That single change makes the planner far more willing to use indexes.
+
+\texttt{effective\_cache\_size} allocates nothing. It is only a hint: ``assume about this much data is cached somewhere.'' The planner uses it in the Mackert--Lohman formula (below) to predict how many repeated page fetches will be cache hits.
+
+\subsection{Pricing a Sequential Scan by Hand}
+
+Take a \texttt{ledger\_lines} table that occupies $10{,}000$ pages and holds $500{,}000$ rows (50 rows per 8~KB page). The cost of reading every row and testing one \texttt{WHERE} predicate is
+\[
+  \underbrace{10{,}000 \times 1.0}_{\text{pages}} \;+\; \underbrace{500{,}000 \times 0.01}_{\text{rows}} \;+\; \underbrace{500{,}000 \times 0.0025}_{\text{one predicate per row}} \;=\; 10{,}000 + 5{,}000 + 1{,}250 \;=\; 16{,}250.
+\]
+You can check this against PostgreSQL directly:
+
+\begin{lstlisting}[language=SQL]
+EXPLAIN SELECT * FROM ledger_lines WHERE amount_minor > 900000;
+\end{lstlisting}
+\begin{lstlisting}
+Seq Scan on ledger_lines  (cost=0.00..16250.00 rows=4975 width=48)
+  Filter: (amount_minor > 900000)
+\end{lstlisting}
+
+Every node in \texttt{EXPLAIN} prints \texttt{cost=}\emph{startup}\texttt{..}\emph{total}:
+\begin{itemize}
+  \item \textbf{Startup cost} is the work done before the node can return its \emph{first} row. A sequential scan can return a row as soon as it reads page~0, so its startup cost is $0$. A \texttt{Sort} must read its entire input before emitting anything, so its startup cost is nearly its total cost.
+  \item \textbf{Total cost} is the work to return \emph{all} rows.
+  \item \texttt{rows} is the estimated output row count and \texttt{width} is the estimated average row size in bytes.
+\end{itemize}
+
+The distinction matters because of \texttt{LIMIT}. If a plan's total cost is $50{,}000$ for $100{,}000$ rows but you only want 10 rows, the planner charges roughly $\text{startup} + (\text{total} - \text{startup}) \times \tfrac{10}{100{,}000}$. A plan with near-zero startup cost (such as walking an index that is already in the requested \texttt{ORDER BY} order) can beat a plan with a lower total cost but a large startup cost (such as sorting everything first). This is the reason \texttt{ORDER BY created\_at DESC LIMIT 20} on a table with an index on \texttt{created\_at} returns in a millisecond.
+
+\section{Four Ways to Read One Table}
+\label{ch07:access-paths}
+
+For a single table with a predicate such as \texttt{WHERE merchant\_id = 4242}, PostgreSQL considers up to four \emph{access paths}.
+
+\subsection{Seq Scan}
+
+Read every page in physical order and test every row. The cost is almost independent of how many rows match. Sequential reads are the cheapest kind of I/O, and the operating system's read-ahead makes them faster still. For a predicate that keeps a large fraction of rows, nothing beats it.
+
+\subsection{Index Scan}
+
+Descend the B-tree (Chapter~3) to the first matching key, then walk the leaf pages. For each index entry, follow its \texttt{ctid} to the heap page, fetch the row, and check visibility against the snapshot (Chapter~5). Rows come out in index order, which can satisfy an \texttt{ORDER BY} for free.
+
+The catch is the heap fetches. Each matching row may live on a different heap page, and each of those page reads may be a random read. How many distinct heap pages does an index scan touch? That depends on \texttt{correlation}, and the planner handles it by computing two extremes and interpolating between them.
+
+\begin{formalbox}
+\textbf{How PostgreSQL prices the heap side of an Index Scan} (\texttt{cost\_index} in \texttt{costsize.c}). Let the table have $T$ pages, and let the scan fetch $N$ rows.
+\begin{itemize}
+  \item \textbf{Worst case (correlation $0$):} the rows are scattered. The number of distinct pages fetched is estimated by the Mackert--Lohman formula; when the table fits in cache it is
+  \[
+    P_{\max} = \min\!\Big(\frac{2TN}{2T + N},\; T\Big),
+  \]
+  and each page costs \texttt{random\_page\_cost}: $\text{IO}_{\max} = P_{\max} \times 4.0$.
+  \item \textbf{Best case (correlation $\pm 1$):} the matching rows sit on consecutive pages. That is $P_{\min} = \lceil \text{sel} \times T \rceil$ pages, the first a random read and the rest sequential: $\text{IO}_{\min} = 4.0 + (P_{\min} - 1) \times 1.0$.
+  \item \textbf{Interpolate with the square of the correlation $c$:}
+  \[
+    \text{IO} = \text{IO}_{\max} + c^2\,(\text{IO}_{\min} - \text{IO}_{\max}).
+  \]
+\end{itemize}
+CPU cost is added on top: \texttt{cpu\_index\_tuple\_cost} plus one \texttt{cpu\_operator\_cost} per index entry, and \texttt{cpu\_tuple\_cost} per heap row.
+\end{formalbox}
+
+\begin{example}[The same 1\% query on two different columns]
+\label{ch07:ex-index-corr}
+Use the \texttt{ledger\_lines} table again: $T = 10{,}000$ pages, $500{,}000$ rows. A predicate keeps 1\%, so $N = 5{,}000$ rows.
+
+\emph{Uncorrelated column ($c = 0.02$, effectively $0$).} Mackert--Lohman gives
+\[
+  P_{\max} = \frac{2 \times 10{,}000 \times 5{,}000}{20{,}000 + 5{,}000} = \frac{10^8}{25{,}000} = 4{,}000 \text{ pages}, \qquad \text{IO} \approx 4{,}000 \times 4.0 = 16{,}000.
+\]
+Add about $5{,}000 \times (0.005 + 0.0025) = 37.5$ for index entries, $5{,}000 \times 0.01 = 50$ for heap rows, and a few dozen for index pages, and the total lands near $16{,}150$. The sequential scan costs $16{,}250$. At 1\%, on an uncorrelated column, the two plans are essentially tied.
+
+\emph{Correlated column ($c = 0.99$, such as \texttt{created\_at} on an append-only table).} Now $P_{\min} = 100$ pages and $\text{IO}_{\min} = 4 + 99 = 103$. With $c^2 = 0.98$:
+\[
+  \text{IO} = 16{,}000 + 0.98 \times (103 - 16{,}000) \approx 420.
+\]
+The total is about $520$, \emph{thirty times} cheaper than the sequential scan. Same selectivity, same table size; the only difference is whether the matching rows sit together on disk.
+\end{example}
+
+That example explains a pattern every PostgreSQL user eventually notices: range queries on \texttt{id} or \texttt{created\_at} of an append-only table use indexes even for large ranges, while the same range size on a randomly distributed column flips to a sequential scan early.
+
+\subsection{Bitmap Index Scan plus Bitmap Heap Scan}
+
+Between ``a handful of rows'' (Index Scan) and ``a large fraction of the table'' (Seq Scan) there is a wide middle zone where neither is good. Suppose 2\% of \texttt{ledger\_lines} match an uncorrelated predicate: $N = 10{,}000$ rows. An Index Scan would visit about $6{,}667$ distinct pages (Mackert--Lohman again), in index-key order, which means jumping randomly back and forth across the file and possibly re-reading pages that fell out of cache. That costs about $26{,}700$, well above the sequential scan.
+
+PostgreSQL's answer is to split the work into two nodes:
+\begin{enumerate}
+  \item \textbf{Bitmap Index Scan.} Walk the index and collect every matching \texttt{ctid}, but do \emph{not} visit the heap yet. Instead, record each \texttt{ctid} in an in-memory bitmap keyed by heap page number: ``page 17, tuples 1 and 9; page 812, tuples 3 and 7.''
+  \item \textbf{Bitmap Heap Scan.} Visit the heap pages listed in the bitmap \emph{in increasing page order}. Each page is read once, no matter how many matching tuples it holds, and the reads move steadily forward through the file, so the operating system's read-ahead helps and the drive sees something close to a sequential pattern.
+\end{enumerate}
+
+The planner prices the per-page cost on a sliding scale between \texttt{random\_page\_cost} and \texttt{seq\_page\_cost}: the larger the fraction of the table being read, the closer to sequential each page is. For our 2\% case, about two thirds of the pages are touched, the per-page cost comes out near $1.55$, and the whole plan costs about $10{,}600$, comfortably below both the Index Scan ($26{,}700$) and the Seq Scan ($16{,}250$). This is why you so often see bitmap scans for predicates matching a few percent of a table.
+
+\paragraph{Exact versus lossy bitmaps.} The bitmap must fit in \texttt{work\_mem}. While it does, every page entry records exactly which tuple offsets matched: an \emph{exact} page. If the bitmap would grow past \texttt{work\_mem}, PostgreSQL starts converting entries to \emph{lossy} form: it keeps only ``some tuple on this page matched'' and forgets which ones. A lossy page costs one bit of information instead of a list of offsets, so memory stays bounded no matter how many rows match. The price is paid at the heap: for a lossy page, the Bitmap Heap Scan must re-evaluate the original condition against \emph{every} tuple on that page. That re-evaluation is the \texttt{Recheck Cond} line you see in the plan, and \texttt{EXPLAIN ANALYZE} tells you how much it cost:
+
+\begin{lstlisting}
+Bitmap Heap Scan on postings
+    (cost=4120.55..98211.31 rows=201004 width=40)
+    (actual time=38.412..402.118 rows=198734 loops=1)
+  Recheck Cond: (merchant_id = 4242)
+  Rows Removed by Index Recheck: 1210554
+  Heap Blocks: exact=21004 lossy=61311
+  Buffers: shared hit=1080 read=81785
+  ->  Bitmap Index Scan on postings_merchant_idx
+        (cost=0.00..4070.30 rows=201004 width=0)
+        (actual time=31.552..31.552 rows=198734 loops=1)
+        Index Cond: (merchant_id = 4242)
+        Buffers: shared hit=550
+\end{lstlisting}
+
+(PostgreSQL prints each node's estimate and actuals on one long line; we wrap lines in this chapter so they fit the page.) Read the middle lines. Of the $82{,}315$ heap pages visited, $61{,}311$ were lossy, and rechecking every tuple on them discarded $1.2$ million non-matching rows. Raising \texttt{work\_mem} for this query (for example, \texttt{SET LOCAL work\_mem = '64MB'}) keeps every page exact; the \texttt{Rows Removed by Index Recheck} line disappears and the heap scan does far less CPU work.
+
+\paragraph{Combining indexes.} Bitmaps can be combined before touching the heap. For \texttt{WHERE merchant\_id = 4242 AND status = 'failed'} with separate indexes on each column, PostgreSQL can run two Bitmap Index Scans and intersect them with a \texttt{BitmapAnd} node (or union them with \texttt{BitmapOr} for an \texttt{OR}), then read only the heap pages present in both. A plain Index Scan can use only one index per table.
+
+\subsection{Index-Only Scan}
+
+If every column the query needs is stored in the index, the heap fetch could be skipped entirely. The obstacle is visibility: index entries carry no \texttt{xmin}/\texttt{xmax}, so the index alone cannot tell whether an entry points to a row your snapshot should see.
+
+PostgreSQL solves this with the \emph{visibility map} (Chapter~3 and Chapter~5): one bit per heap page meaning ``every tuple on this page is visible to every transaction.'' For each index entry, an Index-Only Scan checks the visibility-map bit for its heap page. If the bit is set, the index value is returned directly. If not, the scan falls back to fetching the heap tuple. \texttt{EXPLAIN ANALYZE} counts those fallbacks:
+
+\begin{lstlisting}
+Index Only Scan using postings_acct_amt_idx on postings
+    (actual time=0.031..9.880 rows=48200 loops=1)
+  Index Cond: (account_id = 77)
+  Heap Fetches: 48200
+\end{lstlisting}
+
+\texttt{Heap Fetches: 48200} out of \texttt{rows=48200} means the visibility map was useless and this ``index-only'' scan visited the heap for every row. The usual cause is a recently bulk-loaded or heavily updated table that \texttt{VACUUM} has not yet processed. After \texttt{VACUUM postings;} the same query reports \texttt{Heap Fetches: 0}. Covering indexes with \texttt{INCLUDE} columns, such as \texttt{CREATE INDEX ON postings (account\_id) INCLUDE (amount\_minor)}, exist to make Index-Only Scans possible; vacuum is what makes them actually index-only.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex]
+  % ---------- Left: schematic cost curves ----------
+  \draw[thick,sourceblue!45,fill=sourceblue!4,rounded corners=5pt] (0,0) rectangle (7.4,5.6);
+  \node[font=\bfseries\scriptsize,sourceblue!90!black] at (3.7,5.3) {Estimated cost vs.\ fraction of rows matched};
+  \draw[->,thick,gray!70] (0.7,0.7) -- (7.1,0.7);
+  \draw[->,thick,gray!70] (0.7,0.7) -- (0.7,4.85);
+  \node[font=\tiny,anchor=west] at (0.8,4.8) {cost};
+  % Seq scan: flat
+  \draw[very thick,quotientorange!90!black] (0.7,2.6) -- (6.9,2.6);
+  \node[font=\tiny\bfseries,quotientorange!90!black,anchor=west] at (2.6,2.82) {Seq Scan};
+  % Index scan: steep
+  \draw[very thick,trapred!85!black] plot[smooth] coordinates {(0.75,0.75) (1.0,1.2) (1.3,2.0) (1.6,2.9) (2.0,3.9) (2.35,4.7)};
+  \node[font=\tiny\bfseries,trapred!85!black,anchor=west] at (2.4,4.6) {Index Scan (uncorrelated)};
+  % Bitmap: concave
+  \draw[very thick,targetgreen!75!black] plot[smooth] coordinates {(0.75,0.78) (1.2,1.35) (2.0,1.85) (3.0,2.15) (4.2,2.55) (5.5,2.95) (6.9,3.4)};
+  \node[font=\tiny\bfseries,targetgreen!75!black,anchor=west] at (4.6,2.22) {Bitmap Heap Scan};
+  % zones
+  \draw[dashed,gray!70] (1.15,0.7) -- (1.15,4.4);
+  \draw[dashed,gray!70] (4.3,0.7) -- (4.3,4.4);
+  \node[font=\tiny,align=center] at (0.95,0.45) {few};
+  \node[font=\tiny,align=center] at (2.7,0.45) {middle zone};
+  \node[font=\tiny,align=center] at (5.7,0.45) {large fraction};
+  \node[font=\tiny,align=center] at (3.9,0.18) {fraction of rows matched $\rightarrow$};
+  \node[font=\tiny,gray!80!black,align=center] at (3.2,1.15) {(schematic; crossover points\\depend on table and settings)};
+
+  % ---------- Right: bitmap pipeline ----------
+  \draw[thick,targetgreen!45,fill=targetgreen!4,rounded corners=5pt] (7.8,0) rectangle (15.2,5.6);
+  \node[font=\bfseries\scriptsize,targetgreen!80!black] at (11.5,5.3) {Inside a bitmap scan};
+  % step 1
+  \node[font=\tiny\bfseries,anchor=west] at (8.1,4.75) {1. Bitmap Index Scan collects TIDs in key order:};
+  \node[draw=sourceblue!80,fill=white,rounded corners=2pt,font=\tiny\ttfamily,minimum width=6.6cm] (tids) at (11.5,4.3) {(812,3) (17,9) (4,2) (812,7) (17,1) (930,5) ...};
+  % step 2
+  \node[font=\tiny\bfseries,anchor=west] at (8.1,3.7) {2. Group TIDs by heap page, sorted by page:};
+  \node[draw=targetgreen!80!black,fill=white,rounded corners=2pt,font=\tiny\ttfamily,align=left,minimum width=3.1cm] (bm) at (9.75,2.75) {page 4: \{2\}\\page 17: \{1, 9\}\\page 812: \{3, 7\}};
+  \node[draw=quotientorange!90!black,fill=quotientorange!12,rounded corners=2pt,font=\tiny,align=left,minimum width=3.1cm] (lossy) at (13.3,2.75) {over \texttt{work\_mem}?\\page 930: \emph{lossy}\\(whole page, recheck)};
+  % step 3
+  \node[font=\tiny\bfseries,anchor=west] at (8.1,1.75) {3. Read each heap page once, in page order:};
+  \foreach \i/\p in {0/4,1/17,2/812,3/930} {
+    \node[draw=structurepurple!80,fill=structurepurple!10,rounded corners=2pt,font=\tiny\ttfamily,minimum width=1.3cm,minimum height=0.5cm] (hp\i) at (8.85+1.75*\i,0.95) {page \p};
+  }
+  \draw[->,thick,structurepurple!85!black] (hp0) -- (hp1);
+  \draw[->,thick,structurepurple!85!black] (hp1) -- (hp2);
+  \draw[->,thick,structurepurple!85!black] (hp2) -- (hp3);
+  \node[font=\tiny,gray!80!black] at (11.5,0.35) {forward-only reads; OS read-ahead helps};
+\end{tikzpicture}
+\caption{Left: as the fraction of matching rows grows, a plain Index Scan on an uncorrelated column becomes expensive quickly because each row may cost a random page read; a sequential scan costs the same regardless; a bitmap scan fills the middle zone. Right: a bitmap scan first collects all matching TIDs, groups them by heap page, and then visits each page once in physical order. If the bitmap outgrows \texttt{work\_mem}, some pages become lossy and every tuple on them must be rechecked.}
+\label{ch07:fig-access-paths}
+\end{figure}
+
+\section{Three Ways to Join Two Tables}
+\label{ch07:joins}
+
+A join of two inputs, call them \emph{outer} (left) and \emph{inner} (right), can be computed by three physical algorithms. Each wins in a different situation, and the planner prices all three for every pair of inputs it considers.
+
+You have written all three in Java. Given two \texttt{ArrayList}s to match up, you can write a double \texttt{for} loop (nested loop join), or replace the inner loop with a lookup in a \texttt{TreeMap} you already have (nested loop with an index probe). You can build a \texttt{HashMap} from the smaller list and look up each element of the larger one (hash join). Or, if both lists are sorted, you can walk them together with two indexes, as in the merge step of mergesort (merge join). The database versions are the same algorithms, with two extra concerns: the data may not fit in memory, and the planner must choose \emph{before} it knows the real sizes.
+
+\subsection{Nested Loop}
+
+The simplest algorithm: for each outer row, scan the inner input for matches.
+
+\begin{lstlisting}
+for each row o in outer:
+    for each row i in inner where i.key = o.key:
+        emit (o, i)
+\end{lstlisting}
+
+If the inner side is a full scan, the cost is proportional to $N_{\text{outer}} \times N_{\text{inner}}$, which is disastrous for large inputs: a million outer rows against a million inner rows is $10^{12}$ comparisons. But if the inner side is an \emph{index lookup parameterized by the outer row} (an Index Scan with \texttt{Index Cond: (account\_id = a.id)}), each inner probe costs one B-tree descent, about $\log M$ page touches, often all cache hits. Then a nested loop costs about $N_{\text{outer}} \times \log N_{\text{inner}}$, and it has a property neither of the other algorithms has: \textbf{zero startup cost}. It can return its first joined row after one outer row and one probe. Paired with \texttt{LIMIT}, that makes it unbeatable.
+
+The rule of thumb: \emph{a nested loop is the best join when the outer side is small}, and the worst when the outer side is large and the planner thought it was small. That second case is the most common cause of a sudden, catastrophic plan regression.
+
+Since PostgreSQL~14, the planner can insert a \texttt{Memoize} node between a nested loop and its inner side. If the same outer key value repeats (many postings for the same account, for example), \texttt{Memoize} caches the inner results for that key, so a repeat costs a hash lookup instead of an index probe. \texttt{EXPLAIN ANALYZE} reports \texttt{Hits}, \texttt{Misses}, and \texttt{Evictions} for it.
+
+\subsection{Hash Join}
+
+A hash join works in two phases:
+\begin{enumerate}
+  \item \textbf{Build.} Read the \emph{inner} input (the planner chooses the smaller side) and insert every row into an in-memory hash table keyed on the join column.
+  \item \textbf{Probe.} Stream the \emph{outer} input. For each row, hash its join key and look in one bucket for matches.
+\end{enumerate}
+Each input is read once, so the cost is proportional to $N_{\text{outer}} + N_{\text{inner}}$. There is no need for any index or any sort order. The cost is memory and startup: no row can be emitted until the entire build side is hashed. The hash join only works for equality conditions (\texttt{=}), since hashing destroys order.
+
+The hash table must fit in $\texttt{work\_mem} \times \texttt{hash\_mem\_multiplier}$ (defaults \texttt{4MB} and \texttt{2.0}, so 8~MB). What if the build side is 400~MB?
+
+\paragraph{Multi-batch (Grace) hash join.} PostgreSQL splits the problem into \emph{batches} using some bits of the hash value. Suppose it needs 64 batches. During the build phase, rows whose hash falls in batch~0 go into the in-memory table, and rows belonging to batches 1 through 63 are written to 63 temporary files. During the probe phase, outer rows for batch~0 are probed immediately; outer rows for other batches are written to 63 more temporary files. Then, for each batch $k = 1, \ldots, 63$, PostgreSQL loads inner batch $k$ into memory, streams outer batch $k$ past it, and moves on. Because matching rows have equal hashes, they always land in the same batch, so no match is missed.
+
+The result is still linear in the input sizes, but almost all of both inputs gets written to disk and read back once. That roughly triples the I/O compared with an in-memory hash join, and you can see it in the plan:
+
+\begin{lstlisting}
+Hash Join  (actual time=812.4..6411.9 rows=9840211 loops=1)
+  Hash Cond: (p.account_id = a.id)
+  Buffers: shared hit=2210 read=310118, temp read=96120 written=96120
+  ->  Seq Scan on postings p  (actual rows=20000000 loops=1)
+  ->  Hash  (actual time=811.9..811.9 rows=3000000 loops=1)
+        Buckets: 131072  Batches: 64  Memory Usage: 7937kB
+        ->  Seq Scan on accounts a  (actual rows=3000000 loops=1)
+\end{lstlisting}
+
+\texttt{Batches: 64} and the matching \texttt{temp read}/\texttt{written} counts tell you the hash spilled. If the planner \emph{expected} one batch but the build side turned out much larger, you will also see \texttt{(originally 1)} next to the batch count, which is a sign of an underestimated row count.
+
+\subsection{Merge Join}
+
+If both inputs arrive sorted on the join key, they can be joined like a zipper. Keep a cursor on each input. Compare the two current keys; advance whichever is smaller; when the keys are equal, emit the matching rows (handling runs of duplicates on both sides) and advance. Each input is read once, so the cost is proportional to $N_{\text{outer}} + N_{\text{inner}}$, with very little memory.
+
+Merge join is attractive when sorted input is free: both sides come from B-tree indexes on the join key, or the query needs the result ordered by that key anyway. Otherwise each side needs a \texttt{Sort} node. Sorts report how they ran:
+\begin{itemize}
+  \item \texttt{Sort Method: quicksort Memory: 3120kB}: the input fit in \texttt{work\_mem}.
+  \item \texttt{Sort Method: top-N heapsort Memory: 26kB}: a \texttt{LIMIT} above the sort needs only the best $N$ rows, so PostgreSQL keeps a heap of size $N$ instead of sorting everything.
+  \item \texttt{Sort Method: external merge Disk: 412000kB}: the input did not fit; PostgreSQL sorted chunks that fit in memory, wrote them to temporary files as sorted runs, and merged the runs.
+\end{itemize}
+Merge join also handles range and inequality join conditions that a hash join cannot, though in practice those are rare.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex]
+  % ---------- Nested loop ----------
+  \draw[thick,sourceblue!45,fill=sourceblue!4,rounded corners=5pt] (0,0) rectangle (4.9,6.0);
+  \node[font=\bfseries\scriptsize,sourceblue!90!black] at (2.45,5.7) {Nested Loop + index};
+  \node[font=\tiny\bfseries] at (1.0,5.2) {outer};
+  \foreach \i/\k in {0/7,1/3,2/9,3/7} {
+    \node[draw=sourceblue!80,fill=white,minimum width=1.0cm,minimum height=0.42cm,font=\tiny\ttfamily] (o\i) at (1.0,4.6-0.75*\i) {id=\k};
+  }
+  \node[draw=structurepurple!80,fill=structurepurple!10,rounded corners=2pt,font=\tiny,align=center,minimum width=1.9cm,minimum height=2.6cm] (idx) at (3.6,3.45) {B-tree on\\inner key\\[2pt]one descent\\per outer row};
+  \foreach \i in {0,1,2,3} { \draw[->,thick,sourceblue!80] (o\i.east) -- (idx.west); }
+  \node[font=\tiny,align=center] at (2.45,1.25) {cost $\approx N_{\text{outer}} \times \log N_{\text{inner}}$};
+  \node[font=\tiny,align=center,targetgreen!75!black] at (2.45,0.85) {first row immediately};
+  \node[font=\tiny,align=center,trapred!85!black] at (2.45,0.45) {bad if outer is huge};
+
+  % ---------- Hash join ----------
+  \draw[thick,targetgreen!45,fill=targetgreen!4,rounded corners=5pt] (5.2,0) rectangle (10.1,6.0);
+  \node[font=\bfseries\scriptsize,targetgreen!80!black] at (7.65,5.7) {Hash Join};
+  \node[font=\tiny\bfseries] at (6.35,5.2) {1. build (inner)};
+  \foreach \b in {0,1,2,3} {
+    \node[draw=targetgreen!80!black,fill=white,minimum width=1.5cm,minimum height=0.42cm,font=\tiny\ttfamily,anchor=west] at (5.45,4.6-0.6*\b) {bucket \b};
+  }
+  \node[font=\tiny\bfseries] at (8.9,5.2) {2. probe (outer)};
+  \node[draw=sourceblue!80,fill=white,minimum width=1.3cm,minimum height=0.42cm,font=\tiny\ttfamily] (pr) at (8.9,4.0) {key=7};
+  \draw[->,thick,sourceblue!85!black] (pr.west) -- node[above,font=\tiny] {h(7)} (7.0,3.4);
+  \draw[thick,dashed,quotientorange!90!black,fill=quotientorange!10,rounded corners=2pt] (5.45,1.55) rectangle (9.85,2.35);
+  \node[font=\tiny,align=center,quotientorange!90!black] at (7.65,1.95) {too big for memory? split into\\batches and spill extras to disk};
+  \node[font=\tiny,align=center] at (7.65,1.0) {cost $\approx N_{\text{outer}} + N_{\text{inner}}$};
+  \node[font=\tiny,align=center] at (7.65,0.55) {equality only; build first};
+
+  % ---------- Merge join ----------
+  \draw[thick,structurepurple!45,fill=structurepurple!4,rounded corners=5pt] (10.4,0) rectangle (15.3,6.0);
+  \node[font=\bfseries\scriptsize,structurepurple!90!black] at (12.85,5.7) {Merge Join};
+  \node[font=\tiny\bfseries] at (11.4,5.2) {sorted A};
+  \node[font=\tiny\bfseries] at (14.3,5.2) {sorted B};
+  \foreach \i/\v in {0/2,1/5,2/5,3/8,4/9} {
+    \node[draw=sourceblue!80,fill=white,minimum width=0.9cm,minimum height=0.42cm,font=\tiny\ttfamily] (ma\i) at (11.4,4.6-0.62*\i) {\v};
+  }
+  \foreach \i/\v in {0/1,1/5,2/7,3/8,4/10} {
+    \node[draw=targetgreen!80!black,fill=white,minimum width=0.9cm,minimum height=0.42cm,font=\tiny\ttfamily] (mb\i) at (14.3,4.6-0.62*\i) {\v};
+  }
+  \draw[->,thick,structurepurple!85!black] (ma1.east) -- (mb1.west);
+  \draw[->,thick,structurepurple!85!black] (ma2.east) -- (mb1.west);
+  \draw[->,thick,structurepurple!85!black] (ma3.east) -- (mb3.west);
+  \node[font=\tiny,align=center] at (12.85,1.0) {cost $\approx N_A + N_B$ (if already sorted)};
+  \node[font=\tiny,align=center] at (12.85,0.55) {advance the smaller key};
+\end{tikzpicture}
+\caption{The three physical join algorithms. A nested loop with an index probe is ideal for a small outer input and returns rows immediately. A hash join reads each input once and needs memory for the build side, spilling to batches on disk when that memory runs out. A merge join walks two sorted inputs in step and is cheapest when an index or the query's \texttt{ORDER BY} already provides the sort.}
+\label{ch07:fig-joins}
+\end{figure}
+
+\begin{focusbox}
+Which join will the planner pick? A rough guide that matches most real plans:
+\begin{itemize}
+  \item Small outer side (up to a few thousand rows) and an index on the inner join key: \textbf{Nested Loop}.
+  \item Two large inputs, equality join, no useful order: \textbf{Hash Join}.
+  \item Both inputs already ordered on the join key, or the output must be ordered by it: \textbf{Merge Join}.
+\end{itemize}
+Every one of these decisions depends on the estimated row counts. If the estimate for the outer side is 10 and the truth is 500,000, the planner will choose a nested loop that does 500,000 index probes. That is why reading a plan starts with comparing \texttt{rows} estimates against actual rows.
+\end{focusbox}
+
+\section{Searching Join Orders}
+\label{ch07:join-order}
+
+A query that joins $n$ tables can be evaluated in many orders. How many? Count the binary join trees whose leaves are the $n$ tables. The shapes of binary trees with $n$ leaves are counted by the Catalan number $C_{n-1}$, and the tables can be assigned to the leaves in $n!$ ways, so there are $n! \cdot C_{n-1}$ trees:
+
+\begin{center}
+\small
+\begin{tabular}{@{}rrr@{}}
+\toprule
+$n$ (tables) & $n! \cdot C_{n-1}$ (join trees) & $2^n$ (table subsets) \\
+\midrule
+3 & 12 & 8 \\
+4 & 120 & 16 \\
+8 & 17{,}297{,}280 & 256 \\
+12 & about $2.8 \times 10^{13}$ & 4{,}096 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Each tree also needs a join algorithm at every node and an access path at every leaf. Enumerating trees one at a time is hopeless past a handful of tables. The third column shows the way out.
+
+\subsection{Dynamic Programming over Subsets}
+
+PostgreSQL's standard join search, inherited from IBM's System~R optimizer (Selinger et al., 1979), builds plans bottom-up over \emph{sets of tables}:
+\begin{enumerate}
+  \item \textbf{Level 1:} for each single table, find the cheapest access path (Section~\ref{ch07:access-paths}).
+  \item \textbf{Level 2:} for each pair of tables $\{A, B\}$ that are connected by a join condition, consider joining the best plan for $\{A\}$ with the best plan for $\{B\}$, in both orders and with all three join algorithms. Keep the cheapest plan for the set $\{A, B\}$.
+  \item \textbf{Level $k$:} for each set $S$ of $k$ tables, consider every way to split $S$ into two smaller sets $S_1 \cup S_2$ whose best plans are already known. Keep the cheapest plan for $S$.
+\end{enumerate}
+
+The key insight is that the best plan for $\{A, B, C\}$ only needs the best plans for its subsets, not every tree that produces them. So the work grows with the number of subsets, $2^n$, instead of the number of trees. (A refinement: the planner keeps more than one plan per set when a more expensive plan produces a useful sort order, because a sorted result might save a \texttt{Sort} or enable a merge join higher up. These are called \emph{interesting orders}.)
+
+\subsection{Limits and the Genetic Optimizer}
+
+$2^n$ is still exponential. Two settings keep planning time in check:
+\begin{itemize}
+  \item \textbf{\texttt{join\_collapse\_limit}} and \textbf{\texttt{from\_collapse\_limit}} (default 8): the planner only reorders up to 8 items freely. Beyond that, explicit \texttt{JOIN} syntax order and subquery boundaries are partially respected as written.
+  \item \textbf{\texttt{geqo\_threshold}} (default 12): when a query has 12 or more items in \texttt{FROM}, PostgreSQL switches to the \emph{Genetic Query Optimizer} (GEQO). GEQO treats a join order as a chromosome, generates a population of random orders, and repeatedly combines the cheaper ones. It finds a good plan quickly but not necessarily the best one, and because it is randomized, plans for very large joins can vary between runs (set \texttt{geqo\_seed} to make them reproducible).
+\end{itemize}
+
+\begin{applicationbox}
+ORMs and reporting tools sometimes generate queries joining 15 or 20 tables, many of them small lookup tables. If such a query plans slowly or chooses erratic plans, check the \texttt{Planning Time} line in \texttt{EXPLAIN ANALYZE}. Splitting the query, or writing explicit \texttt{JOIN}s in a sensible order and lowering \texttt{join\_collapse\_limit} for that session, gives you a stable plan and a planning time measured in milliseconds rather than seconds.
+\end{applicationbox}
+
+\section{Reading \texttt{EXPLAIN (ANALYZE, BUFFERS)} Line by Line}
+\label{ch07:explain}
+
+Plain \texttt{EXPLAIN} shows the plan the planner chose and its predictions. \texttt{EXPLAIN ANALYZE} \emph{runs} the query and adds what actually happened at every node. \texttt{BUFFERS} adds how many pages each node touched and where they came from. Use all three together.
+
+\begin{trapbox}
+\texttt{EXPLAIN ANALYZE} really executes the statement. \texttt{EXPLAIN ANALYZE DELETE FROM postings WHERE ...} deletes the rows. Wrap data-modifying statements in a transaction you roll back:
+\begin{lstlisting}[language=SQL]
+BEGIN;
+EXPLAIN (ANALYZE, BUFFERS) DELETE FROM postings WHERE ...;
+ROLLBACK;
+\end{lstlisting}
+\end{trapbox}
+
+\subsection{A Complete Plan}
+
+Here is the plan for the dashboard query from the start of the chapter:
+
+\begin{lstlisting}
+Limit  (cost=48211.20..48211.23 rows=10 width=48)
+       (actual time=212.441..212.446 rows=10 loops=1)
+  Buffers: shared hit=40213 read=6120
+  ->  Sort  (cost=48211.20..48236.20 rows=10000 width=48)
+            (actual time=212.439..212.442 rows=10 loops=1)
+        Sort Key: (sum(p.amount_minor)) DESC
+        Sort Method: top-N heapsort  Memory: 26kB
+        Buffers: shared hit=40213 read=6120
+        ->  HashAggregate
+              (cost=47745.10..47995.10 rows=10000 width=48)
+              (actual time=205.118..209.870 rows=11842 loops=1)
+              Group Key: a.id
+              Batches: 1  Memory Usage: 2577kB
+              Buffers: shared hit=40213 read=6120
+              ->  Nested Loop
+                    (cost=0.86..46120.40 rows=320000 width=24)
+                    (actual time=0.071..151.904 rows=296050 loops=1)
+                    Buffers: shared hit=40213 read=6120
+                    ->  Index Scan using accounts_region_idx on accounts a
+                          (cost=0.42..1210.40 rows=10000 width=24)
+                          (actual time=0.031..6.211 rows=11842 loops=1)
+                          Index Cond: (region = 'EU'::text)
+                          Buffers: shared hit=310 read=95
+                    ->  Index Scan using postings_acct_created_idx
+                          on postings p
+                          (cost=0.44..4.17 rows=32 width=16)
+                          (actual time=0.004..0.011 rows=25 loops=11842)
+                          Index Cond: ((account_id = a.id) AND
+                                       (created_at >= '2026-10-01'))
+                          Buffers: shared hit=39903 read=6025
+Planning Time: 0.912 ms
+Execution Time: 212.533 ms
+\end{lstlisting}
+
+\paragraph{Read from the inside out.} Execution starts at the most indented nodes and flows upward. The two \texttt{Index Scan} nodes are the leaves; the \texttt{Nested Loop} joins them; \texttt{HashAggregate} groups; \texttt{Sort} orders; \texttt{Limit} stops after 10 rows. Figure~\ref{ch07:fig-explain-tree} draws the same tree.
+
+\paragraph{Estimated versus actual.} Every node prints two parentheses. The first, \texttt{cost=... rows=... width=...}, is the planner's prediction. The second, \texttt{actual time=... rows=... loops=...}, is the measurement. Compare \texttt{rows} in each pair. For the EU accounts the planner predicted 10,000 and got 11,842: an error of 18\%, which is excellent. For the postings per account it predicted 32 and got 25. These estimates are good, so the plan is probably good.
+
+\paragraph{\texttt{actual time} is in milliseconds, per loop.} \texttt{actual time=0.031..6.211} means the node returned its first row after 0.031~ms and its last row after 6.211~ms. Unlike \texttt{cost}, these are real milliseconds.
+
+\paragraph{The \texttt{loops} multiplier.} Look at the inner index scan on \texttt{postings}: \texttt{actual time=0.004..0.011 rows=25 loops=11842}. This node ran 11,842 times, once for each EU account from the outer side. \textbf{Both \texttt{actual time} and \texttt{rows} are averages per loop}, so the totals are
+\[
+  \text{rows} = 25 \times 11{,}842 = 296{,}050, \qquad \text{time} \approx 0.011\text{ ms} \times 11{,}842 \approx 130\text{ ms}.
+\]
+That 130~ms is most of the query's 212~ms. If you read only the per-loop number, you would conclude this node costs 0.011~ms and is irrelevant. It is actually the most expensive node in the plan. Whenever you see \texttt{loops} greater than 1, multiply.
+
+\paragraph{Buffers.} \texttt{Buffers: shared hit=39903 read=6025} on the inner scan means it touched 45,928 pages in total: 39,903 were already in \texttt{shared\_buffers} (\texttt{hit}), and 6,025 had to be requested from the operating system (\texttt{read}). A \texttt{read} may still be served from the OS page cache rather than the disk; \texttt{BUFFERS} cannot tell the difference, but \texttt{track\_io\_timing = on} adds an \texttt{I/O Timings} line that can. Other counters you will meet:
+\begin{itemize}
+  \item \texttt{dirtied}: pages this node modified in shared buffers. On a \texttt{SELECT}, this usually means hint bits were set (Chapter~5).
+  \item \texttt{written}: dirty pages this backend had to write out itself to make room, a sign that \texttt{shared\_buffers} or the background writer is struggling.
+  \item \texttt{temp read} / \texttt{temp written}: pages spilled to temporary files by sorts, hashes, and materialization. Any non-zero value here is worth a look at \texttt{work\_mem}.
+\end{itemize}
+Buffer counts are cumulative: a parent's count includes its children's. Here every node above the nested loop shows the same totals because none of them reads any pages itself.
+
+\paragraph{Planning and execution time.} \texttt{Execution Time} covers running the plan, but not sending rows to the client. \texttt{Planning Time} covers the planner's search. For most OLTP queries, planning should be well under a millisecond; if it rivals execution time, prepared statements (Chapter~8) or simpler queries will help.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,
+  pn/.style={draw=sourceblue!80,fill=white,rounded corners=3pt,thick,font=\scriptsize,align=center,minimum width=3.6cm,inner sep=3pt},
+  note/.style={font=\tiny,align=left,anchor=west}]
+  \draw[thick,gray!40,fill=gray!3,rounded corners=6pt] (-0.1,-0.3) rectangle (15.1,8.1);
+  \node[pn] (lim) at (3.6,7.4) {\textbf{Limit}\\rows 10 / 10};
+  \node[pn] (srt) at (3.6,6.15) {\textbf{Sort} (top-N heapsort)\\rows 10 / 10};
+  \node[pn] (agg) at (3.6,4.9) {\textbf{HashAggregate}\\est 10{,}000 / actual 11{,}842};
+  \node[pn,draw=quotientorange!90!black] (nl) at (3.6,3.55) {\textbf{Nested Loop}\\est 320{,}000 / actual 296{,}050};
+  \node[pn] (ia) at (1.9,1.6) {\textbf{Index Scan} accounts\\est 10{,}000 / actual 11{,}842\\loops 1};
+  \node[pn,draw=trapred!85!black,fill=trapred!6] (ip) at (6.2,1.6) {\textbf{Index Scan} postings\\est 32 / actual 25 \emph{per loop}\\loops \textbf{11{,}842}};
+  \draw[->,thick] (srt) -- (lim);
+  \draw[->,thick] (agg) -- (srt);
+  \draw[->,thick] (nl) -- (agg);
+  \draw[->,thick] (ia) -- node[left,font=\tiny] {outer} (nl);
+  \draw[->,thick] (ip) -- node[right,font=\tiny] {inner} (nl);
+
+  \draw[thick,structurepurple!60,fill=white,rounded corners=4pt] (8.9,0.2) rectangle (14.9,7.8);
+  \node[font=\scriptsize\bfseries,structurepurple!90!black] at (11.95,7.45) {How to read it};
+  \node[note] at (9.1,6.85) {\textbf{1. Start at the leaves.} Rows flow upward;};
+  \node[note] at (9.1,6.5) {\quad each parent pulls from its children.};
+  \node[note] at (9.1,5.95) {\textbf{2. Compare est vs actual rows} at every};
+  \node[note] at (9.1,5.6) {\quad node. A 10x gap is worth explaining;};
+  \node[note] at (9.1,5.25) {\quad a 1000x gap usually explains the bug.};
+  \node[note] at (9.1,4.7) {\textbf{3. Multiply by loops.} The postings scan:};
+  \node[note] at (9.1,4.35) {\quad $25 \times 11{,}842 = 296{,}050$ rows,};
+  \node[note] at (9.1,4.0) {\quad $0.011\text{ ms} \times 11{,}842 \approx 130$ ms.};
+  \node[note] at (9.1,3.45) {\textbf{4. Find where time goes.} Subtract each};
+  \node[note] at (9.1,3.1) {\quad child's total from its parent's.};
+  \node[note] at (9.1,2.55) {\textbf{5. Check Buffers.} \texttt{read} = not in shared};
+  \node[note] at (9.1,2.2) {\quad buffers; \texttt{temp} = spilled to disk.};
+  \node[note] at (9.1,1.65) {\textbf{6. Look for spills:} \texttt{Batches > 1},};
+  \node[note] at (9.1,1.3) {\quad \texttt{external merge}, \texttt{lossy=}.};
+  \node[font=\tiny,trapred!85!black,align=center] at (6.2,0.35) {most expensive node in the plan};
+\end{tikzpicture}
+\caption{The dashboard plan as a tree. Each box shows estimated and actual rows. The inner index scan on \texttt{postings} looks cheap per loop but runs 11,842 times and accounts for most of the execution time.}
+\label{ch07:fig-explain-tree}
+\end{figure}
+
+\subsection{Diagnosing a Bad Plan}
+
+Almost every slow plan comes down to one of a few causes. Here is how each shows up and how to fix it.
+
+\paragraph{1. Stale statistics.} A table received a large batch of rows, but autovacuum has not run \texttt{ANALYZE} yet. Typical symptom: a node estimates \texttt{rows=1} or a few hundred and actually produces hundreds of thousands, often on a predicate over recent dates that lie beyond the last histogram bound. Fix: run \texttt{ANALYZE table;} immediately after bulk loads, and lower \texttt{autovacuum\_analyze\_scale\_factor} for large, fast-growing tables.
+
+\paragraph{2. Correlated predicates.} Two predicates on related columns are multiplied as if independent, and the estimate comes out orders of magnitude too low (Section~\ref{ch07:statistics}). Symptom: the estimate is far too small exactly at the node that applies both filters. Fix: \texttt{CREATE STATISTICS ... (dependencies, mcv)} on those columns, then \texttt{ANALYZE}.
+
+\paragraph{3. Opaque expressions.} A function wraps an indexed column (\texttt{date\_trunc}, \texttt{lower}, a cast), so the planner falls back to default selectivities and cannot use a plain index. Symptom: \texttt{Seq Scan} with a \texttt{Filter:} line containing the function, and a round-number estimate such as 0.5\% of the table. Fix: rewrite as a range on the raw column, or add an expression index.
+
+\paragraph{4. Too little memory.} Sorts, hashes, and bitmaps spill. Symptom: \texttt{Sort Method: external merge}, \texttt{Batches:} above 1, \texttt{lossy=} in \texttt{Heap Blocks}, and non-zero \texttt{temp read/written}. Fix: raise \texttt{work\_mem} for that query or role with \texttt{SET LOCAL}. Be careful raising it globally: each sort or hash node in each concurrent query may use that much, so 200 connections times 3 nodes times 256~MB is 150~GB.
+
+\paragraph{5. Wrong cost constants for the hardware.} The planner avoids index scans on NVMe storage that would serve random reads nearly as fast as sequential ones. Symptom: a sequential scan is chosen, but \texttt{SET enable\_seqscan = off} in a test session produces a much faster index plan. Fix: set \texttt{random\_page\_cost = 1.1} and \texttt{effective\_cache\_size} to roughly the memory available for caching (often 50--75\% of RAM). Use \texttt{enable\_*} settings only for diagnosis, never as a permanent fix.
+
+\begin{example}[A thousand-fold misestimate]
+\label{ch07:ex-bad-plan}
+A fraud report filters \texttt{transfers} by \texttt{city = 'Lyon' AND postal\_code = '69001'} and joins to \texttt{accounts}:
+\begin{lstlisting}
+Nested Loop  (cost=0.85..412.66 rows=20 width=64)
+             (actual time=0.090..48711.302 rows=19874 loops=1)
+  ->  Seq Scan on transfers t  (cost=0.00..250.10 rows=20 width=40)
+        (actual time=0.041..911.402 rows=19874 loops=1)
+        Filter: ((city = 'Lyon') AND (postal_code = '69001'))
+        Rows Removed by Filter: 19980126
+  ->  Index Scan using accounts_pkey on accounts a
+        (cost=0.43..8.12 rows=1 width=24)
+        (actual time=2.401..2.405 rows=1 loops=19874)
+        Index Cond: (id = t.account_id)
+\end{lstlisting}
+The scan on \texttt{transfers} estimated 20 rows and produced 19,874: almost exactly the factor of 1,000 that independence predicts when one predicate implies the other. On a 20-row estimate, a nested loop with 20 index probes is a sensible choice. With 19,874 probes, each a cold random read of about 2.4~ms (multiply by \texttt{loops}: $2.4 \times 19{,}874 \approx 47.7$ seconds), it is not. After \texttt{CREATE STATISTICS addr\_stats (dependencies) ON city, postal\_code FROM transfers; ANALYZE transfers;} the estimate becomes about 20,000, the planner switches to a hash join over \texttt{accounts}, and the query finishes in under two seconds.
+\end{example}
+
+\begin{labbox}
+Build intuition with a table you control:
+\begin{lstlisting}[language=SQL]
+CREATE TABLE t AS
+SELECT g AS id,
+       (random() * 1000)::int AS rnd,
+       g / 1000 AS seq
+  FROM generate_series(1, 2000000) g;
+CREATE INDEX ON t (rnd);
+CREATE INDEX ON t (seq);
+ANALYZE t;
+
+SELECT attname, n_distinct, correlation
+  FROM pg_stats WHERE tablename = 't';
+
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t WHERE rnd < 5;
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t WHERE seq < 10;
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t WHERE rnd < 300;
+\end{lstlisting}
+Both of the first two predicates match about 10,000 rows. Notice how differently they are planned and how many buffers each touches, and connect what you see to the \texttt{correlation} values. Then set \texttt{work\_mem = '64kB'} and rerun the \texttt{rnd < 300} query to make the bitmap go lossy.
+\end{labbox}
+
+The planner turns SQL into a plan; MVCC and locking keep concurrent plans correct; WAL keeps their results durable. In Chapter~8 we put all of it to work: designing financial schemas whose constraints make invalid states unrepresentable, replicating them across machines, and serving them to thousands of application tasks through a connection pooler.
+
+\section{Exercises}
+\label{ch07:exercises}
+
+\begin{exercise}[Selectivity from \texttt{pg\_stats}]
+A column \texttt{country} on a 4,000,000-row table has \texttt{null\_frac = 0.01}, \texttt{n\_distinct = 60}, \texttt{most\_common\_vals = \{US,GB,DE,FR\}}, and \texttt{most\_common\_freqs = \{0.40,0.15,0.10,0.08\}}. Estimate the rows returned by (a) \texttt{country = 'DE'}, (b) \texttt{country = 'NZ'}, and (c) \texttt{country IN ('GB','NZ')}. Show each step.
+\end{exercise}
+
+\begin{exercise}[Histogram interpolation]
+A column has \texttt{null\_frac = 0}, no MCV list, and \texttt{histogram\_bounds = \{10,20,40,80,160,320\}} on a 1,000,000-row table. Estimate the rows for (a) \texttt{x < 60}, (b) \texttt{x > 200}, and (c) \texttt{x BETWEEN 15 AND 100}. Why does an equi-depth histogram give better estimates than an equi-width one when the data is skewed?
+\end{exercise}
+
+\begin{exercise}[Pricing scans by hand]
+A table occupies 25,000 pages and holds 2,000,000 rows. Using the default cost constants:
+(a) Compute the total cost of a sequential scan with a single \texttt{WHERE} predicate.
+(b) A predicate keeps 0.5\% of rows on a column with correlation $0$. Use the Mackert--Lohman formula to estimate the heap I/O cost of an Index Scan, and compare it with (a).
+(c) Repeat (b) for correlation $0.95$.
+(d) Repeat (b) and (c) with \texttt{random\_page\_cost = 1.1}. Which decisions change?
+\end{exercise}
+
+\begin{exercise}[Startup cost and \texttt{LIMIT}]
+Plan A for a query has \texttt{cost=0.43..90000.00 rows=1000000}. Plan B has \texttt{cost=21000.00..23500.00 rows=1000000}. Which plan does the planner prefer with no \texttt{LIMIT}? With \texttt{LIMIT 50}? Find the \texttt{LIMIT} value at which the two plans cost the same, and describe what kind of physical operators would produce each cost profile.
+\end{exercise}
+
+\begin{exercise}[Reading a lossy bitmap]
+A plan reports \texttt{Heap Blocks: exact=4000 lossy=36000} and \texttt{Rows Removed by Index Recheck: 2100000} for a query that returns 90,000 rows. (a) Explain what happened in memory. (b) Roughly how many tuples per page does this table hold? (c) Predict how the \texttt{Heap Blocks} line and the \texttt{Rows Removed} line change after \texttt{SET LOCAL work\_mem = '256MB'}, and explain why the number of heap pages read does not change.
+\end{exercise}
+
+\begin{exercise}[Choosing a join algorithm]
+For each case, say which join algorithm you expect and why: (a) 50 rows from \texttt{orders} joined to \texttt{customers} on its primary key; (b) 30 million \texttt{postings} joined to 3 million \texttt{accounts} for a monthly report, \texttt{work\_mem = 64MB}; (c) the same as (b) with \texttt{ORDER BY account\_id} and B-tree indexes on both join columns; (d) the same as (a), but the planner estimated 50 rows and the true count is 2 million.
+\end{exercise}
+
+\begin{exercise}[Multi-batch hash join arithmetic]
+The build side of a hash join has 6,000,000 rows of 56 bytes each, and the hash memory limit is \texttt{work\_mem} $\times$ \texttt{hash\_mem\_multiplier} $= 16\text{ MB}$. (a) Estimate the number of batches (a power of two). (b) What fraction of the build and probe inputs is written to temporary files? (c) If the probe side is 40,000,000 rows of 48 bytes, estimate the total temporary-file bytes written. (d) How large must \texttt{work\_mem} be for a single batch?
+\end{exercise}
+
+\begin{exercise}[Counting join orders]
+(a) Verify the table in Section~\ref{ch07:join-order} for $n = 3$ by listing all 12 join trees of tables $A$, $B$, $C$. (b) If only \emph{left-deep} trees are allowed (every right child is a single table), how many trees are there for $n$ tables? (c) Explain why dynamic programming over subsets needs to examine only $2^n$ sets, and estimate the number of (set, split) pairs it considers for $n = 10$.
+\end{exercise}
+
+\begin{exercise}[Find the slow node]
+In the plan below, compute the total rows and total time contributed by the inner node, identify which node is responsible for most of the runtime, and propose two different fixes.
+\begin{lstlisting}
+Nested Loop  (actual time=0.05..8120.4 rows=420000 loops=1)
+  ->  Index Scan using invoices_due_idx on invoices i
+        (cost=0.43..95.12 rows=40 width=16)
+        (actual time=0.02..58.1 rows=60000 loops=1)
+        Index Cond: (due_date < '2026-11-01')
+  ->  Index Scan using lines_invoice_idx on invoice_lines l
+        (cost=0.43..12.30 rows=7 width=24)
+        (actual time=0.010..0.133 rows=7 loops=60000)
+        Index Cond: (invoice_id = i.id)
+\end{lstlisting}
+\end{exercise}
+
+\begin{exercise}[Index-only scans that are not]
+A query on \texttt{(account\_id) INCLUDE (amount\_minor)} reports \texttt{Index Only Scan ... rows=12000} with \texttt{Heap Fetches: 11800}. (a) Explain what the visibility map has to do with this. (b) Give two operational changes that would bring \texttt{Heap Fetches} near zero. (c) Why can an Index-Only Scan never skip the visibility check entirely, even when the index contains every column the query needs?
+\end{exercise}

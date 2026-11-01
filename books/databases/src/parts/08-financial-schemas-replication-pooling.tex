@@ -1,0 +1,1417 @@
+\chapter{Financial Schemas, Replication, and Connection Pooling}
+\label{ch08:capstone}
+
+For seven chapters we have worked inside the PostgreSQL engine room. We walked
+8~KB slotted heap pages and buffer descriptors in Chapter~2, split Lehman--Yao
+B-link trees and generalized search trees in Chapter~3, flushed write-ahead log
+records and full-page images in Chapter~4, traced multiversion snapshots and
+\texttt{VACUUM} in Chapter~5, reasoned about row-level locks and serializable
+anomalies in Chapter~6, and read cost-based execution plans in Chapter~7. Now we
+sit at the architect's desk and build a system where every one of those low-level
+mechanisms has a dollar sign attached to it: a production double-entry financial
+ledger served by an asynchronous Rust (\texttt{Axum} + \texttt{SQLx}) API over
+PostgreSQL.
+
+Financial systems punish vague thinking because every shortcut fails in a
+specific, observable way. Store balances in binary floating point and sums of
+fee postings stop matching the books to the cent. Store wall-clock timestamps
+without a UTC reference and the autumn daylight-saving fallback folds two distinct
+hours onto the same nominal minute. Choose random \texttt{UUIDv4} primary keys and
+a sixty-gigabyte B-tree turns small inserts into an 8~KB full-page-write storm
+across cold NVMe blocks. Validate invariants only in Rust handlers and a single
+concurrent retry or backfill script creates money out of thin air. Leave
+replication asynchronous and a primary disk failure erases transfers you already
+confirmed to customers; point five thousand Tokio tasks directly at PostgreSQL and
+shared-memory snapshot contention brings a thirty-two-core server to its knees.
+
+In this final chapter, we state every architectural rule by starting with the
+exact production failure it prevents, then trace how PostgreSQL's storage,
+indexing, WAL, locking, and wire-protocol internals enforce the guarantee.
+
+\begin{focusbox}
+By the end of this chapter you will be able to:
+\begin{itemize}
+  \item Select exact storage types for money (\texttt{BIGINT} minor units versus
+    base-$10{,}000$ \texttt{NUMERIC}), instants in time (\texttt{TIMESTAMPTZ}),
+    and high-throughput keys (time-ordered \texttt{UUIDv7} versus \texttt{UUIDv4}).
+  \item Encode domain invariants directly in the schema with \texttt{NOT NULL},
+    \texttt{CHECK}, idempotency keys, and GiST temporal exclusion constraints
+    (\texttt{EXCLUDE USING gist}).
+  \item Implement an append-only double-entry ledger enforced at \texttt{COMMIT}
+    time by a \texttt{DEFERRABLE INITIALLY DEFERRED} constraint trigger, paired
+    with deadlock-free Rust (\texttt{Axum} + \texttt{SQLx}) transfer code.
+  \item Partition multi-billion-row posting tables by time range for warm buffer
+    locality and zero-bloat retention archival.
+  \item Tune physical streaming replication across the \texttt{synchronous\_commit}
+    durability ladder and stream decoded row events with logical replication.
+  \item Multiplex thousands of async Rust tasks onto dozens of PostgreSQL backend
+    processes through \texttt{PgBouncer} transaction pooling without breaking
+    prepared statements or session state.
+\end{itemize}
+\end{focusbox}
+
+\chapterline
+
+\section{Data Types That Never Lie About Money, Time, or Identity}
+\label{ch08:types}
+
+A relational schema is a physical contract about the bit patterns allowed onto
+8~KB heap pages. If a column's type rounds fractions, discards UTC context, or
+scatters keys uniformly across disk, no amount of application-layer discipline can
+undo the damage downstream.
+
+\subsection{Money: Why Binary Floats Fail, and \texttt{BIGINT} vs.\ \texttt{NUMERIC}}
+\label{ch08:money-types}
+
+Suppose a payment platform stores account adjustments in PostgreSQL's 8-byte
+\texttt{DOUBLE PRECISION} type (\texttt{float8}, matching \texttt{f64} in Rust and
+\texttt{double} in Java or C++). A merchant collects a $\$0.10$ platform fee and a
+$\$0.20$ network fee, expecting a $\$0.30$ total. Ask PostgreSQL whether the two
+sides match:
+
+\begin{lstlisting}[language=SQL]
+SELECT (0.1::float8 + 0.2::float8) = 0.3::float8 AS exact_match,
+       (0.1::float8 + 0.2::float8) - 0.3::float8 AS drift;
+-- exact_match: false | drift: 5.551115123125783e-17
+\end{lstlisting}
+
+The comparison returns \texttt{false} because IEEE~754 binary floating point
+represents numbers as $(-1)^s \times m \times 2^e$ with a 53-bit binary
+significand $m$. In base~2, one tenth is an infinite repeating fraction,
+$0.1_{10} = 0.0001100110011\overline{0011}_2$, just as $1/3 = 0.333\ldots_{10}$
+never terminates in base~10. Rounding at bit~53 introduces an error of rough
+magnitude $10^{-17}$ on a single addition. Sum ten million fee postings across
+parallel \texttt{HashAggregate} workers (Chapter~7), where summation order varies
+from run to run, and two identical reconciliation queries can disagree by cents.
+Binary floats (\texttt{REAL} and \texttt{DOUBLE PRECISION}) are therefore strictly
+forbidden for monetary quantities.
+
+PostgreSQL gives you two exact alternatives, each suited to a clear regime:
+
+\begin{enumerate}
+  \item \textbf{\texttt{BIGINT} (\texttt{int8}) minor units.} Instead of storing
+    dollars as fractions, store integer counts of the asset's smallest indivisible
+    unit: cents ($10^{-2}$~USD), micro-dollars ($10^{-6}$~USD) for sub-cent API
+    billing, or satoshis ($10^{-8}$~BTC). On disk, \texttt{BIGINT} occupies a
+    fixed 8~bytes on the heap page, maps directly to \texttt{i64} in Rust or
+    \texttt{long} in Java, and adds or compares in a single CPU integer instruction.
+    Its signed range reaches $\pm(2^{63}-1) \approx \pm 9.22 \times 10^{18}$: in
+    USD cents that exceeds $\$92$~quadrillion; in micro-dollars it exceeds
+    $\$9.22$~trillion. Whenever you store minor units, store the asset's ISO code
+    or integer exponent alongside it so nobody adds Japanese yen ($10^{0}$) to US
+    cents ($10^{-2}$) or Kuwaiti dinar fils ($10^{-3}$).
+  \item \textbf{\texttt{NUMERIC(p, s)} (equivalently \texttt{DECIMAL(p, s)}).}
+    Foreign-exchange rates (\texttt{1.08437525}), fractional equity shares
+    (\texttt{0.00418275} shares), and multi-asset bond accruals often combine
+    precision $p$ up to dozens of digits with varying decimal scales $s$, or
+    multiply two high-precision figures where an intermediate 64-bit integer would
+    overflow. Internally (\texttt{NumericVar} in PostgreSQL's \texttt{numeric.c}),
+    \texttt{NUMERIC} is a variable-length (\texttt{varlena}) structure that packs
+    \emph{four base-10 digits into each 16-bit integer word} (base~$10{,}000$),
+    paired with a compact header storing the base-$10{,}000$ weight, sign, and
+    display scale. Because every power of $10^{-1}$ terminates in base~$10{,}000$,
+    \texttt{0.1::numeric + 0.2::numeric = 0.3::numeric} is exact to every declared
+    digit. The tradeoff is CPU and space: \texttt{NUMERIC} carries a variable-length
+    header (typically 8--16~bytes on disk for moderate values) and executes digit
+    loops in software rather than a single ALU instruction, making heavy
+    \texttt{SUM(amount)} scans roughly $5\times$ to $15\times$ more CPU-intensive
+    than \texttt{SUM(amount\_minor)} on \texttt{BIGINT}. In Rust \texttt{SQLx},
+    \texttt{NUMERIC} binds cleanly to \texttt{rust\_decimal::Decimal} (128-bit
+    fixed decimal) or \texttt{bigdecimal::BigDecimal}.
+\end{enumerate}
+
+For single-scale ledger postings and account balances, \texttt{BIGINT} minor units
+give unbeatable speed and simplicity; for FX rates, unit prices, and tax or
+interest multipliers, \texttt{NUMERIC(p, s)} prevents premature rounding and
+64-bit intermediate overflow.
+
+\subsection{Time: \texttt{TIMESTAMPTZ} and the Daylight-Saving Trap}
+\label{ch08:time-types}
+
+At 01:59:59 Eastern Daylight Time on the first Sunday of November, clocks in New
+York jump backward to 01:00:00 Eastern Standard Time. Suppose a ledger table uses
+\texttt{TIMESTAMP WITHOUT TIME ZONE} (which SQL abbreviates as plain
+\texttt{TIMESTAMP}). A customer wires funds at 01:15~EDT (\texttt{05:15 UTC}),
+and fifty minutes later wires a second payment at 01:05~EST (\texttt{06:05 UTC}).
+Stored as wall-clock New York \texttt{TIMESTAMP} values, the second transfer
+appears to happen \emph{ten minutes before} the first: \texttt{'2026-11-01
+01:05:00'} sorts ahead of \texttt{'2026-11-01 01:15:00'}. Worse, if one API node
+runs with \texttt{TimeZone = 'UTC'} and an admin tool connects with
+\texttt{TimeZone = 'America/Chicago'}, \texttt{TIMESTAMP WITHOUT TIME ZONE} strips
+and ignores timezone offsets on input, mixing incompatible local clocks in the
+same column with zero warning.
+
+\begin{intuitionbox}
+Despite its verbose SQL name, \texttt{TIMESTAMP WITH TIME ZONE}
+(\texttt{TIMESTAMPTZ}) stores \textbf{zero timezone string or UTC offset on disk}.
+Both \texttt{TIMESTAMP} and \texttt{TIMESTAMPTZ} occupy the exact same 8~bytes in
+a heap tuple: a signed 64-bit integer counting microseconds since PostgreSQL's
+epoch, \texttt{2000-01-01 00:00:00 UTC}. The sole difference happens at the input
+and output boundary. When you insert \texttt{'2026-11-01 01:15:00-04'} into a
+\texttt{TIMESTAMPTZ} column, PostgreSQL immediately converts that instant into UTC
+microseconds and stores that single universal point on the physical timeline. On
+\texttt{SELECT}, it formats those UTC microseconds into whatever session
+\texttt{TimeZone} the reader requested.
+\end{intuitionbox}
+
+The rule for financial schemas has only two cases:
+\begin{itemize}
+  \item Every physical instant when an event occurred (\texttt{created\_at},
+    \texttt{posted\_at}, \texttt{expires\_at}) must use \texttt{TIMESTAMPTZ},
+    mapped in Rust \texttt{SQLx} to \texttt{DateTime<Utc>} (from \texttt{chrono})
+    or \texttt{OffsetDateTime} (from \texttt{time}) with session \texttt{TimeZone}
+    set to \texttt{'UTC'}.
+  \item Calendar dates defined by legal contract rather than a physical instant
+    (such as a wire's settlement \texttt{value\_date = '2026-11-02'} or a
+    statement billing date) should use 4-byte \texttt{DATE}, never a midnight
+    timestamp that shifts to the previous calendar day when viewed in another
+    timezone.
+\end{itemize}
+
+\subsection{Primary Keys at Scale: Why \texttt{UUIDv4} Keys Thrash B-Trees and \texttt{UUIDv7} Flies}
+\label{ch08:uuid-types}
+
+An 8-byte \texttt{BIGINT GENERATED ALWAYS AS IDENTITY} sequence appends strictly
+to the right edge of its primary-key B-tree, keeping inserts fast and compact. Yet
+distributed financial systems rarely expose sequential integers as external IDs:
+sequential IDs leak business volume to competitors (\texttt{entry\_id = 1042}
+versus \texttt{1089} an hour later) and force Rust services or mobile clients to
+make a database round-trip before knowing a new resource's identifier. That
+pushes teams toward 128-bit \texttt{UUID} keys (stored natively in PostgreSQL's
+16-byte \texttt{uuid} type, never as 36-byte ASCII \texttt{TEXT}).
+
+Here is the failure mode that catches growing ledgers six months after launch. You
+choose random \texttt{UUIDv4} (122 cryptographically random bits). At five million
+rows, the primary-key B-tree is roughly 150~MB, sits comfortably inside an 8~GB
+\texttt{shared\_buffers} pool (Chapter~2), and sustains $35{,}000$ inserts per
+second. A year later, \texttt{postings} reaches two billion rows and its primary
+B-tree spans 65~GB on a server with 32~GB of RAM. Insert throughput drops by an
+order of magnitude while NVMe write bandwidth pins at $100\%$, even though each new
+posting row is barely a hundred bytes. Three mechanisms from Chapters~2--4 combine
+to cause this collapse:
+
+\begin{enumerate}
+  \item \textbf{Buffer-pool cache misses.} Every \texttt{UUIDv4} lands uniformly
+    at random across the entire $[0, 2^{128})$ keyspace. When a 65~GB leaf layer
+    exceeds \texttt{shared\_buffers}, nearly every single \texttt{INSERT} probes a
+    cold leaf page not in memory, stalling on a random 8~KB disk read and evicting
+    another page.
+  \item \textbf{Midpoint page-split bloat.} As we saw in Chapter~3, random B-tree
+    inserts split full leaf pages 50/50, leaving average leaf occupancy near
+    $70\%$ instead of the $90\%$ fill PostgreSQL keeps when it
+    detects monotonically increasing right-edge inserts.
+  \item \textbf{WAL \texttt{full\_page\_writes} amplification.} Recall from
+    Chapter~4 that the first modification to \emph{any} 8~KB heap or index page
+    after a \texttt{CHECKPOINT} must write the entire 8~KB Full Page Image (FPI)
+    into the WAL stream to survive torn writes. After a checkpoint, ten thousand
+    random \texttt{UUIDv4} inserts dirty roughly ten thousand distinct B-tree leaf
+    pages, turning a few hundred kilobytes of new index entries into about
+    $10{,}000 \times 8\text{ KB} \approx 80\text{ MB}$ of WAL.
+\end{enumerate}
+
+RFC~9562 \textbf{\texttt{UUIDv7}} (available natively as \texttt{uuidv7()} in
+PostgreSQL~18 and via \texttt{uuid::Uuid::now\_v7()} in Rust) eliminates all three
+penalties without reintroducing central sequence contention. Its first 48~bits
+encode the big-endian Unix timestamp in milliseconds, followed by a 4-bit version
+tag (\texttt{0111}), 12~bits of sub-millisecond monotonic or random data
+(\texttt{rand\_a}), a 2-bit variant (\texttt{10}), and 62~bits of cryptographic
+randomness (\texttt{rand\_b}). Because PostgreSQL compares 16-byte \texttt{uuid}
+values lexicographically from most-significant byte to least, every \texttt{UUIDv7}
+minted during the current millisecond sorts to the \emph{far right} of the entire
+historical B-tree (Figure~\ref{ch08:fig-uuidv4-vs-v7}). Concurrent Rust pods mint
+collision-free IDs offline, yet all inserts converge onto a handful of hot
+rightmost leaf pages pinned permanently in \texttt{shared\_buffers}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  >=Latex,
+  bitbox/.style={draw=black!75, thick, minimum height=0.82cm, align=center, inner sep=2pt},
+  leafcold/.style={draw=sourceblue!80!black, fill=sourceblue!8, rounded corners=2pt,
+                   minimum width=1.18cm, minimum height=0.68cm, font=\scriptsize, align=center},
+  leafdirty/.style={draw=trapred, fill=trapred!18, thick, rounded corners=2pt,
+                    minimum width=1.18cm, minimum height=0.68cm, font=\scriptsize, align=center},
+  leafhot/.style={draw=targetgreen!80!black, fill=targetgreen!20, very thick, rounded corners=2pt,
+                  minimum width=1.28cm, minimum height=0.68cm, font=\scriptsize, align=center}
+]
+  % Top panel: UUIDv7 128-bit layout (total width = 14.0 cm)
+  \node[anchor=west, font=\small\bfseries, text=structurepurple!85!black]
+    at (0, 3.85) {RFC 9562 \texttt{UUIDv7} 128-Bit Big-Endian Layout (16 Bytes on Disk)};
+
+  \node[bitbox, fill=targetgreen!18, minimum width=5.2cm, anchor=west] (ts) at (0, 3.05)
+    {\textbf{48-bit Unix Epoch ms}\\ {\scriptsize monotonic B-tree sort prefix}};
+  \node[bitbox, fill=structurepurple!16, minimum width=1.1cm, anchor=west] (ver) at (5.2, 3.05)
+    {\textbf{4b}\\ {\scriptsize \texttt{0111}}};
+  \node[bitbox, fill=sourceblue!14, minimum width=1.8cm, anchor=west] (ra) at (6.3, 3.05)
+    {\textbf{12-bit}\\ {\scriptsize \texttt{rand\_a}}};
+  \node[bitbox, fill=structurepurple!16, minimum width=0.9cm, anchor=west] (var) at (8.1, 3.05)
+    {\textbf{2b}\\ {\scriptsize \texttt{10}}};
+  \node[bitbox, fill=quotientorange!16, minimum width=5.0cm, anchor=west] (rb) at (9.0, 3.05)
+    {\textbf{62-bit CSPRNG (\texttt{rand\_b})}\\ {\scriptsize collision-free across nodes}};
+
+  \node[font=\scriptsize, text=black!70, anchor=north west] at (0, 2.58) {bit 0};
+  \node[font=\scriptsize, text=black!70, anchor=north] at (5.2, 2.58) {48};
+  \node[font=\scriptsize, text=black!70, anchor=north] at (6.3, 2.58) {52};
+  \node[font=\scriptsize, text=black!70, anchor=north] at (8.1, 2.58) {64};
+  \node[font=\scriptsize, text=black!70, anchor=north] at (9.0, 2.58) {66};
+  \node[font=\scriptsize, text=black!70, anchor=north east] at (14.0, 2.58) {127};
+
+  % Bottom-left: UUIDv4 random scatter (x: 0 .. 6.6)
+  \draw[rounded corners=4pt, draw=trapred!70, fill=trapred!4] (0, -1.55) rectangle (6.65, 1.95);
+  \node[font=\small\bfseries, text=trapred!85!black] at (3.32, 1.62)
+    {Random \texttt{UUIDv4}: Cold Leaf Thrashing};
+  \node[draw=trapred, fill=white, rounded corners=2pt, font=\scriptsize, inner sep=3pt]
+    (v4in) at (3.32, 1.02) {4 concurrent inserts (uniform in $[0,2^{128})$)};
+
+  \node[leafdirty] (l1) at (0.80, -0.15) {\texttt{0a..}\\ {\tiny 8 KB FPI}};
+  \node[leafcold]  (l2) at (2.06, -0.15) {\texttt{3f..}\\ {\tiny cold}};
+  \node[leafdirty] (l3) at (3.32, -0.15) {\texttt{7c..}\\ {\tiny 8 KB FPI}};
+  \node[leafdirty] (l4) at (4.58, -0.15) {\texttt{b2..}\\ {\tiny 8 KB FPI}};
+  \node[leafdirty] (l5) at (5.84, -0.15) {\texttt{f9..}\\ {\tiny 8 KB FPI}};
+
+  \draw[->, thick, trapred] (v4in.south) -- (l1.north);
+  \draw[->, thick, trapred] (v4in.south) -- (l3.north);
+  \draw[->, thick, trapred] (v4in.south) -- (l4.north);
+  \draw[->, thick, trapred] (v4in.south) -- (l5.north);
+
+  \node[font=\scriptsize, align=center, text=black!80] at (3.32, -1.05)
+    {Misses \texttt{shared\_buffers}; $\sim 50\%$ split fill;\\every touched leaf logs an 8~KB WAL FPI};
+
+  % Bottom-right: UUIDv7 rightmost append (x: 7.35 .. 14.0)
+  \draw[rounded corners=4pt, draw=targetgreen!75!black, fill=targetgreen!4] (7.35, -1.55) rectangle (14.0, 1.95);
+  \node[font=\small\bfseries, text=targetgreen!75!black] at (10.68, 1.62)
+    {Time-Ordered \texttt{UUIDv7}: Rightmost Append};
+  \node[draw=targetgreen!80!black, fill=white, rounded corners=2pt, font=\scriptsize, inner sep=3pt]
+    (v7in) at (10.68, 1.02) {4 concurrent inserts (\texttt{019a3f...} prefix)};
+
+  \node[leafcold] (r1) at (8.12, -0.15) {\texttt{0197..}\\ {\tiny frozen}};
+  \node[leafcold] (r2) at (9.38, -0.15) {\texttt{0198..}\\ {\tiny frozen}};
+  \node[leafcold] (r3) at (10.64, -0.15) {\texttt{0199..}\\ {\tiny cold}};
+  \node[leafhot]  (r4) at (12.45, -0.15) {\texttt{019a3f..}\\ {\tiny \textbf{Pinned RAM}}};
+
+  \draw[->, thick, targetgreen!75!black] (v7in.south) .. controls (11.2, 0.45) .. ([xshift=-6pt]r4.north);
+  \draw[->, thick, targetgreen!75!black] (v7in.south) .. controls (11.6, 0.45) .. ([xshift=-2pt]r4.north);
+  \draw[->, thick, targetgreen!75!black] (v7in.south) .. controls (12.0, 0.45) .. ([xshift=2pt]r4.north);
+  \draw[->, thick, targetgreen!75!black] (v7in.south) .. controls (12.4, 0.45) .. ([xshift=6pt]r4.north);
+
+  \node[font=\scriptsize, align=center, text=black!80] at (10.68, -1.05)
+    {$>99\%$ buffer hit rate on rightmost leaf;\\$\sim 90\%+$ fill factor; 1 FPI per checkpoint};
+\end{tikzpicture}
+\caption{Bit layout of RFC~9562 \texttt{UUIDv7} (top) and its effect on a multi-gigabyte B-tree (bottom). Random \texttt{UUIDv4} keys scatter writes across cold disk pages and amplify post-checkpoint WAL full-page images, whereas \texttt{UUIDv7} funnels concurrent inserts onto the hot rightmost leaf in \texttt{shared\_buffers}.}
+\label{ch08:fig-uuidv4-vs-v7}
+\end{figure}
+
+\section{Encoding Domain Invariants Directly in the Schema}
+\label{ch08:invariants}
+
+``Our Rust service validates every request struct before calling SQL, so the
+database only needs plain columns.'' That sentence precedes nearly every silent
+data-corruption postmortem. Application code is only one doorway into a database:
+settlement batch jobs, emergency \texttt{psql} backfills, schema migrations, and
+concurrent network retries all write to the same tables. Worse, under \texttt{READ
+COMMITTED} isolation (Chapter~6), two Rust handlers that validate against separate
+snapshots can each see valid preconditions and still commit a combined state that
+violates business law. Pushing invariants into PostgreSQL turns application bugs
+from silent ledger corruption into loud, rolled-back \texttt{ERROR} responses.
+
+\subsection{\texttt{NOT NULL}, \texttt{CHECK}, Domains, and Atomic Idempotency Keys}
+\label{ch08:scalar-invariants}
+
+Recall from Chapter~1 how three-valued logic treats \texttt{NULL} inside a
+\texttt{CHECK} constraint: a row passes \texttt{CHECK (expr)} whenever
+\texttt{expr} evaluates to \texttt{TRUE} \emph{or} \texttt{UNKNOWN}. If you write
+\texttt{amount\_minor BIGINT CHECK (amount\_minor > 0)} without \texttt{NOT NULL},
+inserting \texttt{NULL} evaluates \texttt{NULL > 0} to \texttt{UNKNOWN} and lands
+cleanly on the heap page. Always pair \texttt{NOT NULL} with \texttt{CHECK}.
+
+For constrained text categories, choose deliberately between three tools:
+\begin{itemize}
+  \item \textbf{\texttt{CREATE TYPE ... AS ENUM}} stores each label as a compact
+    4-byte OID on disk and excels for closed state machines whose values are tied
+    to code branches (\texttt{'pending'}, \texttt{'posted'}, \texttt{'voided'}).
+    However, PostgreSQL enums cannot drop obsolete labels without recreating the
+    type.
+  \item \textbf{\texttt{DOMAIN}s or \texttt{CHECK}-constrained \texttt{TEXT}}
+    (such as \texttt{CHAR(3)} checked against \texttt{'\textasciicircum{}[A-Z]\{3\}\$'})
+    validate format uniformly across dozens of tables while allowing new currencies
+    without DDL catalog locks. When currencies carry per-asset metadata such as
+    minor-unit scale ($2$ for \texttt{USD}, $0$ for \texttt{JPY}), a foreign key to
+    a small \texttt{assets} table (\texttt{currency}, \texttt{minor\_scale}) stays
+    permanently cached in \texttt{shared\_buffers}.
+  \item \textbf{Storage-enforced idempotency keys.} When a mobile app or upstream
+    gateway sends \texttt{POST /v1/transfers} and its TCP socket times out while
+    waiting for the HTTP response, the client cannot tell whether the commit
+    succeeded; it \emph{must} retry with the same client-generated
+    \texttt{idempotency\_key}. Checking \texttt{SELECT 1 FROM journal\_entries
+    WHERE client\_id = \$1 AND idempotency\_key = \$2} in Rust before inserting
+    suffers a classic Time-of-Check to Time-of-Use race if two retries arrive
+    simultaneously. Declaring \texttt{UNIQUE (client\_id, idempotency\_key)} makes
+    PostgreSQL's B-tree uniqueness machinery (\texttt{\_bt\_check\_unique}) inspect
+    even uncommitted in-flight index tuples, block the second retry on the first
+    transaction's lock, and resolve atomically via \texttt{ON CONFLICT DO NOTHING}.
+\end{itemize}
+
+\subsection{Temporal Non-Overlapping Invariants with \texttt{EXCLUDE USING gist}}
+\label{ch08:gist-exclude}
+
+Suppose each savings or margin account has a tiered interest-rate schedule valid
+over a time interval. Two administrative jobs concurrently insert schedules for
+account~$A$: one sets $4.50\%$ over $[\text{Jun~1}, \text{Dec~1})$ and another sets
+$5.00\%$ over $[\text{Sep~1}, \text{Mar~1})$. A nightly accrual query joins
+\texttt{accounts} to \texttt{account\_rate\_schedules WHERE now() <@
+effective\_during}, matches \emph{both} rows throughout autumn, and pays $9.50\%$
+interest. No \texttt{UNIQUE} constraint on \texttt{(account\_id, effective\_from)}
+can catch partial interval overlap because the start timestamps differ.
+
+Chapter~3 introduced Generalized Search Trees (GiST) as balanced trees over
+arbitrary bounding predicates rather than total orders. Paired with the bundled
+\texttt{btree\_gist} extension (which teaches GiST to test equality \texttt{=} on
+ordinary scalar types alongside range overlap \texttt{\&\&}), PostgreSQL's
+\textbf{exclusion constraint} rejects any two rows where \emph{all} listed
+operator comparisons return true simultaneously:
+
+\begin{lstlisting}[language=SQL]
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+CREATE TABLE account_rate_schedules (
+    schedule_id      UUID PRIMARY KEY DEFAULT uuidv7(),
+    account_id       UUID NOT NULL,
+    annual_bps       INTEGER NOT NULL CHECK (annual_bps BETWEEN 0 AND 10000),
+    effective_during TSTZRANGE NOT NULL,
+    CONSTRAINT non_empty_window CHECK (NOT isempty(effective_during)),
+    CONSTRAINT no_overlapping_rates EXCLUDE USING gist (
+        account_id       WITH =,
+        effective_during WITH &&
+    )
+);
+\end{lstlisting}
+
+Notice the range type \texttt{TSTZRANGE} and PostgreSQL's canonical half-open
+convention \texttt{'[)'} (closed lower bound, open upper bound). When an old rate
+schedule \texttt{[2026-01-01Z, 2026-06-01Z)} (constructed via \texttt{tstzrange})
+ends at midnight June~1 and its replacement \texttt{[2026-06-01Z, infinity)}
+begins at that exact microsecond, the two intervals touch with zero gap yet share
+zero instants, so \texttt{\&\&} evaluates to \texttt{false}. Even under
+\texttt{READ COMMITTED}, two concurrent transactions inserting overlapping windows
+for the same \texttt{account\_id} collide inside the GiST index just like a
+duplicate primary key: one commits and the other aborts with SQLSTATE
+\texttt{23P01} (\texttt{exclusion\_violation}).
+
+\section{A Double-Entry Financial Ledger in PostgreSQL and Rust}
+\label{ch08:ledger}
+
+Beginners often model money with a single mutable column: \texttt{UPDATE accounts
+SET balance = balance - 5000 WHERE id = \$1} followed by \texttt{UPDATE accounts
+SET balance = balance + 5000 WHERE id = \$2}. Three production hazards make that
+design unacceptable for a real ledger:
+\begin{enumerate}
+  \item \textbf{Destroyed history.} Overwriting \texttt{balance} in place erases
+    \emph{why} the balance changed, making regulatory audits, dispute reversals,
+    and point-in-time historical reconstructions impossible once \texttt{VACUUM}
+    reclaims old tuple versions (Chapter~5).
+  \item \textbf{Unchecked money creation.} Nothing in the schema ties the two
+    \texttt{UPDATE} statements together. A bug in a new promo-credit handler that
+    runs one \texttt{UPDATE} without its counterparty silently alters the total
+    supply of customer funds.
+  \item \textbf{Hot-row contention without audit legs.} Separating immutable
+    event recording from balance caching lets us enforce conservation of money at
+    the database kernel level while keeping point balance reads $O(1)$.
+\end{enumerate}
+
+\subsection{Conservation of Value and \texttt{DEFERRABLE INITIALLY DEFERRED} Triggers}
+\label{ch08:deferred-triggers}
+
+Luca Pacioli codified the cure in Venice in 1494: \textbf{double-entry
+bookkeeping}. Every financial event is recorded as an immutable
+\texttt{journal\_entry} header accompanied by two or more immutable
+\texttt{postings} (legs) in the same currency whose signed minor-unit amounts sum
+to zero:
+\[
+  \forall\, e \in \text{journal\_entries}:\qquad
+  \abs{P(e)} \ge 2
+  \quad\text{and}\quad
+  \sum_{p \in P(e)} p.\texttt{signed\_amount\_minor} = 0.
+\]
+When Alice sends $\$50.00$ ($5{,}000$ cents) to Bob, we do not invent $5{,}000$
+cents in Bob's row; we append one leg of $-5000$ against Alice's liability account
+and one leg of $+5000$ against Bob's liability account under the same
+\texttt{entry\_id}. If a $1\%$ platform fee applies, the same entry has three legs:
+$-5000$ (Alice), $+4950$ (Bob), and $+50$ (Platform Fee Revenue), summing cleanly
+to $-5000 + 4950 + 50 = 0$.
+
+How do we force PostgreSQL itself to reject any transaction that violates this
+zero-sum balance law? A table-level \texttt{CHECK} constraint can inspect only the
+columns of a \emph{single} row. And an ordinary \texttt{AFTER INSERT} trigger fails
+immediately: the moment you insert Alice's $-5000$ leg (before inserting Bob's
+$+5000$ leg), the running sum for \texttt{entry\_id} is $-5000 \ne 0$!
+
+PostgreSQL solves multi-row invariants across statement boundaries with a
+\textbf{\texttt{CONSTRAINT TRIGGER}} declared \textbf{\texttt{DEFERRABLE INITIALLY
+DEFERRED}}. Instead of firing mid-transaction when only half the legs exist,
+PostgreSQL queues a lightweight trigger event in backend memory and executes the
+verification function \emph{when the client issues \texttt{COMMIT}}, right before
+flushing the commit record to WAL (Figure~\ref{ch08:fig-gist-and-deferred}). Let
+us write out the complete ledger schema, including an immutability trigger on
+\texttt{postings} and a materialized \texttt{cached\_balance\_minor} on
+\texttt{accounts} protected against negative overdrafts:
+
+\begin{lstlisting}[language=SQL]
+CREATE TABLE accounts (
+    account_id           UUID PRIMARY KEY DEFAULT uuidv7(),
+    currency             CHAR(3) NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+    cached_balance_minor BIGINT NOT NULL DEFAULT 0,
+    allow_overdraft      BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT non_negative_unless_overdraft
+        CHECK (allow_overdraft OR cached_balance_minor >= 0)
+);
+
+CREATE TABLE journal_entries (
+    entry_id        UUID PRIMARY KEY DEFAULT uuidv7(),
+    client_id       UUID NOT NULL,
+    idempotency_key TEXT NOT NULL CHECK (length(idempotency_key) <= 128),
+    currency        CHAR(3) NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+    description     TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_client_idempotency UNIQUE (client_id, idempotency_key)
+);
+
+CREATE TABLE postings (
+    posting_id          UUID PRIMARY KEY DEFAULT uuidv7(),
+    entry_id            UUID NOT NULL REFERENCES journal_entries(entry_id),
+    account_id          UUID NOT NULL REFERENCES accounts(account_id),
+    signed_amount_minor BIGINT NOT NULL CHECK (signed_amount_minor <> 0),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_postings_entry   ON postings (entry_id);
+CREATE INDEX idx_postings_account ON postings (account_id, created_at DESC);
+
+CREATE OR REPLACE FUNCTION forbid_posting_mutation()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'postings are append-only; post a reversing entry';
+END;
+$$;
+
+CREATE TRIGGER trg_postings_immutable
+BEFORE UPDATE OR DELETE ON postings
+FOR EACH ROW EXECUTE FUNCTION forbid_posting_mutation();
+
+CREATE OR REPLACE FUNCTION verify_entry_zero_sum()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+    v_entry_id UUID := COALESCE(NEW.entry_id, OLD.entry_id);
+    v_legs     BIGINT;
+    v_net_sum  BIGINT;
+    v_bad_ccy  BIGINT;
+BEGIN
+    SELECT COUNT(*), COALESCE(SUM(p.signed_amount_minor), 0),
+           COUNT(*) FILTER (WHERE a.currency <> je.currency)
+      INTO v_legs, v_net_sum, v_bad_ccy
+      FROM journal_entries je
+      LEFT JOIN postings p ON p.entry_id = je.entry_id
+      LEFT JOIN accounts a ON a.account_id = p.account_id
+     WHERE je.entry_id = v_entry_id;
+
+    IF v_legs < 2 OR v_net_sum <> 0 OR v_bad_ccy > 0 THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            MESSAGE = 'unbalanced entry ' || v_entry_id
+                   || ': legs=' || v_legs || ', sum=' || v_net_sum
+                   || ', ccy_mismatch=' || v_bad_ccy;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER trg_verify_entry_zero_sum
+AFTER INSERT OR UPDATE OR DELETE ON postings
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION verify_entry_zero_sum();
+\end{lstlisting}
+
+\begin{trapbox}
+\texttt{verify\_entry\_zero\_sum} checks \emph{three} things
+together: \texttt{v\_legs < 2}, \texttt{v\_net\_sum <> 0}, and
+\texttt{v\_bad\_ccy > 0}. Without \texttt{LEFT JOIN} and \texttt{v\_legs < 2}, an
+entry whose postings were somehow deleted (if someone disabled the immutability
+trigger during maintenance) would return \texttt{SUM(...) = NULL}, which naive
+\texttt{IF v\_net\_sum <> 0} evaluates to \texttt{UNKNOWN} and lets slip past. And
+without checking \texttt{a.currency <> je.currency}, a buggy handler could debit
+5000~JPY from a yen account and credit 5000~USD cents to a dollar account while
+still summing to zero numerically. Finally, attach a second deferred check on
+\texttt{journal\_entries} (or always insert postings in the same helper) so an
+empty header with zero postings cannot commit alone.
+\end{trapbox}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  >=Latex,
+  stepbox/.style={draw=sourceblue!80!black, fill=sourceblue!8, rounded corners=2pt,
+                  minimum height=0.68cm, inner sep=3pt, font=\scriptsize, align=center}
+]
+  % Panel A: GiST Exclusion Geometry (top, y: 2.3 .. 4.9)
+  \draw[rounded corners=4pt, draw=structurepurple!75, fill=structurepurple!4]
+    (0, 2.25) rectangle (14.2, 4.95);
+  \node[font=\small\bfseries, text=structurepurple!85!black, anchor=west]
+    at (0.3, 4.62) {A. \texttt{EXCLUDE USING gist (account\_id WITH =, effective\_during WITH \&\&)}};
+
+  % Time axis
+  \draw[->, thick, black!75] (1.2, 2.70) -- (13.6, 2.70) node[right, font=\scriptsize] {$t$ (UTC)};
+  \foreach \x/\lbl in {2.0/Jan 1, 5.2/Apr 1, 7.4/Jun 1, 10.2/Sep 1, 12.6/Dec 1} {
+    \draw[black!70] (\x, 2.62) -- (\x, 2.78);
+    \node[font=\scriptsize, below] at (\x, 2.62) {\lbl};
+  }
+
+  % Valid half-open intervals [Jan 1, Jun 1) and [Jun 1, Dec 1)
+  \draw[very thick, targetgreen!80!black] (2.0, 3.95) -- (7.32, 3.95);
+  \fill[targetgreen!80!black] (2.0, 3.95) circle (2.3pt);
+  \draw[thick, targetgreen!80!black, fill=white] (7.4, 3.95) circle (2.3pt);
+  \node[font=\scriptsize, text=targetgreen!75!black, above] at (4.65, 3.98)
+    {Row 1: \texttt{[Jan 1, Jun 1)} @ 4.50\%};
+
+  \draw[very thick, sourceblue!85!black] (7.48, 3.95) -- (12.52, 3.95);
+  \fill[sourceblue!85!black] (7.4, 3.95) circle (2.3pt);
+  \draw[thick, sourceblue!85!black, fill=white] (12.6, 3.95) circle (2.3pt);
+  \node[font=\scriptsize, text=sourceblue!85!black, above] at (10.1, 3.98)
+    {Row 2: \texttt{[Jun 1, Dec 1)} @ 4.75\% (no \texttt{\&\&} at Jun 1)};
+
+  % Rejected overlapping interval [Apr 1, Sep 1)
+  \draw[very thick, trapred, dashed] (5.2, 3.25) -- (10.2, 3.25);
+  \fill[trapred] (5.2, 3.25) circle (2.3pt);
+  \draw[thick, trapred, fill=white] (10.2, 3.25) circle (2.3pt);
+  \fill[trapred!20, opacity=0.55] (5.2, 3.15) rectangle (10.2, 3.35);
+  \node[font=\scriptsize\bfseries, text=trapred, right] at (10.35, 3.25)
+    {Rejected (\texttt{23P01}): overlaps!};
+
+  % Panel B: Deferred Constraint Trigger Timeline (bottom, y: -1.15 .. 1.95)
+  \draw[rounded corners=4pt, draw=sourceblue!75, fill=sourceblue!3]
+    (0, -1.15) rectangle (14.2, 1.95);
+  \node[font=\small\bfseries, text=sourceblue!85!black, anchor=west]
+    at (0.3, 1.62) {B. \texttt{DEFERRABLE INITIALLY DEFERRED} Trigger Timeline Across a Transfer};
+
+  \node[stepbox, minimum width=1.55cm] (s1) at (1.15, 0.70) {\texttt{BEGIN}\\ {\tiny $\Sigma = 0$}};
+  \node[stepbox, minimum width=2.35cm, draw=quotientorange!90!black, fill=quotientorange!12]
+    (s2) at (3.75, 0.70) {Leg 1: $-5000$\\ {\tiny $\Sigma = -5000$ (queued)}};
+  \node[stepbox, minimum width=2.35cm]
+    (s3) at (6.75, 0.70) {Leg 2: $+5000$\\ {\tiny $\Sigma = 0$ (queued)}};
+  \node[stepbox, minimum width=1.85cm, draw=structurepurple, fill=structurepurple!14]
+    (s4) at (9.50, 0.70) {\texttt{COMMIT}\\ {\tiny fire triggers}};
+  \node[stepbox, minimum width=2.85cm, draw=targetgreen!80!black, fill=targetgreen!16]
+    (s5) at (12.48, 0.70) {$\Sigma = 0 \land \text{legs} \ge 2$\\ {\tiny flush WAL + ack}};
+
+  \draw[->, thick] (s1) -- (s2);
+  \draw[->, thick] (s2) -- (s3);
+  \draw[->, thick] (s3) -- (s4);
+  \draw[->, thick] (s4) -- (s5);
+
+  \node[font=\scriptsize, text=black!75, align=center] at (7.1, -0.45)
+    {Mid-transaction imbalance after Leg~1 is permitted; if the legs do not sum to zero at \texttt{COMMIT},\\PostgreSQL aborts the transaction before writing any commit record to WAL.};
+\end{tikzpicture}
+\caption{Two declarative PostgreSQL invariants that replace fragile application-side checks: (A) half-open \texttt{TSTZRANGE} intervals enforced by \texttt{EXCLUDE USING gist}, and (B) commit-time conservation verification via a deferred constraint trigger.}
+\label{ch08:fig-gist-and-deferred}
+\end{figure}
+
+\subsection{Deadlock-Free Transfers in Rust (\texttt{Axum} + \texttt{SQLx})}
+\label{ch08:rust-ledger}
+
+Now let us wire our schema to a Rust \texttt{Axum} service using \texttt{SQLx}. Two
+subtle concurrency failures await careless transfer code even when the schema is
+correct:
+
+\begin{enumerate}
+  \item \textbf{Opposite-order deadlocks (Chapter~6).} Suppose Task~1 transfers
+    $\$10$ from Alice to Bob while Task~2 simultaneously transfers $\$5$ from Bob
+    to Alice. If each handler locks \texttt{from\_account} first and
+    \texttt{to\_account} second, Task~1 holds Alice's row lock and waits on Bob,
+    while Task~2 holds Bob's row lock and waits on Alice until PostgreSQL's
+    \texttt{deadlock\_timeout} kills one transaction. Sorting the account UUIDs in
+    canonical ascending order (\texttt{ORDER BY account\_id}) before acquiring
+    locks makes deadlocks across account pairs mathematically impossible, because a
+    strict total order has no cycles.
+  \item \textbf{Over-strong row locks blocking foreign keys.} Recall from Chapter~6
+    that \texttt{INSERT INTO postings} automatically acquires a \texttt{FOR KEY
+    SHARE} tuple lock on the referenced \texttt{accounts} row to make sure nobody
+    deletes that account mid-transaction. If you lock the account rows with
+    \texttt{SELECT ... FOR UPDATE}, PostgreSQL assumes you might change the
+    primary key \texttt{account\_id} itself, which conflicts with \texttt{FOR KEY
+    SHARE}. Instead, use \textbf{\texttt{FOR NO KEY UPDATE}}: it still serializes
+    concurrent \texttt{UPDATE accounts SET cached\_balance\_minor = ...} mutations
+    on the same account, while remaining compatible with \texttt{FOR KEY SHARE}
+    foreign-key checks.
+\end{enumerate}
+
+Listing~\ref{ch08:lst-rust-transfer} puts every piece together: input validation,
+atomic idempotency deduplication, canonical \texttt{FOR NO KEY UPDATE} lock
+ordering, double-entry leg insertion, cached balance updates, and deferred-trigger
+verification on \texttt{tx.commit().await}.
+
+\begin{lstlisting}[language=Rust, caption={Idempotent, deadlock-free double-entry transfer in Rust with \texttt{SQLx}.}, label={ch08:lst-rust-transfer}]
+use sqlx::{PgPool, Postgres, Transaction};
+use uuid::Uuid;
+
+#[derive(Debug)]
+pub struct TransferCmd {
+    pub client_id: Uuid,
+    pub idempotency_key: String,
+    pub from_account: Uuid,
+    pub to_account: Uuid,
+    pub currency: String,
+    pub amount_minor: i64,
+    pub description: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LedgerError {
+    #[error("invalid transfer parameters")]
+    InvalidInput,
+    #[error("account missing or currency mismatch")]
+    AccountMismatch,
+    #[error("insufficient funds")]
+    InsufficientFunds,
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+}
+
+#[derive(sqlx::FromRow)]
+struct LockedAccount {
+    account_id: Uuid,
+    currency: String,
+    cached_balance_minor: i64,
+    allow_overdraft: bool,
+}
+
+pub async fn execute_transfer(
+    pool: &PgPool,
+    cmd: &TransferCmd,
+) -> Result<Uuid, LedgerError> {
+    if cmd.amount_minor <= 0 || cmd.from_account == cmd.to_account {
+        return Err(LedgerError::InvalidInput);
+    }
+
+    let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
+
+    // 1. Atomic idempotency claim via UNIQUE (client_id, idempotency_key).
+    let claimed: Option<Uuid> = sqlx::query_scalar(
+        "INSERT INTO journal_entries \
+            (client_id, idempotency_key, currency, description) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (client_id, idempotency_key) DO NOTHING \
+         RETURNING entry_id",
+    )
+    .bind(cmd.client_id)
+    .bind(&cmd.idempotency_key)
+    .bind(&cmd.currency)
+    .bind(&cmd.description)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(entry_id) = claimed else {
+        // Retry detected: return the committed entry_id cleanly.
+        let existing: Uuid = sqlx::query_scalar(
+            "SELECT entry_id FROM journal_entries \
+             WHERE client_id = $1 AND idempotency_key = $2",
+        )
+        .bind(cmd.client_id)
+        .bind(&cmd.idempotency_key)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.rollback().await?;
+        return Ok(existing);
+    };
+
+    // 2. Canonical lock order prevents A->B vs B->A deadlocks.
+    let mut ids = [cmd.from_account, cmd.to_account];
+    ids.sort_unstable();
+
+    let locked: Vec<LockedAccount> = sqlx::query_as(
+        "SELECT account_id, currency, cached_balance_minor, \
+                allow_overdraft \
+         FROM accounts \
+         WHERE account_id = ANY($1) \
+         ORDER BY account_id \
+         FOR NO KEY UPDATE",
+    )
+    .bind(&ids[..])
+    .fetch_all(&mut *tx)
+    .await?;
+
+    if locked.len() != 2
+        || locked.iter().any(|a| a.currency.trim() != cmd.currency)
+    {
+        return Err(LedgerError::AccountMismatch);
+    }
+
+    let sender = locked
+        .iter()
+        .find(|a| a.account_id == cmd.from_account)
+        .ok_or(LedgerError::AccountMismatch)?;
+
+    if !sender.allow_overdraft
+        && sender.cached_balance_minor < cmd.amount_minor
+    {
+        return Err(LedgerError::InsufficientFunds);
+    }
+
+    // 3. Append both immutable postings in a single multi-row INSERT.
+    sqlx::query(
+        "INSERT INTO postings \
+            (entry_id, account_id, signed_amount_minor) \
+         VALUES ($1, $2, $3), ($1, $4, $5)",
+    )
+    .bind(entry_id)
+    .bind(cmd.from_account)
+    .bind(-cmd.amount_minor)
+    .bind(cmd.to_account)
+    .bind(cmd.amount_minor)
+    .execute(&mut *tx)
+    .await?;
+
+    // 4. Update cached balances while holding FOR NO KEY UPDATE locks.
+    sqlx::query(
+        "UPDATE accounts \
+         SET cached_balance_minor = cached_balance_minor + CASE \
+             WHEN account_id = $1 THEN -$3 \
+             WHEN account_id = $2 THEN  $3 \
+         END \
+         WHERE account_id IN ($1, $2)",
+    )
+    .bind(cmd.from_account)
+    .bind(cmd.to_account)
+    .bind(cmd.amount_minor)
+    .execute(&mut *tx)
+    .await?;
+
+    // 5. Commit fires trg_verify_entry_zero_sum inside PostgreSQL!
+    tx.commit().await?;
+    Ok(entry_id)
+}
+\end{lstlisting}
+
+\section{Declarative Partitioning for Billion-Row Ledgers}
+\label{ch08:partitioning}
+
+Imagine our ledger sustains $150$ transfers ($300$ postings) per second around the
+clock: $300 \times 86{,}400 \times 365 \approx 9.5$ billion new \texttt{postings}
+rows a year. At roughly 100 bytes per row (tuple header, line pointer, and five
+columns), that is close to a terabyte of heap pages a year before any index.
+Keeping years of that inside a single physical relation causes three operational
+failures:
+
+\begin{enumerate}
+  \item \textbf{Cold secondary indexes.} Even with \texttt{UUIDv7} keeping primary
+    key inserts localized, secondary indexes such as \texttt{(account\_id,
+    created\_at DESC)} span years of history across hundreds of gigabytes, evicting
+    hot pages from \texttt{shared\_buffers}.
+  \item \textbf{Multi-hour \texttt{VACUUM} freeze passes.} As we learned in
+    Chapter~5, even an append-only table that never runs \texttt{UPDATE} or
+    \texttt{DELETE} still requires periodic \texttt{autovacuum} freeze scans to
+    mark heap pages all-frozen in the Visibility Map before the 32-bit transaction
+    ID horizon wraps around. Scanning a half-terabyte single heap file saturates
+    storage I/O for hours.
+  \item \textbf{Retention archival via \texttt{DELETE} bloats disk.} When
+    compliance policy moves postings older than seven years to cold object storage,
+    running \texttt{DELETE FROM postings WHERE created\_at < '2019-11-01'} on
+    $250\text{ million}$ rows does \emph{not} return bytes to the filesystem: it
+    marks $250\text{ million}$ dead tuples, writes tens of gigabytes of WAL, and
+    leaves fragmented pages behind.
+\end{enumerate}
+
+PostgreSQL's \textbf{declarative range partitioning} solves all three problems by
+presenting one logical parent table (\texttt{postings}) backed by independent
+monthly physical child tables (\texttt{postings\_2026\_10},
+\texttt{postings\_2026\_11}, and so on), each owning its own heap files, Visibility
+Map, and local B-tree indexes:
+
+\begin{lstlisting}[language=SQL]
+CREATE TABLE postings (
+    posting_id          UUID NOT NULL DEFAULT uuidv7(),
+    entry_id            UUID NOT NULL,
+    account_id          UUID NOT NULL,
+    signed_amount_minor BIGINT NOT NULL CHECK (signed_amount_minor <> 0),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (posting_id, created_at)
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE postings_2026_11 PARTITION OF postings
+    FOR VALUES FROM ('2026-11-01 00:00:00+00')
+                 TO ('2026-12-01 00:00:00+00');
+
+CREATE TABLE postings_2026_12 PARTITION OF postings
+    FOR VALUES FROM ('2026-12-01 00:00:00+00')
+                 TO ('2027-01-01 00:00:00+00');
+
+CREATE INDEX idx_postings_acct_time
+    ON postings (account_id, created_at DESC);
+\end{lstlisting}
+
+Look at what changes inside the engine:
+\begin{itemize}
+  \item \textbf{Plan-time and execution-time partition pruning.} When a customer
+    loads their November statement (\texttt{WHERE account\_id = \$1} with November
+    \texttt{created\_at} bounds), the query planner (Chapter~7) compares those
+    predicates against each child's \texttt{FOR VALUES} range and prunes $83$ out
+    of $84$ monthly partitions before touching a single index page. Even when bounds
+    come from runtime parameters or join keys, PostgreSQL's \texttt{Append} executor
+    prunes non-matching partitions dynamically at execution startup. Only the
+    current month's B-trees need to stay warm in \texttt{shared\_buffers}.
+  \item \textbf{Localized \texttt{autovacuum}.} Once November ends, all pages in
+    \texttt{postings\_2026\_11} are frozen once in the Visibility Map and never
+    scanned again by \texttt{VACUUM}.
+  \item \textbf{Instantaneous zero-bloat archival.} Expiring the oldest month
+    never runs \texttt{DELETE}:
+\begin{lstlisting}[language=SQL]
+ALTER TABLE postings DETACH PARTITION postings_2019_10 CONCURRENTLY;
+-- Export standalone table postings_2019_10 to Parquet/archive, then:
+DROP TABLE postings_2019_10;
+\end{lstlisting}
+    \texttt{DETACH PARTITION CONCURRENTLY} updates system catalogs without blocking
+    concurrent reads or inserts on live months, and \texttt{DROP TABLE} unlinks the
+    underlying 1~GB OS segment files in milliseconds with zero dead tuples.
+\end{itemize}
+
+\begin{trapbox}
+Notice that our partitioned table declared \texttt{PRIMARY KEY (posting\_id,
+created\_at)} rather than \texttt{PRIMARY KEY (posting\_id)}. PostgreSQL rejects
+any \texttt{UNIQUE} or \texttt{PRIMARY KEY} constraint on a partitioned table
+unless \emph{every column of the partition key appears inside the constraint}.
+From Chapter~3 you can see why: each monthly partition owns a separate local
+B-tree, and enforcing global uniqueness on \texttt{posting\_id} alone would force
+every single \texttt{INSERT} to probe all $84$ monthly B-trees. Keep
+\texttt{journal\_entries} unpartitioned (or partitioned with \texttt{created\_at}
+included in the idempotency window) if you need a single global B-tree on
+\texttt{(client\_id, idempotency\_key)}.
+\end{trapbox}
+
+\section{High Availability: Physical Streaming and Logical Replication}
+\label{ch08:replication}
+
+A RAID array or cloud block volume protects one server against a single drive
+failure, not against a kernel panic, motherboard fault, or availability-zone power
+loss. Yet simply standing up a standby server is not enough: depending on two
+configuration parameters, an automatic failover can still silently erase the last
+few milliseconds of committed customer deposits, or a read-balanced API endpoint
+can report a stale balance right after a transfer succeeds.
+
+\subsection{Physical Streaming WAL Replication and Standby Conflicts}
+\label{ch08:physical-replication}
+
+Recall from Chapter~4 that PostgreSQL's Write-Ahead Log records physical changes
+keyed by relation file node, 8~KB block number, and page offset, ordered globally
+by a monotonically increasing 64-bit Log Sequence Number (\texttt{XLogRecPtr}, or
+LSN). \textbf{Physical streaming replication} turns that crash-recovery log into a
+continuous network stream:
+
+\begin{enumerate}
+  \item On the primary, a \texttt{walsender} backend process reads freshly
+    generated WAL bytes straight from WAL buffers or \texttt{pg\_wal} and streams
+    them over TCP to each connected standby. Attaching a \textbf{physical
+    replication slot} records how far each standby has consumed so the primary
+    never recycles a 16~MB WAL segment a disconnected replica still needs (always
+    alert on \texttt{pg\_replication\_slots} lag: an orphaned slot on a dead
+    standby will retain WAL indefinitely until the primary's disk fills $100\%$).
+  \item On the standby, a \texttt{walreceiver} process writes incoming WAL bytes to
+    the standby's own \texttt{pg\_wal} directory and \texttt{fsync}s them, while
+    the standby's \texttt{startup} process continuously replays those records onto
+    the standby's 8~KB heap and index pages.
+\end{enumerate}
+
+Because physical replication ships exact page modifications, a physical standby is
+a \textbf{byte-for-byte clone} of the primary: identical 8~KB slotted pages,
+identical \texttt{xmin}/\texttt{xmax} transaction IDs, and identical B-tree leaves
+across the entire cluster. With \texttt{hot\_standby = on}, read-only queries can
+execute directly against the standby while replay runs underneath them.
+
+That concurrency creates a subtle clash with Chapter~5's \texttt{VACUUM}. Suppose a
+reporting query runs for forty seconds on the hot standby using snapshot
+\texttt{xmin = 50000}. Meanwhile on the primary, no old query is running, so
+\texttt{VACUUM} reclaims dead tuples from transaction \texttt{50010} and emits a
+\texttt{HEAP2\_PRUNE} WAL record. When the standby's \texttt{startup} process
+reaches that WAL record, replaying it immediately would delete tuples still visible
+to the standby's running query. PostgreSQL resolves this \textbf{recovery conflict}
+via \texttt{max\_standby\_streaming\_delay} (default \texttt{30s}): the standby
+pauses WAL replay up to that threshold to let the read query finish, and if the
+query is still running when the timer expires, cancels the read query with
+\texttt{ERROR: canceling statement due to conflict with recovery}. Enabling
+\texttt{hot\_standby\_feedback = on} tells the standby to advertise its oldest
+active \texttt{xmin} back to the primary's \texttt{ProcArray}, preventing query
+cancellations at the cost of holding back \texttt{VACUUM} cleanup on the primary
+whenever a replica runs multi-minute analytics.
+
+\subsection{The \texttt{synchronous\_commit} Durability and Visibility Ladder}
+\label{ch08:sync-commit-ladder}
+
+When a Rust handler calls \texttt{tx.commit().await}, how far through the
+replication pipeline must the commit LSN travel before the primary returns
+\texttt{CommandComplete} to the client? PostgreSQL lets you choose the exact point
+on the latency-versus-durability frontier, either globally in
+\texttt{postgresql.conf} or for one transaction at a time with
+\texttt{SET LOCAL}. Two settings work as a pair: \texttt{synchronous\_commit}
+says how far the commit must travel, and \texttt{synchronous\_standby\_names}
+says which standbys count (for example,
+\texttt{ANY 1 (az2\_standby, az3\_standby)} across three availability zones).
+
+Each standby continuously sends feedback messages reporting three LSN watermarks,
+all visible in the \texttt{pg\_stat\_replication} view:
+\begin{itemize}
+  \item \texttt{write\_lsn}: WAL copied into the standby's OS page cache;
+  \item \texttt{flush\_lsn}: WAL \texttt{fsync}ed to the standby's NVMe drive;
+  \item \texttt{replay\_lsn}: WAL applied to the standby's buffer pages, and
+  therefore visible to standby snapshots.
+\end{itemize}
+Figure~\ref{ch08:fig-replication-ladder} and
+Table~\ref{ch08:tab-sync-commit} compare all five levels.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  >=Latex,
+  stage/.style={draw=black!75, rounded corners=3pt, minimum width=2.30cm,
+                minimum height=1.05cm, align=center, font=\scriptsize, inner sep=3pt},
+  rung/.style={font=\scriptsize\bfseries, anchor=west}
+]
+  % Primary box (left) and Standby box (right), total width = 14.2 cm
+  \draw[rounded corners=4pt, draw=sourceblue!80!black, fill=sourceblue!5]
+    (0, 1.35) rectangle (5.55, 3.35);
+  \node[font=\small\bfseries, text=sourceblue!85!black] at (2.77, 3.05)
+    {Primary Node (AZ-1)};
+
+  \node[stage, fill=white] (pwal) at (1.40, 2.12)
+    {1. WAL Buffer\\ {\tiny \texttt{off} ($\sim 0.05\text{ ms}$)}};
+  \node[stage, fill=sourceblue!16] (pdisk) at (4.15, 2.12)
+    {2. Local NVMe\\ {\tiny \texttt{local} ($\sim 0.3\text{ ms}$)}};
+  \draw[->, thick] (pwal) -- (pdisk);
+
+  \draw[rounded corners=4pt, draw=targetgreen!80!black, fill=targetgreen!5]
+    (6.35, 1.35) rectangle (14.20, 3.35);
+  \node[font=\small\bfseries, text=targetgreen!80!black] at (10.28, 3.05)
+    {Synchronous Standby (AZ-2)};
+
+  \node[stage, fill=quotientorange!15] (swrite) at (7.70, 2.12)
+    {3. OS Cache\\ {\tiny \texttt{write\_lsn}}};
+  \node[stage, fill=targetgreen!18] (sflush) at (10.28, 2.12)
+    {4. Standby NVMe\\ {\tiny \texttt{flush\_lsn}}};
+  \node[stage, fill=structurepurple!18] (sapply) at (12.86, 2.12)
+    {5. Page Replay\\ {\tiny \texttt{replay\_lsn}}};
+
+  \draw[->, very thick, sourceblue!85!black] (pdisk.east) -- node[above, font=\tiny]{TCP} (swrite.west);
+  \draw[->, thick] (swrite) -- (sflush);
+  \draw[->, thick] (sflush) -- (sapply);
+
+  % Wait rungs below (all strictly within x = 0.25 .. 14.1)
+  \draw[|<->|, thick, trapred] (0.25, 0.90) -- (1.40, 0.90);
+  \node[rung, text=trapred] at (1.55, 0.90)
+    {\texttt{off}: returns before local \texttt{fsync} (loses recent commits on OS crash)};
+
+  \draw[|<->|, thick, sourceblue!85!black] (0.25, 0.42) -- (4.15, 0.42);
+  \node[rung, text=sourceblue!85!black] at (4.30, 0.42)
+    {\texttt{local}: local \texttt{fsync} only (RPO $> 0$ if AZ-1 disk dies)};
+
+  \draw[|<->|, thick, quotientorange!90!black] (0.25, -0.06) -- (7.70, -0.06);
+  \node[rung, text=quotientorange!85!black] at (7.85, -0.06)
+    {\texttt{remote\_write}: standby OS cache ($\sim 1\text{ ms}$)};
+
+  \draw[|<->|, thick, targetgreen!80!black] (0.25, -0.54) -- (10.28, -0.54);
+  \node[rung, text=targetgreen!75!black] at (10.43, -0.54)
+    {\texttt{on}: standby \texttt{fsync} ($\text{RPO}=0$)};
+
+  \draw[|<->|, thick, structurepurple!90!black] (0.25, -1.02) -- (12.86, -1.02);
+  \node[font=\scriptsize\bfseries, text=structurepurple!85!black, anchor=east] at (14.10, -1.42)
+    {\texttt{remote\_apply}: replayed in standby \texttt{shared\_buffers} ($\text{RPO}=0$ + read-your-writes)};
+\end{tikzpicture}
+\caption{The five commit-wait watermarks of \texttt{synchronous\_commit} when \texttt{synchronous\_standby\_names} is active.}
+\label{ch08:fig-replication-ladder}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Mode} & \textbf{Wait Condition} & \textbf{Commit Latency} & \textbf{AZ-1 Loss RPO / Standby Reads} \\
+\midrule
+\texttt{off}          & WAL buffer copy       & $\sim 0.05\text{ ms}$ & Loses $\sim 200$--$600\text{ ms}$ on reboot \\
+\texttt{local}        & Primary \texttt{fsync}& $\sim 0.3\text{ ms}$  & RPO $> 0$ on AZ loss; stale reads \\
+\texttt{remote\_write}& Standby \texttt{write()}& $\sim 1.0\text{ ms}$& $\text{RPO}=0$ unless dual crash; brief lag \\
+\texttt{on}           & Standby \texttt{fsync}& $\sim 1.8\text{ ms}$  & \textbf{$\text{RPO}=0$ on AZ loss}; brief lag \\
+\texttt{remote\_apply}& Standby WAL replay    & $\sim 2.4\text{ ms}$  & \textbf{$\text{RPO}=0$ + causal standby reads} \\
+\bottomrule
+\end{tabular}
+\caption{Durability (Recovery Point Objective, RPO) and intra-region cross-AZ latency across \texttt{synchronous\_commit} modes.}
+\label{ch08:tab-sync-commit}
+\end{table}
+
+Two production lessons follow from Table~\ref{ch08:tab-sync-commit}. First, if
+you leave \texttt{synchronous\_standby\_names = ''} (empty, the PostgreSQL
+default), \texttt{synchronous\_commit = on} silently degrades to \texttt{local}:
+PostgreSQL flushes only the primary's disk and ships WAL asynchronously. Second, in
+a three-AZ cluster using \texttt{ANY 1 (az2\_standby, az3\_standby)}, setting
+\texttt{synchronous\_commit = on} gives zero-data-loss (\texttt{RPO = 0}) survival
+of an entire availability zone while tolerating one slow or rebooting standby
+without halting writes; handlers that immediately redirect a customer to a
+read-replica endpoint can elevate just that transaction via \texttt{SET LOCAL
+synchronous\_commit = 'remote\_apply'}.
+
+\subsection{Logical Replication for Zero-Downtime Upgrades and Event Streaming}
+\label{ch08:logical-replication}
+
+Physical replication requires the primary and standby to share the \emph{exact}
+same major PostgreSQL version and CPU architecture because 8~KB page layouts and
+catalog formats evolve across major releases. How, then, do you upgrade a live
+financial ledger from PostgreSQL~16 to PostgreSQL~18 without taking a maintenance
+outage, or stream committed \texttt{postings} rows into an analytics warehouse or
+transactional outbox consumer?
+
+Setting \texttt{wal\_level = logical} enables \textbf{logical decoding}. Instead of
+shipping raw 8~KB block deltas, a logical \texttt{walsender} feeds WAL into the
+\textbf{Reorder Buffer}, which reassembles interleaved physical WAL records per
+\texttt{TransactionId} (spilling large transactions to disk if needed), discards
+rolled-back transactions, and invokes an output plugin (\texttt{pgoutput}) the
+moment a transaction commits to emit structured tuple-level \texttt{INSERT},
+\texttt{UPDATE}, and \texttt{DELETE} messages:
+
+\begin{lstlisting}[language=SQL]
+-- On the primary (or PG 16 source cluster):
+CREATE PUBLICATION ledger_pub
+    FOR TABLE accounts, journal_entries, postings
+    WITH (publish_via_partition_root = true);
+
+-- On the PG 18 target cluster:
+CREATE SUBSCRIPTION ledger_sub
+    CONNECTION 'host=pg16-primary dbname=ledger user=repl_role'
+    PUBLICATION ledger_pub;
+\end{lstlisting}
+
+Notice \texttt{publish\_via\_partition\_root = true}: logical subscribers receive
+changes tagged under the parent table \texttt{postings}, allowing the target
+cluster to use a completely different partitioning scheme or index set. Keep two
+operational constraints in mind during logical upgrades: DDL statements
+(\texttt{ALTER TABLE}) are not replicated automatically, and \texttt{SEQUENCE}
+counters are not synchronized in real time---another reason time-ordered
+\texttt{UUIDv7} primary keys simplify zero-downtime cutovers.
+
+\section{Connection Pooling at Scale: Process Architecture and PgBouncer}
+\label{ch08:pooling}
+
+Our Rust \texttt{Axum} service runs on Tokio's work-stealing async runtime, where a
+single pod handles ten thousand concurrent HTTP sockets in a few dozen megabytes of
+RAM. Suppose you autoscale to $50$ Kubernetes pods, set each pod's
+\texttt{sqlx::PgPool} \texttt{max\_connections} to $100$, and raise PostgreSQL's
+\texttt{max\_connections = 5500} on a 32-core database server so all $5{,}000$
+pooled sockets can stay open directly against PostgreSQL. Everything looks idle in
+staging. Then Monday morning traffic arrives: database CPU spikes to $100\%$ inside
+kernel spinlocks, free RAM vanishes, and P99 transfer latency climbs from $3\text{
+ms}$ to four seconds.
+
+\subsection{Why Five Thousand Backend Processes Melt PostgreSQL}
+\label{ch08:process-model}
+
+Unlike Tokio's cooperative async tasks, PostgreSQL uses a classic
+\textbf{one-OS-process-per-connection} architecture: when a client opens a TCP
+socket, the \texttt{postmaster} supervisor forks a dedicated \texttt{postgres}
+backend process. Holding $5{,}000$ backend processes open degrades throughput
+through three physical bottlenecks:
+
+\begin{enumerate}
+  \item \textbf{Per-backend private memory.} While \texttt{shared\_buffers} is
+    shared across all processes, every \texttt{postgres} backend maintains its own
+    private relation and system-catalog caches (\texttt{relcache} and
+    \texttt{catcache}, which grow substantially on partitioned schemas), cached
+    execution plans, and per-node \texttt{work\_mem} allocations (Chapter~7). At a
+    realistic $10$--$16\text{ MB}$ RSS per active backend, $5{,}000$ processes
+    consume $50$--$80\text{ GB}$ of RAM before caching a single heap page.
+  \item \textbf{\texttt{ProcArray} MVCC snapshot scans.} Recall from Chapter~5 that
+    every statement under \texttt{READ COMMITTED} calls \texttt{GetSnapshotData()},
+    iterating across the shared-memory \texttt{ProcArray} of connected backends to
+    record in-flight transaction IDs. Scanning $5{,}000$ backend slots hundreds of
+    thousands of times per second causes heavy CPU cache-line bouncing around
+    \texttt{ProcArrayLock} whenever commits update those same slots.
+  \item \textbf{OS scheduler preemption inside locks.} When $600$ processes become
+    runnable simultaneously on $32$ CPU cores, the Linux scheduler preempts
+    backends every few milliseconds, flushing TLBs and L1/L2 caches, and
+    stalling dozens of peers whenever a backend is context-switched
+    off CPU \emph{while holding a lightweight buffer lock or spinlock}.
+\end{enumerate}
+
+A common starting point, which you should confirm by benchmarking your own
+workload, is that peak transactional throughput on a server with
+$N_{\text{cores}}$ CPU cores and NVMe storage occurs with roughly
+$1.5 \times N_{\text{cores}}$ to $3 \times N_{\text{cores}}$ \emph{active}
+backends: about \textbf{$48$ to $96$ backends on a 32-core primary}. Beyond that,
+extra connections add contention without adding throughput.
+
+\subsection{\texttt{PgBouncer} Transaction Multiplexing and the Prepared Statement Trap}
+\label{ch08:pgbouncer}
+
+How do $50$ Rust pods holding $2{,}500$ client connections share just $48$ physical
+\texttt{postgres} processes? You place \textbf{\texttt{PgBouncer}}---a lightweight,
+event-driven C proxy that speaks the PostgreSQL v3 wire protocol at roughly
+$2\text{ KB}$ of memory per client socket---in front of the database
+(Figure~\ref{ch08:fig-pgbouncer}). \texttt{PgBouncer} offers three pooling modes:
+
+\begin{itemize}
+  \item \textbf{\texttt{session} mode} pins a physical \texttt{postgres} backend to
+    a client socket from connect until disconnect. Because \texttt{sqlx::PgPool}
+    holds long-lived TCP connections open, \texttt{session} mode achieves \emph{zero}
+    multiplexing ($2{,}500$ client sockets still demand $2{,}500$ backends).
+  \item \textbf{\texttt{transaction} mode} (the production standard) leases a
+    physical backend to a client \emph{only from \texttt{BEGIN} (or a standalone
+    query) until \texttt{COMMIT} or \texttt{ROLLBACK}}. The instant \texttt{COMMIT}
+    completes, \texttt{PgBouncer} returns that backend to the warm server pool for
+    the next waiting request. While an \texttt{Axum} handler parses JSON, checks
+    cryptographic signatures, or streams HTTP responses, it occupies \emph{zero}
+    PostgreSQL processes.
+  \item \textbf{\texttt{statement} mode} reclaims the backend after every single
+    SQL statement and immediately aborts any multi-statement \texttt{BEGIN ...
+    COMMIT} block---unusable for double-entry transactions.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  >=Latex,
+  pod/.style={draw=sourceblue!85!black, fill=sourceblue!10, rounded corners=3pt,
+              minimum width=3.2cm, minimum height=0.85cm, align=center, font=\scriptsize},
+  bouncer/.style={draw=quotientorange!90!black, fill=quotientorange!14, thick, rounded corners=4pt,
+                  minimum width=3.9cm, minimum height=2.9cm, align=center, font=\scriptsize},
+  backend/.style={draw=targetgreen!80!black, fill=targetgreen!14, rounded corners=2pt,
+                  minimum width=2.8cm, minimum height=0.62cm, align=center, font=\scriptsize}
+]
+  % Left: 50 Rust Axum pods (x: 0 .. 3.4)
+  \node[font=\small\bfseries, text=sourceblue!85!black] at (1.7, 3.35)
+    {50 Rust \texttt{Axum} Pods};
+  \node[pod] (p1) at (1.7, 2.50) {Pod 1: Tokio tasks\\ {\tiny \texttt{PgPool} (\texttt{max=50})}};
+  \node[pod] (p2) at (1.7, 1.40) {Pod 2: Tokio tasks\\ {\tiny \texttt{PgPool} (\texttt{max=50})}};
+  \node[font=\bfseries] at (1.7, 0.72) {$\vdots$};
+  \node[pod] (pn) at (1.7, 0.05) {Pod 50: Tokio tasks\\ {\tiny \texttt{PgPool} (\texttt{max=50})}};
+
+  % Center: PgBouncer (x: 5.1 .. 9.0)
+  \node[bouncer] (pgb) at (7.05, 1.30) {
+    \textbf{\texttt{PgBouncer} ($\ge 1.21$)}\\[3pt]
+    \texttt{pool\_mode = transaction}\\
+    \texttt{max\_client\_conn = 5000}\\
+    \texttt{default\_pool\_size = 48}\\
+    \texttt{max\_prepared\_statements}\\
+    \texttt{= 200}\\[2pt]
+    {\tiny Maps client \texttt{sqlx\_s\_1}}\\
+    {\tiny $\leftrightarrow$ backend \texttt{PGBouncer\_7}}
+  };
+
+  % Right: PostgreSQL Primary (x: 10.6 .. 14.3)
+  \draw[rounded corners=4pt, draw=targetgreen!80!black, fill=targetgreen!4]
+    (10.55, -0.55) rectangle (14.35, 3.15);
+  \node[font=\small\bfseries, text=targetgreen!80!black] at (12.45, 2.85)
+    {PostgreSQL (32 Cores)};
+
+  \node[backend] (b1) at (12.45, 2.15) {\texttt{postgres} \#1 (active)};
+  \node[backend] (b2) at (12.45, 1.35) {\texttt{postgres} \#2 (active)};
+  \node[backend] (b3) at (12.45, 0.55) {\texttt{postgres} \#48 (active)};
+  \node[draw=structurepurple, fill=structurepurple!14, rounded corners=2pt,
+        minimum width=3.3cm, minimum height=0.58cm, font=\scriptsize]
+    at (12.45, -0.15) {Compact \texttt{ProcArray} + \texttt{shared\_buffers}};
+
+  % Arrows
+  \draw[->, thick, sourceblue!80!black] (p1.east) -- node[above, sloped, font=\tiny]{2,500 TCP} ([yshift=22pt]pgb.west);
+  \draw[->, thick, sourceblue!80!black] (p2.east) -- ([yshift=2pt]pgb.west);
+  \draw[->, thick, sourceblue!80!black] (pn.east) -- ([yshift=-24pt]pgb.west);
+
+  \draw[->, very thick, targetgreen!80!black] ([yshift=24pt]pgb.east) -- node[above, font=\tiny]{48 warm} (b1.west);
+  \draw[->, very thick, targetgreen!80!black] ([yshift=2pt]pgb.east) -- (b2.west);
+  \draw[->, very thick, targetgreen!80!black] ([yshift=-20pt]pgb.east) -- (b3.west);
+\end{tikzpicture}
+\caption{Multiplexing $2{,}500$ \texttt{SQLx} client connections across $48$ warm \texttt{postgres} backends via \texttt{PgBouncer} in \texttt{transaction} mode, keeping \texttt{ProcArray} compact and CPU caches hot.}
+\label{ch08:fig-pgbouncer}
+\end{figure}
+
+Switching \texttt{pool\_mode = transaction} without understanding the PostgreSQL
+wire protocol triggers a classic production outage within seconds:
+\texttt{ERROR: prepared statement "sqlx\_s\_1" does not exist} (or
+\texttt{already exists}). Here is the exact packet-level reason:
+
+\begin{enumerate}
+  \item By default, \texttt{SQLx} uses PostgreSQL's extended query protocol and
+    caches up to $100$ named prepared statements per TCP socket. In Transaction~A,
+    Client~1 is assigned \texttt{postgres} Backend~\#4 and sends a \texttt{Parse}
+    message creating statement \texttt{sqlx\_s\_1} inside Backend~\#4's private
+    process memory, then commits.
+  \item One millisecond later, Client~1 starts Transaction~B and \texttt{PgBouncer}
+    routes it to Backend~\#19. Assuming its TCP socket still talks to the same
+    process, \texttt{SQLx} skips \texttt{Parse} and sends a \texttt{Bind} packet
+    naming \texttt{sqlx\_s\_1}. Backend~\#19 has never heard of \texttt{sqlx\_s\_1}
+    and aborts the transaction.
+\end{enumerate}
+
+The same backend-hopping mechanism breaks any state stored at \emph{session} scope
+rather than \emph{transaction} scope:
+\begin{itemize}
+  \item Never run bare \texttt{SET synchronous\_commit = 'remote\_apply'} or
+    \texttt{SET statement\_timeout = '2s'} in transaction mode---the setting leaks
+    onto the next unrelated request that lands on that backend. Always write
+    \textbf{\texttt{SET LOCAL ...}}, which PostgreSQL automatically reverts at
+    \texttt{COMMIT} or \texttt{ROLLBACK}.
+  \item Never call session-scoped \texttt{pg\_advisory\_lock}, which leaves the lock
+    held on a pooled backend after your handler returns; always use the
+    transaction-scoped \textbf{\texttt{pg\_advisory\_xact\_lock}} function instead.
+  \item \texttt{LISTEN / NOTIFY} pub-sub channels require a dedicated direct or
+    \texttt{session}-mode connection outside the transaction pool.
+\end{itemize}
+
+For prepared statements, you have two clean fixes. Best of all, \textbf{modern
+\texttt{PgBouncer} ($\ge 1.21$)} supports protocol-level prepared-statement
+multiplexing when you set \texttt{max\_prepared\_statements = 200} in
+\texttt{pgbouncer.ini}: \texttt{PgBouncer} tracks each client's \texttt{Parse}
+text, rewrites client names (\texttt{sqlx\_s\_1}) into deduplicated server-side
+names (\texttt{PGBOUNCER\_7}), and transparently prepares any missing statement on
+whichever physical backend leases the transaction---preserving Chapter~7's plan-cache
+speedups. When deploying behind older proxies or cloud poolers without protocol
+tracking, disable client-side named statement caching on \texttt{PgConnectOptions}
+so \texttt{SQLx} sends unnamed single-use statements:
+
+\begin{lstlisting}[language=Rust]
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use std::str::FromStr;
+use std::time::Duration;
+
+pub async fn build_ledger_pool(
+    db_url: &str,
+    pgbouncer_tracks_stmts: bool,
+) -> Result<sqlx::PgPool, sqlx::Error> {
+    let mut opts = PgConnectOptions::from_str(db_url)?;
+    if !pgbouncer_tracks_stmts {
+        // Fallback for stateless transaction poolers: unnamed statements.
+        opts = opts.statement_cache_capacity(0);
+    }
+
+    PgPoolOptions::new()
+        .max_connections(50)
+        .acquire_timeout(Duration::from_secs(2))
+        .idle_timeout(Duration::from_secs(300))
+        .connect_with(opts)
+        .await
+}
+\end{lstlisting}
+
+Here is the whole path of one \$50.00 transfer through the machinery of this
+book. An \texttt{Axum} task borrows a pooled connection through \texttt{PgBouncer}
+and lands on one of 48 backends, so snapshot scans of \texttt{ProcArray} stay
+short (Chapter~5). It inserts rows with \texttt{UUIDv7} keys, which append to the
+rightmost B-tree leaf already in \texttt{shared\_buffers} (Chapters~2 and~3). It
+claims its idempotency key through a \texttt{UNIQUE} index, locks both accounts in
+ascending order with \texttt{FOR NO KEY UPDATE} (Chapter~6), and inserts two
+\texttt{BIGINT} postings into the current month's partition. At \texttt{COMMIT},
+the deferred trigger checks that the legs sum to zero, and with
+\texttt{synchronous\_commit = on} the commit record is flushed to WAL on two
+machines before the client hears success (Chapter~4).
+
+\section{Exercises}
+\label{ch08:exercises}
+
+\begin{exercise}[IEEE 754 Drift vs.\ Exact Ledger Representations]
+Execute the following query in PostgreSQL:
+\begin{lstlisting}[language=SQL]
+SELECT SUM(val::float8) AS float_sum, SUM(val::numeric) AS num_sum
+FROM generate_series(1, 1000000) AS g(i),
+     LATERAL (VALUES (0.10), (0.20), (-0.30)) AS v(val);
+\end{lstlisting}
+Explain why \texttt{float\_sum} is nonzero while \texttt{num\_sum} is exact. Next,
+design the columns for an FX conversion table that converts \texttt{JPY} (scale $0$),
+\texttt{USD} (scale $2$), and \texttt{BTC} (scale $8$) using \texttt{BIGINT} minor
+units for posted legs and \texttt{NUMERIC(24, 12)} for the exchange rate,
+specifying where rounding happens and which rule it uses so the converted
+journal entry still obeys conservation within each currency. (Note that
+PostgreSQL's \texttt{round()} on \texttt{NUMERIC} rounds halves away from zero,
+not to even; banker's rounding needs an explicit expression.)
+\end{exercise}
+
+\begin{exercise}[The Autumn Daylight-Saving Collision]
+In a \texttt{psql} session with \texttt{TimeZone} set to \texttt{'America/New\_York'},
+compare storing \texttt{'2026-11-01 01:30:00-04'} and \texttt{'2026-11-01
+01:30:00-05'} in a \texttt{TIMESTAMP} column versus a \texttt{TIMESTAMPTZ} column.
+Compute the exact difference between the two 64-bit integer values stored on the
+8~KB heap page for \texttt{TIMESTAMPTZ} (in microseconds since
+\texttt{2000-01-01 00:00:00 UTC}), and show how \texttt{TIMESTAMP} corrupts an
+hourly TWAP (time-weighted average price) query across that hour.
+\end{exercise}
+
+\begin{exercise}[Quantifying \texttt{UUIDv4} WAL Amplification vs.\ \texttt{UUIDv7}]
+Suppose a primary-key B-tree on \texttt{postings} has $8{,}000{,}000$ leaf pages
+($\approx 64\text{ GB}$). Immediately after a \texttt{CHECKPOINT} completes (with
+\texttt{full\_page\_writes = on}), a burst inserts $40{,}000$ new rows within two
+seconds. Estimate how many distinct 8~KB leaf pages are dirtied---and how many
+megabytes of 8~KB Full Page Images are written to WAL---under random \texttt{UUIDv4}
+versus time-ordered \texttt{UUIDv7} (assuming $\sim 120$ index tuples fit per new
+rightmost leaf page).
+\end{exercise}
+
+\begin{exercise}[Non-Overlapping Credit Limits with \texttt{EXCLUDE USING gist}]
+Write the DDL for a \texttt{credit\_limits} table where each \texttt{account\_id}
+has an overdraft limit valid over an \texttt{effective\_during} column of type
+\texttt{TSTZRANGE}, ensuring that \emph{active} schedules (\texttt{status =
+'active'}) for the same account can never overlap in time while allowing historical
+\texttt{status = 'superseded'} rows to remain in the table for audit purposes.
+(Hint: inspect PostgreSQL's partial exclusion constraint syntax \texttt{EXCLUDE
+USING gist (...) WHERE (...)}.) Test what happens at the boundary when two
+intervals use closed bounds \texttt{'[]'} instead of half-open \texttt{'[)'}.
+\end{exercise}
+
+\begin{exercise}[Auditing and Hardening the Double-Entry Deferred Trigger]
+Suppose a transaction inserts four postings for the same \texttt{entry\_id} (sender
+debit, recipient credit, platform fee, partner rebate). How many times does a
+\texttt{FOR EACH ROW} deferred constraint trigger fire at \texttt{COMMIT}? Show how
+to deduplicate redundant checks within the same transaction (for instance, skipping
+if a per-transaction temporary table or session variable already verified
+\texttt{v\_entry\_id} at the final command counter), and write the companion
+deferred constraint trigger on \texttt{journal\_entries} that rejects a header
+committed with zero rows in \texttt{postings}.
+\end{exercise}
+
+\begin{exercise}[Deadlock Cycles and \texttt{FOR NO KEY UPDATE} Internals]
+Construct a two-session \texttt{psql} interleaving ($T_1$ transferring $A \to B$
+and $T_2$ transferring $B \to A$) that deterministically triggers
+\texttt{ERROR: deadlock detected} when canonical UUID sorting is omitted from
+Listing~\ref{ch08:lst-rust-transfer}. Then, using Chapter~6's tuple header lock
+modes, demonstrate in two \texttt{psql} sessions why locking \texttt{accounts} with
+\texttt{FOR UPDATE} blocks a concurrent \texttt{INSERT INTO postings} foreign-key
+check, whereas \texttt{FOR NO KEY UPDATE} lets the foreign-key check proceed until
+the cached-balance \texttt{UPDATE} step.
+\end{exercise}
+
+\begin{exercise}[Partitioning and Retention on a Multi-Billion-Row Table]
+Write a SQL migration or PL/pgSQL helper procedure \texttt{ensure\_monthly\_partition}
+taking \texttt{target\_month DATE} that safely creates next month's
+\texttt{postings\_YYYY\_MM} range partition ahead of time. Explain what happens to
+live \texttt{INSERT} traffic at \texttt{2027-01-01 00:00:00Z} if the cron job fails
+to create January's partition and no \texttt{DEFAULT} partition exists---and
+conversely, why adding a bloated \texttt{DEFAULT} partition can turn a future
+\texttt{ATTACH PARTITION} into a long table-scan lock.
+\end{exercise}
+
+\begin{exercise}[Sizing \texttt{synchronous\_commit} Across Three Availability Zones]
+A ledger cluster spans \texttt{az1} (primary), \texttt{az2} (standby), and
+\texttt{az3} (standby) with local NVMe \texttt{fsync} latency $0.25\text{ ms}$,
+round-trip network latency $1.1\text{ ms}$ (\texttt{az1}--\texttt{az2}) and
+$1.6\text{ ms}$ (\texttt{az1}--\texttt{az3}), and standby WAL replay overhead
+$0.35\text{ ms}$. With \texttt{synchronous\_standby\_names = 'ANY 1 (az2, az3)'},
+calculate the expected commit latency under normal operation and during an
+\texttt{az2} outage for \texttt{local}, \texttt{remote\_write}, \texttt{on}, and
+\texttt{remote\_apply}. Which mode should \texttt{POST /v1/transfers} use if
+\texttt{GET /v1/accounts/:id/balance} is load-balanced across \texttt{az2} and
+\texttt{az3}?
+\end{exercise}
+
+\begin{exercise}[Fixing a \texttt{PgBouncer} Transaction-Mode Rollout]
+An engineering team flips \texttt{PgBouncer} from \texttt{pool\_mode = session} to
+\texttt{pool\_mode = transaction} in front of $40$ Rust \texttt{Axum} pods. Within
+two minutes, monitoring lights up with three errors: (a) \texttt{prepared statement
+``sqlx\_s\_4'' does not exist}, (b) fast transfers mysteriously timing out at
+$150\text{ ms}$ after an admin endpoint ran \texttt{SET statement\_timeout =
+'150ms'}, and (c) a nightly settlement job holding \texttt{pg\_advisory\_lock(99)}
+never releasing the lock after commit. Trace the exact backend-multiplexing cause
+of all three bugs and write the complete configuration and SQL/Rust fixes.
+\end{exercise}

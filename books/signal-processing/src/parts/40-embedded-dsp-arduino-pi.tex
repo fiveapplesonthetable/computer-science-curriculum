@@ -372,9 +372,11 @@ typedef int16_t q15_t;        // value v stored as round(v * 32768)
 
 static inline q15_t q15_mul(q15_t a, q15_t b) {
   int32_t p = (int32_t)a * (int32_t)b;   // Q30 in 32 bits
-  return (q15_t)(p >> 15);               // back to Q15 (truncating)
+  return (q15_t)((p + (1 << 14)) >> 15); // back to Q15, round to nearest
 }
-// example: 0.5 * 0.5 -> 16384 * 16384 = 268435456; >>15 = 8192 = 0.25
+// example: 0.5 * 0.5 -> 16384 * 16384 = 268435456; (+16384) >>15 = 8192 = 0.25
+// A plain p >> 15 truncates toward -infinity: a steady -0.5 LSB bias per multiply.
+// The one overflow case, -1 * -1 = +1, does not fit in Q15 and needs saturation.
 \end{lstlisting}
 
 \begin{figure}[H]
@@ -477,6 +479,15 @@ static inline float biquad(biquad_t* s, float x) {
 }
 \end{lstlisting}
 
+Watch the feedback signs when you copy coefficients in. This listing \emph{subtracts}
+$a_1$ and $a_2$, matching the $H(z)$ denominator $1 + a_1 z^{-1} + a_2 z^{-2}$ that
+\texttt{scipy.signal} returns. CMSIS-DSP's \texttt{arm\_biquad\_\allowbreak cascade\_\allowbreak df2T\_f32}
+\emph{adds} its feedback terms, so its coefficient array is
+$\{b_0, b_1, b_2, -a_1, -a_2\}$. Paste SciPy's $a_1, a_2$ in without negating them and the
+denominator becomes $1 - a_1 z^{-1} - a_2 z^{-2}$: for a complex pole pair ($a_2 = r^2 > 0$),
+the negative constant term splits the conjugate pair into real roots of opposite sign and
+typically pushes a pole outside the unit circle into exponential blow-up.
+
 \subsection{The FFT: CMSIS-DSP on the MCU}
 
 For an FFT on an ARM Cortex-M, do not write your own -- use \textbf{CMSIS-DSP}, ARM's free,
@@ -488,13 +499,17 @@ use the chip's MAC and (on M4/M7) SIMD instructions.
 #include "arm_math.h"
 #define NFFT 256
 arm_rfft_fast_instance_f32 fft;
-float in[NFFT], spec[NFFT], mag[NFFT/2];
+float in[NFFT], spec[NFFT], mag[NFFT/2 + 1];
 
 void fft_setup(void) { arm_rfft_fast_init_f32(&fft, NFFT); }
 
 void fft_block(void) {
-  arm_rfft_fast_f32(&fft, in, spec, 0);    // forward real FFT
-  arm_cmplx_mag_f32(spec, mag, NFFT/2);    // |X[k]| for each bin
+  arm_rfft_fast_f32(&fft, in, spec, 0);    // forward real FFT (overwrites in[])
+  // Packed output: spec[0] = X[0] (real), spec[1] = X[N/2] (real),
+  // then re,im pairs for bins 1 .. N/2-1.
+  mag[0]      = fabsf(spec[0]);            // DC
+  mag[NFFT/2] = fabsf(spec[1]);            // Nyquist
+  arm_cmplx_mag_f32(spec + 2, mag + 1, NFFT/2 - 1);   // |X[k]|, k = 1..N/2-1
 }
 \end{lstlisting}
 
@@ -995,7 +1010,7 @@ Embedded signal processing makes battery-powered sensing devices practical:
 Embedded development lacks several conveniences of desktop software:
 \begin{itemize}
   \item \emph{Severe RAM Constraints:} A typical Cortex-M microcontroller provides 32 to 256 kilobytes of SRAM. You cannot allocate megabyte arrays or dynamically resize buffers; every filter tap, history window, and FFT twiddle table must be statically budgeted at compile time.
-  \item \emph{Dynamic Range and Quantization Noise:} Fixed-point Q15 math has only 16 bits of dynamic range ($96\,\text{dB}$). Without careful scaling, intermediate products either clip and distort or sink below the quantization noise floor.
+  \item \emph{Dynamic Range and Quantization Noise:} Fixed-point Q15 math has only 16 bits ($\approx 90$--$96\,\text{dB}$ of dynamic range, depending on whether you count the sign bit). Without careful scaling, intermediate products either clip and distort or sink below the quantization noise floor.
   \item \emph{Debugging Invisibility:} In a hard real-time streaming loop, you cannot insert \texttt{printf()} statements or set debugger breakpoints without halting the sample clock, dropping DMA frames, and corrupting the real-time filter states.
 \end{itemize}
 

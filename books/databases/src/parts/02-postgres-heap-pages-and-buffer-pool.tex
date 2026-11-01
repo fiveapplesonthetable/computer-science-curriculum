@@ -1,0 +1,1108 @@
+\chapter{Inside an 8 KB Heap Page and the Buffer Pool}
+\label{ch:heap-pages}
+
+In Chapter~1, a table was a clean mathematical object: a relation (or a SQL bag of rows) governed by set algebra and three-valued logic. When you write \texttt{INSERT INTO accounts VALUES (1001, 'Ada', 50000, true)}, SQL lets you picture a neat rectangular spreadsheet gaining one horizontal line.
+
+The Linux kernel knows nothing about relations, columns, or \texttt{BIGINT}s. An NVMe solid-state drive only knows how to read and write flat arrays of bytes at numeric block addresses, and C pointers in RAM only know byte offsets and CPU alignment boundaries. Bridging that gap is the job of PostgreSQL's storage manager and buffer manager. Every design choice we will meet later in this book---why B-tree indexes store 6-byte tuple identifiers (Chapter~3), why Write-Ahead Logging stamps an 8-byte log sequence number at byte~0 of every block (Chapter~4), and why \texttt{UPDATE} writes a brand-new row version instead of overwriting bytes in place (Chapter~5)---is physically anchored inside an \textbf{8,192-byte (8~KB) slotted heap page}.
+
+\begin{focusbox}
+By the end of this chapter, you will be able to:
+\begin{enumerate}
+  \item Locate the exact Linux files backing any PostgreSQL table under \texttt{\$PGDATA/base/}, explain why \texttt{pg\_class.oid} and \texttt{relfilenode} diverge after \texttt{TRUNCATE} or \texttt{VACUUM FULL}, and trace how the \texttt{\_fsm} and \texttt{\_vm} companion forks accelerate inserts, index-only scans, and vacuuming.
+  \item Read an 8,192-byte slotted heap page byte by byte (\texttt{PageHeaderData}, downward-growing \texttt{ItemIdData} line pointers, and upward-growing heap tuples) and prove why slotted indirection lets PostgreSQL defragment a page without rewriting external indexes.
+  \item Compute exact tuple sizes down to a single byte---accounting for the 23-byte \texttt{HeapTupleHeaderData}, the optional null bitmap, \texttt{MAXALIGN} padding, and CPU type alignment---and reorder columns to save hundreds of megabytes on large tables.
+  \item Explain \texttt{varlena} 1-byte versus 4-byte headers and trace how TOAST compresses and slices oversized values into \texttt{pg\_toast} chunks.
+  \item Trace how \texttt{shared\_buffers} maps block tags to frames, why buffer pins differ from content locks, how the clock-sweep hand chooses eviction victims, and how a 256~KB ring buffer stops a 500~GB sequential scan from evicting hot OLTP data.
+\end{enumerate}
+\end{focusbox}
+
+% ======================================================================
+\section{Where a Table Actually Lives on Disk}
+\label{sec:ch02-files-and-forks}
+% ======================================================================
+
+Let us create a small ledger table in \texttt{psql} and ask PostgreSQL a direct physical question: \emph{which file on the Linux filesystem holds these rows?}
+
+\begin{lstlisting}[language=SQL]
+CREATE TABLE accounts (
+    account_id    BIGINT  PRIMARY KEY,
+    owner_name    TEXT    NOT NULL,
+    balance_cents BIGINT  NOT NULL,
+    is_active     BOOLEAN NOT NULL
+);
+
+SELECT oid, relname, relfilenode
+FROM pg_class
+WHERE relname = 'accounts';
+--   oid  | relname  | relfilenode
+-- -------+----------+-------------
+--  24576 | accounts |       24576
+
+SELECT pg_relation_filepath('accounts');
+--  pg_relation_filepath
+-- ----------------------
+--  base/16384/24576
+\end{lstlisting}
+
+Relative to your PostgreSQL data directory (\texttt{\$PGDATA}, such as \texttt{/var/lib/postgresql/17/main}), the table \texttt{accounts} is an ordinary regular file at \texttt{\$PGDATA/base/16384/24576}. Every piece of that path has a specific catalog meaning:
+\begin{itemize}
+  \item \textbf{\texttt{base/}} holds all default-tablespace databases (the \texttt{pg\_default} tablespace). Shared cluster-wide catalogs like \texttt{pg\_database} and \texttt{pg\_authid} live next door in \texttt{global/}.
+  \item \textbf{\texttt{16384}} is the object identifier (\texttt{oid}) of the current database in \texttt{pg\_database} (\texttt{SELECT oid, datname FROM pg\_database}). Every database inside the cluster gets its own subdirectory under \texttt{base/}.
+  \item \textbf{\texttt{24576}} is \texttt{pg\_class.relfilenode}---not \texttt{pg\_class.oid}. Right after \texttt{CREATE TABLE}, the two integers happen to match, which tempts many engineers into thinking they are the same thing. Watch what happens the moment we truncate the table.
+\end{itemize}
+
+\subsection{Why \texttt{oid} and \texttt{relfilenode} Split: Transactional File Swaps}
+
+Suppose a transaction runs \texttt{TRUNCATE accounts;} and then, three statements later, hits an error and executes \texttt{ROLLBACK;}. Unlike many older database engines, PostgreSQL makes \texttt{TRUNCATE}, \texttt{CLUSTER}, and \texttt{VACUUM FULL} \textbf{fully transactional}.
+
+Think about what would go wrong if \texttt{TRUNCATE} simply called the Linux \texttt{ftruncate(fd, 0)} system call on file \texttt{24576} in place. The instant the kernel zeroes the file's length, the old 8~KB blocks are gone. If the transaction rolls back ten milliseconds later, there is nothing left to restore.
+
+\begin{intuitionbox}
+PostgreSQL solves transactional table rewrites by separating \textbf{logical identity} (\texttt{pg\_class.oid}) from \textbf{physical storage file} (\texttt{pg\_class.relfilenode}):
+\begin{itemize}
+  \item Views, foreign keys, triggers, and privilege grants all point to \texttt{oid = 24576}. That number never changes for the lifetime of the table.
+  \item When you run \texttt{TRUNCATE accounts} (or rewrite the table with \texttt{VACUUM FULL} or \texttt{CLUSTER}), PostgreSQL allocates a fresh file number---say \texttt{24589}---creates a brand-new file \texttt{base/16384/24589}, and updates the \texttt{pg\_class} catalog row for \texttt{oid = 24576} so its \texttt{relfilenode} column now reads \texttt{24589}.
+\end{itemize}
+If your transaction executes \texttt{ROLLBACK}, the catalog update becomes invisible, PostgreSQL unlinks the unused file \texttt{24589}, and file \texttt{24576} is still sitting intact on disk without a single byte harmed. If your transaction executes \texttt{COMMIT}, the catalog update becomes visible atomically, new queries open \texttt{24589}, and PostgreSQL unlinks the old file \texttt{24576} as part of post-commit cleanup.
+\end{intuitionbox}
+
+Let us verify this split directly in SQL:
+
+\begin{lstlisting}[language=SQL]
+BEGIN;
+TRUNCATE accounts;
+
+SELECT oid, relfilenode, pg_relation_filepath('accounts') AS path
+FROM pg_class
+WHERE relname = 'accounts';
+--   oid  | relfilenode |       path
+-- -------+-------------+------------------
+--  24576 |       24589 | base/16384/24589
+
+ROLLBACK;
+
+SELECT oid, relfilenode, pg_relation_filepath('accounts') AS path
+FROM pg_class
+WHERE relname = 'accounts';
+--   oid  | relfilenode |       path
+-- -------+-------------+------------------
+--  24576 |       24576 | base/16384/24576
+\end{lstlisting}
+
+Inside the C source code (modern PostgreSQL 16+ in \texttt{src/include/storage/relfilelocator.h}), the physical address of a relation on disk is a three-integer triple called \texttt{RelFileLocator}: \texttt{(spcOid, dbOid, relNumber)}. Whenever you inspect files on disk after a maintenance rewrite, always query \texttt{pg\_relation\_filepath(oid)} rather than grepping for \texttt{pg\_class.oid}.
+
+\subsection{1 GB Segment Splitting}
+
+A busy production table easily grows past 100~GB, yet if you run \texttt{ls -lh \$PGDATA/base/16384/} you will never see a file larger than \textbf{1~GiB} ($1{,}073{,}741{,}824$ bytes).
+
+PostgreSQL slices every relation fork into fixed segments of $\texttt{RELSEG\_SIZE} = 131{,}072$ blocks of $8{,}192$ bytes ($131{,}072 \times 8{,}192 = 1{,}073{,}741{,}824\text{ bytes} = 1\text{ GiB}$). Originally introduced to avoid 2~GB signed \texttt{off\_t} limits on 32-bit Unix filesystems, segment splitting remains valuable on 64-bit Linux because incremental backup tools and parallel file copiers can process independent 1~GiB files cleanly.
+
+For a 2.6~GiB table with \texttt{relfilenode = 24589}, the directory contains three segment files:
+\begin{itemize}
+  \item \texttt{24589} \quad (blocks $0 \dots 131{,}071$, bytes $0 \dots 1\text{ GiB} - 1$)
+  \item \texttt{24589.1} \quad (blocks $131{,}072 \dots 262{,}143$, the second GiB)
+  \item \texttt{24589.2} \quad (blocks $262{,}144 \dots 340{,}786$, the remaining $0.6\text{ GiB}$)
+\end{itemize}
+Locating any logical 32-bit \texttt{BlockNumber} $B$ on disk is pure integer division and modulo arithmetic:
+\[
+  \text{segment\_index} = \floor*{\frac{B}{131{,}072}},
+  \qquad
+  \text{byte\_offset\_in\_segment} = (B \bmod 131{,}072) \times 8{,}192.
+\]
+For instance, block $B = 300{,}000$ lives in segment $\floor{300{,}000 / 131{,}072} = 2$ (\texttt{24589.2}) at local block $300{,}000 - 262{,}144 = 37{,}856$, starting at byte $37{,}856 \times 8{,}192 = 310{,}116{,}352$. Because \texttt{BlockNumber} is a 32-bit unsigned integer ($0 \dots 4{,}294{,}967{,}294$, with \texttt{0xFFFFFFFF} reserved as \texttt{InvalidBlockNumber}), a single standard PostgreSQL table can hold up to $(2^{32} - 1) \times 8\text{ KiB} \approx \mathbf{32\text{ TiB}}$ before requiring partitioning.
+
+\subsection{Companion Forks: Free Space Map (\texttt{\_fsm}) and Visibility Map (\texttt{\_vm})}
+
+Look again in \texttt{\$PGDATA/base/16384/} after inserting rows and running \texttt{VACUUM accounts;}, and two sibling files appear alongside \texttt{24589}: \texttt{24589\_fsm} and \texttt{24589\_vm}. In PostgreSQL terminology (\texttt{ForkNumber} in \texttt{src/include/common/relpath.h}), one relation owns up to four physical \textbf{forks}:
+
+\begin{enumerate}
+  \item \textbf{Main Fork (\texttt{MAIN\_FORKNUM = 0}, file \texttt{24589})}: Holds the 8~KB heap data pages (or index pages, if the relation is an index).
+
+  \item \textbf{Free Space Map (\texttt{FSM\_FORKNUM = 1}, file \texttt{24589\_fsm})}: Suppose \texttt{accounts} has 1,000,000 pages ($\approx 8\text{ GB}$) with deleted gaps scattered throughout, and a backend wants to \texttt{INSERT} a 110-byte tuple. Checking heap pages one by one to find 110 free bytes would turn every \texttt{INSERT} into a linear scan.
+
+  Instead, the Free Space Map quantizes each heap page's largest contiguous free region into \textbf{a single byte} (\texttt{0..255}) measured in 32-byte chunks ($\floor{\text{free\_bytes} / 32}$, since $8{,}192 / 256 = 32$). A leaf byte of \texttt{4} guarantees at least $4 \times 32 = 128$ free bytes on that heap page. Inside each 8~KB \texttt{\_fsm} block, PostgreSQL arranges roughly 4,000 leaf bytes at the bottom of an \textbf{array-backed binary max-heap tree}, where every internal node stores $\max(\text{left\_child}, \text{right\_child})$:
+  \begin{itemize}
+    \item If the root node at the top of an \texttt{\_fsm} page reads \texttt{100} ($3{,}200$ bytes), at least one heap page underneath has $3{,}200+$ free bytes.
+    \item Finding a page for our 110-byte tuple ($\lceil 110 / 32 \rceil = 4$ units) walks downward from the root in $\Oh(\log N)$ byte comparisons, descending into whichever child has value $\ge 4$. Across a multi-terabyte table, stacked upper-level \texttt{\_fsm} pages form a 3-level tree of binary trees, locating an eligible target block in at most \textbf{three 8~KB buffer lookups}.
+    \item Notice that \texttt{\_fsm} is an \emph{advisory} hint structure, not ground truth: if a concurrent backend fills the page a microsecond earlier, the inserter inspects the real heap page header, updates the \texttt{\_fsm} leaf downward, and asks the tree for the next candidate.
+  \end{itemize}
+
+  \item \textbf{Visibility Map (\texttt{VM\_FORKNUM = 2}, file \texttt{24589\_vm})}: Stores just \textbf{2 bits per heap page}:
+  \begin{itemize}
+    \item Bit 0 (\texttt{VISIBILITYMAP\_ALL\_VISIBLE = 0x01}): Every tuple on that heap page is committed and visible to \emph{all} current and future transactions, with zero dead tuples awaiting cleanup.
+    \item Bit 1 (\texttt{VISIBILITYMAP\_ALL\_FROZEN = 0x02}): Every tuple on that heap page has also been frozen against 32-bit transaction ID wraparound (Chapter~5).
+  \end{itemize}
+  Four heap pages pack into a single byte of the Visibility Map. After subtracting the 24-byte page header ($8{,}192 - 24 = 8{,}168$ payload bytes), \textbf{one 8~KB \texttt{\_vm} page tracks $8{,}168 \times 4 = 32{,}672$ heap pages}---roughly \textbf{255~MiB} of table data. Those two tiny bits unlock two major production speedups: \textbf{Index-Only Scans} (Chapter~3) consult the \texttt{\_vm} page in RAM and skip reading the heap block entirely whenever \texttt{ALL\_VISIBLE} is \texttt{1}; and \textbf{aggressive \texttt{VACUUM}} (Chapter~5) skips scanning any heap block whose \texttt{ALL\_FROZEN} bit is already \texttt{1}. Any \texttt{INSERT}, \texttt{UPDATE}, or \texttt{DELETE} on heap block $B$ clears both bits for block $B$.
+
+  \item \textbf{Initialization Fork (\texttt{INIT\_FORKNUM = 3}, file \texttt{24589\_init})}: Created only for \texttt{UNLOGGED} tables and their indexes. It holds an empty template image of the relation; if the server crashes, PostgreSQL wipes the corrupted main fork during startup and copies \texttt{\_init} over it to reset the unlogged table to a clean empty state (Chapter~4).
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\resizebox{0.98\textwidth}{!}{%
+\begin{tikzpicture}[
+    font=\small,
+    box/.style={draw=gray!70, rounded corners=2pt, thick, fill=white, align=left},
+    fork/.style={draw=sourceblue!80!black, rounded corners=2pt, thick, fill=sourceblue!6, align=left},
+    arr/.style={-{Stealth[length=2.5mm,width=1.8mm]}, thick}
+]
+  % Catalog box on left (raised for clean gap above old file box)
+  \node[box, fill=codebg, text width=4.7cm, inner sep=6pt] (cat) at (0, 1.85) {
+    \textbf{\texttt{pg\_class} catalog row}\\[2pt]
+    \texttt{relname = 'accounts'}\\
+    \texttt{oid = 24576} {\footnotesize\color{targetgreen!80!black}(fixed ID)}\\
+    \texttt{relfilenode:} \textcolor{trapred}{\texttt{24576}} $\rightarrow$ \textbf{\texttt{24589}}
+  };
+
+  \node[box, dashed, draw=trapred!80, fill=trapred!4, text width=4.7cm, inner sep=6pt] (oldf) at (0, -1.65) {
+    \textcolor{trapred!85!black}{\textbf{Old file \texttt{base/16384/24576}}}\\[1pt]
+    {\footnotesize Kept alive until \texttt{TRUNCATE} commits; unlinked after \texttt{COMMIT}, or retained intact on \texttt{ROLLBACK}.}
+  };
+
+  \draw[arr, trapred!80, dashed] (cat.south) -- node[right, font=\scriptsize, text=trapred!85!black] {pre-\texttt{TRUNCATE}} (oldf.north);
+
+  % Directory container on right
+  \draw[rounded corners=4pt, thick, draw=gray!55, fill=gray!4] (3.2, -2.85) rectangle (14.2, 3.35);
+  \node[anchor=north west, font=\small\bfseries, text=gray!35!black] at (3.4, 3.22) {\texttt{\$PGDATA/base/16384/} (Database OID \texttt{16384})};
+
+  % Main fork + segments
+  \node[fork, text width=10.1cm, inner sep=6pt] (mainf) at (8.7, 2.00) {
+    \textbf{Main Fork:} \texttt{24589}, \texttt{24589.1}, \texttt{24589.2}, \dots\\
+    {\footnotesize 8,192-byte slotted heap pages; split every $131{,}072$ blocks ($= 1\text{ GiB}$).}
+  };
+
+  % FSM fork with mini binary max-heap illustration clearly separated on right
+  \node[fork, fill=targetgreen!7, draw=targetgreen!75!black, text width=5.9cm, inner sep=6pt] (fsm) at (6.6, 0.15) {
+    \textbf{FSM Fork:} \texttt{24589\_fsm}\\
+    {\footnotesize 1 byte/page ($\floor{\text{free}/32}$); binary max-heap tree finds free space in $\Oh(\log N)$.}
+  };
+
+  \begin{scope}[shift={(11.95, 0.72)}, scale=0.68]
+    \node[circle, draw=targetgreen!80!black, fill=white, inner sep=1.5pt, font=\scriptsize\bfseries] (r) at (0, 0) {140};
+    \node[circle, draw=targetgreen!80!black, fill=white, inner sep=1.2pt, font=\scriptsize] (l1) at (-1.15, -0.95) {62};
+    \node[circle, draw=targetgreen!80!black, fill=targetgreen!18, inner sep=1.2pt, font=\scriptsize\bfseries] (r1) at (1.15, -0.95) {140};
+    \node[circle, draw=gray!70, fill=white, inner sep=1.2pt, font=\tiny] (ll) at (-1.70, -1.90) {18};
+    \node[circle, draw=gray!70, fill=white, inner sep=1.2pt, font=\tiny] (lr) at (-0.60, -1.90) {62};
+    \node[circle, draw=targetgreen!80!black, fill=targetgreen!25, inner sep=1.2pt, font=\tiny\bfseries] (rl) at (0.60, -1.90) {140};
+    \node[circle, draw=gray!70, fill=white, inner sep=1.2pt, font=\tiny] (rr) at (1.70, -1.90) {95};
+    \draw[thick, gray!70] (r)--(l1) (l1)--(ll) (l1)--(lr) (r1)--(rr);
+    \draw[thick, targetgreen!80!black, -{Stealth[length=1.8mm]}] (r)--(r1);
+    \draw[thick, targetgreen!80!black, -{Stealth[length=1.8mm]}] (r1)--(rl);
+  \end{scope}
+
+  % VM fork cleanly below FSM and mini-heap
+  \node[fork, fill=structurepurple!8, draw=structurepurple!75!black, text width=10.1cm, inner sep=6pt] (vm) at (8.7, -1.85) {
+    \textbf{VM Fork:} \texttt{24589\_vm} \quad {\footnotesize\texttt{[all\_visible | all\_frozen]} (2 bits / heap page)}\\
+    {\footnotesize One 8~KB VM block tracks $32{,}672$ heap blocks ($\approx 255\text{ MiB}$) for Index-Only Scans \& \texttt{VACUUM}.}
+  };
+
+  % Arrow from catalog to active main fork
+  \draw[arr, sourceblue!85!black, very thick] (cat.east) -- ++(0.38,0) |- (mainf.west);
+\end{tikzpicture}%
+}
+\caption{Physical file layout under \texttt{\$PGDATA/base/16384/}. Transactional rewrites (\texttt{TRUNCATE}, \texttt{CLUSTER}, \texttt{VACUUM FULL}) preserve \texttt{pg\_class.oid} while swapping \texttt{relfilenode} to a new file family (\texttt{24589}, \texttt{24589\_fsm}, \texttt{24589\_vm}).}
+\label{fig:ch02-pgdata-forks}
+\end{figure}
+
+% ======================================================================
+\section{Anatomy of an 8,192-Byte Slotted Heap Page}
+\label{sec:ch02-slotted-page}
+% ======================================================================
+
+Open \texttt{base/16384/24576} in a hex editor and slice it every $\texttt{BLCKSZ} = 8{,}192$ bytes. Each 8,192-byte chunk (offsets $0 \dots 8{,}191$) is a self-contained \textbf{slotted page}.
+
+\begin{walkbox}
+Try designing the page layout yourself first. You have an 8,192-byte array in RAM, and SQL rows are \textbf{variable-length} (\texttt{'Ada'} is 3 characters; \texttt{'Grace Hopper'} is 12; another row has a 400-byte note). Worse, rows get deleted out of order, leaving variable-sized holes in the middle of the page, while three separate B-tree indexes outside this page hold pointers to your live rows.
+
+If a B-tree index stored a row's raw byte offset---say \texttt{(block 0, byte 8072)}---what happens the moment you slide rows together to reclaim a deleted 64-byte gap? Every moved row's byte offset changes, forcing you to hunt down and rewrite entries across every index on the table. How can we pack variable-length tuples into 8,192 bytes, coalesce free space into one contiguous region, \emph{and} move tuples inside the page without invalidating a single external pointer?
+\end{walkbox}
+
+The slotted-page architecture (pioneered in System~R and refined across four decades of Postgres) solves all three problems at once with two tricks:
+\begin{enumerate}
+  \item \textbf{Two-way growth toward a central free gap}: Small fixed-size 4-byte \textbf{line pointers} (\texttt{ItemIdData}) grow \emph{downward} from byte~24 toward higher addresses, while variable-length \textbf{heap tuples} grow \emph{upward} from byte~8,192 toward lower addresses. All unallocated space sits in a single contiguous gap \texttt{[pd\_lower .. pd\_upper)} in the middle---neither side ever wastes space guessing a fixed boundary in advance.
+  \item \textbf{One level of slot indirection}: External B-tree indexes never store a tuple's byte offset. They store \texttt{ctid = (block\_number, slot\_number)}, where \texttt{slot\_number} ($1, 2, 3, \dots$) indexes into the 4-byte line pointer array at the top of the page. When PostgreSQL compacts a fragmented page, it slides tuple bytes upward in RAM and updates the 15-bit byte offset \emph{inside that page's own 4-byte slot}---leaving \texttt{(block\_number, slot\_number)} untouched everywhere else in the database.
+\end{enumerate}
+
+\subsection{Byte-Offset Tour of \texttt{PageHeaderData} (Bytes \texttt{0..24})}
+
+Every 8~KB page---whether heap, B-tree, GIN, GiST, FSM, or VM---begins with the exact 24-byte C struct \texttt{PageHeaderData} defined in \texttt{src/include/storage/bufpage.h}:
+
+\begin{lstlisting}[language=C]
+/* Simplified from src/include/storage/bufpage.h */
+typedef struct PageHeaderData
+{
+    /* [0..8)   LSN of last WAL record modifying this page */
+    PageXLogRecPtr pd_lsn;
+
+    /* [8..10)  16-bit page checksum (if data_checksums is enabled) */
+    uint16         pd_checksum;
+
+    /* [10..12) Flag bits: PD_HAS_FREE_LINES, PD_PAGE_FULL, PD_ALL_VISIBLE */
+    uint16         pd_flags;
+
+    /* [12..14) Byte offset to START of free space (end of line pointers) */
+    LocationIndex  pd_lower;
+
+    /* [14..16) Byte offset to END of free space (start of lowest tuple) */
+    LocationIndex  pd_upper;
+
+    /* [16..18) Byte offset to start of special access-method space */
+    LocationIndex  pd_special;
+
+    /* [18..20) Page size (upper 8 bits) + layout version (lower 8 bits) */
+    uint16         pd_pagesize_version;
+
+    /* [20..24) Oldest unpruned XMAX on page (hint for in-page pruning) */
+    TransactionId  pd_prune_xid;
+
+    /* [24..)   1-indexed array of 4-byte line pointers growing downward */
+    ItemIdData     pd_linp[FLEXIBLE_ARRAY_MEMBER];
+} PageHeaderData;
+\end{lstlisting}
+
+Let us inspect every field and verify that the byte offsets sum to exactly \textbf{24 bytes}:
+\begin{itemize}
+  \item \textbf{Bytes \texttt{[0..8)} --- \texttt{pd\_lsn} (8 bytes)}: Stores the 64-bit Write-Ahead Log Sequence Number (\texttt{XLogRecPtr}) of the most recent WAL record that mutated this page. (In C, \texttt{PageXLogRecPtr} stores the 64-bit integer as two consecutive \texttt{uint32} halves so the struct remains 4-byte aligned even on legacy 32-bit platforms.) In Chapter~4 we will see how the buffer manager compares \texttt{pd\_lsn} against the durable WAL flush pointer before allowing any dirty page onto the NVMe drive.
+  \item \textbf{Bytes \texttt{[8..10)} --- \texttt{pd\_checksum} (2 bytes)}: When the cluster is initialized with \texttt{initdb --data-checksums} (the default in PostgreSQL~18, and strongly recommended on all earlier versions), PostgreSQL computes a fast SIMD-vectorized FNV-1a checksum over the 8,192 bytes (temporarily zeroing \texttt{pd\_checksum} and mixing in the \texttt{BlockNumber} so a page accidentally written to the wrong disk sector is caught too) right before flushing the page out of \texttt{shared\_buffers}. If silent storage corruption flips a bit on disk, the next read immediately raises \texttt{ERROR: invalid page in block}.
+  \item \textbf{Bytes \texttt{[10..12)} --- \texttt{pd\_flags} (2 bytes)}: Three bitflags live here:
+  \begin{itemize}
+    \item \texttt{PD\_HAS\_FREE\_LINES (0x0001)}: At least one existing \texttt{ItemIdData} slot is marked \texttt{LP\_UNUSED}, so an \texttt{INSERT} can recycle an old slot number instead of extending \texttt{pd\_lower}.
+    \item \texttt{PD\_PAGE\_FULL (0x0002)}: Not enough free space remained for a recent update, warning future updates not to waste effort trying in-page placement until pruning runs.
+    \item \texttt{PD\_ALL\_VISIBLE (0x0004)}: Page-local mirror of the Visibility Map's \texttt{ALL\_VISIBLE} bit.
+  \end{itemize}
+  \item \textbf{Bytes \texttt{[12..14)} and \texttt{[14..16)} --- \texttt{pd\_lower} and \texttt{pd\_upper} (2 bytes each)}: Two unsigned 16-bit byte offsets (\texttt{LocationIndex}) framing the central free gap. On a freshly initialized empty heap page, $\texttt{pd\_lower} = 24$ and $\texttt{pd\_upper} = 8{,}192$, leaving $8{,}192 - 24 = \mathbf{8{,}168\text{ contiguous free bytes}}$. Checking whether a new tuple fits requires one subtraction: $\texttt{pd\_upper} - \texttt{pd\_lower}$.
+  \item \textbf{Bytes \texttt{[16..18)} --- \texttt{pd\_special} (2 bytes)}: Index access methods need a small trailer at the very end of each 8~KB page for metadata like left/right sibling page pointers in a B-link tree (\texttt{BTPageOpaqueData}, 16 bytes, setting $\texttt{pd\_special} = 8{,}176$ in Chapter~3). Heap pages need no trailer at all, so on every heap page \textbf{$\texttt{pd\_special} = 8{,}192$}.
+  \item \textbf{Bytes \texttt{[18..20)} --- \texttt{pd\_pagesize\_version} (2 bytes)}: Packs the compile-time block size and page layout version: $\texttt{8192 | 4} = \texttt{0x2004} = 8{,}196$ (version~4 has been PostgreSQL's page format since PostgreSQL~8.3).
+  \item \textbf{Bytes \texttt{[20..24)} --- \texttt{pd\_prune\_xid} (4 bytes)}: Records the oldest deleting/updating transaction ID (\texttt{xmax}) among dead or updated tuples on this page. Before scanning the page, a reader can compare \texttt{pd\_prune\_xid} against its snapshot horizon; if \texttt{pd\_prune\_xid} has already finished behind every active transaction, the backend knows immediately that a quick in-page defragmentation pass (\emph{HOT pruning}, Chapter~5) will reclaim dead space.
+\end{itemize}
+
+\subsection{The Line Pointer Array: \texttt{ItemIdData} (4 Bytes per Slot)}
+
+Starting right at byte~24 is \texttt{pd\_linp[]}, an array of 32-bit (\textbf{4-byte}) line pointers defined in \path{src/include/storage/itemid.h}. Note a classic PostgreSQL convention: in C, \texttt{pd\_linp[0]} sits at byte~24, yet SQL and \texttt{ctid} number slots \textbf{starting at 1} (\texttt{OffsetNumber = 1} means bytes \texttt{[24..28)}, \texttt{OffsetNumber = 2} means bytes \texttt{[28..32)}, and slot $k$ sits at byte $24 + 4(k - 1)$).
+
+\begin{lstlisting}[language=C]
+/* From src/include/storage/itemid.h */
+typedef struct ItemIdData
+{
+    unsigned lp_off:15,   /* byte offset to tuple (0..32767) */
+             lp_flags:2,  /* state of line pointer, see below */
+             lp_len:15;   /* byte length of tuple (0..32767) */
+} ItemIdData;
+
+#define LP_UNUSED    0    /* unused slot (lp_len is always 0) */
+#define LP_NORMAL    1    /* used slot pointing to a tuple (lp_len > 0) */
+#define LP_REDIRECT  2    /* HOT redirect (lp_off = target slot, lp_len == 0) */
+#define LP_DEAD      3    /* dead item, tuple storage already reclaimed */
+\end{lstlisting}
+
+Look how cleanly those 32 bits are budgeted:
+\begin{itemize}
+  \item \textbf{\texttt{lp\_off} (15 bits)}: Ranges over $0 \dots 32{,}767$, enough to address every byte of an 8,192-byte page (and supporting compile-time \texttt{--with-blocksize=32} up to 32~KB).
+  \item \textbf{\texttt{lp\_len} (15 bits)}: Exact unpadded byte length of the tuple.
+  \item \textbf{\texttt{lp\_flags} (2 bits)}: Encodes the four-state lifecycle of a slot. Every live or recently deleted tuple starts as \texttt{LP\_NORMAL (1)}. If an in-page Heap-Only Tuple update occurs (Chapter~5), the root slot can become \texttt{LP\_REDIRECT (2)}, where \texttt{lp\_off} holds another \emph{slot number} on the same page. When an ordinary dead tuple's bytes are pruned away before indexes have been cleaned, the slot transitions to \texttt{LP\_DEAD (3)} ($\texttt{lp\_len} = 0$): the 4-byte gravestone stays put so index scans arriving with \texttt{ctid = (0, 2)} immediately see \texttt{LP\_DEAD} without reading garbage, and once \texttt{VACUUM} removes those index entries, the slot finally flips back to \texttt{LP\_UNUSED (0)} for reuse by a future \texttt{INSERT}.
+\end{itemize}
+
+\subsection{Step-by-Step Trace: Inserting, Deleting, and Compacting Without Breaking Indexes}
+
+Let us trace Page~0 of our \texttt{accounts} table with exact numbers from initialization through three inserts, one delete, and an in-page compaction (\texttt{PageRepairFragmentation}). In Section~\ref{sec:ch02-tuple-layout} we will verify why these three rows have raw byte lengths $49$, $57$, and $49$, which round up under 8-byte \texttt{MAXALIGN} to \textbf{56}, \textbf{64}, and \textbf{56} bytes when carved from \texttt{pd\_upper}:
+
+\begin{enumerate}
+  \item \textbf{Fresh Empty Page~0}:
+  \[
+    \texttt{pd\_lower} = 24, \qquad \texttt{pd\_upper} = 8{,}192, \qquad \text{free gap} = 8{,}192 - 24 = 8{,}168\text{ B}.
+  \]
+
+  \item \textbf{Insert Row~1} (\texttt{1001, 'Ada', 50000, true}; raw $\texttt{lp\_len} = 49\text{ B}$, aligned $56\text{ B}$):
+  \begin{itemize}
+    \item Allocate Slot~1 at bytes \texttt{[24..28)}; advance $\texttt{pd\_lower}: 24 \to 28$.
+    \item Pull $\texttt{pd\_upper}$ down by $56$ bytes: $8{,}192 - 56 = \mathbf{8{,}136}$. Copy the 49 tuple bytes into \texttt{[8136..8185)} (leaving \texttt{[8185..8192)} as 7 trailing alignment pad bytes).
+    \item Write Slot~1 = \texttt{(lp\_off = 8136, lp\_flags = LP\_NORMAL, lp\_len = 49)}.
+    \item The primary-key B-tree index \texttt{accounts\_pkey} records \texttt{1001} $\mapsto$ \texttt{ctid = (0, 1)}.
+  \end{itemize}
+
+  \item \textbf{Insert Row~2} (\texttt{1002, 'Grace Hopper', 125000, true}; raw $\texttt{lp\_len} = 57\text{ B}$, aligned $64\text{ B}$):
+  \begin{itemize}
+    \item Allocate Slot~2 at bytes \texttt{[28..32)}; advance $\texttt{pd\_lower}: 28 \to 32$.
+    \item Pull $\texttt{pd\_upper}$ down by $64$ bytes: $8{,}136 - 64 = \mathbf{8{,}072}$. Copy the 57 tuple bytes into \texttt{[8072..8129)}.
+    \item Write Slot~2 = \texttt{(lp\_off = 8072, lp\_flags = LP\_NORMAL, lp\_len = 57)}.
+    \item \texttt{accounts\_pkey} records \texttt{1002} $\mapsto$ \texttt{ctid = (0, 2)}.
+  \end{itemize}
+
+  \item \textbf{Insert Row~3} (\texttt{1003, 'Edsger', 90000, false}; raw $\texttt{lp\_len} = 49\text{ B}$, aligned $56\text{ B}$):
+  \begin{itemize}
+    \item Allocate Slot~3 at bytes \texttt{[32..36)}; advance $\texttt{pd\_lower}: 32 \to 36$.
+    \item Pull $\texttt{pd\_upper}$ down by $56$ bytes: $8{,}072 - 56 = \mathbf{8{,}016}$. Copy the 49 tuple bytes into \texttt{[8016..8065)}.
+    \item Write Slot~3 = \texttt{(lp\_off = 8016, lp\_flags = LP\_NORMAL, lp\_len = 49)}.
+    \item \texttt{accounts\_pkey} (and any secondary indexes on \texttt{owner\_name} or \texttt{balance\_cents}) records \texttt{1003} $\mapsto$ \textbf{\texttt{ctid = (0, 3)}}. Free gap is now $8{,}016 - 36 = 7{,}980\text{ B}$.
+  \end{itemize}
+
+  \item \textbf{Delete Row~2 (\texttt{1002}) and Compact Page~0 (\texttt{PageRepairFragmentation})}:
+  \begin{itemize}
+    \item Once the \texttt{DELETE} commits and no running transaction can see Row~2 anymore, bytes \texttt{[8072..8136)} form a \textbf{64-byte dead hole} trapped between Tuple~3 (\texttt{[8016..8072)}) and Tuple~1 (\texttt{[8136..8192)}).
+    \item Inside RAM, PostgreSQL executes \texttt{memmove} to slide Tuple~3 upward by 64 bytes: from \texttt{[8016..8072)} into \textbf{\texttt{[8080..8136)}}.
+    \item $\texttt{pd\_upper}$ jumps upward from $8{,}016$ to $\mathbf{8{,}080}$, merging all 64 reclaimed bytes straight back into the central free gap ($8{,}080 - 36 = 8{,}044\text{ B}$).
+    \item Slot~2 (\texttt{[28..32)}) is marked \texttt{(lp\_off = 0, lp\_flags = LP\_DEAD, lp\_len = 0)}. Notice that \textbf{Slot~3 is never renumbered to Slot~2}.
+    \item Slot~3 (\texttt{[32..36)}) simply rewrites its internal offset from \texttt{8016} to \textbf{\texttt{8080}}: \texttt{(lp\_off = 8080, lp\_flags = LP\_NORMAL, lp\_len = 49)}.
+  \end{itemize}
+\end{enumerate}
+
+\begin{whybox}
+Look at what happened to every external B-tree index pointing to \texttt{'Edsger'} at \texttt{ctid = (0, 3)}. Not a single index page had to be locked, dirtied, WAL-logged, or rewritten. When an index lookup lands on Page~0 and asks for Slot~3, it reads bytes \texttt{[32..36)}, follows the updated \texttt{lp\_off = 8080}, and lands on Edsger's relocated tuple in one memory dereference. Four bytes of per-row slot indirection decouple \emph{internal page defragmentation} from \emph{global index maintenance}.
+\end{whybox}
+
+Compare this with two mechanisms you already know. Java's compacting garbage collector also moves objects to close gaps, and it then rewrites every reference to each moved object; it can do that because it stops the application threads and walks the whole heap. PostgreSQL cannot afford to find and rewrite index entries stored in other files every time it tidies one page, so it adds one level of indirection instead: an index stores \texttt{(block, slot)}, and only the 4-byte slot inside the page knows the byte offset. In C you see the failure this avoids: a raw pointer into a buffer dangles as soon as \texttt{realloc} moves the buffer, whereas an index into the buffer stays valid.
+
+\begin{figure}[htbp]
+\centering
+\resizebox{0.99\textwidth}{!}{%
+\begin{tikzpicture}[
+    font=\footnotesize,
+    ptr/.style={-{Stealth[length=2.3mm,width=1.7mm]}, thick}
+]
+  % ==================== LEFT: Full 8192-byte page anatomy ====================
+  \node[font=\small\bfseries] at (3.75, 6.35) {(a) 8,192-Byte Heap Page (Before Prune)};
+
+  % Outer width: 0 to 7.5 cm (plenty of room for every text line!)
+  % Header [0..24)
+  \filldraw[fill=sourceblue!14, draw=sourceblue!80!black, thick] (0, 5.05) rectangle (7.5, 5.90);
+  \node[align=center] at (3.75, 5.475) {\textbf{\texttt{PageHeaderData} (24 B, bytes \texttt{0..24})}\\
+    {\scriptsize \texttt{pd\_lsn} \textbar{} \texttt{checksum} \textbar{} \texttt{pd\_lower=36} \textbar{} \texttt{pd\_upper=8016}}};
+  \node[anchor=east, font=\scriptsize\ttfamily, text=gray!70!black] at (-0.10, 5.90) {0};
+  \node[anchor=east, font=\scriptsize\ttfamily, text=gray!70!black] at (-0.10, 5.05) {24};
+
+  % Slots 1, 2, 3
+  \filldraw[fill=targetgreen!14, draw=targetgreen!75!black, thick] (0, 4.60) rectangle (7.5, 5.05);
+  \node at (3.75, 4.825) {\scriptsize \textbf{Slot 1} \texttt{[24..28)}: \texttt{lp\_off=8136, NORMAL, len=49}};
+  \filldraw[fill=trapred!14, draw=trapred!75!black, thick] (0, 4.15) rectangle (7.5, 4.60);
+  \node at (3.75, 4.375) {\scriptsize \textbf{Slot 2} \texttt{[28..32)}: \texttt{lp\_off=8072, NORMAL, len=57} {\color{trapred!85!black}(deleted)}};
+  \filldraw[fill=quotientorange!16, draw=quotientorange!80!black, thick] (0, 3.70) rectangle (7.5, 4.15);
+  \node at (3.75, 3.925) {\scriptsize \textbf{Slot 3} \texttt{[32..36)}: \texttt{lp\_off=8016, NORMAL, len=49}};
+  \node[anchor=east, font=\scriptsize\ttfamily, text=sourceblue!85!black] at (-0.10, 3.70) {36};
+
+  % Contiguous free space
+  \filldraw[fill=white, draw=gray!60, thick] (0, 2.05) rectangle (7.5, 3.70);
+  \draw[-{Stealth[length=2mm]}, thick, targetgreen!75!black] (1.7, 3.65) -- (1.7, 3.20);
+  \draw[-{Stealth[length=2mm]}, thick, quotientorange!85!black] (5.8, 2.10) -- (5.8, 2.55);
+  \node[align=center, text=gray!65!black] at (3.75, 2.88) {\textbf{Unallocated Free Gap ($7{,}980$ B)}\\ {\scriptsize \texttt{pd\_linp[]} grows $\downarrow$ \quad\textbar\quad tuples grow $\uparrow$}};
+
+  % Tuples 3, 2, 1 at bottom (high offsets)
+  \node[anchor=east, font=\scriptsize\ttfamily, text=sourceblue!85!black] at (-0.10, 2.05) {8016};
+  \filldraw[fill=quotientorange!18, draw=quotientorange!85!black, thick] (0, 1.38) rectangle (7.5, 2.05);
+  \node at (3.75, 1.715) {\scriptsize \textbf{Tuple 3 (\texttt{'Edsger'})} --- 56 B aligned (\texttt{[8016..8072)})};
+
+  \node[anchor=east, font=\scriptsize\ttfamily, text=gray!70!black] at (-0.10, 1.38) {8072};
+  \filldraw[fill=trapred!15, draw=trapred!80!black, thick, pattern=north east lines, pattern color=trapred!35] (0, 0.65) rectangle (7.5, 1.38);
+  \fill[white, opacity=0.86] (1.05, 0.78) rectangle (6.45, 1.25);
+  \node[text=trapred!85!black] at (3.75, 1.015) {\scriptsize \textbf{Dead Tuple 2 (\texttt{'Grace Hopper'})} --- 64 B hole};
+
+  \node[anchor=east, font=\scriptsize\ttfamily, text=gray!70!black] at (-0.10, 0.65) {8136};
+  \filldraw[fill=targetgreen!14, draw=targetgreen!75!black, thick] (0, 0.0) rectangle (7.5, 0.65);
+  \node at (3.75, 0.325) {\scriptsize \textbf{Tuple 1 (\texttt{'Ada'})} --- 56 B aligned (\texttt{[8136..8192)})};
+  \node[anchor=east, font=\scriptsize\ttfamily, text=gray!70!black] at (-0.10, 0.0) {8192};
+
+  % ==================== RIGHT: After PageRepairFragmentation ====================
+  \begin{scope}[shift={(8.85, 0)}]
+    \node[font=\small\bfseries] at (3.65, 6.35) {(b) After Compaction (\texttt{ctid} Preserved)};
+
+    % External B-tree index pointer at top-right
+    \node[draw=structurepurple!85!black, fill=structurepurple!10, rounded corners=2pt, thick, inner sep=4.5pt, font=\scriptsize] (idx) at (3.65, 5.50) {
+      \textbf{B-Tree Index Entry:} \texttt{key=1003} $\rightarrow$ \textbf{\texttt{ctid = (0, 3)}} (unchanged!)
+    };
+
+    % Slots 1, 2 (LP_DEAD), 3 (updated lp_off=8080) -- width 0.2 to 7.1 (6.9 cm)
+    \filldraw[fill=targetgreen!14, draw=targetgreen!75!black, thick] (0.2, 4.45) rectangle (7.1, 4.90);
+    \node at (3.65, 4.675) {\scriptsize \textbf{Slot 1}: \texttt{lp\_off=8136, LP\_NORMAL, len=49}};
+
+    \filldraw[fill=gray!18, draw=gray!70, thick] (0.2, 4.00) rectangle (7.1, 4.45);
+    \node[text=gray!60!black] at (3.65, 4.225) {\scriptsize \textbf{Slot 2}: \texttt{lp\_off=0, LP\_DEAD, len=0} (slot preserved)};
+
+    \filldraw[fill=quotientorange!22, draw=quotientorange!90!black, very thick] (0.2, 3.55) rectangle (7.1, 4.00);
+    \node at (3.65, 3.775) {\scriptsize \textbf{Slot 3}: \textbf{\texttt{lp\_off=8080}}, \texttt{LP\_NORMAL, len=49}};
+
+    % Expanded free space!
+    \filldraw[fill=targetgreen!4, draw=targetgreen!60!black, thick] (0.2, 1.38) rectangle (7.1, 3.55);
+    \node[align=center, text=targetgreen!55!black] at (3.65, 2.48) {\textbf{Expanded Free Gap ($8{,}044$ B)}\\ {\scriptsize $+64$ B coalesced; \texttt{pd\_upper}: $8016 \to \mathbf{8080}$}};
+
+    % Relocated Tuple 3 + untouched Tuple 1 (offset labels on left gutter so right side arrow is clean!)
+    \node[anchor=east, font=\scriptsize\ttfamily, text=quotientorange!85!black] at (0.12, 1.38) {8080};
+    \filldraw[fill=quotientorange!20, draw=quotientorange!90!black, very thick] (0.2, 0.65) rectangle (7.1, 1.38);
+    \node at (3.65, 1.015) {\scriptsize \textbf{Tuple 3 (\texttt{'Edsger'})} slid up to \texttt{[8080..8136)}};
+
+    \node[anchor=east, font=\scriptsize\ttfamily, text=gray!70!black] at (0.12, 0.65) {8136};
+    \filldraw[fill=targetgreen!14, draw=targetgreen!75!black, thick] (0.2, 0.0) rectangle (7.1, 0.65);
+    \node at (3.65, 0.325) {\scriptsize \textbf{Tuple 1 (\texttt{'Ada'})} stays at \texttt{[8136..8192)}};
+    \node[anchor=east, font=\scriptsize\ttfamily, text=gray!70!black] at (0.12, 0.0) {8192};
+
+    % Indirection arrows: Index -> Slot 3 -> Tuple 3
+    \draw[ptr, structurepurple!85!black, very thick] (idx.south) -- ++(0, -0.22) -| (-0.22, 3.775) -- (0.2, 3.775);
+    \draw[ptr, quotientorange!90!black, very thick] (7.1, 3.775) -- ++(0.45, 0) |- (7.1, 1.015);
+  \end{scope}
+\end{tikzpicture}%
+}
+\caption{Anatomy of an 8,192-byte slotted heap page and in-page defragmentation (\texttt{PageRepairFragmentation}). Sliding Tuple~3 upward over Dead Tuple~2 reclaims 64 contiguous bytes into the central gap while updating only Slot~3's internal \texttt{lp\_off} ($8016 \to 8080$); external index pointers to \texttt{ctid = (0, 3)} remain valid with zero index I/O.}
+\label{fig:ch02-slotted-page}
+\end{figure}
+
+% ======================================================================
+\section{Inside a Heap Tuple: Headers, Null Bitmaps, and Column Tetris}
+\label{sec:ch02-tuple-layout}
+% ======================================================================
+
+Now let us zoom in on the 49 bytes starting at byte~8,136 of Page~0---Row~1 of \texttt{accounts}. Every heap tuple begins with a fixed \textbf{23-byte} C structure, \texttt{HeapTupleHeaderData} (\path{src/include/access/htup_details.h}), optionally followed by a variable-length \textbf{null bitmap}, alignment padding up to byte \texttt{t\_hoff}, and finally the serialized user columns.
+
+\begin{lstlisting}[language=C]
+/* Simplified from src/include/access/htup_details.h */
+struct HeapTupleHeaderData
+{
+    union {
+        HeapTupleFields t_heap;   /* [0..12) t_xmin (4B), t_xmax (4B), t_cid (4B) */
+        DatumTupleFields t_datum; /* used for in-memory composite datums */
+    } t_choice;
+
+    ItemPointerData t_ctid;       /* [12..18) current or newer (block, slot) (6B) */
+
+    uint16          t_infomask2;  /* [18..20) lower 11 bits = natts; upper = HOT flags */
+    uint16          t_infomask;   /* [20..22) HASNULL, HASVARWIDTH, XMIN/XMAX hint bits */
+    uint8           t_hoff;       /* [22..23) byte offset to user data (MAXALIGN'd!) */
+
+    /* [23..) Optional null bitmap (1 bit per column when HEAP_HASNULL is set) */
+    bits8           t_bits[FLEXIBLE_ARRAY_MEMBER];
+
+    /* User column bytes start at exact offset t_hoff from start of header! */
+};
+\end{lstlisting}
+
+\subsection{Why a 23-Byte Struct Produces a 24-Byte Header (and Free 8-Column Null Bitmaps)}
+
+A Java~6 object on 64-bit HotSpot also starts with a header: an 8-byte mark word (lock and garbage-collector state) and an 8-byte class pointer, or 12 bytes total with compressed references. A PostgreSQL tuple header plays the same role for a row, but what it records is different: which transactions created and deleted this version, and where the newer version lives. Count its bytes carefully:
+\begin{itemize}
+  \item \textbf{\texttt{t\_xmin} (\texttt{[0..4)}, 4 bytes)} and \textbf{\texttt{t\_xmax} (\texttt{[4..8)}, 4 bytes)}: The 32-bit transaction IDs that inserted and deleted/updated/locked this tuple version (the heart of MVCC in Chapter~5).
+  \item \textbf{\texttt{t\_cid} (\texttt{[8..12)}, 4 bytes)}: Command ID tracking which SQL statement inside a multi-statement transaction created or modified the row.
+  \item \textbf{\texttt{t\_ctid} (\texttt{[12..18)}, 6 bytes)}: On the latest version of a row, \texttt{t\_ctid} points to \emph{itself} (e.g., \texttt{(0, 1)}). When an \texttt{UPDATE} creates a newer version of the row, the old version's \texttt{t\_ctid} is overwritten to point forward to the new version's \texttt{(block, slot)}, forming a version chain.
+  \begin{implementbox}
+  Why is \texttt{ItemPointerData} 6 bytes instead of 8 bytes when it holds a 32-bit \texttt{BlockNumber} plus a 16-bit \texttt{OffsetNumber}? In C, a struct containing a \texttt{uint32} and a \texttt{uint16} has 4-byte alignment and \texttt{sizeof} $= 8$ (wasting 2 tail-padding bytes inside every tuple header and every B-tree index entry). PostgreSQL splits \texttt{BlockIdData} into \emph{two consecutive \texttt{uint16} integers} (\texttt{bi\_hi} and \texttt{bi\_lo}), keeping alignment at 2 bytes and \texttt{sizeof(ItemPointerData)} at \textbf{6 bytes exact}. Saving 2 bytes per pointer shrinks every heap row and every B-tree leaf entry across the entire database.
+  \end{implementbox}
+  \item \textbf{\texttt{t\_infomask2} (\texttt{[18..20)}, 2 bytes)}: Masks the column count \texttt{natts} in its lower 11 bits (\texttt{0x07FF}) and HOT-update flags (\texttt{HEAP\_HOT\_UPDATED}, \texttt{HEAP\_ONLY\_TUPLE}) in its upper 5 bits.
+  \item \textbf{\texttt{t\_infomask} (\texttt{[20..22)}, 2 bytes)}: Tracks structural flags---\texttt{HEAP\_HASNULL} (\texttt{0x0001}), \texttt{HEAP\_HASVARWIDTH} (\texttt{0x0002}), and \texttt{HEAP\_HASEXTERNAL} (\texttt{0x0004}, TOAST pointer present)---plus commit/abort \textbf{hint bits} (\texttt{HEAP\_XMIN\_COMMITTED} \texttt{0x0100}, \texttt{HEAP\_XMAX\_INVALID} \texttt{0x0800}) cached directly on the tuple so readers do not repeatedly consult the commit log.
+  \item \textbf{\texttt{t\_hoff} (\texttt{[22..23)}, 1 byte)}: Byte offset where user column~1 begins.
+\end{itemize}
+
+That brings us to offset~\textbf{23}. Why can't user column~1 (\texttt{account\_id BIGINT}) start right at byte~23? Because on 64-bit CPUs, reading an 8-byte \texttt{int64} or \texttt{double} expects an 8-byte aligned memory address ($\texttt{MAXALIGN} = 8$); since every tuple starts at an 8-byte aligned \texttt{pd\_upper}, user data must also start at a multiple of 8 relative to the tuple header.
+
+Watch the arithmetic across three cases:
+\begin{enumerate}
+  \item \textbf{Row has zero \texttt{NULL} values (\texttt{HEAP\_HASNULL = 0})}: PostgreSQL omits \texttt{t\_bits[]} completely. Rounding $23$ up to the next multiple of $8$ yields $\texttt{t\_hoff} = \mathbf{24}$ (byte~23 is a single zero-padding byte).
+  \item \textbf{Row has at least one \texttt{NULL}, and $1 \le \text{natts} \le 8$ columns (\texttt{HEAP\_HASNULL = 1})}: The null bitmap needs $\ceil{\text{natts}/8} = 1$ byte, which drops neatly into \textbf{byte~23}---the exact byte that was previously wasted on alignment padding. Now $23 + 1 = 24$, which is already divisible by $8$, so \textbf{$\texttt{t\_hoff}$ is still $24$}. Even better, any column whose bit in \texttt{t\_bits[]} is \texttt{0} (\emph{null}) writes \textbf{0 data bytes} into the tuple payload. (In PostgreSQL's bitmap convention, bit~\texttt{1} means \emph{present / NOT NULL} and bit~\texttt{0} means \emph{NULL}.)
+  \item \textbf{Row has at least one \texttt{NULL}, and $\text{natts} = 9$ columns}: Now the null bitmap needs $\ceil{9 / 8} = 2$ bytes (\texttt{[23..25)}), bringing the unaligned header to $23 + 2 = 25$ bytes. Rounding $25$ up to the next multiple of $8$ jumps $\texttt{t\_hoff}$ from $24$ all the way to \textbf{32 bytes} (7 padding bytes at \texttt{[25..32)}).
+\end{enumerate}
+
+\begin{trapbox}
+Adding a 9th column (or a 73rd column, where $23 + 10 = 33 \to \texttt{t\_hoff} = 40$) to a wide table that frequently contains \texttt{NULL}s adds an invisible \textbf{8-byte cliff} to every nullable row's header. Conversely, contrary to a widespread myth, \texttt{NULL} columns in PostgreSQL do \emph{not} reserve their full column width on disk: a row with twenty \texttt{BIGINT} columns all set to \texttt{NULL} stores just the 23-byte header + 3-byte bitmap + 6 pad bytes = \textbf{32 bytes total}, not $20 \times 8 = 160$ bytes.
+\end{trapbox}
+
+\subsection{CPU Alignment Padding and ``Column Tetris''}
+
+Once PostgreSQL reaches \texttt{t\_hoff}, it serializes each non-\texttt{NULL} column in exact \texttt{CREATE TABLE} order. Before writing column $i$, PostgreSQL advances the current offset to the alignment boundary dictated by \texttt{pg\_type.typalign}:
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{6.6cm}l@{}}
+\toprule
+\textbf{\texttt{typalign}} & \textbf{Boundary} & \textbf{Common PostgreSQL Types} & \textbf{Width (\texttt{typlen})} \\
+\midrule
+\texttt{'d'} (double) & 8 bytes & \texttt{BIGINT} (\texttt{int8}), \texttt{DOUBLE PRECISION}, \texttt{TIMESTAMPTZ}, \texttt{TIMESTAMP} & 8 B (\texttt{INTERVAL}: 16 B) \\
+\texttt{'i'} (int) & 4 bytes & \texttt{INTEGER} (\texttt{int4}), \texttt{REAL} (\texttt{float4}), \texttt{DATE}, 4B-header \texttt{varlena} & 4 B (or variable) \\
+\texttt{'s'} (short) & 2 bytes & \texttt{SMALLINT} (\texttt{int2}) & 2 B \\
+\texttt{'c'} (char) & 1 byte & \texttt{BOOLEAN}, \texttt{"char"}, \texttt{UUID} (16 B), short 1B-header \texttt{varlena} & 1 B, 16 B, or var. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Note \texttt{UUID} in the bottom row: even though a \texttt{UUID} is 16 bytes wide (\texttt{unsigned char data[16]}), its C representation is an array of single bytes, so \texttt{typalign = 'c'} (1-byte aligned, zero pre-padding ever required). By contrast, \texttt{BIGINT} and \texttt{TIMESTAMPTZ} demand \texttt{'d'} (8-byte) alignment: if the previous column ended at offset~25, PostgreSQL inserts \textbf{7 dead zero bytes} (\texttt{[25..32)}) so the \texttt{BIGINT} starts cleanly at offset~32.
+
+This is the same rule your C compiler applies to struct members. On x86-64, \texttt{struct \{ char a; int64\_t b; \}} has \texttt{sizeof} 16, not 9, because \texttt{b} must start at offset 8. The C compiler pays that padding once per struct in RAM. PostgreSQL pays it once per row on disk, again in WAL, and again in \texttt{shared\_buffers}. Java hides the issue because HotSpot is free to reorder an object's fields by size; the order you declare fields in a Java class does not decide its memory layout.
+
+PostgreSQL \emph{never} reorders columns behind your back to save padding; physical tuple order matches logical \texttt{pg\_attribute.attnum} order. Let us calculate what happens on a 50-million-row payment-events table when an engineer alternates narrow and 8-byte columns versus ordering them from widest alignment downward:
+
+\begin{lstlisting}[language=SQL]
+-- Layout A: Alternating 1B/2B and 8B columns ("Swiss-cheese tuple")
+CREATE TABLE events_bad (
+    is_settled   BOOLEAN     NOT NULL, -- 1B at [24..25) + 7B pad [25..32)
+    account_id   BIGINT      NOT NULL, -- 8B at [32..40)
+    region_code  SMALLINT    NOT NULL, -- 2B at [40..42) + 6B pad [42..48)
+    created_at   TIMESTAMPTZ NOT NULL, -- 8B at [48..56)
+    retry_flag   BOOLEAN     NOT NULL, -- 1B at [56..57) + 7B pad [57..64)
+    amount_cents BIGINT      NOT NULL, -- 8B at [64..72)
+    channel_id   INTEGER     NOT NULL, -- 4B at [72..76)
+    fee_bps      SMALLINT    NOT NULL  -- 2B at [76..78) -> lp_len=78, MAXALIGN=80B!
+);
+
+-- Layout B: Identical 8 columns ordered 8B -> 4B -> 2B -> 1B ("Column Tetris")
+CREATE TABLE events_good (
+    account_id   BIGINT      NOT NULL, -- 8B at [24..32)
+    created_at   TIMESTAMPTZ NOT NULL, -- 8B at [32..40)
+    amount_cents BIGINT      NOT NULL, -- 8B at [40..48)
+    channel_id   INTEGER     NOT NULL, -- 4B at [48..52)
+    region_code  SMALLINT    NOT NULL, -- 2B at [52..54)
+    fee_bps      SMALLINT    NOT NULL, -- 2B at [54..56)
+    is_settled   BOOLEAN     NOT NULL, -- 1B at [56..57)
+    retry_flag   BOOLEAN     NOT NULL  -- 1B at [57..58) -> lp_len=58, MAXALIGN=64B!
+);
+\end{lstlisting}
+
+Check the math. Both tables store the exact same $8 + 8 + 8 + 4 + 2 + 2 + 1 + 1 = \mathbf{34\text{ bytes}}$ of user payload plus a 24-byte header ($58$ useful bytes total):
+\begin{itemize}
+  \item In \texttt{events\_bad}, three alignment gaps ($7 + 6 + 7 = 20\text{ B}$) inflate \texttt{lp\_len} to $78\text{ B}$, which \texttt{MAXALIGN} rounds to \textbf{80 bytes} on the page (+4~B \texttt{ItemIdData} = \textbf{84~B/row}). Each 8~KB heap page ($8{,}168$ usable bytes) holds $\floor{8{,}168 / 84} = \mathbf{97\text{ rows}}$. Across $50{,}000{,}000$ rows, \texttt{events\_bad} consumes $\ceil{50{,}000{,}000 / 97} = 515{,}464$ blocks $\approx \mathbf{4.22\text{ GB}}$ ($4{,}027\text{ MiB}$).
+  \item In \texttt{events\_good}, every single column starts naturally on its required boundary with \textbf{zero internal padding}: $\texttt{lp\_len} = 58\text{ B}$, \texttt{MAXALIGN} $= \mathbf{64\text{ bytes}}$ (+4~B \texttt{ItemIdData} = \textbf{68~B/row}). Each 8~KB page now holds $\floor{8{,}168 / 68} = \mathbf{120\text{ rows}}$! Across $50{,}000{,}000$ rows, \texttt{events\_good} consumes $416{,}667$ blocks $\approx \mathbf{3.41\text{ GB}}$ ($3{,}255\text{ MiB}$).
+\end{itemize}
+Reordering eight lines of DDL saves \textbf{16 bytes per row} and \textbf{810 MB} of NVMe storage, WAL traffic, and \texttt{shared\_buffers} RAM without changing a single query. Better yet, if you also have \texttt{TEXT} or \texttt{JSONB} columns, place all fixed-width \texttt{NOT NULL} columns \emph{first} (ordered $8\text{B} \to 4\text{B} \to 2\text{B} \to 1\text{B}$) and variable-width or nullable columns \emph{last}: PostgreSQL caches the fixed byte offset (\texttt{attcacheoff}) of leading fixed-width non-null columns so the executor can jump straight to \texttt{amount\_cents} at offset~40 in $\Oh(1)$ CPU instructions instead of walking earlier variable-length headers.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    font=\scriptsize,
+    hdr/.style={draw=sourceblue!80!black, fill=sourceblue!14, thick},
+    dat8/.style={draw=targetgreen!80!black, fill=targetgreen!16, thick},
+    dat4/.style={draw=structurepurple!80!black, fill=structurepurple!14, thick},
+    dat2/.style={draw=quotientorange!85!black, fill=quotientorange!16, thick},
+    dat1/.style={draw=cyan!70!black, fill=cyan!14, thick},
+    pad/.style={draw=trapred!80!black, fill=trapred!18, pattern=north east lines, pattern color=trapred!55, thick}
+]
+  % ==================== TOP: 24-Byte HeapTupleHeaderData ====================
+  \node[anchor=west, font=\small\bfseries] at (0, 4.15) {(a) \texttt{HeapTupleHeaderData} Byte Map (\texttt{0..24})};
+
+  % Scale for top bar: 24 bytes -> 14.4 cm (0.6 cm per byte!)
+  \draw[hdr] (0, 3.25) rectangle (2.4, 3.85); \node at (1.2, 3.55) {\texttt{t\_xmin} (4B)};
+  \draw[hdr] (2.4, 3.25) rectangle (4.8, 3.85); \node at (3.6, 3.55) {\texttt{t\_xmax} (4B)};
+  \draw[hdr] (4.8, 3.25) rectangle (7.2, 3.85); \node at (6.0, 3.55) {\texttt{t\_cid} (4B)};
+  \draw[hdr, fill=sourceblue!22] (7.2, 3.25) rectangle (10.8, 3.85); \node at (9.0, 3.55) {\texttt{t\_ctid} (6B: \texttt{blk,slot})};
+  \draw[hdr] (10.8, 3.25) rectangle (12.0, 3.85); \node at (11.4, 3.55) {\texttt{mask2}};
+  \draw[hdr] (12.0, 3.25) rectangle (13.2, 3.85); \node at (12.6, 3.55) {\texttt{mask}};
+  \draw[hdr, fill=quotientorange!22] (13.2, 3.25) rectangle (13.8, 3.85); \node at (13.5, 3.55) {\texttt{hoff}};
+  \draw[draw=trapred!80!black, fill=trapred!14, thick] (13.8, 3.25) rectangle (14.4, 3.85);
+  \node[font=\tiny] at (14.1, 3.55) {pad};
+
+  \foreach \b/\x in {0/0, 4/2.4, 8/4.8, 12/7.2, 18/10.8, 20/12.0, 22/13.2, 23/13.8, 24/14.4} {
+    \node[font=\tiny\ttfamily, text=gray!75!black] at (\x, 3.07) {\b};
+  }
+
+  % ==================== MIDDLE: events_bad (80 Bytes) ====================
+  % Scale for comparison bars: 80 bytes -> 14.4 cm (0.18 cm per byte!)
+  \node[anchor=west, font=\small\bfseries] at (0, 2.38) {(b) \texttt{events\_bad}: 80 Aligned Bytes/Tuple (22 Bytes Wasted on Padding = 27.5\%)};
+
+  % [0..24) hdr = 4.32
+  \draw[hdr] (0, 1.55) rectangle (4.32, 2.10); \node at (2.16, 1.825) {Header (24B)};
+  % [24..25) bool = 0.18, [25..32) pad = 1.26
+  \draw[dat1] (4.32, 1.55) rectangle (4.50, 2.10);
+  \draw[pad]  (4.50, 1.55) rectangle (5.76, 2.10); \fill[white,opacity=0.78] (4.68,1.67) rectangle (5.58,1.98); \node[text=trapred!90!black,font=\tiny\bfseries] at (5.13,1.825) {+7B pad};
+  % [32..40) int8 = 1.44
+  \draw[dat8] (5.76, 1.55) rectangle (7.20, 2.10); \node at (6.48, 1.825) {\texttt{int8} (8B)};
+  % [40..42) int2 = 0.36, [42..48) pad = 1.08
+  \draw[dat2] (7.20, 1.55) rectangle (7.56, 2.10);
+  \draw[pad]  (7.56, 1.55) rectangle (8.64, 2.10); \fill[white,opacity=0.78] (7.68,1.67) rectangle (8.52,1.98); \node[text=trapred!90!black,font=\tiny\bfseries] at (8.10,1.825) {+6B pad};
+  % [48..56) ts = 1.44
+  \draw[dat8] (8.64, 1.55) rectangle (10.08, 2.10); \node at (9.36, 1.825) {\texttt{tstz} (8B)};
+  % [56..57) bool = 0.18, [57..64) pad = 1.26
+  \draw[dat1] (10.08, 1.55) rectangle (10.26, 2.10);
+  \draw[pad]  (10.26, 1.55) rectangle (11.52, 2.10); \fill[white,opacity=0.78] (10.44,1.67) rectangle (11.34,1.98); \node[text=trapred!90!black,font=\tiny\bfseries] at (10.89,1.825) {+7B pad};
+  % [64..72) int8 = 1.44
+  \draw[dat8] (11.52, 1.55) rectangle (12.96, 2.10); \node at (12.24, 1.825) {\texttt{int8} (8B)};
+  % [72..76) int4 = 0.72, [76..78) int2 = 0.36, [78..80) tail pad = 0.36
+  \draw[dat4] (12.96, 1.55) rectangle (13.68, 2.10); \node[font=\tiny] at (13.32, 1.825) {\texttt{i4}};
+  \draw[dat2] (13.68, 1.55) rectangle (14.04, 2.10); \node[font=\tiny] at (13.86, 1.825) {\texttt{i2}};
+  \draw[pad]  (14.04, 1.55) rectangle (14.40, 2.10);
+
+  \foreach \b/\x in {0/0, 24/4.32, 32/5.76, 40/7.20, 48/8.64, 56/10.08, 64/11.52, 72/12.96, 80/14.40} {
+    \node[font=\tiny\ttfamily, text=gray!75!black] at (\x, 1.37) {\b};
+  }
+
+  % ==================== BOTTOM: events_good (64 Bytes) ====================
+  \node[anchor=west, font=\small\bfseries] at (0, 0.85) {(c) \texttt{events\_good}: 64 Aligned Bytes/Tuple (Saves 16 B/Row = 810 MB / 50M Rows)};
+
+  \draw[hdr]  (0, 0.02) rectangle (4.32, 0.57); \node at (2.16, 0.295) {Header (24B)};
+  \draw[dat8] (4.32, 0.02) rectangle (5.76, 0.57); \node at (5.04, 0.295) {\texttt{int8} (8B)};
+  \draw[dat8] (5.76, 0.02) rectangle (7.20, 0.57); \node at (6.48, 0.295) {\texttt{tstz} (8B)};
+  \draw[dat8] (7.20, 0.02) rectangle (8.64, 0.57); \node at (7.92, 0.295) {\texttt{int8} (8B)};
+  \draw[dat4] (8.64, 0.02) rectangle (9.36, 0.57); \node[font=\tiny] at (9.00, 0.295) {\texttt{i4}(4)};
+  \draw[dat2] (9.36, 0.02) rectangle (9.72, 0.57); \node[font=\tiny] at (9.54, 0.295) {\texttt{i2}};
+  \draw[dat2] (9.72, 0.02) rectangle (10.08, 0.57); \node[font=\tiny] at (9.90, 0.295) {\texttt{i2}};
+  \draw[dat1] (10.08, 0.02) rectangle (10.26, 0.57);
+  \draw[dat1] (10.26, 0.02) rectangle (10.44, 0.57);
+  \draw[pad]  (10.44, 0.02) rectangle (11.52, 0.57); \fill[white,opacity=0.8] (10.56,0.14) rectangle (11.40,0.45); \node[font=\tiny,text=trapred!85!black] at (10.98, 0.295) {tail 6B};
+
+  % Saved 16 bytes callout bracket from 11.52 to 14.40
+  \draw[dashed, thick, targetgreen!75!black] (11.52, 0.02) rectangle (14.40, 0.57);
+  \node[text=targetgreen!70!black, font=\scriptsize\bfseries] at (12.96, 0.295) {16 B saved / row!};
+
+  \foreach \b/\x in {0/0, 24/4.32, 32/5.76, 40/7.20, 48/8.64, 56/10.08, 58/10.44, 64/11.52, 80/14.40} {
+    \node[font=\tiny\ttfamily, text=gray!75!black] at (\x, -0.16) {\b};
+  }
+\end{tikzpicture}
+\caption{Byte-by-byte tuple layout and ``Column Tetris.'' Ordering columns from 8-byte alignment downward eliminates all 20 bytes of internal alignment holes in \texttt{events\_bad}, shrinking the \texttt{MAXALIGN}ed footprint from 80~bytes to 64~bytes.}
+\label{fig:ch02-tuple-tetris}
+\end{figure}
+
+\subsection{Decoding Real Disk Bytes with \texttt{pageinspect}}
+
+Nothing cements this byte arithmetic like inspecting a live PostgreSQL heap page yourself. The built-in \texttt{pageinspect} contrib extension exposes raw 8~KB blocks directly as SQL rows.
+
+\begin{labbox}
+Run the following session in any local PostgreSQL scratch database (superuser required for \texttt{get\_raw\_page}):
+\begin{lstlisting}[language=SQL]
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+
+INSERT INTO accounts VALUES
+    (1001, 'Ada',          50000,  true),
+    (1002, 'Grace Hopper', 125000, true),
+    (1003, 'Edsger',       90000,  false);
+
+SELECT lower, upper, special, pagesize
+FROM page_header(get_raw_page('accounts', 0));
+--  lower | upper | special | pagesize
+-- -------+-------+---------+----------
+--     36 |  8016 |    8192 |     8192
+
+SELECT lp, lp_off, lp_flags, lp_len, t_xmin, t_xmax, t_ctid,
+       t_infomask2, t_infomask, t_hoff, t_attrs
+FROM heap_page_item_attrs(get_raw_page('accounts', 0), 'accounts'::regclass);
+-- lp | lp_off | lp_flags | lp_len | t_xmin | t_ctid | mask2 | mask | hoff
+-- ---+--------+----------+--------+--------+--------+-------+------+-----
+--  1 |   8136 |        1 |     49 |    742 | (0,1)  |     4 | 2306 |   24
+--      t_attrs: {"\\xe903000000000000","\\x09416461","\\x50c3000000000000","\\x01"}
+--  2 |   8072 |        1 |     57 |    742 | (0,2)  |     4 | 2306 |   24
+--      t_attrs: {"\\xea03000000000000","\\x1b477261636520486f70706572","\\x48e8010000000000","\\x01"}
+--  3 |   8016 |        1 |     49 |    742 | (0,3)  |     4 | 2306 |   24
+--      t_attrs: {"\\xeb03000000000000","\\x0f456473676572","\\x905f010000000000","\\x00"}
+\end{lstlisting}
+Every single number from our hand calculation in Section~\ref{sec:ch02-slotted-page} appears verbatim. Look closer at Row~1's fields on an x86-64 (little-endian) Linux machine:
+\begin{itemize}
+  \item \texttt{t\_infomask2 = 4}: 4 columns (\texttt{natts = 4}), zero HOT flags.
+  \item \texttt{t\_infomask = 2306 = 0x0902}: Bitwise OR of \texttt{0x0002} (\texttt{HEAP\_HASVARWIDTH}, because \texttt{owner\_name} is \texttt{TEXT}), \texttt{0x0100} (\texttt{HEAP\_XMIN\_COMMITTED}), and \texttt{0x0800} (\texttt{HEAP\_XMAX\_INVALID}, meaning nobody has deleted Row~1).
+  \item \texttt{t\_attrs[1] = \textbackslash{}xe903000000000000}: Little-endian 8-byte integer $\texttt{0x03e9} = 3 \times 256 + 233 = \mathbf{1001}$.
+  \item \texttt{t\_attrs[2] = \textbackslash{}x09416461}: Why does the 3-byte string \texttt{'Ada'} (\texttt{0x41 0x64 0x61}) start with the single header byte \texttt{0x09}? Because $1 + 3 = 4$ total bytes encoded as a \textbf{short 1-byte \texttt{varlena} header} is $(4 \ll 1) \mid 1 = 9 = \texttt{0x09}$. And notice the hidden Column Tetris flaw inside \texttt{accounts}: placing \texttt{owner\_name} (4~B ending at byte~36) \emph{before} \texttt{balance\_cents BIGINT} forced 4 wasted alignment padding bytes (\texttt{[36..40)}) that brought \texttt{lp\_len} to $24 + 8 + 4 + 4 + 8 + 1 = \mathbf{49\text{ B}}$. Moving \texttt{owner\_name} to the end of \texttt{accounts} drops \texttt{lp\_len} to $24 + 8 + 8 + 1 + 4 = \mathbf{45\text{ B}}$, shrinking the aligned page footprint of Row~1 from \textbf{56 bytes down to 48 bytes}.
+\end{itemize}
+\end{labbox}
+
+% ======================================================================
+\section{TOAST: The Oversized-Attribute Storage Technique}
+\label{sec:ch02-toast}
+% ======================================================================
+
+Stop and ask an uncomfortable question about fixed 8,192-byte pages. Every \texttt{ItemIdData} slot points to a single tuple inside a single 8~KB block, and after subtracting the 24-byte page header plus one 4-byte line pointer, at most $\texttt{MaxHeapTupleSize} = 8{,}160$ bytes exist on an empty page. Yet PostgreSQL lets you insert a \textbf{400~KB} JSON document or a \textbf{50~MB} \texttt{TEXT} report into a single column. Where do those bytes go if a heap tuple is forbidden from spanning two 8~KB pages?
+
+First, why \emph{does} PostgreSQL forbid tuples from straddling page boundaries? Because keeping every heap tuple self-contained inside one 8~KB frame keeps the entire storage engine simple and fast:
+\begin{itemize}
+  \item Reading a row by \texttt{ctid = (block, slot)} pins \textbf{one} buffer frame and acquires \textbf{one} content lock---no multi-page latch deadlocks.
+  \item Every 8~KB page carries a single \texttt{pd\_lsn} for Write-Ahead Logging and crash recovery (Chapter~4).
+  \item In-page compaction (\texttt{PageRepairFragmentation}) is a local \texttt{memmove} inside a single 8,192-byte C array.
+\end{itemize}
+In fact, PostgreSQL goes further: to keep sequential scans and page packing healthy, it wants \emph{at least four tuples} to fit on every 8~KB heap page whenever possible. That sets the threshold $\texttt{TOAST\_TUPLE\_THRESHOLD} \approx \mathbf{2{,}000\text{ bytes}}$ (specifically $2{,}032$ bytes on 64-bit builds with 8~KB pages: $(8{,}192 - 40) / 4 = 2{,}038$, rounded down to a multiple of 8). Whenever an inserted or updated row would exceed roughly $2\text{ KB}$, PostgreSQL invokes \textbf{TOAST}---\emph{The Oversized-Attribute Storage Technique} (\texttt{src/backend/access/common/toast\_internals.c}).
+
+\subsection{Inside \texttt{varlena} Headers: Saving 3 to 6 Bytes on Every Short String}
+
+Before TOAST even touches a large string, PostgreSQL optimizes \emph{small} variable-length values (\texttt{TEXT}, \texttt{VARCHAR}, \texttt{BYTEA}, \texttt{NUMERIC}, \texttt{JSONB}) using a polymorphic C header family called \textbf{\texttt{varlena}} (\emph{variable-length array}, defined in \texttt{src/include/varatt.h}).
+
+Naive implementations prepend a 4-byte (\texttt{uint32}) length word to every string. On a 3-letter string like \texttt{'USD'} or \texttt{'Ada'}, a 4-byte header plus up to 3 bytes of 4-byte CPU alignment padding would burn \textbf{7 overhead bytes} just to store 3 ASCII characters. On little-endian architectures (x86-64 and ARM64 Linux), PostgreSQL inspects the \textbf{lowest two bits of the very first byte} in memory to distinguish four physical layouts:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllp{5.8cm}@{}}
+\toprule
+\textbf{First-Byte Tag} & \textbf{Variant (\texttt{varatt.h})} & \textbf{Align} & \textbf{Payload \& Max Capacity} \\
+\midrule
+\texttt{xxxxxx00} (2b) & 4B uncompressed (\texttt{va\_4byte}) & 4 B (\texttt{'i'}) & Upper 30 bits = total len up to $2^{30}-1$ (\textbf{1~GB}) \\
+\texttt{xxxxxx10} (2b) & 4B compressed (\texttt{va\_compressed}) & 4 B (\texttt{'i'}) & +4B \texttt{tcinfo} (raw size + \texttt{pglz}/\texttt{lz4} codec ID) \\
+\texttt{xxxxxxx1} ($\neq \texttt{0x01}$) & \textbf{1B short} (\texttt{va\_1byte}) & \textbf{1 B (\texttt{'c'})} & Upper 7 bits = total len $1\dots 127$ (\textbf{0..126 data B}) \\
+\texttt{00000001} (\texttt{0x01}) & \textbf{18B TOAST pointer} & \textbf{1 B (\texttt{'c'})} & Byte~1 = tag (\texttt{18}); bytes \texttt{2..18} = \texttt{varatt\_external} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Note the 1-byte short header (\texttt{xxxxxxx1}). Any \texttt{TEXT}, \texttt{VARCHAR}, or \texttt{NUMERIC} value up to \textbf{126 bytes} long needs only \textbf{1 byte of length header} \emph{and} drops from 4-byte alignment to \textbf{1-byte alignment} (zero pre-padding). That is why \texttt{VARCHAR(20)} is never physically smaller on disk than \texttt{TEXT} in PostgreSQL: both use the exact same 1-byte \texttt{varlena} representation.
+
+And look at the fourth row: when byte~0 equals exact \texttt{0x01} and byte~1 equals \texttt{VARTAG\_ONDISK (18)}, the entire giant column inside the main heap tuple is replaced by a compact \textbf{18-byte TOAST pointer} (\texttt{struct varatt\_external}):
+
+\begin{lstlisting}[language=C]
+/* From src/include/varatt.h -- 16-byte payload inside an 18-byte TOAST pointer */
+typedef struct varatt_external
+{
+    int32    va_rawsize;     /* Original uncompressed size (incl. 4B header) */
+    uint32   va_extinfo;     /* Lower 30 bits: stored size; upper 2: codec   */
+    Oid      va_valueid;     /* Unique chunk_id inside the TOAST table       */
+    Oid      va_toastrelid;  /* OID of pg_toast.pg_toast_<table_oid>         */
+} varatt_external;
+\end{lstlisting}
+
+\subsection{The Four TOAST Strategies and \texttt{pg\_toast} Chunk Slicing}
+
+Every column in \texttt{pg\_attribute} carries a 1-character \texttt{attstorage} policy telling TOAST what transformations are permitted when a tuple crosses $\texttt{TOAST\_TUPLE\_THRESHOLD}$ ($\approx 2{,}000\text{ B}$):
+
+\begin{enumerate}
+  \item \textbf{\texttt{PLAIN} (\texttt{'p'})}: Used by fixed-width types (\texttt{BIGINT}, \texttt{BOOLEAN}, \texttt{TIMESTAMPTZ}, \texttt{UUID}). Never compressed, never moved out-of-line.
+  \item \textbf{\texttt{EXTENDED} (\texttt{'x'}, the default for \texttt{TEXT}, \texttt{BYTEA}, \texttt{JSONB}, \texttt{NUMERIC})}: Permits \emph{both} inline compression (\texttt{pglz} by default, or much faster \texttt{lz4} when \texttt{default\_toast\_compression = 'lz4'}) \emph{and} out-of-line storage in the companion TOAST table.
+  \item \textbf{\texttt{EXTERNAL} (\texttt{'e'})}: Permits out-of-line TOAST storage while \textbf{disabling compression}. Why disable compression? Two practical reasons: if a \texttt{BYTEA} column already holds pre-compressed PNGs, Zstandard archives, or random ciphertext, running \texttt{pglz} wastes CPU cycles for zero byte savings; and if queries extract slices of a large string via \texttt{substring(payload, 50000, 80)}, an uncompressed \texttt{EXTERNAL} column lets PostgreSQL compute the exact chunk number and read \textbf{one 2~KB chunk} instead of fetching and decompressing all chunks from byte~0.
+  \item \textbf{\texttt{MAIN} (\texttt{'m'})}: Permits inline compression and fights hard to keep the attribute \textbf{inside the main heap page}, evicting it out-of-line only as a last resort when the row still exceeds $\texttt{MaxHeapTupleSize}$ ($8{,}160\text{ B}$) after all \texttt{EXTENDED} and \texttt{EXTERNAL} columns have already been moved out.
+\end{enumerate}
+
+If no column is allowed to leave the page, an oversized row is rejected rather than split across two pages:
+\begin{lstlisting}[language=SQL]
+CREATE TABLE notes (body TEXT);
+ALTER TABLE notes ALTER COLUMN body SET STORAGE PLAIN;
+INSERT INTO notes SELECT repeat('x', 9000);
+-- ERROR:  row is too big: size 9028, maximum size 8160
+\end{lstlisting}
+The size is the 24-byte tuple header, the 4-byte \texttt{varlena} length word, and the 9,000 payload bytes; 8,160 is \texttt{MaxHeapTupleSize}, the 8,192-byte page minus its 24-byte header, minus one 4-byte line pointer, rounded down to a multiple of 8.
+
+When a variable-length value is evicted out-of-line, where does it land? Whenever you create a table with at least one TOASTable column, PostgreSQL automatically creates a hidden companion heap table \texttt{pg\_toast.pg\_toast\_}$\langle\text{oid}\rangle$ (linked via \texttt{pg\_class.reltoastrelid}) with three columns and a unique B-tree index on \texttt{(chunk\_id, chunk\_seq)}:
+
+\begin{lstlisting}[language=SQL]
+-- Conceptual schema of pg_toast.pg_toast_24576:
+--   chunk_id   OID    (matches varatt_external.va_valueid)
+--   chunk_seq  INT4   (0, 1, 2, ... in byte order)
+--   chunk_data BYTEA  (up to TOAST_MAX_CHUNK_SIZE ~= 1,996 bytes each)
+--   PRIMARY KEY (chunk_id, chunk_seq)
+\end{lstlisting}
+
+\begin{example}[Counting TOAST Chunks by Hand]
+\label{ex:ch02-toast-chunks}
+Suppose we add \texttt{audit\_json JSONB} (\texttt{EXTENDED}, \texttt{lz4}) to \texttt{accounts} (\texttt{oid = 24576}) and insert a row whose \texttt{audit\_json} serializes to $30{,}720\text{ bytes}$ ($30\text{ KiB}$).
+\begin{enumerate}
+  \item Because $30{,}720 + 49 > 2{,}032$, \texttt{toast\_insert\_or\_update} first compresses \texttt{audit\_json} with \texttt{lz4}, shrinking it to, say, \textbf{$9{,}000\text{ bytes}$}.
+  \item $9{,}000 + 49 = 9{,}049\text{ B}$ still exceeds $\texttt{TOAST\_TUPLE\_TARGET}$ ($2{,}032\text{ B}$), so PostgreSQL moves the compressed blob out-of-line.
+  \item Each TOAST chunk holds at most $\texttt{TOAST\_MAX\_CHUNK\_SIZE} = 1{,}996\text{ bytes}$ (sized so 4 TOAST chunk rows plus their headers and line pointers pack cleanly onto one 8,192-byte TOAST page). Slicing $9{,}000\text{ bytes}$ produces:
+  \[
+    \ceil*{\frac{9{,}000}{1{,}996}} = \mathbf{5\text{ chunks}} \quad (\texttt{chunk\_seq} = 0, 1, 2, 3\text{ of }1{,}996\text{ B each, plus }\texttt{chunk\_seq} = 4\text{ of }1{,}016\text{ B}).
+  \]
+  \item Those 5 rows are inserted into \texttt{pg\_toast.pg\_toast\_24576} under a fresh \texttt{chunk\_id}, while the \texttt{accounts} tuple in the main heap shrinks \texttt{audit\_json} down to an \textbf{18-byte TOAST pointer} (total main tuple $\texttt{lp\_len} = 49 + 18 = 67\text{ B}$, aligned to $72\text{ B}$, setting \texttt{HEAP\_HASEXTERNAL} in \texttt{t\_infomask}).
+\end{enumerate}
+\end{example}
+
+\begin{applicationbox}
+Understanding that 18-byte pointer explains two production behaviors:
+\begin{itemize}
+  \item \textbf{Why \texttt{SELECT *} on wide tables is slow}: If an ORM runs \texttt{SELECT * FROM accounts WHERE is\_active}, PostgreSQL must \emph{detoast} every matching row---probing \texttt{pg\_toast\_24576\_index}, fetching 5 chunk rows, and decompressing 30~KB of JSON that your application code immediately throws away. Projecting only the columns you need (\texttt{SELECT account\_id, balance\_cents FROM accounts WHERE is\_active}) scans $110+$ compact rows per 8~KB main heap page and \textbf{never opens the TOAST table at all}.
+  \item \textbf{Why \texttt{UPDATE} on narrow columns stays cheap}: When you run \texttt{UPDATE accounts SET balance\_cents = balance\_cents + 500 WHERE account\_id = 1001}, PostgreSQL writes a new version of the main heap tuple (Chapter~5), sees that \texttt{audit\_json} was untouched, and \textbf{copies the 18-byte \texttt{varatt\_external} pointer verbatim} into the new tuple without duplicating or rewriting a single byte in \texttt{pg\_toast\_24576}. (Conversely, an \texttt{UPDATE} that appends one key to a 10~MB \texttt{JSONB} column must rewrite all 10~MB of TOAST chunks.)
+\end{itemize}
+\end{applicationbox}
+
+% ======================================================================
+\section{Double Buffering, \texttt{shared\_buffers}, Pins, and Clock-Sweep}
+\label{sec:ch02-buffer-pool}
+% ======================================================================
+
+So far we have inspected 8~KB pages on disk. Now let us trace how a running PostgreSQL server moves those 8~KB blocks between NVMe storage and RAM.
+
+PostgreSQL uses a multi-process architecture: each client connection talks to a dedicated \texttt{postgres} backend OS process, and all backend processes attach to a single large shared-memory region allocated at server startup called \textbf{\texttt{shared\_buffers}} (\texttt{src/backend/storage/buffer/bufmgr.c}). Every read or write of a heap, index, FSM, or VM block goes through \texttt{shared\_buffers} first.
+
+\subsection{Why Not Just Rely on the Linux Page Cache? (Double Buffering)}
+
+When a backend misses in \texttt{shared\_buffers}, it calls \texttt{pread()} on the segment file descriptor. Notice what Linux does inside \texttt{pread()}: the kernel reads the NVMe sectors into the \textbf{Linux OS page cache} first, and then copies those 8,192 bytes into PostgreSQL's \texttt{shared\_buffers} frame. For a while, the exact same 8~KB block sits in RAM \emph{twice}---once in kernel page cache and once in \texttt{shared\_buffers}. This phenomenon is called \textbf{double buffering}, and it explains why seasoned PostgreSQL DBAs typically set \texttt{shared\_buffers} to \textbf{25\%--40\% of total machine RAM} (leaving the remaining RAM to double as an effective secondary victim cache in the Linux kernel plus working memory for sorts and hashes) rather than 90\% of RAM.
+
+Why doesn't PostgreSQL abandon \texttt{shared\_buffers} and simply \texttt{mmap()} its heap files straight out of the Linux page cache? Two fundamental reasons forbid it:
+\begin{enumerate}
+  \item \textbf{Strict Write-Ordering for Crash Safety (The WAL Rule)}: In Chapter~4 we will prove the iron law of durability: \emph{a dirty 8~KB heap page must never reach disk before the WAL record describing its mutation (\texttt{pd\_lsn}) has been \texttt{fsync}ed to disk}. If PostgreSQL mutated \texttt{mmap}ped kernel pages directly, Linux's background writeback threads could flush a half-committed dirty page to NVMe behind PostgreSQL's back before its WAL record hit disk, causing unrecoverable database corruption on a power outage. Keeping dirty pages inside user-space \texttt{shared\_buffers} guarantees the OS kernel \emph{never even sees} the modified bytes until PostgreSQL explicitly verifies $\texttt{FlushedWAL} \ge \texttt{pd\_lsn}$ and issues \texttt{pwrite()}.
+  \item \textbf{Zero-Syscall Shared-Memory Reads}: Hitting a hot root B-tree block inside \texttt{shared\_buffers} executes entirely in user space---one hash-table probe and one atomic CPU instruction, with zero user-to-kernel context switches and zero 8~KB \texttt{memcpy} overhead. (Modern PostgreSQL~17 and~18 are going a step further by adding asynchronous Direct I/O and \texttt{io\_uring} paths that eventually let large installations bypass double buffering on the OS side too.)
+\end{enumerate}
+
+\subsection{Inside \texttt{shared\_buffers}: Hash Partitions and \texttt{BufferDesc.state}}
+
+Think of \texttt{shared\_buffers} with $N$ frames (for instance, $\texttt{shared\_buffers = 16GB} \implies N = 2{,}097{,}152$ frames of 8~KB each) as three parallel structures in shared memory (\path{src/include/storage/buf_internals.h}):
+\begin{enumerate}
+  \item \textbf{\texttt{BufferBlocks}}: A contiguous array of $N$ raw 8,192-byte page frames (\texttt{buf\_id = 0 .. N-1}).
+  \item \textbf{Shared Buffer Lookup Hash Table}: Maps a 20-byte \texttt{BufferTag} = \texttt{(RelFileLocator, ForkNumber, BlockNumber)} to its integer frame slot \texttt{buf\_id}. To prevent 64 CPU cores from bottlenecking on one global hash-table lock, PostgreSQL splits the hash bucket space across \textbf{\texttt{NUM\_BUFFER\_PARTITIONS = 128} independent \texttt{LWLock} partitions}: two backends looking up different blocks hash to different lock partitions almost 99.2\% of the time.
+  \item \textbf{\texttt{BufferDescriptors}}: An array of $N$ compact \textbf{64-byte} metadata headers (\texttt{BufferDesc}, padded to match one CPU L1 cache line so adjacent frames never suffer false sharing).
+\end{enumerate}
+
+Look inside \texttt{BufferDesc} at how PostgreSQL packs a buffer's reference count, clock-sweep popularity score, and status flags into a \textbf{single 32-bit atomic integer} (\texttt{pg\_atomic\_uint32 state}):
+
+\begin{lstlisting}[language=C]
+/* Simplified from src/include/storage/buf_internals.h */
+typedef struct BufferDesc
+{
+    BufferTag        tag;          /* (RelFileLocator, ForkNumber, BlockNumber) */
+    int              buf_id;       /* Frame index 0 .. NBuffers-1               */
+
+    /* Single 32-bit atomic word: [31..22 flags | 21..18 usage | 17..0 refcount] */
+    pg_atomic_uint32 state;
+
+    int              wait_backend_pgprocno; /* For cleanup-lock waiters         */
+    int              freeNext;              /* Link in initial free list        */
+    LWLock           content_lock;          /* Shared/Exclusive page byte lock  */
+} BufferDesc;
+
+/* Exact bit layout of BufferDesc.state:
+ *   Bits  0..17 (18 bits): refcount (pin count, up to 262,143 concurrent pins!)
+ *   Bits 18..21 ( 4 bits): usage_count (clock-sweep popularity, capped 0..5)
+ *   Bits 22..31 (10 bits): BM_LOCKED, BM_DIRTY, BM_VALID, BM_TAG_VALID,
+ *                          BM_IO_IN_PROGRESS, BM_PERMANENT, ...
+ */
+\end{lstlisting}
+
+Why pack \texttt{refcount}, \texttt{usage\_count}, and \texttt{BM\_DIRTY} into one 32-bit word? Because in older PostgreSQL releases, pinning or unpinning a buffer had to acquire a per-buffer spinlock first; on multi-socket servers hammering a hot index root page, spinlock cache-line bouncing dominated CPU profiles. With the packed 32-bit \texttt{state} word, pinning a buffer and bumping its \texttt{usage\_count} executes in \textbf{one lock-free compare-and-swap (\texttt{CAS}) instruction} (and if \texttt{usage\_count} is already at its cap of $\texttt{BM\_MAX\_USAGE\_COUNT} = \mathbf{5}$, \texttt{PinBuffer} only adds $+1$ to \texttt{refcount}).
+
+\subsection{Buffer Pins (\texttt{refcount}) vs.\ Content Locks (\texttt{LWLock})}
+
+Two different mechanisms protect a buffer: \textbf{pinning} the buffer and \textbf{locking} its contents.
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{6.8cm}@{}}
+\toprule
+\textbf{Mechanism} & \textbf{Where Stored} & \textbf{What It Protects \& How Long It Is Held} \\
+\midrule
+\textbf{Pin} (\texttt{refcount > 0}) & \texttt{state[17:0]} & Prevents \emph{eviction} of the frame. Held across tuple evaluation; \textbf{never blocks} other readers or writers. \\
+\textbf{Shared Lock} (\texttt{LW\_SHARED}) & \texttt{content\_lock} & Protects \texttt{pd\_linp[]} / tuple bytes from concurrent \texttt{memmove}; held for \textbf{microseconds} while locating tuples. \\
+\textbf{Exclusive Lock} (\texttt{LW\_EXCLUSIVE}) & \texttt{content\_lock} & Acquired to insert/update tuples or modify header offsets; blocks other \texttt{LW\_SHARED}/\texttt{LW\_EXCLUSIVE} holders briefly. \\
+\textbf{Cleanup Lock} & \texttt{LW\_EXCLUSIVE} + $\texttt{ref}=1$ & Required by \texttt{PageRepairFragmentation} / \texttt{VACUUM} before sliding tuple bytes so no C pointer goes stale. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Trace what happens during a table scan to see why both mechanisms are indispensable:
+\begin{enumerate}
+  \item Your backend hashes \texttt{(accounts, MAIN\_FORK, block 0)} $\mapsto$ \texttt{buf\_id = 42}, increments \texttt{refcount} ($0 \to 1$, \textbf{pinned}), and acquires \texttt{content\_lock} in \texttt{LW\_SHARED} mode.
+  \item Under \texttt{LW\_SHARED}, it quickly checks MVCC visibility of the slots on Page~0, records the visible slots, and \textbf{immediately releases \texttt{content\_lock}}---while \emph{keeping its pin} ($\texttt{refcount} = 1$).
+  \item Now your backend evaluates expensive SQL \texttt{WHERE} functions or streams rows up the executor plan tree. Because \texttt{content\_lock} was released, another backend can simultaneously acquire \texttt{LW\_EXCLUSIVE} on Page~0, \texttt{INSERT} Row~4 into the central free gap, and commit without waiting for your scan. Meanwhile, because your pin keeps $\texttt{refcount} \ge 1$, neither the clock-sweep evictor nor \texttt{VACUUM}'s byte-sliding compaction is allowed to overwrite or shift the live tuple bytes your C pointer is reading.
+  \item Once your scan steps to Page~1, it decrements Page~0's \texttt{refcount} ($1 \to 0$, \textbf{unpinned}).
+\end{enumerate}
+
+\subsection{Clock-Sweep Eviction: Step-by-Step Trace on a 6-Frame Pool}
+
+What happens when every frame in \texttt{shared\_buffers} is occupied and a backend requests a block not in RAM?
+
+Textbooks teach doubly-linked \textbf{Least Recently Used (LRU)} queues: every time a page is read, unlink its node and move it to the head of the global queue. On a 64-core database serving $2{,}000{,}000$ buffer hits per second, a textbook LRU list does not scale: every read hit mutates the global list head pointers, serializing all 64 cores on a single cache line. You may have built this textbook LRU in Java~6 as \texttt{new LinkedHashMap<K,V>(16, 0.75f, true)} with an overridden \texttt{removeEldestEntry}. With access order turned on, every \texttt{get()} relinks the entry to the tail, so a read is a write; wrapping the map in \texttt{Collections.synchronizedMap} makes every cache hit take the same lock. That lock is exactly the bottleneck clock-sweep avoids.
+
+PostgreSQL instead uses \textbf{Clock-Sweep} (a generalized Second-Chance / NFU clock algorithm in \texttt{StrategyGetBuffer}, \texttt{src/backend/storage/buffer/freelist.c}):
+\begin{itemize}
+  \item \textbf{On a buffer hit (the 99\% fast path)}: Touch \emph{nothing} global. Locally increment that frame's 4-bit \texttt{usage\_count} up to the ceiling of \textbf{5} ($\min(\text{usage\_count} + 1, 5)$). Why cap at 5 instead of 15? If a hot page accumulated $\texttt{usage\_count} = 15$, a sudden workload shift would force the clock hand to spin around the entire buffer pool 15 times before evicting old pages.
+  \item \textbf{On a buffer miss (eviction path)}: Advance the shared clock hand \texttt{nextVictimBuffer} modulo $N$, inspecting \texttt{BufferDescriptors[hand]} at each step:
+  \begin{enumerate}
+    \item \textbf{If $\texttt{refcount} > 0$ (currently pinned)}: Cannot evict. Leave \texttt{usage\_count} untouched and advance $\texttt{hand} \leftarrow (\texttt{hand} + 1) \bmod N$.
+    \item \textbf{If $\texttt{refcount} = 0$ and $\texttt{usage\_count} > 0$}: Give the frame another life by decrementing $\texttt{usage\_count} \leftarrow \texttt{usage\_count} - 1$, and advance $\texttt{hand} \leftarrow (\texttt{hand} + 1) \bmod N$.
+    \item \textbf{If $\texttt{refcount} = 0$ and $\texttt{usage\_count} = 0$}: \textbf{Victim found.} Pin the frame ($\texttt{refcount} = 1$), advance \texttt{hand} for the next caller, flush the old page if \texttt{BM\_DIRTY} is set (after enforcing $\texttt{FlushedWAL} \ge \texttt{pd\_lsn}$; normally PostgreSQL's background writer \texttt{bgwriter} pre-cleans upcoming low-usage dirty buffers ahead of the clock hand so user backends rarely pay this write cost), replace the hash-table \texttt{BufferTag}, and \texttt{pread()} the new 8~KB block into the frame with $\texttt{usage\_count} = 1$.
+  \end{enumerate}
+\end{itemize}
+
+\begin{example}[Tracing the Clock Hand Across 6 Buffer Frames]
+\label{ex:ch02-clock-trace}
+Consider a 6-frame pool (\texttt{F0..F5}) with \texttt{nextVictimBuffer} starting at \textbf{Frame~0} and initial states \texttt{(refcount, usage)}:
+\[
+  \texttt{F0:(1, 3)}, \quad \texttt{F1:(0, 2)}, \quad \texttt{F2:(0, 1)}, \quad \texttt{F3:(2, 0)}, \quad \texttt{F4:(0, 1)}, \quad \texttt{F5:(0, 2)}.
+\]
+Watch how \texttt{StrategyGetBuffer} finds a victim when a backend misses on \texttt{accounts} block~9:
+\begin{enumerate}
+  \item \textbf{Tick 1 (Frame 0)}: $\texttt{refcount} = 1 > 0$ (pinned). Skip immediately; \texttt{F0} stays \texttt{(1, 3)}. Hand $\to$ \texttt{F1}.
+  \item \textbf{Tick 2 (Frame 1)}: $\texttt{refcount} = 0, \texttt{usage} = 2 > 0$. Decrement $\texttt{usage}: 2 \to 1$. Hand $\to$ \texttt{F2}.
+  \item \textbf{Tick 3 (Frame 2)}: $\texttt{refcount} = 0, \texttt{usage} = 1 > 0$. Decrement $\texttt{usage}: 1 \to \mathbf{0}$. Hand $\to$ \texttt{F3}.
+  \item \textbf{Tick 4 (Frame 3)}: Even though $\texttt{usage} = 0$, $\texttt{refcount} = 2 > 0$ (two backends hold pins on \texttt{F3}). Pinned frames are immune to eviction; skip \texttt{F3}. Hand $\to$ \texttt{F4}.
+  \item \textbf{Tick 5 (Frame 4)}: $\texttt{refcount} = 0, \texttt{usage} = 1 > 0$. Decrement $\texttt{usage}: 1 \to 0$. Hand $\to$ \texttt{F5}.
+  \item \textbf{Tick 6 (Frame 5)}: $\texttt{refcount} = 0, \texttt{usage} = 2 > 0$. Decrement $\texttt{usage}: 2 \to 1$. Hand wraps $\to$ \texttt{F0}.
+  \item \textbf{Tick 7 (Frame 0)}: Still pinned ($\texttt{refcount} = 1$). Skip. Hand $\to$ \texttt{F1}.
+  \item \textbf{Tick 8 (Frame 1)}: $\texttt{refcount} = 0, \texttt{usage} = 1 > 0$. Decrement $\texttt{usage}: 1 \to 0$. Hand $\to$ \texttt{F2}.
+  \item \textbf{Tick 9 (Frame 2)}: $\texttt{refcount} = 0$ \textbf{and} $\texttt{usage} = 0$! \textbf{Frame~2 is evicted.} It loads \texttt{accounts} block~9 with state \texttt{(refcount=1, usage=1)}, and \texttt{nextVictimBuffer} parks at \textbf{Frame~3} ready for the next miss.
+\end{enumerate}
+\end{example}
+
+\subsection{Buffer Access Strategies: Why a 500 GB \texttt{Seq Scan} Doesn't Wipe Out RAM}
+
+Example~\ref{ex:ch02-clock-trace} has a weakness. Suppose your production server has $\texttt{shared\_buffers = 16 GB}$ ($2{,}097{,}152$ frames) holding your entire hot OLTP working set of customer accounts and B-tree indexes at $\texttt{usage\_count} = 5$. At 2:00~PM, an analyst runs an unindexed reporting query:
+\begin{lstlisting}[language=SQL]
+SELECT count(*), sum(amount_cents) FROM historical_ledger; -- 500 GB cold table!
+\end{lstlisting}
+Reading $500\text{ GB}$ streams $65{,}536{,}000$ cold blocks through the buffer manager---more than \textbf{31 times larger} than the entire 16~GB pool. If every cold block used the global clock-sweep hand, the hand would spin around \texttt{shared\_buffers} dozens of times, decrementing every hot OLTP buffer's \texttt{usage\_count} from $5 \to 4 \to 3 \to 2 \to 1 \to 0$ and \textbf{evicting your entire hot OLTP cache} for blocks the reporting query reads once and never touches again.
+
+PostgreSQL prevents this cache pollution with \textbf{Buffer Access Strategies} (\emph{Ring Buffers}, \texttt{GetAccessStrategy} in \texttt{freelist.c}):
+\begin{itemize}
+  \item \textbf{\texttt{BAS\_BULKREAD} (32-frame = 256~KB ring)}: Whenever a sequential scan targets a table larger than $\texttt{shared\_buffers} / 4$, the executor allocates a tiny private array of \textbf{32 buffer IDs} ($32 \times 8\text{ KB} = \mathbf{256\text{ KB}}$). As the 500~GB scan streams blocks $0, 1, 2, \dots$, it cycles strictly around those 32 frames, immediately reusing the frame it read 32 blocks earlier (since its $\texttt{usage\_count} = 1$ and $\texttt{refcount} = 0$). What if a concurrent OLTP backend \emph{also} happened to read one of those 32 frames, bumping its $\texttt{usage\_count} > 1$ or pinning it? Then PostgreSQL \emph{graduates} that genuinely popular frame out of the ring into the main pool and pulls one fresh replacement frame. Thus a 500~GB sequential scan touches only 256~KB of \texttt{shared\_buffers}, leaving \textbf{99.998\%} of your hot OLTP cache untouched.
+  \item \textbf{\texttt{BAS\_BULKWRITE} (2,048-frame = 16~MB ring)}: Used by \texttt{COPY FROM}, \texttt{CREATE TABLE AS}, and \texttt{SELECT INTO} so bulk data loads stream through a 16~MB ring instead of flooding \texttt{shared\_buffers} with newly written pages.
+  \item \textbf{\texttt{BAS\_VACUUM} (default 2~MB ring via \texttt{vacuum\_buffer\_usage\_limit})}: Keeps background autovacuum workers inside a compact ring so routine dead-tuple cleanup never evicts user query caches.
+\end{itemize}
+
+\begin{connectionbox}
+Notice an unexpected bonus of \texttt{BAS\_BULKREAD} called \textbf{synchronized sequential scans} (\texttt{synchronize\_seqscans = on}): if Analyst~B launches a second \texttt{Seq Scan} on that same 500~GB \texttt{historical\_ledger} table halfway through Analyst~A's scan, PostgreSQL starts Analyst~B \emph{at the exact block Analyst~A is currently reading} (wrapping around to block~0 at the end) so both queries ride inside the same 256~KB cache window and cut disk I/O in half---which is also why Chapter~1 warned that \texttt{SELECT} without \texttt{ORDER BY} makes zero promise of returning rows starting from block~0.
+\end{connectionbox}
+
+\begin{figure}[htbp]
+\centering
+\resizebox{0.99\textwidth}{!}{%
+\begin{tikzpicture}[
+    font=\scriptsize,
+    arr/.style={-{Stealth[length=2.3mm,width=1.7mm]}, thick}
+]
+  % ==================== TOP: 32-Bit Atomic BufferDesc.state ====================
+  \node[anchor=west, font=\small\bfseries] at (0, 5.75) {(a) \texttt{BufferDesc.state} Packed 32-Bit Atomic Word (Lock-Free Pin \& Usage CAS)};
+
+  \filldraw[fill=trapred!14, draw=trapred!80!black, thick] (0, 4.75) rectangle (5.4, 5.45);
+  \node[align=center] at (2.7, 5.10) {\textbf{Status Flags (10 bits, \texttt{31..22})}\\ {\tiny \texttt{BM\_LOCKED \textbar{} BM\_DIRTY \textbar{} BM\_VALID \textbar{} ...}}};
+
+  \filldraw[fill=quotientorange!18, draw=quotientorange!85!black, thick] (5.4, 4.75) rectangle (9.6, 5.45);
+  \node[align=center] at (7.5, 5.10) {\textbf{\texttt{usage\_count} (4b, \texttt{21..18})}\\ {\tiny Clock popularity \texttt{0..5}}};
+
+  \filldraw[fill=sourceblue!14, draw=sourceblue!80!black, thick] (9.6, 4.75) rectangle (16.8, 5.45);
+  \node[align=center] at (13.2, 5.10) {\textbf{\texttt{refcount} Pin Count (18 bits, \texttt{17..0})}\\ {\tiny Active backend pins ($0 \dots 262{,}143$); $\texttt{refcount} > 0 \implies$ not evictable}};
+
+  \node[font=\tiny\ttfamily, text=gray!75!black] at (0.15, 4.55) {31};
+  \node[font=\tiny\ttfamily, text=gray!75!black] at (5.40, 4.55) {22 / 21};
+  \node[font=\tiny\ttfamily, text=gray!75!black] at (9.60, 4.55) {18 / 17};
+  \node[font=\tiny\ttfamily, text=gray!75!black] at (16.65, 4.55) {0};
+
+  % ==================== BOTTOM LEFT: Clock-Sweep 6-Frame Ring ====================
+  \node[font=\small\bfseries] at (3.6, 3.95) {(b) Clock-Sweep (\texttt{shared\_buffers})};
+
+  \begin{scope}[shift={(3.6, 1.55)}]
+    % Faint ellipse guide
+    \draw[dashed, gray!45, thick] (0, 0) ellipse (2.0cm and 1.85cm);
+    \fill[gray!60!black] (0, 0) circle (2.2pt);
+
+    % 6 frames placed on an ellipse so neighbours never touch
+    \node[draw=sourceblue!85!black, fill=sourceblue!12, rounded corners=2pt, thick, minimum width=1.80cm, align=center] (f0) at (0, 1.85) {\textbf{F0} {\tiny(pinned)}\\ {\tiny \texttt{ref=1, u=3}}};
+    \node[draw=gray!75, fill=white, rounded corners=2pt, thick, minimum width=1.80cm, align=center] (f1) at (2.05, 0.95) {\textbf{F1}\\ {\tiny \texttt{ref=0, u:2$\to$0}}};
+    \node[draw=targetgreen!85!black, fill=targetgreen!18, rounded corners=2pt, very thick, minimum width=1.85cm, align=center] (f2) at (2.05, -0.95) {\textbf{F2 (victim)}\\ {\tiny \texttt{ref=0, u=0}}};
+    \node[draw=sourceblue!85!black, fill=sourceblue!12, rounded corners=2pt, thick, minimum width=1.80cm, align=center] (f3) at (0, -1.85) {\textbf{F3} {\tiny(pinned)}\\ {\tiny \texttt{ref=2, u=0}}};
+    \node[draw=gray!75, fill=white, rounded corners=2pt, thick, minimum width=1.80cm, align=center] (f4) at (-2.05, -0.95) {\textbf{F4}\\ {\tiny \texttt{ref=0, u:1$\to$0}}};
+    \node[draw=gray!75, fill=white, rounded corners=2pt, thick, minimum width=1.80cm, align=center] (f5) at (-2.05, 0.95) {\textbf{F5}\\ {\tiny \texttt{ref=0, u:2$\to$1}}};
+
+    % Clock hand pointing to F2
+    \draw[-{Stealth[length=2.6mm,width=1.8mm]}, very thick, targetgreen!80!black] (0, 0) -- (1.05, -0.49);
+    \draw[-{Stealth[length=1.8mm]}, thick, quotientorange!85!black] (65:0.58cm) arc (65:-18:0.58cm);
+    \node[font=\tiny\bfseries, text=quotientorange!85!black] at (40:0.95cm) {sweep};
+  \end{scope}
+
+  % ==================== BOTTOM RIGHT: 256 KB BAS_BULKREAD Ring Bypass ====================
+  \node[font=\small\bfseries] at (12.45, 3.95) {(c) \texttt{BAS\_BULKREAD} 256 KB Ring Bypass};
+
+  % Main OLTP pool box (protected!) -- width 8.1 to 16.8 (8.7 cm)
+  \draw[rounded corners=3pt, thick, draw=sourceblue!80!black, fill=sourceblue!6] (8.1, 2.25) rectangle (16.8, 3.55);
+  \node[align=center] at (12.45, 2.90) {\textbf{Main \texttt{shared\_buffers} Pool (16 GB = 2M Frames)}\\
+    {\tiny Hot OLTP pages \& B-tree roots stay at \texttt{usage\_count = 5} (\textbf{99.998\% untouched})}};
+
+  % Small 32-frame ring below
+  \draw[rounded corners=3pt, very thick, draw=quotientorange!90!black, fill=quotientorange!10] (8.1, -0.45) rectangle (16.8, 1.55);
+  \node[anchor=north west, font=\scriptsize\bfseries, text=quotientorange!85!black] at (8.30, 1.47) {500 GB \texttt{Seq Scan} recycles 32-frame (256 KB) private ring:};
+
+  \foreach \i/\lbl in {0/R0, 1/R1, 2/R2, 3/{\dots}, 4/R30, 5/R31} {
+    \pgfmathsetmacro{\xx}{8.45 + \i*1.32}
+    \filldraw[fill=white, draw=quotientorange!85!black, thick] (\xx, 0.32) rectangle (\xx+1.04, 0.90);
+    \node[font=\tiny\bfseries] at (\xx+0.52, 0.61) {\lbl};
+  }
+  % Recycle loop arrow underneath R31 -> R0
+  \draw[arr, quotientorange!90!black] (15.57, 0.32) -- (15.57, 0.10) -- (8.97, 0.10) -- (8.97, 0.32);
+  \node[font=\tiny, text=quotientorange!90!black, anchor=north] at (12.27, 0.02) {reuses own frame ($\texttt{ref}=0, \texttt{u}=1$)};
+
+  % Graduation arrow up to main pool if u > 1
+  \draw[arr, targetgreen!80!black, thick] (14.25, 1.55) -- node[right, font=\tiny\bfseries, text=targetgreen!75!black] {graduates if \texttt{u > 1}} (14.25, 2.25);
+\end{tikzpicture}%
+}
+\caption{Shared buffer management in PostgreSQL: (a) the lock-free 32-bit \texttt{BufferDesc.state} word; (b) Clock-Sweep eviction skipping pinned frames (\texttt{F0}, \texttt{F3}) and decrementing \texttt{usage\_count} until \texttt{F2} hits $(0, 0)$; (c) the 256~KB \texttt{BAS\_BULKREAD} ring buffer isolating a 500~GB sequential scan from the hot OLTP working set.}
+\label{fig:ch02-clock-sweep-ring}
+\end{figure}
+
+\begin{complexitybox}
+\textbf{Physical Numbers Worth Memorizing}:
+\begin{itemize}
+  \item \textbf{Page size (\texttt{BLCKSZ})}: $8{,}192\text{ B}$ ($24\text{ B}$ \texttt{PageHeaderData} $\implies 8{,}168\text{ B}$ usable; $4\text{ B}$ per \texttt{ItemIdData} slot).
+  \item \textbf{Segment size (\texttt{RELSEG\_SIZE})}: $131{,}072\text{ blocks} = 1\text{ GiB}$ per physical file; max standard table $\approx 32\text{ TiB}$.
+  \item \textbf{Companion forks}: \texttt{\_fsm} = $1\text{ B}$/heap page in a binary max-heap tree; \texttt{\_vm} = $2\text{ bits}$/heap page ($32{,}672$ heap blocks $\approx 255\text{ MiB}$ per 8~KB VM block).
+  \item \textbf{Tuple header}: $23\text{ B}$ struct $\to$ $\texttt{t\_hoff} = 24\text{ B}$ (with 0 nulls, or with nulls and $\le 8$ columns); $+4\text{ B}$ slot + 8-byte \texttt{MAXALIGN} means \textbf{even a single-boolean row costs $4 + 32 = 36\text{ bytes}$} on a page.
+  \item \textbf{TOAST}: Triggers at $\approx 2{,}000\text{ B}$; short \texttt{varlena} uses $1\text{ B}$ header up to $126\text{ B}$; out-of-line pointer is $18\text{ B}$ pointing to $\approx 1{,}996\text{ B}$ chunks in \texttt{pg\_toast}.
+  \item \textbf{\texttt{shared\_buffers}}: $128$ hash lock partitions; $\texttt{usage\_count} \in \{0 \dots 5\}$; \texttt{BAS\_BULKREAD} sequential-scan ring = $32\text{ frames} = 256\text{ KB}$.
+\end{itemize}
+\end{complexitybox}
+
+% ======================================================================
+\section{Exercises}
+\label{sec:ch02-exercises}
+% ======================================================================
+
+\begin{exercise}[Segment File and Byte-Offset Arithmetic]
+\label{ex:ch02-seg-math}
+A production ledger table has \texttt{pg\_class.oid = 41200}, \texttt{pg\_class.relfilenode = 58910} inside database \texttt{oid = 16384}, and currently holds $420{,}000$ heap blocks.
+\begin{enumerate}[label=(\alph*)]
+  \item List the exact filenames (and exact byte sizes) of all main-fork segment files on disk under \texttt{\$PGDATA/base/16384/}.
+  \item An index lookup returns \texttt{ctid = (275000, 14)}. Which exact segment file does PostgreSQL open, at what byte offset inside that file does the 8~KB page begin, and at what exact byte offset inside that 8~KB page does the 4-byte \texttt{ItemIdData} for slot~14 sit?
+  \item How many 8~KB blocks does the Visibility Map file \texttt{58910\_vm} require to track all $420{,}000$ heap blocks?
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Tracing Slotted-Page Offsets and In-Page Compaction]
+\label{ex:ch02-page-trace}
+Start with a freshly initialized empty 8,192-byte heap page ($\texttt{pd\_lower} = 24$, $\texttt{pd\_upper} = 8{,}192$, $\texttt{pd\_special} = 8{,}192$). Four tuples with unpadded lengths $\texttt{lp\_len} = 52, 75, 40, 61$ bytes are inserted in order as Slots 1, 2, 3, and 4.
+\begin{enumerate}[label=(\alph*)]
+  \item Accounting for 8-byte \texttt{MAXALIGN} when carving tuple space from \texttt{pd\_upper}, give the exact values of \texttt{pd\_lower}, \texttt{pd\_upper}, contiguous free bytes, and each slot's \texttt{(lp\_off, lp\_flags, lp\_len)} after all four inserts.
+  \item Suppose Tuples~1 and~3 are deleted, their deleting transactions commit behind every active snapshot, and PostgreSQL runs \texttt{PageRepairFragmentation} (before index vacuuming). Give the new \texttt{pd\_lower}, \texttt{pd\_upper}, and all four slots' \texttt{(lp\_off, lp\_flags, lp\_len)}.
+  \item Next, \texttt{VACUUM} removes the index entries for Slots~1 and~3, marking those slots \texttt{LP\_UNUSED} and setting \texttt{PD\_HAS\_FREE\_LINES} in \texttt{pd\_flags}. A fifth tuple of length $\texttt{lp\_len} = 46$ bytes is now inserted. Which slot number does it receive, and what are the resulting \texttt{pd\_lower} and \texttt{pd\_upper}?
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Null Bitmaps and the 9th-Column \texttt{t\_hoff} Cliff]
+\label{ex:ch02-null-cliff}
+Consider two schemas where every column is \texttt{SMALLINT} (2 bytes, 2-byte aligned): \texttt{t8} has 8 \texttt{SMALLINT} columns, and \texttt{t9} has 9 \texttt{SMALLINT} columns. Compute \texttt{t\_hoff}, raw \texttt{lp\_len}, and the \texttt{MAXALIGN}ed page footprint (including the 4-byte \texttt{ItemIdData} slot) for:
+\begin{enumerate}[label=(\alph*)]
+  \item A row in \texttt{t8} with zero \texttt{NULL}s versus a row in \texttt{t8} where columns~2 and~7 are \texttt{NULL}.
+  \item A row in \texttt{t9} with zero \texttt{NULL}s versus a row in \texttt{t9} where column~9 alone is \texttt{NULL}. Explain why setting column~9 to \texttt{NULL} actually makes the row \emph{8 bytes larger} on the page than storing a concrete integer in column~9.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Column Tetris on a 100-Million-Row Sensor Table]
+\label{ex:ch02-tetris-calc}
+An IoT team proposes the following schema for a 100-million-row table (all columns \texttt{NOT NULL}):
+\begin{lstlisting}[language=SQL]
+CREATE TABLE telemetry (
+    online       BOOLEAN,
+    device_id    BIGINT,
+    firmware_ver SMALLINT,
+    recorded_at  TIMESTAMPTZ,
+    battery_pct  SMALLINT,
+    reading_val  DOUBLE PRECISION,
+    sensor_slot  BOOLEAN,
+    seq_no       INTEGER,
+    trace_uuid   UUID
+);
+\end{lstlisting}
+\begin{enumerate}[label=(\alph*)]
+  \item Compute the exact offset of every column, total internal + trailing padding bytes, \texttt{lp\_len}, \texttt{MAXALIGN}ed tuple size, rows per 8~KB page, and total table size in GiB for $100{,}000{,}000$ rows. (Watch \texttt{UUID}'s alignment carefully.)
+  \item Write an optimal \texttt{CREATE TABLE telemetry\_packed} ordering that minimizes tuple size without changing any column name or data type. Compute the new bytes saved per row, rows per 8~KB page, and total GiB saved across $100{,}000{,}000$ rows.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Decoding Raw Hex Bytes from \texttt{pageinspect}]
+\label{ex:ch02-hex-decode}
+On an x86-64 Linux PostgreSQL server, \texttt{heap\_page\_item\_attrs} on a 3-column table \texttt{(id INT4, code TEXT, price\_cents INT8)} returns a tuple with $\texttt{t\_hoff} = 24$, $\texttt{t\_infomask} = \texttt{0x0903}$, $\texttt{t\_bits} = \texttt{'10100000'}$, and \texttt{t\_attrs} $=$ \texttt{\{''\textbackslash{}x2a000000'', NULL, ''\textbackslash{}x1027000000000000''\}}.
+\begin{enumerate}[label=(\alph*)]
+  \item Decode the exact SQL values of \texttt{id}, \texttt{code}, and \texttt{price\_cents}, and explain every set bit of \texttt{t\_infomask = 0x0903}.
+  \item Compute the exact \texttt{lp\_len} of this tuple, paying close attention to alignment padding before \texttt{price\_cents} when \texttt{code} is \texttt{NULL}.
+  \item If \texttt{code} is updated from \texttt{NULL} to \texttt{'EUR'}, write the exact hex bytes of \texttt{t\_attrs[2]} (including its 1-byte \texttt{varlena} header) and compute the new \texttt{lp\_len}.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[TOAST Compression, Chunk Counts, and \texttt{EXTERNAL} Slicing]
+\label{ex:ch02-toast-math}
+A table \texttt{documents} with three \texttt{NOT NULL} columns (\texttt{doc\_id BIGINT}, \texttt{title TEXT}, \texttt{body TEXT}) stores a row with a 20-byte ASCII \texttt{title} and a $120{,}000$-byte \texttt{body}.
+\begin{enumerate}[label=(\alph*)]
+  \item Under default \texttt{EXTENDED} storage with \texttt{lz4}, \texttt{body} compresses by $3\times$ to $40{,}000$ bytes. How many rows are inserted into the \texttt{pg\_toast} table (assuming $\texttt{TOAST\_MAX\_CHUNK\_SIZE} = 1{,}996\text{ B}$), how many 8~KB TOAST heap pages do they occupy, and what is the exact \texttt{lp\_len} of the main heap row in \texttt{documents}?
+  \item Suppose a hot API endpoint runs \texttt{SELECT substring(body, 110000, 64) FROM documents WHERE doc\_id = \$1} ten thousand times per second. Compare the exact number of TOAST chunks fetched and decompressed per query under \texttt{EXTENDED} versus \texttt{ALTER TABLE documents ALTER COLUMN body SET STORAGE EXTERNAL}. When does \texttt{EXTERNAL} win despite using $3\times$ more disk space?
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Clock-Sweep Hand Simulation]
+\label{ex:ch02-clock-sim}
+A 5-frame toy buffer pool (\texttt{F0..F4}) starts with \texttt{nextVictimBuffer = F1} and states \texttt{(refcount, usage\_count)}:
+\[
+  \texttt{F0:(0, 3)}, \quad \texttt{F1:(1, 1)}, \quad \texttt{F2:(0, 2)}, \quad \texttt{F3:(0, 0)}, \quad \texttt{F4:(0, 4)}.
+\]
+\begin{enumerate}[label=(\alph*)]
+  \item Backend~A misses on block~10 and calls \texttt{StrategyGetBuffer}. Trace every tick of the clock hand, give the victim frame, the new state of all 5 frames (assuming Backend~A keeps block~10 pinned for a moment), and the new position of \texttt{nextVictimBuffer}.
+  \item Immediately afterward, Backend~A unpins its buffer ($\texttt{refcount}: 1 \to 0$) while Backend~B unpins \texttt{F1} ($\texttt{refcount}: 1 \to 0$), and Backend~C misses on block~11. Trace \texttt{StrategyGetBuffer} again from the current \texttt{nextVictimBuffer} until the second victim is chosen, listing the final \texttt{(refcount, usage\_count)} of every frame.
+\end{enumerate}
+\end{exercise}
+
+\begin{exercise}[Sizing Ring Buffers vs.\ Cache Pollution]
+\label{ex:ch02-ring-calc}
+A server has $\texttt{shared\_buffers} = 32\text{ GiB}$. Two workloads run concurrently: $4{,}000$ OLTP point lookups per second hitting a $20\text{ GiB}$ hot index/heap working set, and a batch ETL job running \texttt{Seq Scan} over a $2\text{ GiB}$ staging table \texttt{raw\_imports} ten times per minute.
+\begin{enumerate}[label=(\alph*)]
+  \item Using PostgreSQL's $\texttt{shared\_buffers} / 4$ threshold for \texttt{BAS\_BULKREAD}, determine whether \texttt{Seq Scan} on \texttt{raw\_imports} uses the 256~KB ring buffer or allocates straight from the main pool, and explain why.
+  \item Now suppose \texttt{raw\_imports} grows from $2\text{ GiB}$ to $12\text{ GiB}$. How does \texttt{Seq Scan}'s buffer allocation behavior suddenly change, and what happens to \texttt{EXPLAIN (ANALYZE, BUFFERS)} \texttt{shared hit} vs.\ \texttt{shared read} counts across consecutive scans of \texttt{raw\_imports}?
+\end{enumerate}
+\end{exercise}
+
+\chapterline
