@@ -1,20 +1,20 @@
 \chapter{Async Rust From Silicon to Tokio: State Machines, Pinning, and Cancellation}
 
-Throughout the first four parts of this book, almost every function we traced ran from top to bottom on a contiguous call stack. When a function called a helper, the CPU decremented the stack pointer, wrote a new frame, ran the helper to completion, popped the frame, and carried on. Even when we stepped outside synchronous code in Part~IV --- examining Kotlin's continuation-passing coroutines and Go's dynamically resized goroutine stacks --- we looked at concurrency models from the outside in, comparing trade-offs across languages.
+Throughout the first four parts of this book, almost every function we traced ran straight down a contiguous call stack. Calling a helper pushed a stack frame, ran the helper to completion, popped the frame, and carried on. Even in Part~IV---when we examined Kotlin's coroutines and Go's growable goroutine stacks---we compared concurrency models from the outside in.
 
-Now we open Part~V, where every concept we have built --- stack versus heap layout, destructive moves, lifetimes, algebraic data types, traits, monomorphization, and functional error pipelines --- converges on a single engineering goal: building a production-grade financial ledger and payment API in Rust using Axum, SQLx, and PostgreSQL.
+Now we open Part~V, where every tool from Parts~I--III comes together in one system. Stack layout, moves, lifetimes, enums, traits, monomorphization, and \texttt{Result} pipelines all serve one goal: building a production financial ledger in Rust with Axum, SQLx, and PostgreSQL.
 
-Why begin a financial backend capstone with the low-level mechanics of asynchronous I/O rather than jumping straight to HTTP routes and SQL tables? Because a payment service spends well over $99\%$ of its wall-clock execution time waiting on network wires. Consider what physically happens during one transfer request:
+Why start a financial backend capstone with asynchronous I/O before touching HTTP routes or SQL tables? A payment server spends well over $99\%$ of its wall-clock time waiting on networks and disks. Trace what physically happens during a single transfer request:
 \begin{enumerate}
-  \item Bytes trickle across a client's TLS connection into a kernel socket buffer as mobile packets arrive.
-  \item Your handler parses the JSON request and sends a parameterized query over a TCP socket to PostgreSQL.
-  \item Your process waits hundreds of microseconds to several milliseconds while PostgreSQL acquires row locks, appends redo records to its Write-Ahead Log, and flushes nonvolatile storage via \texttt{fsync}.
-  \item Your handler serializes the receipt and waits for the outbound socket buffer to drain back to the caller.
+  \item Client bytes trickle across a mobile TLS connection into a kernel socket buffer.
+  \item Your handler parses the JSON body and sends a parameterized SQL query over TCP to PostgreSQL.
+  \item Your process waits while PostgreSQL locks rows, appends to its Write-Ahead Log, and flushes storage via \texttt{fsync}.
+  \item Your handler formats the receipt and waits for the outbound socket buffer to drain back to the caller.
 \end{enumerate}
 
-At $3\text{ GHz}$, one millisecond of network and disk latency is three million clock cycles. How your programming language represents a paused request during those three million cycles determines two critical properties of a financial system. First, it governs capacity and tail latency: whether a single server handles $800$ concurrent requests before thrashing memory or $80{,}000$ requests with sub-millisecond scheduling overhead. Second, and far more subtly, it governs \emph{what happens when a wait is interrupted}: if a mobile client loses cellular signal halfway through a transfer, or a load-balancer timeout fires between two database calls, where does execution stop, which destructors run, and can half a financial mutation leak into permanent state?
+At $3\text{ GHz}$, one millisecond of network and disk latency equals three million CPU clock cycles. How a language represents a paused request during those cycles governs two things that make or break a ledger. First, it sets your capacity: whether one server stalls at $800$ concurrent requests or handles $80{,}000$ smoothly. Second, it decides \emph{what happens when a wait is cut short}. Suppose a mobile client drops offline mid-transfer, or a gateway timeout fires between two SQL statements. Where does execution stop, which destructors run, and can half a transfer leak into permanent state?
 
-In Rust, asynchronous functions are not scheduled by a virtual machine, nor do they allocate miniature call stacks. Instead, the compiler lowers each \texttt{async fn} into a plain, exact-sized \texttt{enum} state machine driven by a single three-line trait called \texttt{Future}. Once you see that transformation down to bytes and addresses, the signatures that confuse most newcomers --- \texttt{Pin<\&mut Self>}, \texttt{Unpin}, \texttt{Context<'\_>}, \texttt{Waker}, and \texttt{Send + 'static} --- each follow from one fact: a paused function's local variables are stored inside an ordinary Rust value that can be moved, shared, or dropped.
+Rust answers both questions without a virtual machine and without miniature per-task stacks. Remember our compiler pipeline from Chapter~1: \texttt{rustc} lowers source code into a control-flow graph (MIR) before handing it to LLVM. When \texttt{rustc} compiles an \texttt{async fn}, it cuts that function at every \texttt{.await} point and packs the surviving local variables into a plain, exact-sized \texttt{enum} state machine. Once you see that \texttt{enum} laid out in memory, every piece of Rust's async machinery---futures, wakeup handles, pinning, thread safety, and drop-based cancellation---follows from ordinary ownership rules.
 
 \chapterline
 
@@ -75,40 +75,40 @@ public final class BlockingTransferServer {
 
 For moderate concurrency --- say fifty internal corporate users --- this model is wonderfully straightforward. The sequential order of lines in \texttt{handleClient} matches the chronological order of events, local variables sit cleanly in stack frames, and \texttt{try}/\texttt{finally} scopes clean up resources.
 
-Now put this server at the edge of a retail payment gateway handling $25{,}000$ concurrent mobile connections over high-latency cellular networks, plus occasional downstream slowdowns when a fraud-scoring service or contested database row takes $200\text{ ms}$ instead of $2\text{ ms}$. By Little's Law, the average number of in-flight requests $L$ in a stationary system equals the arrival rate $\lambda$ times the mean residence time $W$:
+Now put this server at the edge of a retail payment gateway with $25{,}000$ mobile connections on slow cellular links. Add an occasional downstream hiccup where a contested database row takes $200\text{ ms}$ instead of $2\text{ ms}$. By Little's Law, the average number of in-flight requests $L$ equals the arrival rate $\lambda$ times the mean response time $W$:
 \[
   L = \lambda \cdot W.
 \]
-At $\lambda = 10{,}000\text{ requests/s}$ and $W = 2\text{ ms}$ ($0.002\text{ s}$), only $L = 20$ requests are simultaneously in flight. If network jitter and a brief downstream stall push $W$ to $1.5\text{ s}$, in-flight concurrency jumps immediately to $L = 15{,}000$ requests.
+At $\lambda = 10{,}000\text{ requests/s}$ and $W = 2\text{ ms}$ ($0.002\text{ s}$), only $L = 20$ requests are in flight at once. When network jitter or a brief database stall pushes $W$ to $1.5\text{ s}$, concurrency jumps straight to $L = 15{,}000$ in-flight requests.
 
-What happens when you ask an operating system and a Java~6 JVM to run $15{,}000$ threads? Two hardware walls appear at once: one in memory capacity, and one in CPU cache residency.
+What happens when you ask an operating system and a Java~6 JVM to run $15{,}000$ threads? Two hardware walls appear at once: one in memory capacity, and one in CPU caches.
 
 \subsection{The Memory Cost of Preallocated Call Stacks}
 
-An OS thread (a Linux \texttt{pthread}, which is a kernel task created via \texttt{clone}) can call arbitrary C functions, dynamic libraries, and recursive routines whose maximum stack depth the compiler cannot predict ahead of time. Because C and JVM native frames hold raw stack pointers into themselves, an OS thread stack \emph{cannot be moved or reallocated} once created; doing so would invalidate every frame pointer (\texttt{rbp}) and stack-local address inside it.
+An OS thread can call arbitrary C functions, native libraries, and recursive routines whose maximum call depth the compiler cannot predict in advance. Worse, native C and JVM stack frames hold raw addresses pointing into that stack. Once created, an OS thread stack \emph{cannot move in memory} without breaking every pointer into it.
 
-Consequently, Linux and the JVM reserve a large, contiguous virtual address range up front for every thread --- typically $1\text{ MiB}$ on 64-bit HotSpot (\texttt{-Xss1m}) and $2\text{ MiB}$ to $8\text{ MiB}$ for default glibc \texttt{pthread} stacks, bounded at the bottom by an unmapped $4\text{ KiB}$ guard page to trap stack overflow with \texttt{SIGSEGV}. Even if physical RAM pages are faulted in lazily on first touch, any thread that has traversed deep servlet filters, TLS buffers, JSON parsers, and JDBC drivers dirties $64\text{ KiB}$ to $256\text{ KiB}$ of physical pages --- pages the kernel can never reclaim while that thread remains alive in a pool, plus kernel-space stack memory ($16\text{ KiB}$ pinned per task on x86-64 Linux) and \texttt{task\_struct} scheduler metadata.
+The operating system and JVM must therefore reserve a large contiguous address range up front for every single thread. On 64-bit HotSpot, each thread reserves $1\text{ MiB}$ by default (\texttt{-Xss1m}), while Linux C threads reserve $2\text{ MiB}$ to $8\text{ MiB}$. Physical RAM pages are committed lazily as the stack grows, yet deep web filters, TLS buffers, JSON parsers, and database drivers quickly touch $64\text{ KiB}$ to $256\text{ KiB}$ per thread. As long as that pooled thread stays alive, the kernel cannot reclaim those dirty stack pages or its own per-thread kernel stack ($16\text{ KiB}$ on x86-64 Linux).
 
-Multiply $15{,}000$ threads by $1\text{ MiB}$ of virtual reservation and $128\text{ KiB}$ of resident stack + kernel pages: you burn $15\text{ GiB}$ of virtual address space and roughly $2\text{ GiB}$ of physical RAM \emph{merely to remember where paused functions were parked} while waiting on idle sockets. Worse, if you cap \texttt{newFixedThreadPool(512)} to avoid exhausting RAM, the moment $512$ slow mobile clients occupy those threads waiting to upload their request bodies, request $513$ --- even from a fast internal health check --- sits starving in an unbounded queue.
+Do the multiplication for $15{,}000$ threads. You reserve $15\text{ GiB}$ of virtual address space and burn roughly $2\text{ GiB}$ of physical RAM \emph{just to hold the stacks of functions sleeping on idle sockets}. Capping your pool at \texttt{newFixedThreadPool(512)} avoids running out of RAM, only to trade a crash for head-of-line blocking. As soon as $512$ slow mobile clients tie up all $512$ worker threads uploading request bodies, request~$513$---even a local health check---stalls in a queue.
 
 \subsection{The Hidden Tax of Kernel Context Switches}
 
-Even when RAM is plentiful, switching between thousands of runnable OS threads punishes modern superscalar silicon. When a blocking \texttt{recvfrom()} system call finds no unread bytes in the socket receive buffer, the CPU must:
+Even when RAM is plentiful, switching among thousands of OS threads slows modern CPUs down. When a blocking socket read finds no bytes ready yet, the operating system must put the calling thread to sleep:
 \begin{enumerate}
-  \item Trap from user mode (Ring~3) into kernel mode (Ring~0) via \texttt{syscall}, flushing parts of the instruction pipeline and applying Spectre/Meltdown page-table or branch-target mitigations where configured.
-  \item Append the current task onto the socket's wait queue, mark the task \texttt{TASK\_INTERRUPTIBLE}, and invoke the Linux CFS/EEVDF scheduler.
-  \item Save general-purpose and SIMD/vector registers, swap stack pointers and thread-local storage (\texttt{fs} segment base), and --- if switching processes --- reload \texttt{CR3} page-table roots.
+  \item The CPU crosses from unprivileged user code into the OS kernel via a system call.
+  \item The kernel parks the current thread on the socket's wait list and picks another runnable thread to execute.
+  \item The CPU saves the old thread's registers and stack pointer, loads the next thread's registers, and resumes execution.
 \end{enumerate}
 
-The direct register-and-kernel switch takes roughly $1.5$ to $4\text{ }\mu\text{s}$. The \emph{indirect} cost is often five to ten times larger: when Thread~A yields and $400$ other threads run before Thread~A wakes up again, Thread~A's $32\text{ KiB}$ L1 data cache, L1 instruction cache, L2 cache lines, and Translation Lookaside Buffer (TLB) entries have been evicted by those intervening stacks. Thread~A resumes on a cold CPU and stalls for hundreds of nanoseconds per cache miss while refetching its stack frame from DRAM.
+That direct kernel switch takes roughly $1.5$ to $4\text{ }\mu\text{s}$. The \emph{indirect} cache penalty is far larger. While Thread~A sleeps and $400$ other threads take turns on the core, their stacks evict Thread~A's working data from the core's fast L1 and L2 caches. When Thread~A finally wakes up, it resumes on a cold cache and stalls repeatedly while fetching its stack frame back from main memory.
 
 \subsection{Non-Blocking Sockets and Kernel Readiness (\texttt{epoll} and \texttt{io\_uring})}
 
-How do we wait on $50{,}000$ sockets using only $8$ OS threads (one per physical CPU core)? By separating \emph{waiting on I/O} from \emph{holding an OS thread}.
+How do we wait on $50{,}000$ sockets using only $8$ OS threads (one per CPU core)? By separating \emph{waiting on a network socket} from \emph{tying up an OS thread}.
 
-If you mark a Linux socket file descriptor with \texttt{O\_NONBLOCK} and call \texttt{read(fd, buf, len)} when no bytes have arrived yet, the kernel does \emph{not} put your thread to sleep. It returns immediately in a fraction of a microsecond with $-1$ and sets \texttt{errno = EAGAIN} (\texttt{EWOULDBLOCK} --- ``nothing ready right now; ask me later'').
+If you put a socket into non-blocking mode (\texttt{O\_NONBLOCK}) and call \texttt{read()} before data arrives, the kernel does \emph{not} put your thread to sleep. Instead, \texttt{read()} returns immediately with a status code (\texttt{EAGAIN}, meaning ``no bytes ready right now; ask again later'').
 
-Of course, looping over $50{,}000$ non-blocking sockets in user space calling \texttt{read()} over and over would burn $100\%$ CPU for nothing. Instead, modern operating systems expose kernel event multiplexers: \texttt{epoll} on Linux, \texttt{kqueue} on BSD/macOS, IOCP on Windows, and more recently Linux \texttt{io\_uring}. With \texttt{epoll}, a single worker thread registers tens of thousands of non-blocking file descriptors inside an in-kernel red-black tree via \texttt{epoll\_ctl}, attaching a 64-bit user-data token (\texttt{epoll\_data.u64}) to each socket. When a network interface card (NIC) DMAs an incoming TCP packet into RAM and raises a hardware interrupt, the kernel TCP stack appends just the newly ready socket's token onto an internal readiness list in $O(1)$ time. One call to \texttt{epoll\_wait} then hands the worker thread the exact batch of sockets that actually have bytes ready right now, in time proportional to \emph{active events} rather than total open connections. Linux \texttt{io\_uring} goes a step further, placing two lock-free ring buffers (a Submission Queue and a Completion Queue) in shared memory mapped into both user space and kernel space so batches of network and storage operations can be submitted and harvested with minimal or zero system calls.
+Calling non-blocking \texttt{read()} in a tight user-space loop across $50{,}000$ sockets would still waste $100\%$ CPU. Instead, every modern OS provides an \emph{event notification table}: \texttt{epoll} on Linux, \texttt{kqueue} on macOS/BSD, and IOCP on Windows. A worker thread registers all $50{,}000$ non-blocking sockets with \texttt{epoll} once, attaching a 64-bit task ID to each socket. Whenever a network card delivers a TCP packet into RAM, the kernel appends that socket's task ID onto a ready list in $O(1)$ time. One call to \texttt{epoll\_wait} then hands the worker thread only the sockets that have data right now, scaling with \emph{active traffic} rather than open connections. Newer Linux kernels also offer \texttt{io\_uring}, where user space and the kernel share two lock-free ring buffers in memory to submit I/O batches and harvest completions with almost zero system calls.
 
 \begin{figure}[H]
 \centering
@@ -166,9 +166,9 @@ Of course, looping over $50{,}000$ non-blocking sockets in user space calling \t
 \label{ch12:fig-threads-vs-epoll}
 \end{figure}
 
-Figure~\ref{ch12:fig-threads-vs-epoll} shows the architectural shift. What the operating system gives us with \texttt{epoll} is low-cost multiplexing, \emph{provided} our user-space code can pause in the middle of handling request~$k$ when a socket returns \texttt{EAGAIN}, save just enough state to remember where it left off, go work on request~$m$, and resume request~$k$ later when \texttt{epoll\_wait} reports that socket~$k$ is ready.
+Figure~\ref{ch12:fig-threads-vs-epoll} shows the architectural shift. Kernel readiness notifications give us cheap multiplexing, \emph{provided} our user-space code can pause cleanly in the middle of request~$k$. When a socket returns \texttt{EAGAIN}, the handler must save just enough local state to remember where it stopped, switch to request~$m$, and resume request~$k$ once \texttt{epoll\_wait} reports socket~$k$ ready.
 
-In Java~6 NIO (using \texttt{Selector} from \texttt{java.nio}), doing that meant tearing your \texttt{handleClient} method apart by hand into callback objects and manual byte-buffer state fields --- losing local variables, structured \texttt{try} and \texttt{catch} error handling, and readable control flow. Rust's \texttt{async} and \texttt{.await} give you back ordinary sequential code while compiling down to the exact same lean state machine you would have written by hand in C.
+In Java~6 NIO (using \texttt{Selector} from \texttt{java.nio}), pausing mid-request meant tearing \texttt{handleClient} apart by hand into callback classes and manual byte buffers. You lost local variables, structured \texttt{try}/\texttt{catch} blocks, and readable control flow. Rust's \texttt{async} and \texttt{.await} let you write ordinary sequential code while compiling down to the exact same lean state machine you would write by hand in C.
 
 \section{Rust's Stackless Model: The \texttt{Future} Trait}
 \label{ch12:future-trait}
@@ -216,7 +216,7 @@ Here is what each piece of this interface does:
       \item If the computation reaches a non-blocking socket or lock or timer that is not ready yet (e.g., \texttt{EAGAIN}), \texttt{poll} saves its current position inside \texttt{self}, arranges for \texttt{cx.waker()} to be notified when readiness changes, and returns \texttt{Poll::Pending} immediately.
     \end{itemize}
   \item \textbf{\texttt{cx: \&mut Context<'\_>}} --- a lightweight wrapper whose sole method today is \texttt{cx.waker() -> \&Waker}. This is how a leaf I/O resource tells the top-level runtime scheduler, ``Task~4182 is now ready to be polled again,'' without the executor ever spinning in a busy loop.
-  \item \textbf{\texttt{self: Pin<\&mut Self>}} --- instead of taking an ordinary mutable reference \texttt{\&mut self}, \texttt{poll} demands a \emph{pinned} mutable reference. For the next five pages, treat \texttt{Pin<\&mut Self>} mentally as ``a mutable reference \texttt{\&mut Self} accompanied by a compile-time promise that the caller will never move the bytes of \texttt{Self} to a different memory address.'' In Section~\ref{ch12:pin-and-unpin} we will prove with raw hex addresses why omitting \texttt{Pin} would let safe Rust corrupt memory.
+  \item \textbf{\texttt{self: Pin<\&mut Self>}} --- instead of taking an ordinary mutable reference \texttt{\&mut self}, \texttt{poll} takes a \emph{pinned} mutable reference. For the next few pages, read \texttt{Pin<\&mut Self>} as ``a \texttt{\&mut Self} paired with a compile-time promise that the bytes of \texttt{Self} will never move to another memory address.'' In Section~\ref{ch12:pin-and-unpin} we will trace concrete hex addresses to see why omitting \texttt{Pin} would let safe Rust corrupt memory.
 \end{enumerate}
 
 \subsection{Writing a Leaf \texttt{Future} by Hand}
@@ -277,7 +277,7 @@ impl Future for BackoffDelay {
 }
 \end{lstlisting}
 
-Notice why \texttt{mut self: Pin<\&mut Self>} let us write \texttt{self.started = true} directly on line~34: every field of \texttt{BackoffDelay} (\texttt{Duration}, \texttt{bool}, \texttt{Arc<AtomicBool>}) is an ordinary value with no internal self-pointers, so \texttt{BackoffDelay} automatically implements \texttt{Unpin}, allowing \texttt{Pin<\&mut BackoffDelay>} to dereference mutably just like \texttt{\&mut BackoffDelay}.
+Why did \texttt{mut self: Pin<\&mut Self>} let us write \texttt{self.started = true} directly on line~34? Every field of \texttt{BackoffDelay} (\texttt{Duration}, \texttt{bool}, \texttt{Arc<AtomicBool>}) is a plain value with no internal self-pointers. Rust therefore implements the marker trait \texttt{Unpin} for \texttt{BackoffDelay} automatically, letting \texttt{Pin<\&mut BackoffDelay>} dereference mutably just like \texttt{\&mut BackoffDelay}.
 
 \section{How \texttt{async}/\texttt{await} Compiles Into an Enum State Machine}
 \label{ch12:state-machine-desugaring}
@@ -401,9 +401,9 @@ impl<'a> Future for SpendableStateMachine<'a> {
 The \texttt{loop} around a \texttt{match} shows three properties of async Rust:
 
 \begin{enumerate}
-  \item \textbf{Zero intermediate heap allocations across nested \texttt{async} calls.} Notice that \texttt{fut1: FetchSettledFut<'a>} and \texttt{fut2: FetchHoldsFut<'a>} are stored \emph{by value} directly inside the enum variants of \texttt{SpendableStateMachine}, not behind \texttt{Box<dyn Future>}. If your Axum HTTP handler awaits a domain service method, which awaits a repository method, which awaits a SQLx socket read, all four nested state machines flatten into \emph{one single contiguous struct} whose exact byte size is known at compile time. When \texttt{tokio::spawn} allocates that top-level task on the heap, it performs \textbf{one} allocation for the entire call tree, compared to allocating a fresh \texttt{Promise}/\texttt{CompletableFuture} node on every single \texttt{.await} step in JavaScript or Java.
-  \item \textbf{Immediate fast-path fallthrough via \texttt{loop}.} Suppose \texttt{fetch\_settled\_balance} checks an in-memory cache or finds that PostgreSQL's response packet has already arrived in the kernel socket buffer before \texttt{poll} returns. Then \texttt{pinned\_fut1.poll(cx)} yields \texttt{Poll::Ready} on its first try. Because the state machine sits inside a \texttt{loop}, it transitions straight into \texttt{WaitingHolds} and polls \texttt{fut2} in the exact same CPU time slice, without bouncing through the Tokio scheduler or touching an atomic queue.
-  \item \textbf{Union memory reuse across sequential \texttt{.await}s.} Recall from Chapter~5 that a Rust \texttt{enum}'s size is its discriminant tag plus the size of its \emph{largest} variant (not the sum of all variants). \texttt{fut1} and \texttt{fut2} never exist simultaneously, so they share the exact same byte offsets inside \texttt{SpendableStateMachine}.
+  \item \textbf{Zero intermediate heap allocations across nested \texttt{async} calls.} Notice that \texttt{fut1} and \texttt{fut2} live \emph{by value} directly inside the enum variants of \texttt{SpendableStateMachine}, not behind \texttt{Box<dyn Future>}. Suppose an Axum handler awaits a service method, which awaits a repository call, which awaits a SQLx socket read. At compile time, \texttt{rustc} flattens all four nested state machines into \emph{one contiguous struct} of known byte size. Calling \texttt{tokio::spawn} performs \textbf{one} heap allocation for that entire call tree, whereas JavaScript and Java allocate a fresh \texttt{Promise} or \texttt{CompletableFuture} on every \texttt{.await} step.
+  \item \textbf{Immediate fast-path fallthrough via \texttt{loop}.} Suppose \texttt{fetch\_settled\_balance} hits an in-memory cache or finds PostgreSQL's reply packet already waiting in the kernel socket buffer. Then \texttt{pinned\_fut1.poll(cx)} returns \texttt{Poll::Ready} on its first try. Because the state machine runs inside a \texttt{loop}, it transitions straight to \texttt{WaitingHolds} and polls \texttt{fut2} in the same CPU time slice without bouncing through the scheduler.
+  \item \textbf{Union memory reuse across sequential \texttt{.await}s.} Recall from Chapter~5 that a Rust \texttt{enum} takes only the size of its tag plus its \emph{largest} variant, not the sum of all variants. Because \texttt{fut1} and \texttt{fut2} never live at the same time, they reuse the exact same byte offsets inside \texttt{SpendableStateMachine}.
 \end{enumerate}
 
 \begin{figure}[H]
@@ -459,7 +459,7 @@ The \texttt{loop} around a \texttt{match} shows three properties of async Rust:
 \end{figure}
 
 \begin{trapbox}
-\textbf{Large futures from stack buffers held across \texttt{.await}.} Because every variable that remains in scope across an \texttt{.await} point becomes a stored field inside the compiler-generated \texttt{enum}, declaring a large scratch array on the stack and leaving it in scope across \texttt{.await} inflates the byte size of the \texttt{Future} itself:
+\textbf{Large futures from stack buffers held across \texttt{.await}.} Every local variable still in scope across an \texttt{.await} becomes a stored field inside the compiler-generated \texttt{enum}. Declaring a large stack array and keeping it alive across \texttt{.await} inflates the byte size of the \texttt{Future} itself:
 \begin{lstlisting}[language=Rust]
 async fn bad_audit_export(pool: &PgPool) -> Result<(), DbError> {
     let mut csv_scratch = [0u8; 65_536]; // 64 KiB array!
@@ -507,12 +507,12 @@ Let us trace concrete hexadecimal addresses to see what happens if we move the s
       \item \texttt{fut.read\_exact.slice\_ptr} stores the address of \texttt{fut.buf}: \textbf{\texttt{0x55a0\_0050}}.
     \end{itemize}
     Suppose only $2$ bytes have arrived on the wire; \texttt{poll} writes them into bytes \texttt{0..2} at \texttt{0x55a0\_0050} and returns \texttt{Poll::Pending}. \textbf{\texttt{fut} is now a self-referential struct.}
-  \item \textbf{Step 3 (What would happen without \texttt{Pin}):} Suppose \texttt{Future::poll} took an ordinary \texttt{\&mut Self} instead of \texttt{Pin<\&mut Self>}. In safe Rust, if you hold \texttt{f1: \&mut F} and \texttt{f2: \&mut F} (or own \texttt{fut} in a \texttt{Vec<F>} that reallocates), you can legally move \texttt{fut} to a brand-new address \texttt{0x55a0\_9000} via \texttt{std::mem::swap} or \texttt{Vec::push}. A Rust move is always a blind bitwise \texttt{memcpy}:
+  \item \textbf{Step 3 (What would happen without \texttt{Pin}):} Suppose \texttt{Future::poll} took a plain \texttt{\&mut Self} instead of \texttt{Pin<\&mut Self>}. In safe Rust, holding \texttt{f1: \&mut F} and \texttt{f2: \&mut F} (or storing \texttt{fut} in a \texttt{Vec<F>} that reallocates) lets you move \texttt{fut} to a new address \texttt{0x55a0\_9000} via \texttt{std::mem::swap} or \texttt{Vec::push}. Every Rust move is a blind bitwise \texttt{memcpy}:
     \begin{itemize}
       \item \texttt{fut.buf} now lives at \texttt{0x55a0\_9010}.
       \item \emph{Nothing updated the \texttt{slice\_ptr} inside \texttt{fut.read\_exact}.} Bitwise \texttt{memcpy} copied the old pointer value \textbf{\texttt{0x55a0\_0050}} verbatim into the new struct.
     \end{itemize}
-  \item \textbf{Step 4 (Silent memory corruption):} Meanwhile, the heap allocator reused the freed block at \texttt{0x55a0\_0040} for an unrelated customer's \texttt{Transfer} struct. Two milliseconds later, the remaining $2$ TCP bytes arrive and \texttt{poll} runs on the moved future at \texttt{0x55a0\_9000}. \texttt{ReadExact} writes those $2$ incoming network bytes directly to \texttt{slice\_ptr} (\textbf{\texttt{0x55a0\_0050}}), overwriting two bytes inside that other customer's \texttt{Transfer} while \texttt{fut.buf} at \texttt{0x55a0\_9010} still holds zeroes.
+  \item \textbf{Step 4 (Silent memory corruption):} Meanwhile, the allocator reuses the freed block at \texttt{0x55a0\_0040} for another customer's \texttt{Transfer} struct. Two milliseconds later, the last $2$ TCP bytes arrive and \texttt{poll} runs on the moved future at \texttt{0x55a0\_9000}. \texttt{ReadExact} writes those $2$ bytes straight to \texttt{slice\_ptr} (\textbf{\texttt{0x55a0\_0050}}), corrupting the other customer's \texttt{Transfer} while \texttt{fut.buf} stays zero.
 \end{itemize}
 
 \begin{figure}[H]
@@ -552,7 +552,7 @@ Let us trace concrete hexadecimal addresses to see what happens if we move the s
 Figure~\ref{ch12:fig-self-ref-pin} is the entire reason \texttt{Pin} exists in Rust. Look at the timeline in those four steps and ask: \emph{what is the exact minimal rule that prevents Step~3 without adding a garbage collector, pointer-patching runtime, or extra heap indirection?}
 
 \begin{formalbox}
-\textbf{The Pinning Guarantee.} A pointer \texttt{Pin<P>} (such as \texttt{Pin<\&mut T>} or \texttt{Pin<Box<T>>}) wraps a pointer \texttt{P} whose target \texttt{*P} has type \texttt{T}. If \texttt{T} does \emph{not} implement the marker trait \texttt{Unpin}, then once a \texttt{Pin<P>} pointing to an instance of \texttt{T} at memory address $A$ has been constructed, \textbf{the bytes of that \texttt{T} instance must remain at address $A$ --- never moved, swapped, or deallocated without running \texttt{T::drop} in place at address $A$}.
+\textbf{The Pinning Guarantee.} A pointer \texttt{Pin<P>} (such as \texttt{Pin<\&mut T>} or \texttt{Pin<Box<T>>}) wraps a pointer \texttt{P} targeting a value of type \texttt{T}. Suppose \texttt{T} does \emph{not} implement the marker trait \texttt{Unpin}. Once a \texttt{Pin<P>} points to an instance of \texttt{T} at address $A$, \textbf{the bytes of that \texttt{T} must stay at address $A$}. They may never be moved, swapped, or freed before \texttt{T::drop} runs in place at address $A$.
 \end{formalbox}
 
 Notice how surgical that rule is:
@@ -590,8 +590,8 @@ What does \emph{not} implement \texttt{Unpin}?
 In $99\%$ of application code, you simply write \texttt{foo().await}, and the enclosing \texttt{async fn} state machine handles pinning automatically. When you \emph{do} manually drive a \texttt{!Unpin} future --- for example, polling a stream inside a custom Tower middleware or storing a dynamic future inside a struct --- you have two clean, safe idioms:
 
 \begin{enumerate}
-  \item \textbf{Heap pinning via \texttt{Box::pin(fut)}:} Allocates \texttt{fut} on the heap once and returns a \texttt{Pin<Box<F>>}. Because the future's bytes now live at a fixed heap address (say \texttt{0x55a0\_0040}), \emph{you can freely move the 8-byte \texttt{Pin<Box<F>>} handle around by value.} In fact, \texttt{Pin<Box<F>>} itself implements \texttt{Unpin} even when \texttt{F} is \texttt{!Unpin}, because moving the pointer on the stack does not move the heap allocation it points to.
-  \item \textbf{Zero-allocation stack pinning via \texttt{std::pin::pin!}:} If the future does not need to outlive the current scope, calling \texttt{std::pin::pin!(fut)} shadows \texttt{fut} with a \texttt{Pin<\&mut F>} tied to a hidden local variable that goes out of scope (running \texttt{Drop} in place) before its stack slot can ever be reused or moved. That gives $100\%$ compile-time safety with zero heap allocation.
+  \item \textbf{Heap pinning via \texttt{Box::pin(fut)}:} Allocates \texttt{fut} on the heap once and returns a \texttt{Pin<Box<F>>}. Because the future's bytes now sit at a fixed heap address (say \texttt{0x55a0\_0040}), \emph{you can move the 8-byte \texttt{Pin<Box<F>>} handle freely by value.} Even when \texttt{F} is \texttt{!Unpin}, \texttt{Pin<Box<F>>} itself implements \texttt{Unpin}, since moving the stack pointer never moves the heap block.
+  \item \textbf{Zero-allocation stack pinning via \texttt{std::pin::pin!}:} When the future stays inside the current scope, \texttt{std::pin::pin!(fut)} shadows \texttt{fut} with a \texttt{Pin<\&mut F>} bound to a hidden local slot. That local slot runs \texttt{Drop} in place at scope exit before its stack bytes can ever be reused or moved, giving $100\%$ compile-time safety with zero heap allocation.
 \end{enumerate}
 
 \begin{trapbox}
@@ -619,7 +619,7 @@ We now have half of the async engine: a compiler that turns sequential \texttt{a
 
 Suppose Task~42 awaits \texttt{socket.read(\&mut buf)}. Under the hood, Tokio's \texttt{poll\_read} method on \texttt{TcpStream} attempts a non-blocking \texttt{read()} syscall and gets \texttt{EAGAIN}. Before returning \texttt{Poll::Pending}, it stores \texttt{cx.waker().clone()} inside Tokio's I/O driver slab slot associated with that socket's \texttt{epoll} token.
 
-What physically \emph{is} a \texttt{std::task::Waker}? Because \texttt{core::future::Future} lives in Rust's runtime-agnostic \texttt{core} library (which cannot depend on Tokio or even heap memory), \texttt{Waker} is a custom two-word fat value \texttt{(data: *const (), vtable: \&'static RawWakerVTable)} containing four function pointers: \texttt{clone}, \texttt{wake}, \texttt{wake\_by\_ref}, and \texttt{drop}. In Tokio, \texttt{data} points directly to the reference-counted header of Task~42's heap allocation. Calling \texttt{waker.wake()} transitions Task~42's atomic lifecycle state from \texttt{IDLE} to \texttt{SCHEDULED} (via a compare-and-swap) and pushes Task~42's pointer onto a worker's run queue.
+What physically \emph{is} a \texttt{std::task::Waker}? Because \texttt{Future} lives in Rust's runtime-agnostic \texttt{core} library, it cannot depend on Tokio or even heap memory. Instead, \texttt{Waker} is a two-word fat value \texttt{(data: *const (), vtable: \&'static RawWakerVTable)} holding four function pointers: \texttt{clone}, \texttt{wake}, \texttt{wake\_by\_ref}, and \texttt{drop}. In Tokio, \texttt{data} points to the reference-counted header of Task~42's heap block. Calling \texttt{waker.wake()} flips Task~42's atomic state from \texttt{IDLE} to \texttt{SCHEDULED} and pushes its pointer onto a worker's run queue.
 
 \begin{trapbox}
 \textbf{What if the TCP packet arrives \emph{while} \texttt{poll} is returning \texttt{Pending}?} In multithreaded systems programming, the classic race condition is the \emph{lost wakeup}:
@@ -636,10 +636,10 @@ Tokio eliminates this race with a small atomic state machine inside every task h
 When you annotate \texttt{\#[tokio::main]} above \texttt{async fn main()}, the macro expands into building a \texttt{tokio::runtime::Runtime} configured by default with one worker OS thread per logical CPU core. Let us trace how Tokio schedules tasks across those cores with minimal lock contention (Figure~\ref{ch12:fig-tokio-runtime}):
 
 \begin{itemize}
-  \item \textbf{Per-worker local queue + LIFO slot:} Every worker thread owns a fixed-capacity, single-producer multi-consumer ring buffer of $256$ task pointers, plus a single \emph{LIFO slot} holding the most recently woken task. Why a LIFO slot? Suppose an Axum handler sends a message over an in-process channel or wakes a parent task: running the newly woken task \emph{immediately next} on the exact same CPU core means the message payload is still sitting hot in that core's $32\text{ KiB}$ L1 data cache. To prevent two ping-ponging tasks from starving older tasks in the ring buffer, Tokio limits consecutive LIFO-slot runs per tick (the cooperative budget, $128$ polls by default) before draining the FIFO ring buffer.
-  \item \textbf{Global injection queue:} Tasks spawned from outside worker threads (or overflow when a worker's $256$-slot local queue fills up) land in a shared MPSC \texttt{Inject} queue checked periodically (every $61$ ticks by default, a prime interval chosen to avoid resonant starvation cycles).
-  \item \textbf{Work stealing:} When Worker~1 exhausts its LIFO slot and its local $256$-slot queue, it checks the global queue; if empty, it picks a random sibling (say Worker~0) and atomically steals \emph{half} of Worker~0's queued tasks in a single batch operation. Stealing half amortizes cross-core atomic cache-line traffic while keeping all CPU cores utilized when a few requests take longer than others.
-  \item \textbf{Shared I/O reactor and timer wheel:} When a worker finds no runnable tasks anywhere, one idle worker becomes the designated driver thread and parks inside \texttt{epoll\_wait} (with timeout set to the next expiring deadline in Tokio's $O(1)$ hierarchical hashed timer wheel), waking siblings only when fresh kernel events arrive.
+  \item \textbf{Per-worker local queue + LIFO slot:} Every worker thread owns a ring buffer of $256$ task pointers plus one \emph{LIFO slot} holding the most recently woken task. Why a LIFO slot? When an Axum handler sends on a channel or wakes a parent task, running the woken task \emph{next} on the same CPU core finds the message payload hot in L1 cache. To stop two ping-ponging tasks from starving older work, Tokio caps consecutive runs per tick ($128$ polls by default) before draining the FIFO ring buffer.
+  \item \textbf{Global injection queue:} Tasks spawned from outside worker threads---or overflow when a worker's $256$-slot buffer fills up---land in a shared \texttt{Inject} queue. Workers check that global queue every $61$ ticks so external work never starves.
+  \item \textbf{Work stealing:} When Worker~1 empties its LIFO slot and local buffer, it checks the global queue. If that too is empty, Worker~1 picks a sibling (say Worker~0) and atomically steals \emph{half} of Worker~0's queued tasks in one batch. Stealing half amortizes cross-core atomic traffic while keeping every core busy.
+  \item \textbf{Shared I/O reactor and timer wheel:} When no runnable tasks remain, one idle worker becomes the driver thread and parks inside \texttt{epoll\_wait}, setting its timeout to the next timer wheel deadline. It wakes sibling workers only when fresh network or timer events arrive.
 \end{itemize}
 
 \begin{figure}[H]
@@ -698,8 +698,8 @@ where
 
 Every single bound in that \texttt{where} clause comes straight out of Figure~\ref{ch12:fig-tokio-runtime} and Section~\ref{ch12:state-machine-desugaring}:
 \begin{enumerate}
-  \item \textbf{Why \texttt{F: 'static}?} Recall Chapter~4's golden rule: \texttt{T: 'static} does \emph{not} mean \texttt{T} lives until the process exits; it means \texttt{T} contains no non-\texttt{'static} borrowed references \texttt{\&'a X} pointing into a caller's temporary stack frame. Because a spawned task runs independently in the background, the function calling \texttt{tokio::spawn} may return immediately and pop its stack frame while the spawned task is still running. Therefore, a spawned future must own its data (\texttt{Uuid}, \texttt{String}, \texttt{PgPool} --- which internally wraps an \texttt{Arc}) or share read-only state via \texttt{Arc<AppState>}.
-  \item \textbf{Why \texttt{F: Send}?} Look at the orange work-stealing arrow at the top of Figure~\ref{ch12:fig-tokio-runtime}. Suppose Task~T6 starts running on Worker Thread~0 (Core~0), hits \texttt{.await}, and suspends inside its \texttt{WaitingHolds} enum variant. When PostgreSQL replies $2\text{ ms}$ later, Worker~0 happens to be busy, so Worker Thread~1 (Core~1) steals Task~T6 and calls \texttt{poll()} on Core~1. Task~T6 just migrated between two OS threads midway through its function body. For that migration to be free of data races and undefined behavior, \textbf{every local variable stored inside any \texttt{.await} state variant of \texttt{F} must itself be \texttt{Send}}.
+  \item \textbf{Why \texttt{F: 'static}?} Recall Chapter~4's rule: \texttt{T: 'static} does \emph{not} mean \texttt{T} lives until process exit. It means \texttt{T} holds no borrowed references \texttt{\&'a X} pointing into a caller's temporary stack frame. A spawned task runs independently, so its caller may return immediately and pop its stack frame while the task continues. Therefore, a spawned future must own its data (\texttt{Uuid}, \texttt{String}, \texttt{PgPool}) or share state via \texttt{Arc<AppState>}.
+  \item \textbf{Why \texttt{F: Send}?} Look at the orange work-stealing arrow at the top of Figure~\ref{ch12:fig-tokio-runtime}. Task~T6 may start on Worker~0 (Core~0), hit \texttt{.await}, and pause inside its \texttt{WaitingHolds} variant. Two milliseconds later, Worker~0 is busy, so Worker~1 (Core~1) steals Task~T6 and calls \texttt{poll()} on Core~1. Task~T6 just moved across OS threads mid-function. To keep that move race-free, \textbf{every local variable stored across \texttt{.await} inside \texttt{F} must itself be \texttt{Send}}.
 \end{enumerate}
 
 \subsection{How the Compiler Saves You From a \texttt{MutexGuard} Worker Deadlock}
@@ -739,7 +739,7 @@ Why is \texttt{std::sync::MutexGuard} marked \texttt{!Send}? First, on POSIX sys
 \begin{enumerate}
   \item Task~A locks \texttt{rates} on Worker~0, hits \texttt{.await} on \texttt{record\_quote}, and yields \texttt{Poll::Pending} \emph{while still holding the locked OS mutex}.
   \item Worker~0 is now free to run the next task in its queue: Task~B.
-  \item Task~B calls \texttt{rates.lock()}. Because \texttt{std::sync::Mutex::lock} blocks the \textbf{entire OS thread} waiting for Task~A to unlock \texttt{rates} --- and Task~A is sitting suspended in memory waiting for a worker thread to poll it after \texttt{record\_quote} finishes --- Worker~0 is now blocked inside \texttt{lock()} and polls nothing else. If all $N$ worker threads hit the same lock, your entire payment gateway deadlocks permanently with $0\%$ CPU usage.
+  \item Task~B calls \texttt{rates.lock()}. Because \texttt{std::sync::Mutex::lock} blocks the \textbf{entire OS thread}, Worker~0 stalls waiting for Task~A to release \texttt{rates}. Meanwhile, Task~A is sitting paused in memory waiting for a worker thread to poll \texttt{record\_quote}. If all $N$ worker threads hit that lock, your entire payment gateway deadlocks at $0\%$ CPU.
 \end{enumerate}
 
 The fix is simple, explicit, and makes your critical section ten thousand times shorter: scope the synchronous \texttt{MutexGuard} inside an inner block so it drops \emph{before} the \texttt{.await} point.
@@ -785,14 +785,14 @@ The async worker thread registers its \texttt{Waker}, returns \texttt{Poll::Pend
 \section{Backpressure, Bounded Channels, and Cancellation Safety}
 \label{ch12:backpressure-and-cancellation}
 
-Making individual tasks cheap is a double-edged sword. In Java~6, spawning $200{,}000$ threads crashes immediately, forcing engineers to bound thread pools early. In async Rust, spawning $200{,}000$ compact tasks or pushing $5{,}000{,}000$ audit events into an \emph{unbounded} \texttt{mpsc} channel (\texttt{unbounded\_channel} in \texttt{tokio::sync::mpsc}) succeeds right up until a database failover slows consumers while producers keep accepting traffic at line rate, exhausting $32\text{ GiB}$ of RAM and triggering the Linux OOM killer.
+Making individual tasks cheap is a double-edged sword. In Java~6, spawning $200{,}000$ threads crashes immediately, forcing engineers to bound thread pools early. In async Rust, spawning $200{,}000$ tiny tasks or pushing $5{,}000{,}000$ events into an \emph{unbounded} \texttt{mpsc} channel succeeds at first. Then a database failover slows consumers while producers keep accepting traffic at line rate, exhausting $32\text{ GiB}$ of RAM and triggering the Linux OOM killer.
 
 \subsection{Explicit Backpressure with Bounded \texttt{mpsc} and \texttt{Semaphore}}
 
 Production financial services enforce \textbf{bounded queues everywhere}:
 \begin{itemize}
-  \item \textbf{Bounded \texttt{mpsc::channel(capacity)}:} When all \texttt{capacity} slots are full, \texttt{tx.send(msg).await} suspends the producer (\texttt{Poll::Pending}) until the consumer drains a slot, or \texttt{tx.try\_send(msg)} fails immediately in $O(1)$ time with \texttt{TrySendError::Full} so an HTTP ingress layer can shed excess non-critical load cleanly with \texttt{429 Too Many Requests} or \texttt{503 Service Unavailable}.
-  \item \textbf{Concurrency caps via \texttt{Semaphore}:} In \texttt{tokio::sync}, a \texttt{Semaphore} caps concurrent in-flight calls against a scarce downstream resource (for instance, allowing at most $64$ concurrent calls to an external card-network gateway even when $10{,}000$ inbound client connections are open). Calling \texttt{sem.acquire().await} hands back a \texttt{SemaphorePermit} guard whose \texttt{Drop} destructor automatically releases the permit back to the next waiting \texttt{Waker} --- even on early \texttt{?} return or panic.
+  \item \textbf{Bounded \texttt{mpsc::channel(capacity)}:} When all \texttt{capacity} slots are full, \texttt{tx.send(msg).await} suspends the producer (\texttt{Poll::Pending}) until a consumer frees a slot. For ingress load shedding, \texttt{tx.try\_send(msg)} fails immediately in $O(1)$ time with \texttt{TrySendError::Full}, letting your HTTP layer return \texttt{429 Too Many Requests} or \texttt{503 Service Unavailable}.
+  \item \textbf{Concurrency caps via \texttt{Semaphore}:} In \texttt{tokio::sync}, a \texttt{Semaphore} caps concurrent calls to a scarce downstream service---for instance, limiting an external card-network gateway to $64$ in-flight RPCs across $10{,}000$ client connections. Calling \texttt{sem.acquire().await} returns a \texttt{SemaphorePermit} guard whose \texttt{Drop} destructor releases the permit automatically on return, \texttt{?}, or panic.
 \end{itemize}
 
 \subsection{Async Cancellation in Rust: Dropping a \texttt{Future} Mid-Flight}
@@ -905,7 +905,7 @@ loop {
 
 Why was \texttt{job\_rx.recv()} safe to drop when the \texttt{shutdown\_rx} branch won the race? Because \texttt{Receiver::recv} in \texttt{tokio::sync::mpsc} holds zero half-consumed state inside its temporary \texttt{Recv} future: if dropped while \texttt{Pending}, no item was popped from the channel.
 
-By contrast, \texttt{read\_exact(\&mut buf)} on \texttt{AsyncReadExt} is \textbf{not cancellation-safe} inside a \texttt{select!} loop. As we saw in Figure~\ref{ch12:fig-self-ref-pin}, if $2$ bytes of a $4$-byte frame arrive and then another \texttt{select!} branch wins and drops the \texttt{ReadExact} future, those $2$ bytes have already been drained from the kernel TCP socket into the dropped future's local state and are lost forever when the next loop iteration starts a fresh \texttt{read\_exact}. Whenever you multiplex byte streams inside \texttt{select!}, accumulate partial frames in a persistent buffer (such as \texttt{BytesMut} paired with \texttt{Framed} in \texttt{tokio\_util::codec}) owned \emph{outside} the \texttt{select!} macro so partial progress lives across iterations.
+By contrast, \texttt{read\_exact(\&mut buf)} on \texttt{AsyncReadExt} is \textbf{not cancellation-safe} inside a \texttt{select!} loop. Recall Figure~\ref{ch12:fig-self-ref-pin}: suppose $2$ bytes of a $4$-byte frame arrive, and then another \texttt{select!} branch wins and drops the \texttt{ReadExact} future. Those $2$ bytes were already drained from the kernel TCP socket into the dropped future's buffer, so the next loop iteration loses them forever. Whenever you multiplex byte streams inside \texttt{select!}, accumulate partial frames in a persistent buffer (\texttt{BytesMut} or \texttt{Framed} from \texttt{tokio\_util::codec}) owned \emph{outside} the \texttt{select!} macro.
 
 \begin{table}[H]
 \centering
@@ -1002,6 +1002,6 @@ Trace what happens when a \texttt{Cmd} arrives at $t = 999\text{ ms}$, \texttt{r
 Your payment service runs on an 8-core machine with a PostgreSQL \texttt{PgPool} configured to \texttt{max\_connections = 32}. Each transfer transaction holds a database connection for $W_{\text{db}} = 4\text{ ms}$ ($0.004\text{ s}$) on average.
 \begin{enumerate}
   \item Using Little's Law ($L = \lambda W$), what is the maximum sustained throughput $\lambda_{\max}$ (in transfers per second) that those $32$ database connections can process?
-  \item Suppose a flash sale sends $\lambda = 12{,}000\text{ transfers/s}$ for $30\text{ seconds}$. Compare what happens to memory usage and client latency under (a) unbounded task spawning waiting indefinitely on \texttt{pool.begin().await}, versus (b) wrapping ingress with a \texttt{tokio::sync::Semaphore} of $256$ permits paired with a $250\text{ ms}$ \texttt{acquire\_timeout} returning HTTP \texttt{503 Service Unavailable} with a \texttt{Retry-After} header.
+  \item Suppose a flash sale sends $\lambda = 12{,}000\text{ transfers/s}$ for $30\text{ seconds}$. Compare memory usage and client latency under two designs: (a) unbounded task spawning waiting on \texttt{pool.begin().await}, versus (b) guarding ingress with a $256$-permit \texttt{tokio::sync::Semaphore} and a $250\text{ ms}$ timeout returning HTTP \texttt{503} with \texttt{Retry-After}.
 \end{enumerate}
 \end{exercise}

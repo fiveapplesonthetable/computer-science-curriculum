@@ -31,7 +31,7 @@ void append_bonus_if_positive(std::vector<int64_t>& postings) {
 
 Walk through what happens in memory when \texttt{postings} enters this function with length $4$ and capacity $4$. On line~6, \texttt{first} stores the raw 64-bit machine address of element $0$ inside the heap buffer owned by \texttt{postings}. Even though \texttt{first} is marked \texttt{const}, \texttt{const} in C++ only means ``\emph{I} promise not to mutate through \texttt{first}''; it does not stop anyone else from mutating or freeing the memory behind it.
 
-On line~8, \texttt{postings.push\_back(500)} sees that length equals capacity. To grow, the vector allocates a fresh 8-element heap buffer, copies the four existing \texttt{int64\_t} values into the new buffer, writes \texttt{500} into slot $4$, and calls \texttt{delete[]} on the \emph{old} heap buffer. Now step onto line~9: \texttt{first} still holds the address of the old, freed buffer. Reading \texttt{first} is a textbook \textbf{use-after-free} in clean, single-threaded C++. Under light load the old bytes might happen to sit untouched in the allocator's free list and print the expected number in every unit test; under production load another request allocates that exact chunk for an HTTP header, and \texttt{first} reads garbage bytes or crashes the process.
+On line~8, \texttt{postings.push\_back(500)} sees that length equals capacity. To grow, the vector allocates a fresh 8-element heap buffer, copies the four existing \texttt{int64\_t} values over, writes \texttt{500} into slot $4$, and calls \texttt{delete[]} on the \emph{old} buffer. Now step onto line~9: \texttt{first} still holds the address of the freed buffer. Reading \texttt{first} is a textbook \textbf{use-after-free} in clean, single-threaded C++. Under light load, those freed bytes may sit untouched in the free list and pass every unit test. Under production load, another request claims that chunk for an HTTP header, and \texttt{first} reads garbage or crashes the process.
 
 Now write the analogous loop in Java~6:
 
@@ -50,9 +50,9 @@ public class LedgerAdjuster {
 }
 \end{lstlisting}
 
-Java's garbage collector prevents a raw memory-corruption crash here: even if \texttt{ArrayList.add} allocates a larger \texttt{Object[]} backing array, the old array stays alive in the GC heap as long as any reference points to it. Yet when you run this method on a non-empty list with a positive entry, it blows up on the next loop step with \texttt{java.util.ConcurrentModificationException} --- in a program with only one thread. Why? Because the \texttt{for}-each loop holds an internal \texttt{Iterator} cursor over \texttt{postings} while the loop body mutates \texttt{postings} behind the iterator's back. Java's \texttt{ArrayList} keeps an integer counter \texttt{modCount} on every list instance, increments it on every \texttt{add} or \texttt{remove}, and checks \texttt{modCount == expectedModCount} on every \texttt{iterator.next()} call, paying a runtime branch on every element so that the bug becomes an exception instead of silently skipped or repeated elements.
+Java's garbage collector prevents raw memory corruption here. Even if \texttt{ArrayList.add} allocates a larger \texttt{Object[]} array, the old array stays alive in the GC heap while referenced. Yet running this method on a non-empty list with a positive entry throws \texttt{ConcurrentModificationException} on the next step --- with only one thread in the program. Why? The \texttt{for}-each loop holds an internal \texttt{Iterator} cursor over \texttt{postings} while the body mutates \texttt{postings} behind its back. Java's \texttt{ArrayList} increments \texttt{modCount} on every \texttt{add} or \texttt{remove} and checks \texttt{modCount == expectedModCount} on every \texttt{next()}. It pays a runtime branch per element just to turn skipped or repeated elements into an exception.
 
-Worse, \texttt{modCount} only guards standard collection iterators. When two components in a Java~6 service hold references to the same mutable \texttt{OrderDraft} object --- say a risk-scoring cache and a fee calculator --- mutating \texttt{draft.setAmountCents(0)} through one reference silently alters what the other component observes mid-calculation, with no exception at all.
+Worse, \texttt{modCount} guards only collection iterators. Suppose a risk cache and a fee calculator in Java~6 both hold references to a mutable \texttt{OrderDraft}. Calling \texttt{draft.setAmountCents(0)} through one reference silently changes what the other observes mid-calculation, with no exception at all.
 
 \begin{intuitionbox}
 Strip away C++ destructors and Java garbage collection, and ask: what two ingredients had to collide in \emph{every single one} of those failures?
@@ -60,7 +60,7 @@ Strip away C++ destructors and Java garbage collection, and ask: what two ingred
   \item \textbf{Aliasing:} Two or more live access paths (\texttt{postings} and \texttt{first}; the loop's \texttt{Iterator} and \texttt{postings}; two object references \texttt{a} and \texttt{b}, or two threads) reach overlapping bytes of memory at the same time.
   \item \textbf{Mutation:} At least one of those paths modifies (or reallocates) the underlying state while another path expects that state to hold still.
 \end{enumerate}
-Aliasing \emph{without} mutation is completely harmless: fifty readers can inspect the same immutable configuration table or UTF-8 string across threads without interfering with one another. Mutation \emph{without} aliasing is just as harmless: if you hold the \emph{only} pointer to a buffer in the entire program, you can overwrite it, resize it, or free it, and nobody else's pointer can possibly dangle because nobody else has one. Trouble only begins when \textbf{aliasing and mutation happen simultaneously}.
+Aliasing \emph{without} mutation is harmless: fifty threads can inspect the same immutable table or UTF-8 string without interfering. Mutation \emph{without} aliasing is equally harmless. Hold the \emph{only} pointer to a buffer in the program, and you can overwrite, resize, or free it without dangling anyone else's pointer. Trouble begins only when \textbf{aliasing and mutation happen at the same time}.
 \end{intuitionbox}
 
 Rust turns that observation into a rule the compiler checks.
@@ -111,7 +111,7 @@ If you have used \texttt{java.util.concurrent.locks.ReentrantReadWriteLock} in J
 \label{ch03:fig-aliasing-quadrant}
 \end{figure}
 
-When the compiler rejects a program with a borrow error, find the two access paths that overlap in Figure~\ref{ch03:fig-aliasing-quadrant}'s bottom-right box: \emph{which two paths alias the same memory while one of them mutates it, and what would break if the vector reallocated or a second thread ran at that point?} Answering that question usually tells you how to restructure the code, as the examples later in this chapter show.
+Whenever the compiler rejects a program with a borrow error, look at Figure~\ref{ch03:fig-aliasing-quadrant}'s bottom-right box. Ask which two paths alias the same memory while one mutates it, and what would break if a vector reallocated or another thread ran there. Answering that question almost always shows how to restructure the code.
 
 \section{Ownership and Exact Byte Layouts on Stack and Heap}
 \label{ch03:ownership-byte-layouts}
@@ -123,12 +123,12 @@ To enforce Aliasing XOR Mutability without a garbage collector, Rust starts by g
 Every value in Rust obeys three compile-time rules:
 \begin{enumerate}
   \item Every value has a single \textbf{owner} (a variable, a struct field, or a collection slot).
-  \item There can be \textbf{only one owner at a time} (unless ownership is explicitly shared through a reference-counted smart pointer such as \texttt{Rc<T>} or \texttt{Arc<T>}, covered in \S\ref{ch03:shared-ownership-rc-arc}).
-  \item When the owner goes out of scope (and ownership has not been moved elsewhere), the value is \textbf{dropped} deterministically right at that point: the compiler inserts a call to \texttt{Drop::drop}, freeing heap buffers, closing sockets, or rolling back uncommitted database transactions in reverse order of declaration.
+  \item There can be \textbf{only one owner at a time}, unless shared explicitly through \texttt{Rc<T>} or \texttt{Arc<T>} (\S\ref{ch03:shared-ownership-rc-arc}).
+  \item When the owner leaves scope without moving elsewhere, the value \textbf{drops} right there. The compiler inserts \texttt{Drop::drop} in reverse declaration order to free buffers, close sockets, or roll back transactions.
 \end{enumerate}
 \end{definition}
 
-If you read Chapter~2 carefully, Rule~3 looks just like C++ RAII (\emph{Resource Acquisition Is Initialization}), and at runtime it compiles to the exact same machine code: deterministic calls at scope exit, with no background GC threads scanning object graphs. Where Rust parts ways with both Java~6 and C++ is in how values sit in memory and how ownership moves between variables. Let us look directly at the bytes on a 64-bit machine (\texttt{usize} $= 8$ bytes).
+Rule~3 looks just like C++ RAII from Chapter~2, and at runtime it emits the exact same code: deterministic calls at scope exit, with zero GC threads. Where Rust parts ways with Java~6 and C++ is in how values sit in memory and how ownership moves. Let us inspect the exact bytes on a 64-bit machine (\texttt{usize} $= 8$ bytes).
 
 \subsection{\texttt{String} (24 Bytes Owned) versus \texttt{\&str} (16-Byte Fat Slice)}
 
@@ -146,9 +146,9 @@ In Rust, an owned \texttt{String} is a flat, 24-byte struct sitting directly ins
   \item \texttt{len: usize} (offset $8..16$, 8 bytes): how many initialized UTF-8 bytes the string currently holds.
   \item \texttt{cap: usize} (offset $16..24$, 8 bytes): total byte capacity allocated on the heap before reallocation is needed.
 \end{itemize}
-When \texttt{let mut pair = String::with\_capacity(8); pair.push\_str("EURUSD");} runs, the stack frame holds the three 64-bit words $(\texttt{ptr}, 6, 8)$, and the heap holds just the raw UTF-8 bytes \texttt{E U R U S D} followed by two unused capacity bytes --- no object header on the stack, no object header in front of the \texttt{u8} array beyond the allocator's internal size class. When \texttt{pair} goes out of scope, \texttt{Drop} passes \texttt{ptr} and \texttt{cap} straight to the allocator's \texttt{dealloc}.
+Run \texttt{let mut pair = String::with\_capacity(8); pair.push\_str("EURUSD");}. The stack frame holds three 64-bit words $(\texttt{ptr}, 6, 8)$, and the heap holds the raw UTF-8 bytes \texttt{E U R U S D} plus two spare bytes. Neither the stack nor the heap array carries a JVM-style object header. When \texttt{pair} leaves scope, \texttt{Drop} hands \texttt{ptr} and \texttt{cap} straight to \texttt{dealloc}.
 
-Now suppose a function only wants to \emph{inspect} text --- say, parsing the base currency \texttt{"EUR"} out of \texttt{"EURUSD"} or checking a string literal \texttt{"USD"}. Allocating a new heap \texttt{String} just to read three letters would be wasteful, and taking \texttt{\&String} (an 8-byte pointer to a 24-byte \texttt{String} on the stack, which then points to the heap) would force callers with a string literal \texttt{"USD"} (baked into the binary's read-only \texttt{.rodata} segment, with no heap allocation at all) to heap-allocate a \texttt{String} first.
+Now suppose a function only wants to \emph{inspect} text --- say, reading \texttt{"EUR"} out of \texttt{"EURUSD"} or checking a literal \texttt{"USD"}. Allocating a fresh heap \texttt{String} just to read three letters would waste memory. Taking \texttt{\&String} (a pointer to a 24-byte \texttt{String} header) is also too narrow: callers holding a literal \texttt{"USD"} in \texttt{.rodata} would have to heap-allocate a \texttt{String} first.
 
 Rust solves this with \texttt{\&str}, a \textbf{16-byte fat pointer} (or \emph{string slice}) consisting of just two 64-bit registers:
 \begin{itemize}
@@ -246,13 +246,13 @@ Notice what is \emph{missing} from \texttt{\&str}: there is no \texttt{cap} fiel
 
 The exact same pairing repeats for general contiguous collections:
 \begin{itemize}
-  \item \textbf{\texttt{Vec<T>} (24 bytes on stack: \texttt{ptr}, \texttt{len}, \texttt{cap}):} owns a contiguous heap array of \texttt{cap} slots, the first \texttt{len} of which hold initialized \texttt{T} values packed back-to-back with \emph{zero} per-element pointers or headers. If \texttt{Account} is a 24-byte struct, a \texttt{Vec<Account>} of $1{,}000$ accounts is one single $24{,}000$-byte heap allocation through which the CPU hardware prefetcher streams linearly. (Compare Java~6's \texttt{ArrayList<Account>}: an array of $1{,}000$ references scattered across $1{,}000$ individually heap-allocated \texttt{Account} objects, each carrying a 16-byte JVM header)
+  \item \textbf{\texttt{Vec<T>} (24 bytes on stack: \texttt{ptr}, \texttt{len}, \texttt{cap}):} owns a contiguous heap array of \texttt{cap} slots, with \texttt{len} initialized \texttt{T} values packed back-to-back and zero per-element headers. If \texttt{Account} takes 24 bytes, a \texttt{Vec<Account>} of $1{,}000$ accounts is one $24{,}000$-byte allocation that streams linearly into the CPU prefetcher. Contrast Java~6's \texttt{ArrayList<Account>}: $1{,}000$ references chasing $1{,}000$ separate heap objects, each carrying a 16-byte header.
   \item \textbf{\texttt{\&[T]} and \texttt{\&mut [T]} (16 bytes on stack: \texttt{ptr}, \texttt{len}):} borrowed slice views into any contiguous sequence of \texttt{T} --- whether backed by a heap \texttt{Vec<T>}, a fixed stack array \texttt{[T; N]}, or memory-mapped file bytes.
-  \item \textbf{\texttt{Box<T>} (8 bytes on stack: \texttt{ptr}):} unique ownership of a single \texttt{T} placed on the heap. Coming from Java~6, newcomers often wrap structs in \texttt{Box<Order>} out of habit because Java puts every object on the heap. In Rust, default to plain stack/inline values (\texttt{Order}), and reach for \texttt{Box<T>} only for three concrete engineering reasons: (1)~recursive types like AST or tree nodes whose size would otherwise be infinite (Chapter~5), (2)~moving a multi-kilobyte struct around by copying an 8-byte pointer instead of \texttt{memcpy}-ing $4{,}096$ bytes, or (3)~holding a dynamically sized trait object \texttt{Box<dyn Pricing>} (Chapter~6).
+  \item \textbf{\texttt{Box<T>} (8 bytes on stack: \texttt{ptr}):} unique ownership of one \texttt{T} on the heap. Java~6 newcomers often wrap structs in \texttt{Box<Order>} out of habit. In Rust, keep values inline (\texttt{Order}) by default. Reach for \texttt{Box<T>} in only three cases: recursive tree types whose inline size would be infinite (Chapter~5), multi-kilobyte structs cheaper to move via a pointer, or dynamic trait objects \texttt{Box<dyn Pricing>} (Chapter~6).
 \end{itemize}
 
 \begin{trapbox}
-\textbf{Never write \texttt{\&String} or \texttt{\&Vec<T>} in function parameters when \texttt{\&str} or \texttt{\&[T]} suffices.} If you write \texttt{fn total(xs: \&Vec<i64>) -> i64}, a caller holding a fixed stack array \texttt{[10, 20, 30]} or a sub-slice \texttt{\&vec[1..5]} cannot call your function without allocating a brand-new heap \texttt{Vec<i64>}. Worse, inside \texttt{total}, reading an element through \texttt{\&Vec<i64>} chases two pointers (caller stack $\to$ \texttt{Vec} header $\to$ heap elements) instead of reading \texttt{ptr} directly from the 16-byte \texttt{\&[i64]} register pair. Meanwhile, callers who \emph{do} own a \texttt{Vec<i64>} or \texttt{String} can still pass \texttt{\&my\_vec} or \texttt{\&my\_string} effortlessly because Rust automatically deref-coerces \texttt{\&Vec<T>} to \texttt{\&[T]} and \texttt{\&String} to \texttt{\&str}.
+\textbf{Never write \texttt{\&String} or \texttt{\&Vec<T>} in function parameters when \texttt{\&str} or \texttt{\&[T]} suffices.} Suppose you write \texttt{fn total(xs: \&Vec<i64>) -> i64}. Callers holding a stack array \texttt{[10, 20, 30]} or a sub-slice \texttt{\&vec[1..5]} cannot call it without allocating a new \texttt{Vec<i64>}. Reading through \texttt{\&Vec<i64>} also chases two pointers instead of reading \texttt{ptr} straight from the 16-byte \texttt{\&[i64]} register pair. With \texttt{\&[i64]} and \texttt{\&str}, callers owning a \texttt{Vec} or \texttt{String} still pass \texttt{\&my\_vec} or \texttt{\&my\_string} directly via deref coercion.
 \end{trapbox}
 
 You do not have to take any byte count in this book on faith. Because Rust knows exact type layouts at compile time, we can verify every layout with \texttt{const} assertions checked by \texttt{rustc} before a binary is even emitted:
@@ -311,7 +311,7 @@ fn process_memo() {
 } // Only `b` is live here -> Drop frees Heap alloc #1 exactly ONCE.
 \end{lstlisting}
 
-Look at what would happen if \texttt{a} remained usable after \texttt{let b = a;} without cloning the heap buffer: both \texttt{a.ptr} and \texttt{b.ptr} would hold the exact same heap address, creating two mutable aliases to the same buffer during \texttt{process\_memo} \emph{and} causing \texttt{Drop} to call \texttt{free()} twice on the same pointer at \texttt{\}} (a heap-corrupting \textbf{double free}). By killing \texttt{a} statically at line~3, Rust transfers unique ownership in three register moves --- zero \texttt{nullptr} writes into \texttt{a}, zero branch inside \texttt{a}'s non-existent destructor, and zero possibility of use-after-move.
+What would happen if \texttt{a} stayed usable after \texttt{let b = a;} without cloning the buffer? Both \texttt{a.ptr} and \texttt{b.ptr} would hold the same heap address. That would create two mutable aliases during \texttt{process\_memo}, and \texttt{Drop} would call \texttt{free()} twice at \texttt{\}} --- an instant \textbf{double free}. Killing \texttt{a} statically at line~3 transfers ownership in three register moves, with zero \texttt{nullptr} writes and zero use-after-move risk.
 
 \begin{figure}[H]
 \centering
@@ -431,7 +431,7 @@ fn append_bonus_if_positive(postings: &mut Vec<i64>) {
 
 Feed those seven lines to \texttt{rustc} and read the exact diagnostic it prints:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=Plain]
 error[E0502]: cannot borrow `*postings` as mutable because it is also borrowed as immutable
  --> src/lib.rs:4:9
   |
@@ -457,7 +457,7 @@ fn append_bonus_if_positive_fixed(postings: &mut Vec<i64>) {
 }
 \end{lstlisting}
 
-Wait --- why did \texttt{first\_ref}'s borrow end right at line~4 instead of lasting all the way down to the closing brace on line~7? Because modern Rust uses \textbf{Non-Lexical Lifetimes (NLL)}, tracking borrows up to their \emph{last actual use} along the control-flow graph rather than stubbornly locking variables until \texttt{\}}. Chapter~4 opens up the NLL region solver in full detail.
+Wait --- why did \texttt{first\_ref}'s borrow end right at line~4 instead of lasting all the way down to the closing brace on line~7? Recall the compiler pipeline from Chapter~1 (\S\ref{ch01:compiler-pipeline}): before checking borrows, \texttt{rustc} lowers your function into \textbf{MIR} (Mid-level Intermediate Representation), a step-by-step flowchart of numbered basic blocks and jumps. Modern Rust runs \textbf{Non-Lexical Lifetimes (NLL)} on that MIR flowchart, tracking each borrow only up to its \emph{last actual read} along reachable paths rather than locking variables until \texttt{\}}. Once line~4 copies \texttt{*first\_ref} into \texttt{saved}, \texttt{first\_ref} is never read again, so its borrow ends immediately. Chapter~4 opens up the NLL solver in full detail.
 
 \subsection{Implicit Reborrowing: Why Doesn't Passing \texttt{\&mut T} Move It?}
 
@@ -636,10 +636,10 @@ Rust splits reference-counted shared ownership into two distinct smart pointers 
 \label{ch03:fig-rc-arc-layout}
 \end{figure}
 
-Note the caption of Figure~\ref{ch03:fig-rc-arc-layout}: \textbf{dereferencing \texttt{Rc<T>} or \texttt{Arc<T>} only ever gives you \texttt{\&T}, never \texttt{\&mut T}.} Why? Because the purpose of \texttt{Rc} and \texttt{Arc} is that \emph{multiple handles can alias the same heap allocation}, and by Aliasing XOR Mutability (\S\ref{ch03:aliasing-xor-mutability}), aliased memory cannot be mutated directly. (The one exception is \texttt{Arc::get\_mut(\&mut arc)} or copy-on-write \texttt{Arc::make\_mut(\&mut arc)}, which checks at runtime whether \texttt{strong\_count == 1 \&\& weak\_count == 0}: if you happen to be the \emph{sole} owner right now, it hands you \texttt{\&mut T} in place; if others are sharing it, \texttt{make\_mut} clones \texttt{T} into a private allocation before mutating.)
+Note the caption of Figure~\ref{ch03:fig-rc-arc-layout}: \textbf{dereferencing \texttt{Rc<T>} or \texttt{Arc<T>} yields only \texttt{\&T}, never \texttt{\&mut T}.} Multiple handles can alias the same heap block, so Aliasing XOR Mutability (\S\ref{ch03:aliasing-xor-mutability}) forbids direct mutation. The lone escape hatch is \texttt{Arc::get\_mut(\&mut arc)} or copy-on-write \texttt{Arc::make\_mut(\&mut arc)}. At runtime, \texttt{make\_mut} checks whether \texttt{strong\_count == 1 \&\& weak\_count == 0}. If you are the sole owner, it lends \texttt{\&mut T} in place; otherwise it clones \texttt{T} into a fresh allocation first.
 
 \begin{remark}[Reference Cycles and \texttt{Weak<T>}]
-Unlike a tracing garbage collector, reference counting cannot collect isolated cycles: if node~$A$ holds an \texttt{Rc} to node~$B$ and node~$B$ holds an \texttt{Rc} back to node~$A$, both \texttt{strong\_count}s stay $\ge 1$ forever and leak memory (safe Rust considers leaking memory undesirable, though memory-safe --- no dangling pointer is created). Whenever a parent-child relationship exists, parents own children via \texttt{Rc<Node>} (\texttt{strong}) while children point upward via \texttt{Weak<Node>} (\texttt{Rc::downgrade(\&parent)}), which increments \texttt{weak\_count} without keeping the value alive; reading a \texttt{Weak<Node>} requires calling \texttt{.upgrade() -> Option<Rc<Node>>} to check whether the parent still exists. Even better, as Chapter~8 shows, idiomatic Rust usually represents graphs as a flat \texttt{Vec<Node>} indexed by integer IDs (\texttt{NodeId(u32)}), avoiding reference-counted pointer webs altogether.
+Unlike a tracing GC, reference counting cannot collect isolated cycles. If node~$A$ holds an \texttt{Rc} to $B$ and $B$ holds an \texttt{Rc} back to $A$, both strong counts stay $\ge 1$ forever and leak memory (safe Rust treats leaks as memory-safe since no pointer dangles). In parent-child trees, parents own children via \texttt{Rc<Node>} while children point upward via \texttt{Weak<Node>} (\texttt{Rc::downgrade(\&parent)}). Reading a \texttt{Weak<Node>} calls \texttt{.upgrade() -> Option<Rc<Node>>} to check whether the parent still lives. Better still, Chapter~8 replaces pointer webs with a flat \texttt{Vec<Node>} indexed by integer IDs (\texttt{NodeId(u32)}).
 \end{remark}
 
 \section{Controlled Interior Mutability: \texttt{Cell}, \texttt{RefCell}, and \texttt{Mutex}}
@@ -672,7 +672,7 @@ impl QuoteClient {
 }
 \end{lstlisting}
 
-Why is \texttt{self.request\_count.set(next)} completely sound through a shared \texttt{\&self} without any lock or runtime borrow counter? \textbf{Because \texttt{Cell<T>} never gives out a \texttt{\&T} or \texttt{\&mut T} reference to the bytes inside it.} You can only copy values out (\texttt{.get()} when \texttt{T: Copy}), overwrite the whole value (\texttt{.set(new\_val)}), or swap a non-\texttt{Copy} value in and out atomically on one thread (\texttt{.replace(new\_val)} / \texttt{.take()}). Since no pointer into a \texttt{Cell<T>}'s interior can ever exist, overwriting its contents can never invalidate a dangling reference --- and because \texttt{Cell<T>} is \texttt{!Sync} (cannot be shared across threads), no second thread can race with those writes. \texttt{size\_of::<Cell<u64>>()} is $8$~bytes, and \texttt{.set()} compiles down to a single \texttt{mov} instruction.
+Why is \texttt{self.request\_count.set(next)} sound through a shared \texttt{\&self} with zero locks or counters? \textbf{Because \texttt{Cell<T>} never hands out a \texttt{\&T} or \texttt{\&mut T} pointing inside it.} Callers can only copy values out (\texttt{.get()} when \texttt{T: Copy}), overwrite the whole slot (\texttt{.set(val)}), or swap values on one thread (\texttt{.replace(val)} / \texttt{.take()}). No interior reference exists to dangle, and \texttt{Cell<T>} is \texttt{!Sync} so no second thread can race with writes. \texttt{size\_of::<Cell<u64>>()} is $8$~bytes, and \texttt{.set()} compiles to one \texttt{mov} instruction.
 
 \subsection{2. \texttt{RefCell<T>}: Single-Threaded Runtime Borrow Checking}
 
@@ -685,7 +685,7 @@ In memory on a 64-bit machine, \texttt{RefCell<T>} stores \texttt{T} alongside o
   \item $\texttt{borrow} == -1$: currently borrowed mutably by \textbf{one} exclusive \texttt{RefMut<'\_, T>} guard. When that \texttt{RefMut} guard drops, \texttt{borrow} resets to $0$.
 \end{itemize}
 
-If your code calls \texttt{.borrow\_mut()} while \texttt{borrow != 0} (or calls \texttt{.borrow()} while \texttt{borrow == -1}), \texttt{RefCell} catches the Aliasing $+$ Mutation violation immediately on that exact line and \textbf{panics} (unwinding the thread cleanly before a single byte of undefined behavior can occur; if you prefer a recoverable \texttt{Result}, call \texttt{.try\_borrow\_mut()}).
+Calling \texttt{.borrow\_mut()} while \texttt{borrow != 0} (or \texttt{.borrow()} while \texttt{borrow == -1}) violates Aliasing XOR Mutability at runtime. \texttt{RefCell} catches it on that exact line and \textbf{panics}, unwinding the thread cleanly before any undefined behavior can occur. Callers who prefer a recoverable \texttt{Result} can call \texttt{.try\_borrow\_mut()}.
 
 \begin{lstlisting}[language=Rust]
 use std::cell::RefCell;
@@ -735,7 +735,7 @@ public class SharedVault {
 }
 \end{lstlisting}
 
-Experienced Java and C++ engineers ship bugs like \texttt{peekBalanceBuggy()} regularly: forgetting to acquire the lock in a newly added method, forgetting \texttt{try/finally} so an early return leaks a held lock, or returning a reference to a mutable \texttt{HashMap} stored inside the class so the caller keeps reading and mutating the map \emph{after} \texttt{finally \{ lock.unlock(); \}} has already released the lock.
+Experienced Java and C++ teams ship bugs like \texttt{peekBalanceBuggy()} regularly. A new getter forgets \texttt{lock.lock()}, an early return skips \texttt{try/finally} and leaks a held lock, or a method returns a reference to a private \texttt{HashMap} that callers keep mutating after \texttt{unlock()}.
 
 Look at \texttt{std::sync::Mutex<T>} in Rust. In Rust, \textbf{a \texttt{Mutex} is a generic container that physically wraps and owns the \texttt{T} inside itself}:
 
@@ -814,7 +814,7 @@ Each of the three properties below is enforced by the type system:
 \label{ch03:fig-java-vs-rust-mutex}
 \end{figure}
 
-When reads heavily outnumber writes (such as our five-minute \texttt{FeeSchedule} refresh read by thousands of HTTP requests per second), swap \texttt{Mutex<T>} for \texttt{std::sync::RwLock<T>}: \texttt{.read()} hands out concurrent shared \texttt{RwLockReadGuard<'\_, T>} handles across all CPU cores simultaneously, while \texttt{.write()} waits for exclusive \texttt{RwLockWriteGuard<'\_, T>} access --- the exact runtime multi-threaded twin of Rust's compile-time \texttt{\&T} versus \texttt{\&mut T}.
+When reads heavily outnumber writes --- such as our five-minute \texttt{FeeSchedule} refresh --- swap \texttt{Mutex<T>} for \texttt{std::sync::RwLock<T>}. Calling \texttt{.read()} hands out concurrent \texttt{RwLockReadGuard<'\_, T>} handles across cores, while \texttt{.write()} waits for exclusive \texttt{RwLockWriteGuard<'\_, T>} access. It is the runtime multi-threaded twin of compile-time \texttt{\&T} versus \texttt{\&mut T}.
 
 \subsection{Putting the Entire Pointer \& Ownership Toolkit Together}
 
@@ -845,10 +845,10 @@ Table~\ref{ch03:tab-pointer-toolkit} summarizes every ownership, borrowing, and 
 \end{table}
 
 \begin{applicationbox}
-In Chapters~12 through~14, when we wire up our production Axum financial service backed by PostgreSQL, almost every shared service handle in \texttt{AppState} will be a cheap-to-clone \texttt{Arc<...>} wrapping immutable config and a thread-safe \texttt{PgPool}, while per-request ledger mutations happen either on uniquely owned local values or inside PostgreSQL row locks (\texttt{SELECT ... FOR UPDATE}) rather than global process-wide mutexes. Knowing every row of Table~\ref{ch03:tab-pointer-toolkit} tells you immediately why that architecture scales across 64 cores without contention.
+In Chapters~12 through~14, we wire up our Axum financial service backed by PostgreSQL. Almost every shared handle in \texttt{AppState} is a cheap-to-clone \texttt{Arc<...>} wrapping immutable config and a thread-safe \texttt{PgPool}. Per-request ledger updates happen on uniquely owned local values or inside PostgreSQL row locks (\texttt{SELECT ... FOR UPDATE}) rather than global process mutexes. Knowing Table~\ref{ch03:tab-pointer-toolkit} makes it clear why that design scales across 64 cores without lock contention.
 \end{applicationbox}
 
-In the next chapter, we look directly at the lifetime tick marks (\texttt{'a}) we glimpsed on borrowed references and guards --- stripping away every trace of mysticism around how the compiler tracks regions, when lifetimes can be elided, why \texttt{String: 'static} is true, and how six lines of carefully audited \texttt{unsafe} code power \texttt{Vec<T>} and \texttt{split\_at\_mut}.
+Next, Chapter~4 tackles the lifetime tick marks (\texttt{'a}) we saw on borrowed references and guards. You will see how the compiler tracks regions, when lifetimes can be omitted, why \texttt{String: 'static} holds, and how six lines of audited \texttt{unsafe} code power \texttt{split\_at\_mut}.
 
 \section{Exercises}
 \label{ch03:exercises}
@@ -874,9 +874,11 @@ codes.push(String::from("USD"));
 codes.push(String::from("CHF"));
 let view: &[String] = &codes[0..2];
 \end{lstlisting}
-(a) How many bytes sit on the stack frame for \texttt{codes} and \texttt{view} combined?\\
-(b) How many distinct heap allocations exist, and what are their exact sizes and byte contents?\\
-(c) Compare your answer to storing two three-letter currency codes in \texttt{Vec<[u8; 3]>} with capacity $4$: how many heap allocations and total heap bytes does \texttt{Vec<[u8; 3]>} use, and why?
+\begin{enumerate}[label=(\alph*)]
+  \item How many bytes sit on the stack frame for \texttt{codes} and \texttt{view} combined?
+  \item How many distinct heap allocations exist, and what are their exact sizes and byte contents?
+  \item Compare storing two three-letter currency codes in \texttt{Vec<[u8; 3]>} with capacity $4$. How many heap allocations and total heap bytes does \texttt{Vec<[u8; 3]>} use, and why?
+\end{enumerate}
 \end{exercise}
 
 \begin{exercise}[Destructive move versus C++ \texttt{std::move}]
@@ -913,9 +915,11 @@ fn call_twice_generic(r: &mut i64) {
 \end{exercise}
 
 \begin{exercise}[Generalizing \texttt{split\_at\_mut} to three accounts]
-In \S\ref{ch03:borrowing-reborrowing-slices} we wrote \texttt{transfer\_in\_slice} to obtain two disjoint \texttt{\&mut Account} references from \texttt{accounts: \&mut [Account]}. Now suppose every transfer also credits a fee directly to a house fee account at index \texttt{fee\_idx} inside the \emph{same} \texttt{\&mut [Account]} slice, requiring \textbf{three} simultaneous mutable references \texttt{(\&mut Account, \&mut Account, \&mut Account)} for \texttt{(from\_idx, to\_idx, fee\_idx)}.\\
-(a) What precondition on \texttt{(from\_idx, to\_idx, fee\_idx)} must hold for three simultaneous mutable borrows to be sound?\\
-(b) Write a safe Rust helper \texttt{borrow\_three\_mut<T>(slice: \&mut [T], i: usize, j: usize, k: usize)} returning \texttt{Option<(\&mut T, \&mut T, \&mut T)>} using two calls to \texttt{split\_at\_mut} (Hint: sort the three indices along with their original positions first).
+In \S\ref{ch03:borrowing-reborrowing-slices} we wrote \texttt{transfer\_in\_slice} to borrow two disjoint \texttt{\&mut Account} slots from \texttt{accounts: \&mut [Account]}. Now suppose every transfer also credits a fee to a house account at \texttt{fee\_idx} in the same slice. You need three simultaneous mutable references \texttt{(\&mut Account, \&mut Account, \&mut Account)} for \texttt{(from\_idx, to\_idx, fee\_idx)}.
+\begin{enumerate}[label=(\alph*)]
+  \item What precondition on \texttt{(from\_idx, to\_idx, fee\_idx)} must hold for three simultaneous mutable borrows to be sound?
+  \item Write a safe helper \texttt{borrow\_three\_mut<T>(slice: \&mut [T], i: usize, j: usize, k: usize)} returning \texttt{Option<(\&mut T, \&mut T, \&mut T)>} via two calls to \texttt{split\_at\_mut}. Hint: sort the three indices along with their original positions first.
+\end{enumerate}
 \end{exercise}
 
 \begin{exercise}[Tracing \texttt{RefCell<T>} borrow states]
@@ -938,7 +942,7 @@ For each engineering requirement below, pick the simplest, lowest-overhead Rust 
 \begin{enumerate}
   \item[(a)] A read-only TLS certificate chain loaded at startup and inspected on every incoming HTTPS connection across 32 Tokio worker threads.
   \item[(b)] A single-threaded compiler pass where AST expression nodes share references to symbol-table entries whose inferred type slot starts \texttt{None} and gets filled in during type checking.
-  \item[(c)] An in-memory FX rate map read $50{,}000$ times per second across 16 threads and replaced once every $2$~seconds by a background market-data feed thread. (Bonus: compare wrapping the map in \texttt{Arc<RwLock<RateMap>>} versus storing \texttt{Mutex<Arc<RateMap>>} so readers clone an immutable \texttt{Arc<RateMap>})
+  \item[(c)] An in-memory FX rate map read $50{,}000$ times per second across 16 threads and replaced once every $2$~seconds by a background market-data feed thread. (Bonus: compare wrapping the map in \texttt{Arc<RwLock<RateMap>>} versus storing \texttt{Mutex<Arc<RateMap>>} so readers clone an immutable \texttt{Arc<RateMap>}.)
 \end{enumerate}
 \end{exercise}
 

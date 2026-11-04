@@ -5,7 +5,7 @@ Chapters~3 and~4 tracked \emph{who owns} a block of memory and \emph{how long} a
 
 If you grew up in Java~6 and C++, your reflexes for modeling domain data were shaped by mutable classes full of nullable references and boolean flags, plus open \texttt{extends} hierarchies on the heap. Rust drops both \texttt{extends} implementation inheritance and implicit \texttt{null}. In their place, it gives you \emph{algebraic data types} (\texttt{struct} and data-carrying \texttt{enum}) paired with exhaustive pattern matching (\texttt{match}). This chapter counts how many nonsensical states each design allows, and then inspects the exact bytes the compiler emits for the safer design.
 
-We will study Rust's data model from two angles: first from above, using simple counting algebra to measure how tightly a type fits its domain, and then down to the metal, counting exact bytes, alignment padding, discriminant tags, and bit-pattern niches on a 64-bit machine.
+We study Rust's data model from two angles. First we use simple counting algebra to measure how tightly a type fits its domain. Then we drop down to the metal, counting exact bytes, alignment padding, discriminant tags, and bit-pattern niches on a 64-bit machine.
 
 \chapterline
 
@@ -49,7 +49,7 @@ Bundling fields \texttt{a: A} and \texttt{b: B} into a record lets every value o
 Because their cardinalities multiply, structs and tuples are \emph{product types}. Rust provides three forms:
 \begin{enumerate}
   \item \textbf{Named-field structs}, such as \texttt{struct Point \{ x: i32, y: i32 \}}, with cardinality $2^{32} \cdot 2^{32} = 2^{64}$.
-  \item \textbf{Tuple structs}, such as \texttt{pub struct BasisPoints(pub u16);}, with cardinality $65{,}536$. Wrapping a primitive in a single-field tuple struct --- the \emph{newtype} idiom --- creates a distinct compile-time type with \emph{zero} heap boxing or object header: in machine code it is an unboxed 2-byte \texttt{u16} in a register, yet the compiler rejects passing a bare \texttt{u16} where \texttt{BasisPoints} are expected.
+  \item \textbf{Tuple structs}, such as \texttt{pub struct BasisPoints(pub u16);}, with cardinality $65{,}536$. Wrapping a primitive in a single-field tuple struct --- the \emph{newtype} idiom --- creates a distinct compile-time type with zero heap boxing or header. In machine code it stays an unboxed 2-byte \texttt{u16} in a register, while the compiler rejects a bare \texttt{u16} where \texttt{BasisPoints} is expected.
   \item \textbf{Unit structs}, such as \texttt{pub struct Usd;}, an empty product ($\abs{\texttt{Usd}} = 1$, zero runtime bytes) used as type-level markers in Chapter~6.
 \end{enumerate}
 
@@ -224,7 +224,7 @@ const _: () = assert!(size_of::<CompactHeaderRust>() == 16);
 const _: () = assert!(align_of::<CompactHeaderRust>() == 8);
 \end{lstlisting}
 
-Because \texttt{size\_of} and \texttt{align\_of} are \texttt{const fn}s, \texttt{const \_: () = assert!(...);} checks layouts at compile time at zero runtime cost. Under \texttt{\#[repr(C)]}, 10 bytes of actual payload expand to 24 bytes (14 bytes of padding) so \texttt{tx\_id} aligns to 8 bytes in every element of \texttt{[PaddedHeaderC; N]}. Under default \texttt{repr(Rust)}, field offsets are intentionally unspecified so \texttt{rustc} can place \texttt{tx\_id: u64} first at bytes \texttt{0..=7}, followed by \texttt{version} at byte~8, \texttt{flags} at byte~9, and 6 tail-padding bytes (\texttt{10..=15}) --- saving 33\% of cache space without forcing you to reorder source fields for the machine. Add \texttt{\#[repr(C)]} only at C FFI or kernel ABI boundaries.
+Because \texttt{size\_of} and \texttt{align\_of} are \texttt{const fn}s, \texttt{const \_: () = assert!(...);} checks layouts at compile time at zero runtime cost. Under \texttt{\#[repr(C)]}, 10 bytes of actual payload expand to 24 bytes (14 bytes of padding) so \texttt{tx\_id} aligns to 8 bytes in every element of \texttt{[PaddedHeaderC; N]}. Under default \texttt{repr(Rust)}, field offsets are left unspecified so \texttt{rustc} can reorder them automatically. It places \texttt{tx\_id: u64} first at bytes \texttt{0..=7}, \texttt{version} at byte~8, \texttt{flags} at byte~9, and 6 tail-padding bytes at \texttt{10..=15}, saving 33\% of cache space without manual source reordering. Add \texttt{\#[repr(C)]} only at C FFI or kernel ABI boundaries.
 
 \subsection{How a General \texttt{enum} Sits in Memory: The Tagged Union}
 \label{ch05:tagged-union-layout}
@@ -699,7 +699,14 @@ public class PaymentOrder {
 }
 \end{lstlisting}
 
-Java's compiler accepts all four failure modes here without complaint: (1)~moving to \texttt{CAPTURED} while leaving \texttt{captureTxId == null}, which surfaces hours later as a \texttt{NullPointerException} in the nightly settlement job; (2)~capturing an order that was never authorized, or capturing more than was authorized, because \texttt{capture} checks neither \texttt{status} nor \texttt{authorizedCents}; (3)~calling \texttt{refund(0, "x")} on an uncharged \texttt{CREATED} order, which passes the guard because \texttt{settledCents} defaulted to \texttt{0L}; and (4)~accepting zero or negative amounts, since every amount is a signed \texttt{long}. On top of that, a method that throws halfway through leaves a half-mutated object behind.
+Java's compiler accepts all four failure modes here without complaint:
+\begin{enumerate}
+  \item Moving to \texttt{CAPTURED} while leaving \texttt{captureTxId == null}, which surfaces hours later as a \texttt{NullPointerException} in nightly settlement.
+  \item Capturing an unauthorized order, or capturing more than was authorized, because \texttt{capture} checks neither \texttt{status} nor \texttt{authorizedCents}.
+  \item Calling \texttt{refund(0, "x")} on an uncharged \texttt{CREATED} order, which passes the guard because \texttt{settledCents} defaulted to \texttt{0L}.
+  \item Accepting zero or negative amounts, since every amount is a signed \texttt{long}.
+\end{enumerate}
+On top of that, a method that throws halfway through leaves a half-mutated object behind.
 
 \subsection{Step-by-Step Refactoring into an Algebraic State Machine}
 \label{ch05:rust-payment-machine}
@@ -899,10 +906,10 @@ impl PaymentOrder {
 }
 \end{lstlisting}
 
-Each of the four Java~6 bugs is now either unrepresentable or rejected by a checked transition: \texttt{Captured} cannot be constructed without a non-empty \texttt{CaptureTxId}; \texttt{capture} only accepts an \texttt{Authorized} order and returns \texttt{CaptureExceedsAuth} instead of over-capturing; \texttt{refund} can only read a balance out of \texttt{PaymentState::Settled}; and \texttt{Cents} cannot hold zero or a negative number. Because each transition consumes \texttt{self} and builds a fresh value, there is no half-mutated object to leave behind, and callers cannot keep using a stale pre-transition variable. Moving \texttt{capture\_tx\_id} from \texttt{Captured} into \texttt{Settled} copies 24 stack bytes without cloning the heap characters.
+Every one of the four Java~6 bugs is now either unrepresentable or rejected by a checked transition. \texttt{Captured} requires a non-empty \texttt{CaptureTxId}. Calling \texttt{capture} accepts only an \texttt{Authorized} order and returns \texttt{CaptureExceedsAuth} on over-capture. Calling \texttt{refund} reads a balance only out of \texttt{PaymentState::Settled}, and \texttt{Cents} rejects zero and negative numbers. Because each transition consumes \texttt{self} and builds a fresh value, no half-mutated object can survive, and callers cannot reuse a stale pre-transition variable. Moving \texttt{capture\_tx\_id} from \texttt{Captured} into \texttt{Settled} copies 24 stack bytes without cloning heap characters.
 
 \begin{connectionbox}
-\textbf{Recovering \texttt{self} on error, and compile-time typestate.} If a caller needs the un-transitioned \texttt{PaymentOrder} back when a transition fails without cloning up front, return \texttt{Result<Self, (Self, OrderTransitionError)>}. The standard library uses the same ownership-recovery idea: \texttt{String::from\_utf8} hands the bytes back inside its \texttt{FromUtf8Error}, and \texttt{mpsc::Sender::send} hands the unsent value back inside its \texttt{SendError}. In Chapter~8 we will also meet the \emph{typestate} pattern (\texttt{PaymentOrder<Created>}, \texttt{PaymentOrder<Authorized>}), which encodes known states in generic type parameters; runtime sum enums (\texttt{PaymentState}, essential when loading rows dynamically from PostgreSQL in Chapter~13) and compile-time typestates work side by side in production Rust.
+\textbf{Recovering \texttt{self} on error, and compile-time typestate.} If a caller needs the original \texttt{PaymentOrder} back on failure without cloning up front, return \texttt{Result<Self, (Self, OrderTransitionError)>}. Standard library APIs do the same: \texttt{String::from\_utf8} returns the byte vector inside \texttt{FromUtf8Error}, and \texttt{mpsc::Sender::send} returns the unsent value inside \texttt{SendError}. In Chapter~8 we also meet \emph{typestate} (\texttt{PaymentOrder<Created>}, \texttt{PaymentOrder<Authorized>}), which puts known states into generic type parameters. Runtime sum enums (\texttt{PaymentState}, needed when loading PostgreSQL rows in Chapter~13) and compile-time typestates work side by side in production Rust.
 \end{connectionbox}
 
 In Chapter~6 we move from modeling the \emph{shape} of a single type to abstracting \emph{shared behavior} across types: traits, generics, monomorphization, and \texttt{dyn Trait} vtables --- the machinery behind \texttt{From::from} and \texttt{?} in this chapter, built without a single \texttt{extends} superclass.

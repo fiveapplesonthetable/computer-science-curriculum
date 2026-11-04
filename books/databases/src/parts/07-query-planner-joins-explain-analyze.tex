@@ -17,7 +17,18 @@ The query says \emph{what} answer we want. It says nothing about \emph{how} to g
 
 The piece of PostgreSQL that chooses among those plans is the \emph{query planner} (also called the optimizer). It never runs the candidates. It \emph{predicts} what each would cost using statistics about your data and a small set of cost constants, and then hands the cheapest prediction to the executor. When the prediction is right, you never think about it. When it is wrong, a query that ran in 3~ms yesterday runs for 40 seconds today, and the only way to see why is to read \texttt{EXPLAIN (ANALYZE, BUFFERS)} output.
 
-This chapter builds the planner's reasoning from the ground up: the statistics it collects, the units it measures cost in, the four ways it can read one table, the three ways it can join two tables, how it searches through join orders, and how to read its output line by line so you can tell exactly where a prediction went wrong.
+This chapter builds the planner's reasoning from the ground up. We start with the column statistics it collects and the cost units it uses as currency. Then we trace the four ways it reads a single table, the three ways it joins two tables, and how it searches join orders. Finally, we read \texttt{EXPLAIN (ANALYZE, BUFFERS)} output line by line to spot exactly where a slow plan went wrong.
+
+\begin{focusbox}
+By the end of this chapter you will be able to answer five practical engineering questions:
+\begin{itemize}
+  \item How can sampling just $30{,}000$ random rows let PostgreSQL estimate filter matches on a five-billion-row table?
+  \item Why does an index scan on a timestamp column run thirty times faster than the exact same $1\%$ index scan on a random amount column?
+  \item When does PostgreSQL build an in-memory page bitmap instead of using a plain index scan or reading the whole table?
+  \item How does the planner choose between a Nested Loop, a Hash Join, and a Merge Join---and what happens when a Hash Join runs out of RAM?
+  \item When a query suddenly slows from $3\text{ ms}$ to $40\text{ seconds}$, which numbers in \texttt{EXPLAIN (ANALYZE, BUFFERS)} reveal the root cause?
+\end{itemize}
+\end{focusbox}
 
 \chapterline
 
@@ -65,7 +76,7 @@ SELECT attname, null_frac, avg_width, n_distinct,
    AND attname IN ('status', 'amount_minor');
 \end{lstlisting}
 
-\begin{lstlisting}
+\begin{lstlisting}[language=Plain]
 -[ RECORD 1 ]-----+------------------------------------
 attname           | status
 null_frac         | 0
@@ -268,7 +279,7 @@ You can check this against PostgreSQL directly:
 \begin{lstlisting}[language=SQL]
 EXPLAIN SELECT * FROM ledger_lines WHERE amount_minor > 900000;
 \end{lstlisting}
-\begin{lstlisting}
+\begin{lstlisting}[language=Plain]
 Seq Scan on ledger_lines  (cost=0.00..16250.00 rows=4975 width=48)
   Filter: (amount_minor > 900000)
 \end{lstlisting}
@@ -295,17 +306,17 @@ Read every page in physical order and test every row. The cost is almost indepen
 
 Descend the B-tree (Chapter~3) to the first matching key, then walk the leaf pages. For each index entry, follow its \texttt{ctid} to the heap page, fetch the row, and check visibility against the snapshot (Chapter~5). Rows come out in index order, which can satisfy an \texttt{ORDER BY} for free.
 
-The catch is the heap fetches. Each matching row may live on a different heap page, and each of those page reads may be a random read. How many distinct heap pages does an index scan touch? That depends on \texttt{correlation}, and the planner handles it by computing two extremes and interpolating between them.
+The catch is the heap fetches. Each matching row may live on a different heap page, and each of those page reads may be a random read. How many distinct heap pages does an index scan touch? If matching rows sit next to each other on disk, $5{,}000$ rows at $50$ rows per page fit on just $100$ consecutive pages. If matching rows are scattered at random across a $10{,}000$-page table, almost every fetch lands on a different page, though some pages will be hit twice by chance. The planner computes both extremes---completely scattered versus perfectly clustered---and blends between them using the column's squared \texttt{correlation} statistic.
 
 \begin{formalbox}
 \textbf{How PostgreSQL prices the heap side of an Index Scan} (\texttt{cost\_index} in \texttt{costsize.c}). Let the table have $T$ pages, and let the scan fetch $N$ rows.
 \begin{itemize}
-  \item \textbf{Worst case (correlation $0$):} the rows are scattered. The number of distinct pages fetched is estimated by the Mackert--Lohman formula; when the table fits in cache it is
+  \item \textbf{Worst case (correlation $0$, scattered rows):} the expected number of distinct pages visited when drawing $N$ rows across $T$ pages with caching is approximated by the Mackert--Lohman formula. When the table fits inside \texttt{effective\_cache\_size}, that count is
   \[
     P_{\max} = \min\!\Big(\frac{2TN}{2T + N},\; T\Big),
   \]
   and each page costs \texttt{random\_page\_cost}: $\text{IO}_{\max} = P_{\max} \times 4.0$.
-  \item \textbf{Best case (correlation $\pm 1$):} the matching rows sit on consecutive pages. That is $P_{\min} = \lceil \text{sel} \times T \rceil$ pages, the first a random read and the rest sequential: $\text{IO}_{\min} = 4.0 + (P_{\min} - 1) \times 1.0$.
+  \item \textbf{Best case (correlation $\pm 1$, clustered rows):} the matching rows sit on consecutive pages. That touches $P_{\min} = \lceil \text{sel} \times T \rceil$ pages, with the first a random read and the rest sequential: $\text{IO}_{\min} = 4.0 + (P_{\min} - 1) \times 1.0$.
   \item \textbf{Interpolate with the square of the correlation $c$:}
   \[
     \text{IO} = \text{IO}_{\max} + c^2\,(\text{IO}_{\min} - \text{IO}_{\max}).
@@ -347,7 +358,7 @@ The planner prices the per-page cost on a sliding scale between \texttt{random\_
 
 \paragraph{Exact versus lossy bitmaps.} The bitmap must fit in \texttt{work\_mem}. While it does, every page entry records exactly which tuple offsets matched: an \emph{exact} page. If the bitmap would grow past \texttt{work\_mem}, PostgreSQL starts converting entries to \emph{lossy} form: it keeps only ``some tuple on this page matched'' and forgets which ones. A lossy page costs one bit of information instead of a list of offsets, so memory stays bounded no matter how many rows match. The price is paid at the heap: for a lossy page, the Bitmap Heap Scan must re-evaluate the original condition against \emph{every} tuple on that page. That re-evaluation is the \texttt{Recheck Cond} line you see in the plan, and \texttt{EXPLAIN ANALYZE} tells you how much it cost:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=Plain]
 Bitmap Heap Scan on postings
     (cost=4120.55..98211.31 rows=201004 width=40)
     (actual time=38.412..402.118 rows=198734 loops=1)
@@ -364,15 +375,15 @@ Bitmap Heap Scan on postings
 
 (PostgreSQL prints each node's estimate and actuals on one long line; we wrap lines in this chapter so they fit the page.) Read the middle lines. Of the $82{,}315$ heap pages visited, $61{,}311$ were lossy, and rechecking every tuple on them discarded $1.2$ million non-matching rows. Raising \texttt{work\_mem} for this query (for example, \texttt{SET LOCAL work\_mem = '64MB'}) keeps every page exact; the \texttt{Rows Removed by Index Recheck} line disappears and the heap scan does far less CPU work.
 
-\paragraph{Combining indexes.} Bitmaps can be combined before touching the heap. For \texttt{WHERE merchant\_id = 4242 AND status = 'failed'} with separate indexes on each column, PostgreSQL can run two Bitmap Index Scans and intersect them with a \texttt{BitmapAnd} node (or union them with \texttt{BitmapOr} for an \texttt{OR}), then read only the heap pages present in both. A plain Index Scan can use only one index per table.
+\paragraph{Combining indexes.} Bitmaps can be combined before touching the heap. Consider \texttt{WHERE merchant\_id = 4242 AND status = 'failed'} when each column has its own separate B-tree index. PostgreSQL can run two Bitmap Index Scans, intersect their page bitmaps with a \texttt{BitmapAnd} node (or union them with \texttt{BitmapOr} for \texttt{OR}), and read only the heap pages present in both. A plain Index Scan can use only one index per table.
 
 \subsection{Index-Only Scan}
 
 If every column the query needs is stored in the index, the heap fetch could be skipped entirely. The obstacle is visibility: index entries carry no \texttt{xmin}/\texttt{xmax}, so the index alone cannot tell whether an entry points to a row your snapshot should see.
 
-PostgreSQL solves this with the \emph{visibility map} (Chapter~3 and Chapter~5): one bit per heap page meaning ``every tuple on this page is visible to every transaction.'' For each index entry, an Index-Only Scan checks the visibility-map bit for its heap page. If the bit is set, the index value is returned directly. If not, the scan falls back to fetching the heap tuple. \texttt{EXPLAIN ANALYZE} counts those fallbacks:
+PostgreSQL solves this with the \emph{visibility map} (Chapters~3 and~5). The visibility map stores one bit per heap page meaning ``every tuple on this page is visible to all current and future transactions.'' For each index entry, an Index-Only Scan checks the visibility-map bit for its heap page. If the bit is set, the index value is returned directly. If not, the scan falls back to fetching the heap tuple. \texttt{EXPLAIN ANALYZE} counts those fallbacks:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=Plain]
 Index Only Scan using postings_acct_amt_idx on postings
     (actual time=0.031..9.880 rows=48200 loops=1)
   Index Cond: (account_id = 77)
@@ -443,7 +454,7 @@ You have written all three in Java. Given two \texttt{ArrayList}s to match up, y
 
 The simplest algorithm: for each outer row, scan the inner input for matches.
 
-\begin{lstlisting}
+\begin{lstlisting}[language=Plain]
 for each row o in outer:
     for each row i in inner where i.key = o.key:
         emit (o, i)
@@ -470,7 +481,7 @@ The hash table must fit in $\texttt{work\_mem} \times \texttt{hash\_mem\_multipl
 
 The result is still linear in the input sizes, but almost all of both inputs gets written to disk and read back once. That roughly triples the I/O compared with an in-memory hash join, and you can see it in the plan:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=Plain]
 Hash Join  (actual time=812.4..6411.9 rows=9840211 loops=1)
   Hash Cond: (p.account_id = a.id)
   Buffers: shared hit=2210 read=310118, temp read=96120 written=96120
@@ -618,7 +629,7 @@ ROLLBACK;
 
 Here is the plan for the dashboard query from the start of the chapter:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=Plain]
 Limit  (cost=48211.20..48211.23 rows=10 width=48)
        (actual time=212.441..212.446 rows=10 loops=1)
   Buffers: shared hit=40213 read=6120
@@ -674,6 +685,17 @@ That 130~ms is most of the query's 212~ms. If you read only the per-loop number,
 Buffer counts are cumulative: a parent's count includes its children's. Here every node above the nested loop shows the same totals because none of them reads any pages itself.
 
 \paragraph{Planning and execution time.} \texttt{Execution Time} covers running the plan, but not sending rows to the client. \texttt{Planning Time} covers the planner's search. For most OLTP queries, planning should be well under a millisecond; if it rivals execution time, prepared statements (Chapter~8) or simpler queries will help.
+
+\begin{recoverybox}
+\textbf{Pause and check: the 30-second \texttt{EXPLAIN (ANALYZE, BUFFERS)} checklist.}
+Whenever you stare at an unfamiliar plan, check four things in order:
+\begin{enumerate}
+  \item \textbf{Multiply by \texttt{loops}.} Any node with \texttt{loops > 1} reports per-iteration averages; multiply both \texttt{actual time} and \texttt{rows} by \texttt{loops} before deciding whether a node is cheap or expensive.
+  \item \textbf{Spot row-estimate gaps.} Find the deepest node where estimated \texttt{rows} and actual \texttt{rows} disagree by $10\times$ or more. That node is where the planner's mental map diverged from reality.
+  \item \textbf{Check for memory spills.} Look for \texttt{Batches: > 1}, \texttt{Sort Method: external merge}, \texttt{lossy=} blocks, or \texttt{temp read/written}.
+  \item \textbf{Separate cache hits from reads.} High \texttt{shared read} with \texttt{track\_io\_timing = on} tells you the query waited on storage rather than CPU.
+\end{enumerate}
+\end{recoverybox}
 
 \begin{figure}[H]
 \centering
@@ -732,7 +754,7 @@ Almost every slow plan comes down to one of a few causes. Here is how each shows
 \begin{example}[A thousand-fold misestimate]
 \label{ch07:ex-bad-plan}
 A fraud report filters \texttt{transfers} by \texttt{city = 'Lyon' AND postal\_code = '69001'} and joins to \texttt{accounts}:
-\begin{lstlisting}
+\begin{lstlisting}[language=Plain]
 Nested Loop  (cost=0.85..412.66 rows=20 width=64)
              (actual time=0.090..48711.302 rows=19874 loops=1)
   ->  Seq Scan on transfers t  (cost=0.00..250.10 rows=20 width=40)
@@ -799,7 +821,11 @@ A plan reports \texttt{Heap Blocks: exact=4000 lossy=36000} and \texttt{Rows Rem
 \end{exercise}
 
 \begin{exercise}[Choosing a join algorithm]
-For each case, say which join algorithm you expect and why: (a) 50 rows from \texttt{orders} joined to \texttt{customers} on its primary key; (b) 30 million \texttt{postings} joined to 3 million \texttt{accounts} for a monthly report, \texttt{work\_mem = 64MB}; (c) the same as (b) with \texttt{ORDER BY account\_id} and B-tree indexes on both join columns; (d) the same as (a), but the planner estimated 50 rows and the true count is 2 million.
+For each case below, state which join algorithm you expect the planner to pick and explain why.
+(a) Joining 50 rows from \texttt{orders} to \texttt{customers} on its primary key.
+(b) Joining 30 million \texttt{postings} to 3 million \texttt{accounts} for a monthly report with \texttt{work\_mem = 64MB}.
+(c) The same query as (b), now with \texttt{ORDER BY account\_id} and B-tree indexes on both join columns.
+(d) The same query as (a), except the planner estimated 50 outer rows when the true count is 2 million.
 \end{exercise}
 
 \begin{exercise}[Multi-batch hash join arithmetic]
@@ -812,7 +838,7 @@ The build side of a hash join has 6,000,000 rows of 56 bytes each, and the hash 
 
 \begin{exercise}[Find the slow node]
 In the plan below, compute the total rows and total time contributed by the inner node, identify which node is responsible for most of the runtime, and propose two different fixes.
-\begin{lstlisting}
+\begin{lstlisting}[language=Plain]
 Nested Loop  (actual time=0.05..8120.4 rows=420000 loops=1)
   ->  Index Scan using invoices_due_idx on invoices i
         (cost=0.43..95.12 rows=40 width=16)
