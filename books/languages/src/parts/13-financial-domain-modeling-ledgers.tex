@@ -1,10 +1,10 @@
 \chapter{Modeling Money and Ledgers in Types: Fixed-Point Arithmetic, Double-Entry Accounting, and Typestate}
 
-In Chapter~12 we solved the \emph{temporal} engineering problem of a financial backend: how a single Rust process multiplexes tens of thousands of waiting HTTP and PostgreSQL sockets onto a handful of CPU cores via stackless \texttt{Future} state machines, and why async cancellation demands atomic database transactions. Now we turn from how requests wait to \emph{what those requests compute and store}.
+In Chapter~12 we solved the \emph{timing} half of a financial backend. One Rust process can multiplex tens of thousands of HTTP and PostgreSQL sockets onto a few cores using \texttt{Future} state machines, while atomic transactions guard against mid-flight cancellation. Now we turn from how requests wait to \emph{what those requests compute and store}.
 
-In most web applications, minor data anomalies are tolerable irritations. If a video platform miscounts view totals by two during a cache flush, nobody summons an external auditor. Financial systems cannot tolerate that. A single cent created out of rounding noise, lost during a three-way fee split, added across mismatched currencies, or subtracted from one account without an equal counter-entry breaks the conservation laws of the ledger. Worse, silent arithmetic bugs compound: a tenth-of-a-cent rounding bias across forty million card settlements quietly drifts corporate cash accounts by tens of thousands of dollars before month-end reconciliation flags a discrepancy.
+In most web applications, small data glitches are harmless annoyances. If a video site miscounts views by two during a cache flush, nobody calls an auditor. Financial systems cannot afford that margin. Creating a single cent out of rounding noise, losing a cent during a fee split, or mixing currencies breaks the ledger's conservation law. Worse, tiny biases compound: a tenth-of-a-cent drift across forty million card settlements quietly shifts cash accounts by tens of thousands of dollars.
 
-This chapter builds the pure domain core of our ledger service before we touch HTTP headers or SQL wire protocols in Chapter~14. You will see how every Rust mechanism from Parts~II and~III --- fixed-width integers, stack-allocated value structs, \texttt{\#[repr(transparent)]} newtypes, \texttt{PhantomData}, exhaustive enums, private module boundaries, and typestate --- works together to enforce a single architectural principle: \emph{make illegal financial states unrepresentable at compile time}.
+This chapter builds the pure domain core of our ledger before we touch HTTP headers or SQL wire protocols in Chapter~14. Every Rust tool from Parts~II and~III---fixed-width integers, value structs, \texttt{\#[repr(transparent)]} newtypes, \texttt{PhantomData}, exhaustive enums, private fields, and typestate---serves one goal. \emph{Make illegal financial states unrepresentable at compile time.}
 
 \chapterline
 
@@ -56,11 +56,11 @@ How do we make every currency amount an exact integer multiple of a base-10 unit
       \item Japanese Yen (\texttt{JPY}) has exponent~$0$: $2{,}500\text{ JPY}$ is stored as \texttt{2500\_i64} yen ($2500 \times 10^{0}$).
       \item Bahraini Dinars (\texttt{BHD}) and Kuwaiti Dinars (\texttt{KWD}) have exponent~$3$: $1.250\text{ KWD}$ is stored as \texttt{1250\_i64} fils ($1250 \times 10^{-3}$).
     \end{itemize}
-    How large is a signed 64-bit integer? $\texttt{i64::MAX} = 9{,}223{,}372{,}036{,}854{,}775{,}807 \approx 9.22 \times 10^{18}$. In US cents, that is $\$92{,}233{,}720{,}368{,}547{,}758.07$ --- over \textbf{ninety-two quadrillion dollars}, roughly eight hundred times total global GDP, fitting inside a single 8-byte CPU general-purpose register and mapping one-to-one onto PostgreSQL's 8-byte \texttt{BIGINT} column type. Systems that track sub-cent micropayments (such as cloud-compute billing at $\$0.000001$ per call or crypto-asset satoshis/wei) either scale \texttt{i64} to micro-units ($10^{-6}$) or step up to Rust's native 128-bit integer \texttt{i128} ($\approx 1.7 \times 10^{38}$, the choice made by the TigerBeetle financial database).
+    How large is a signed 64-bit integer? $\texttt{i64::MAX} = 9{,}223{,}372{,}036{,}854{,}775{,}807 \approx 9.22 \times 10^{18}$. In US cents, that exceeds \textbf{ninety-two quadrillion dollars}---roughly eight hundred times global GDP. It fits in one 8-byte CPU register and maps directly onto PostgreSQL's 8-byte \texttt{BIGINT} column. Systems tracking sub-cent micropayments (such as cloud billing at $\$0.000001$ per call or crypto wei) either scale \texttt{i64} to micro-units ($10^{-6}$) or step up to Rust's native \texttt{i128} ($\approx 1.7 \times 10^{38}$, used by the TigerBeetle ledger database).
 
-  \item \textbf{Base-10 scaled decimals (\texttt{rust\_decimal::Decimal}) for rates, prices, and percentages.} While settled balances live in integer minor units, fee schedules ($2.9\%$), foreign-exchange rates ($\text{EUR/USD} = 1.08475$), and bond yields have varying decimal places. If you come from Java~6, you reached for \texttt{java.math.BigDecimal}. Recall from Chapter~1 what a \texttt{BigDecimal} costs on the JVM: a heap-allocated wrapper object pointing to a \texttt{BigInteger} object pointing to a heap-allocated \texttt{int[]} magnitude array --- two pointer dereferences and garbage-collector pressure on every arithmetic operation.
+  \item \textbf{Base-10 scaled decimals (\texttt{rust\_decimal::Decimal}) for rates, prices, and percentages.} Settled balances live in integer minor units, yet fee schedules ($2.9\%$), FX rates ($\text{EUR/USD} = 1.08475$), and bond yields need varying decimal places. In Java~6, you reached for \texttt{java.math.BigDecimal}. Recall from Chapter~1 what \texttt{BigDecimal} costs on the JVM: a heap wrapper pointing to a \texttt{BigInteger} pointing to a heap \texttt{int[]} array, chasing two pointers per operation.
 
-  In Rust, the widely used \texttt{rust\_decimal::Decimal} type is a \textbf{16-byte stack-inline \texttt{Copy} value} with zero heap pointers. It packs a 96-bit unsigned integer mantissa ($0 \le M < 2^{96} \approx 7.92 \times 10^{28}$), $1$ sign bit, and a base-10 scale $s \in [0, 28]$ into four 32-bit words representing $(-1)^{\text{sign}} \cdot M \cdot 10^{-s}$. SQLx maps it to PostgreSQL \texttt{NUMERIC}: \texttt{NUMERIC(20, 4)} for amounts that need sub-cent precision, and a wider scale such as \texttt{NUMERIC(20, 8)} for exchange rates.
+  In Rust, \texttt{rust\_decimal::Decimal} is a \textbf{16-byte stack-inline \texttt{Copy} value} with zero heap pointers. It packs a 96-bit unsigned mantissa ($0 \le M < 2^{96} \approx 7.92 \times 10^{28}$), a sign bit, and a base-10 scale $s \in [0, 28]$ into four 32-bit words representing $(-1)^{\text{sign}} \cdot M \cdot 10^{-s}$. SQLx maps it directly to PostgreSQL \texttt{NUMERIC}---say \texttt{NUMERIC(20, 4)} for sub-cent prices and \texttt{NUMERIC(20, 8)} for FX rates.
 \end{enumerate}
 
 \begin{figure}[H]
@@ -111,19 +111,19 @@ Switching from \texttt{f64} to \texttt{i64} closes the binary rounding hole, but
 In Java~6, \texttt{Long.MAX\_VALUE + 1L} never throws an exception; it wraps silently via two's-complement arithmetic to \texttt{Long.MIN\_VALUE}, turning the largest possible positive balance into the most negative one. In C and C++, signed integer overflow is \emph{undefined behavior}, allowing optimizing compilers to delete bounds checks downstream. What does Rust do?
 \begin{itemize}
   \item In \textbf{debug builds} (\texttt{cargo test}, \texttt{cargo build}), \texttt{a + b} panics on overflow.
-  \item In \textbf{release builds} (\texttt{cargo build --release}), unless you explicitly enable \texttt{overflow-checks} in \texttt{Cargo.toml}, \textbf{ordinary \texttt{+}, \texttt{-}, and \texttt{*} wrap two's-complement just like Java}. Even if you turn overflow checks on (which you should in every financial binary's release profile), panicking an HTTP worker thread on untrusted input --- say a JSON body whose \texttt{amount\_cents} field is \texttt{9223372036854775807} --- turns a malformed payload into a denial-of-service vector.
+  \item In \textbf{release builds} (\texttt{cargo build --release}), ordinary \texttt{+}, \texttt{-}, and \texttt{*} wrap two's-complement just like Java unless you enable \texttt{overflow-checks} in \texttt{Cargo.toml}. You should enable \texttt{overflow-checks} in every financial release profile as a backstop, yet panics are still wrong for user input. Panicking a worker task when a JSON body sends \texttt{amount\_cents = 9223372036854775807} turns bad input into noisy crashes instead of a clean \texttt{422} error.
 \end{itemize}
 
-The idiomatic Rust rule for financial code is straightforward: \textbf{ban raw \texttt{+}, \texttt{-}, \texttt{*}, and \texttt{/} on domain money types, and use \texttt{checked\_add}, \texttt{checked\_sub}, and widened \texttt{i128} intermediate products} returning explicit \texttt{Option} or \texttt{Result} values.
+The Rust rule for financial code is simple: \textbf{avoid raw \texttt{+}, \texttt{-}, \texttt{*}, and \texttt{/} on domain money types}. Use \texttt{checked\_add}, \texttt{checked\_sub}, and widened \texttt{i128} intermediate products that return explicit \texttt{Option} or \texttt{Result} values.
 
 \subsection{Banker's Rounding and Penny-Exact Fee Allocation}
 
-Even when balances live in exact integer cents, division re-enters the picture the moment you compute a percentage fee ($2.9\%$ of $\$10.05 = 29.145\text{ cents}$) or split an invoice across multiple parties. You must decide two things explicitly: \emph{how to round a single fractional cent}, and \emph{where leftover pennies go when splitting a total}.
+Even when balances live in exact integer cents, division returns whenever you compute a percentage fee ($2.9\%$ of $\$10.05 = 29.145\text{ cents}$) or split an invoice. You must decide two rules up front: \emph{how to round a fractional cent}, and \emph{where leftover pennies go when splitting a total}.
 
 \paragraph{1. Unbiased midpoint rounding (Banker's Rounding).}
-In elementary school we learned ``round half up'' ($2.5 \to 3$, $3.5 \to 4$). Notice the asymmetry among the ten tenths $.0, .1, \dots, .9$: \texttt{.0} needs no rounding, four digits (\texttt{.1, .2, .3, .4}) round down, four digits (\texttt{.6, .7, .8, .9}) round up, and \textbf{\texttt{.5} always rounds up}. Across tens of millions of two-decimal fee calculations where exact half-cent midpoints arise routinely (e.g., $2.5\%$ fee on any odd multiple of $20\text{ cents}$), always rounding \texttt{.5} upward introduces a systematic one-way drift.
+In school we learned ``round half up'' ($2.5 \to 3$, $3.5 \to 4$). Look at the ten tenths $.0, .1, \dots, .9$: \texttt{.0} stays put, four digits (\texttt{.1..\allowbreak{}.4}) round down, four (\texttt{.6..\allowbreak{}.9}) round up, and \textbf{\texttt{.5} always rounds up}. Across millions of fee calculations where exact half-cents arise often (such as $2.5\%$ on odd multiples of $20\text{ cents}$), always rounding \texttt{.5} upward creates a steady upward drift.
 
-Many ledgers (and IEEE~754 itself) therefore default to \textbf{round half to even} (\emph{Banker's Rounding}, \texttt{MidpointNearestEven} in \texttt{rust\_decimal}): exact midpoints round to whichever neighbor has an \emph{even} last digit ($2.5 \to 2$, $3.5 \to 4$, $4.5 \to 4$, $5.5 \to 6$), canceling midpoint bias across even and odd quanta. Rounding is still a policy choice: many tax and invoicing rules require half-up, so production code takes the rounding mode as an explicit parameter set per jurisdiction or contract rather than hard-coding one. Let us write an exact basis-point fee calculator ($1\text{ bp} = 0.01\% = 1/10{,}000$) using pure integer arithmetic with zero floating-point instructions:
+Many ledgers (and IEEE~754 itself) therefore default to \textbf{round half to even} (\emph{Banker's Rounding}, \texttt{MidpointNearestEven} in \texttt{rust\_decimal}). Exact midpoints round to whichever neighbor ends in an \emph{even} digit ($2.5 \to 2$, $3.5 \to 4$, $4.5 \to 4$, $5.5 \to 6$), canceling bias across even and odd amounts. Rounding remains a business policy: tax rules often mandate half-up, so pass the rounding mode explicitly per jurisdiction rather than hard-coding one. Here is an exact basis-point fee calculator ($1\text{ bp} = 0.01\% = 1/10{,}000$) using pure integer arithmetic:
 
 \begin{lstlisting}[language=Rust, caption={Exact integer basis-point fee calculation using widened i128 and round-half-to-even.}]
 /// Computes `round_half_to_even(amount_minor * rate_bps / 10_000)` for non-negative
@@ -267,7 +267,7 @@ impl IdempotencyKey {
 }
 \end{lstlisting}
 
-Notice two subtle details here. First, both \texttt{AccountId} and \texttt{JournalEntryId} derive \texttt{Ord}: in Chapter~14 we will sort \texttt{AccountId}s in canonical ascending order before acquiring PostgreSQL row locks so concurrent transfers \texttt{A -> B} and \texttt{B -> A} can never deadlock. Second, \texttt{AccountId::new\_v7()} generates an RFC~9562 \textbf{UUIDv7} (whose top $48\text{ bits}$ store a big-endian Unix millisecond timestamp followed by $74\text{ bits}$ of cryptographic randomness) rather than a purely random UUIDv4. Random UUIDv4 inserts scatter uniformly across an entire multi-gigabyte PostgreSQL B-tree index, dirtying cold 8~KiB pages all over disk; time-ordered UUIDv7 inserts append monotonically at the right edge of the B-tree, keeping active leaf pages hot in shared RAM while still being globally unique without central coordination.
+Notice two details here. First, both \texttt{AccountId} and \texttt{JournalEntryId} derive \texttt{Ord}: in Chapter~14 we will lock accounts in ascending \texttt{AccountId} order so concurrent \texttt{A -> B} and \texttt{B -> A} transfers never deadlock. Second, \texttt{AccountId::new\_v7()} generates an RFC~9562 \textbf{UUIDv7} (a 48-bit Unix millisecond timestamp followed by 74 random bits) rather than a purely random UUIDv4. Random UUIDv4 inserts scatter across an entire PostgreSQL B-tree index, dirtying cold 8~KiB pages all over disk. Time-ordered UUIDv7 inserts append at the right edge of the B-tree, keeping active leaf pages hot in RAM without central coordination.
 
 \subsection{Phantom Compile-Time Currencies Versus Runtime Multi-Currency \texttt{Money}}
 
@@ -398,7 +398,7 @@ Notice that we deliberately did \emph{not} implement \texttt{std::ops::Add} (\te
 \section{Double-Entry Accounting From First Principles}
 \label{ch13:double-entry-accounting}
 
-Suppose your product manager asks for a peer-to-peer transfer feature: ``Move $\$100.00$ from Alice to Bob, charging a $\$1.50$ platform fee.'' An engineer who has never built a financial system almost always designs a single database table \texttt{users(id, balance\_cents)} and runs two mutable updates:
+Suppose a product manager asks for peer-to-peer transfers: ``Move $\$100.00$ from Alice to Bob, charging a $\$1.50$ platform fee.'' An engineer building a ledger for the first time usually creates one table \texttt{users(id, balance\_cents)} and runs two mutable updates:
 \begin{lstlisting}[language=SQL]
 UPDATE users SET balance_cents = balance_cents - 10000 WHERE id = $1;
 UPDATE users SET balance_cents = balance_cents + 9850  WHERE id = $2;
@@ -420,11 +420,11 @@ In 1494 in Venice, the Franciscan friar and mathematician Luca Pacioli --- a clo
 
 Engineers often find accounting terminology (\emph{debit} and \emph{credit}) confusing because everyday consumer slang uses them backwards from how your bank sees them. When your bank sends an SMS saying ``We \emph{credited} your checking account $\$50$,'' why does \emph{credit} mean ``increased'' there, whereas on a company's cash asset account \emph{debit} means ``increased''?
 
-Set aside memorization tables and derive the entire sign rule in three lines of algebra. Every financial entity obeys one foundational balance-sheet equation: everything the business \emph{holds or owns} (\textbf{Assets}, such as cash held at a partner bank) equals what it \emph{owes to external parties} (\textbf{Liabilities}, such as customer wallet balances payable on demand) plus the residual net worth belonging to its owners (\textbf{Equity}, which grows via \textbf{Revenue} and shrinks via \textbf{Expenses}):
+Set aside memorization tables and derive the entire sign rule in three lines of algebra. Every business obeys one balance-sheet equation. Everything the business \emph{holds or owns} (\textbf{Assets}, such as cash at a partner bank) equals what it \emph{owes to outsiders} (\textbf{Liabilities}, such as customer wallets) plus its owners' net worth (\textbf{Equity}, which grows via \textbf{Revenue} and shrinks via \textbf{Expenses}):
 \[
   \text{Assets} \;=\; \text{Liabilities} + \text{Equity} + \text{Revenue} - \text{Expenses}.
 \]
-In software and bookkeeping, we hate subtracting signed numbers because negative signs invite sign-flip bugs. Move $-\text{Expenses}$ across the equals sign so \textbf{every single term is non-negative and added}:
+In software and bookkeeping, we avoid subtracting signed numbers because negative signs invite sign-flip bugs. Move $-\text{Expenses}$ across the equals sign so \textbf{every single term is non-negative and added}:
 \begin{equation}
   \label{ch13:eq-accounting}
   \underbrace{\text{Assets} + \text{Expenses}}_{\text{Left side: \textbf{Debit-Normal} (Dr increases)}}
@@ -450,7 +450,7 @@ Equation~\eqref{ch13:eq-accounting} explains \emph{everything} in two words: \te
     \end{equation}
 \end{itemize}
 
-Check why Equation~\eqref{ch13:eq-conservation} automatically preserves Equation~\eqref{ch13:eq-accounting} on every single write. Whether a journal entry moves value \emph{across} the equals sign (say $+\$100$ Debit to an Asset and $+\$100$ Credit to a Liability: both sides of~\eqref{ch13:eq-accounting} rise by $\$100$) or \emph{within} the right-hand side (say $\$100$ Debit to Alice's Liability wallet, $\$97$ Credit to Bob's Liability wallet, and $\$3$ Credit to Platform Fee Revenue: the right-hand side changes by $-100 + 97 + 3 = 0$), Equation~\eqref{ch13:eq-accounting} can \textbf{never} fall out of balance.
+Check why Equation~\eqref{ch13:eq-conservation} preserves Equation~\eqref{ch13:eq-accounting} on every write. Suppose an entry moves value \emph{across} the equals sign, such as $+\$100$ Debit to an Asset and $+\$100$ Credit to a Liability: both sides of~\eqref{ch13:eq-accounting} rise by $\$100$. Or suppose it moves value \emph{within} the right-hand side: $\$100$ Debit to Alice's Liability wallet, $\$97$ Credit to Bob's wallet, and $\$3$ Credit to Fee Revenue. The right-hand side changes by $-100 + 97 + 3 = 0$, so Equation~\eqref{ch13:eq-accounting} can \textbf{never} fall out of balance.
 
 \begin{intuitionbox}
 \textbf{Why a customer's wallet is a Liability (and why ``crediting Alice'' makes total sense now).} When Alice wires $\$100.00$ into your payment platform, that cash sits physically inside your company's custodial omnibus bank account at a partner bank (an FBO --- \emph{For Benefit Of} --- account).
@@ -458,7 +458,7 @@ Check why Equation~\eqref{ch13:eq-conservation} automatically preserves Equation
   \item Your \texttt{FBO\_Bank\_Cash} account is an \textbf{Asset} (left side): it goes up by $\$100.00$ via a \textbf{Debit} of \texttt{10\_000} cents.
   \item \texttt{Alice\_Wallet} is a \textbf{Liability} (right side) --- money your platform owes back to Alice. Because Liabilities live on the right side, increasing Alice's wallet balance requires a \textbf{Credit} of \texttt{10\_000} cents, and spending from Alice's wallet requires a \textbf{Debit}.
 \end{itemize}
-That is why banks say ``we \emph{credited} your checking account'' when you deposit money and call your spending card a ``\emph{debit} card'': the bank is speaking from the perspective of \emph{its own} ledger, on which your checking account is the bank's Liability to you.
+That is why banks say ``we \emph{credited} your checking account'' on a deposit and call your spending card a ``\emph{debit} card.'' The bank is speaking from \emph{its own} ledger, where your checking balance is the bank's Liability to you.
 \end{intuitionbox}
 
 \begin{figure}[H]
@@ -650,7 +650,7 @@ impl PositiveMoney {
 }
 \end{lstlisting}
 
-Think about an exploit class that \texttt{PositiveMoney} kills immediately: in dozens of historical web-wallet vulnerabilities, an attacker submitted \texttt{\{"to": "victim", "amount": -50000\}} to a ``send money'' endpoint; naive code checked \texttt{if sender\_balance >= amount} ($0 \ge -50{,}000$ is \texttt{true}), subtracted \texttt{-50000} from the attacker (adding $\$500$), and added \texttt{-50000} to the victim. With \texttt{PositiveMoney}, negative and zero transfer amounts cannot even cross into domain functions.
+Think about an exploit class that \texttt{PositiveMoney} stops cold. In dozens of real web-wallet bugs, an attacker sent \texttt{\{"to": "victim", "amount": -50000\}} to a ``send money'' endpoint. Naive code checked \texttt{sender\_balance >= amount} ($0 \ge -50{,}000$ is \texttt{true}), subtracted \texttt{-50000} from the attacker (adding $\$500$), and added \texttt{-50000} to the victim. With \texttt{PositiveMoney}, negative and zero transfer amounts cannot even cross into domain functions.
 
 \subsection{Step 2: Typestate Sealing of \texttt{JournalDraft} Into \texttt{BalancedEntry}}
 
@@ -808,7 +808,7 @@ impl JournalEntry<Sealed> {
 Here is what the compiler now enforces across the whole workspace:
 \begin{enumerate}
   \item Can a caller mutate \texttt{BalancedEntry} after calling \texttt{.seal()}? \emph{No.} A sealed entry exposes its postings only as an immutable slice (\texttt{\&[Posting]}) and does \textbf{not} implement \texttt{push\_debit} or \texttt{push\_credit}.
-  \item Can a caller pass an unsealed \texttt{JournalDraft} directly to \texttt{repo::commit\_entry(tx, entry: \&BalancedEntry)}? \emph{No.} \texttt{JournalEntry<Unsealed>} and \texttt{JournalEntry<Sealed>} are incompatible types at compile time, even though their runtime memory layout is byte-for-byte identical (\texttt{\_state: PhantomData} is $0\text{ bytes}$, so \texttt{seal()} compiles down to checking the sum and returning the exact same \texttt{Vec<Posting>} pointer in registers with zero reallocation).
+  \item Can a caller pass an unsealed \texttt{JournalDraft} directly to \texttt{repo::commit\_entry(tx, entry: \&BalancedEntry)}? \emph{No.} \texttt{JournalEntry<Unsealed>} and \texttt{JournalEntry<Sealed>} are distinct types at compile time, even though their memory layouts are identical. Because \texttt{\_state: PhantomData} occupies $0\text{ bytes}$, \texttt{seal()} compiles down to checking the sum and returning the same \texttt{Vec<Posting>} pointer in registers.
   \item Can a caller construct a sealed entry by struct literal outside the \texttt{domain::ledger} module? \emph{No.} Because the fields \texttt{id}, \texttt{postings}, and \texttt{\_state} are module-private, the \emph{only} path in the program that produces a \texttt{BalancedEntry} runs through the debit-equals-credit check inside \texttt{seal()}.
 \end{enumerate}
 
@@ -879,9 +879,9 @@ pub fn build_peer_transfer_entry(
 
 \subsection{Lifecycle Typestate: Authorization Holds, Captures, and Voids}
 
-Beyond single-step transfers, card networks and ACH rails separate \textbf{authorization} (placing a hold on funds when you swipe your card at a hotel check-in) from \textbf{settlement/capture} (charging the final room bill three days later) or \textbf{void} (releasing the hold if you cancel).
+Card networks and ACH rails split two-phase payments into separate steps. First comes \textbf{authorization}, which places a hold on funds when you check into a hotel. Days later comes \textbf{capture} (charging the final room bill) or \textbf{void} (releasing the hold if you cancel).
 
-In Java~6 or C++, an \texttt{AuthHold} class typically carries a \texttt{Status} enum field (\texttt{AUTHORIZED}, \texttt{CAPTURED}, \texttt{VOIDED}), and every method begins with a guard that throws \texttt{IllegalStateException} unless the status is \texttt{AUTHORIZED}. In Rust, we encode the lifecycle state as a type parameter: \texttt{AuthHold<Authorized>} has \texttt{capture} and \texttt{void\_hold} methods that \textbf{consume \texttt{self} by value} (a destructive move), so calling \texttt{.capture()} twice, or calling \texttt{.void\_hold()} on an already-captured hold, is a compile-time error:
+In Java~6 or C++, an \texttt{AuthHold} class typically stores a mutable \texttt{Status} enum (\texttt{AUTHORIZED}, \texttt{CAPTURED}, \texttt{VOIDED}), and every method checks it at runtime. In Rust, we encode the state as a type parameter on \texttt{AuthHold<State>}. On \texttt{AuthHold<Authorized>}, both \texttt{capture} and \texttt{void\_hold} \textbf{consume \texttt{self} by value}. Calling \texttt{.capture()} twice---or calling \texttt{.void\_hold()} after capture---becomes a compile-time move error:
 
 \begin{lstlisting}[language=Rust, caption={Destructive-move typestate preventing double-capture or void-after-capture at compile time.}]
 pub struct Authorized;
@@ -973,9 +973,9 @@ impl AuthHold<Authorized> {
 }
 \end{lstlisting}
 
-Notice how subaccounts handle holds in \texttt{AuthHold<Authorized>::capture}. Instead of inventing an error-prone ``available balance minus pending holds'' query across disconnected tables, placing an authorization hold is \emph{itself} a balanced journal entry moving funds from \texttt{customer\_wallet} to \texttt{customer\_hold\_subaccount} (both Liabilities belonging to Alice). And partial capture (say holding $\$150.00$ at a gas pump and capturing $\$42.18$) drains the $\$150.00$ hold subaccount, credits $\$42.18$ to the merchant, and credits the unused $\$107.82$ right back to Alice's wallet in one balanced 3-leg entry ($15{,}000 = 4{,}218 + 10{,}782$).
+Notice how subaccounts handle holds in \texttt{AuthHold<Authorized>::capture}. We never invent an error-prone ``available balance minus pending holds'' query across separate tables. Placing an authorization hold is \emph{itself} a balanced journal entry moving funds from \texttt{customer\_wallet} to \texttt{customer\_hold\_subaccount} (both Liabilities belonging to Alice). Suppose a gas pump holds $\$150.00$ and later captures $\$42.18$. One 3-leg entry drains the $\$150.00$ hold subaccount, credits $\$42.18$ to the merchant, and returns $\$107.82$ to Alice's wallet ($15{,}000 = 4{,}218 + 10{,}782$).
 
-With our domain invariants locked tight inside \texttt{Money}, \texttt{PositiveMoney}, \texttt{AccountId}, \texttt{IdempotencyKey}, and \texttt{BalancedEntry}, we are ready in Chapter~14 to wire this exact domain core into PostgreSQL, SQLx, Tower, and Axum --- solving concurrent overdraft races, deadlocks, idempotency retries, and transactional event delivery end to end.
+Our domain invariants now live inside \texttt{Money}, \texttt{PositiveMoney}, \texttt{AccountId}, \texttt{IdempotencyKey}, and \texttt{BalancedEntry}. In Chapter~14 we wire this domain core into PostgreSQL, SQLx, Tower, and Axum---handling concurrent overdrafts, deadlocks, idempotency retries, and reliable event delivery end to end.
 
 \section{Exercises}
 \label{ch13:exercises}
@@ -1000,7 +1000,7 @@ Prove rigorously for any integer $T \ge 0$ and any non-empty slice of weights $w
 Suppose Alice converts $100.00\text{ EUR}$ (\texttt{10\_000} \texttt{Eur} minor units) from her EUR wallet into her USD wallet at an exchange rate of $1.0847\text{ USD/EUR}$, yielding $\$108.47$ (\texttt{10\_847} \texttt{Usd} minor units).
 \begin{enumerate}
   \item Why can a single two-leg entry (\texttt{Debit Alice\_EUR 10\_000}, \texttt{Credit Alice\_USD 10\_847}) never satisfy single-currency conservation, and what goes wrong on your company balance sheet if FX rates move tomorrow?
-  \item Introduce two internal liquidity/FX position accounts (\texttt{FxClearing\_EUR} and \texttt{FxClearing\_USD}) and generalize \texttt{JournalDraft} and \texttt{BalancedEntry} so a multi-currency FX journal entry contains four postings --- two in \texttt{Eur} and two in \texttt{Usd} --- and \texttt{seal()} verifies $\sum_{p \in \text{Dr}(c)} p.\text{amount} = \sum_{p \in \text{Cr}(c)} p.\text{amount}$ independently for \emph{every} \texttt{Currency} $c$ present in the entry.
+  \item Introduce two internal FX position accounts (\texttt{FxClearing\_EUR} and \texttt{FxClearing\_USD}) and generalize \texttt{JournalDraft} and \texttt{BalancedEntry} for multi-currency entries. Your four-leg FX entry should hold two \texttt{Eur} postings and two \texttt{Usd} postings, while \texttt{seal()} checks $\sum_{p \in \text{Dr}(c)} p.\text{amount} = \sum_{p \in \text{Cr}(c)} p.\text{amount}$ for each \texttt{Currency}~$c$.
 \end{enumerate}
 \end{exercise}
 

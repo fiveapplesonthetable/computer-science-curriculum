@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import katex from 'katex';
 import { BOOKS } from './books.mjs';
+import { highlightCode } from './highlight.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO = join(here, '../..');
@@ -805,10 +806,19 @@ function parseEnv(name, inner, level) {
     const [opts, e0] = optArg(inner, 0);
     let anchor = null;
     let lang = null;
+    let rawLang = '';
+    let capHtml = null;
     if (opts) {
       const langM = /\blanguage\s*=\s*(?:\{([^}]*)\}|([^,\s\]}]+))/.exec(opts);
-      const rawLang = langM ? (langM[1] || langM[2]).trim().replace(/^\[[^\]]*\]/, '').toLowerCase() : '';
+      rawLang = langM ? (langM[1] || langM[2]).trim().replace(/^\[[^\]]*\]/, '').toLowerCase() : '';
       if (rawLang && LANG_NAMES[rawLang]) lang = LANG_NAMES[rawLang];
+      const capIdx = opts.search(/\bcaption\s*=/);
+      let capRaw = null;
+      if (capIdx >= 0) {
+        let ci = capIdx + opts.slice(capIdx).indexOf('=') + 1;
+        ci = skipWs(opts, ci);
+        if (opts[ci] === '{') capRaw = group(opts, ci)[0];
+      }
       const lm = /label\s*=\s*(?:\{([^}]*)\}|([^,\s\]}]+))|\\label\{([^}]*)\}/.exec(opts);
       const lab = lm ? (lm[1] || lm[2] || lm[3]).trim() : null;
       if (lab || /\bcaption\s*=/.test(opts)) {
@@ -816,10 +826,12 @@ function parseEnv(name, inner, level) {
         const num = B.cfg.unit === 'section' ? `${B.lstN}` : `${B.chapNum}.${B.lstN}`;
         anchor = `lst-${B.lstN}`;
         if (lab) B.labels[lab] = { text: `Listing ${num}`, anchor };
+        if (capRaw) capHtml = `<span class="caption-num">Listing ${num}.</span> ${textToHtml(capRaw)}`;
       }
     }
     let body = inner.slice(e0).replace(/^\{[^}]*\}/, '');
-    return { t: 'pre', text: body.replace(/^\r?\n/, '').replace(/\s+$/, ''), anchor, lang };
+    const cleanText = body.replace(/^\r?\n/, '').replace(/\s+$/, '');
+    return { t: 'pre', text: cleanText, codeHtml: highlightCode(cleanText, rawLang), anchor, lang, caption: capHtml };
   }
   if (bare === 'algorithm' || bare === 'algorithm2e') {
     let [, e0] = optArg(inner, 0);
@@ -1276,7 +1288,11 @@ function render(b) {
       return `<${tag}${id}>${b.number ? `<span class="secnum">${b.number}</span> ` : ''}${b.html}</${tag}>`;
     }
     case 'math': return mathHtml(b.src, true);
-    case 'pre': return `<pre${b.anchor ? ` id="${b.anchor}"` : ''}${b.lang ? ` data-lang="${escAttr(b.lang)}"` : ''}><code>${esc(b.text)}</code></pre>`;
+    case 'pre': {
+      const pre = `<pre${!b.caption && b.anchor ? ` id="${b.anchor}"` : ''}${b.lang ? ` data-lang="${escAttr(b.lang)}"` : ''}><code>${b.codeHtml ?? esc(b.text)}</code></pre>`;
+      if (b.caption) return `<div class="codeblock"${b.anchor ? ` id="${b.anchor}"` : ''}>${pre}<p class="code-cap">${b.caption}</p></div>`;
+      return pre;
+    }
     case 'algorithm':
       return `<section class="env env-algorithm" id="${b.anchor}"><p class="env-label">Algorithm ${b.number}${b.title ? ` (${b.title})` : ''}</p><div class="alg-body">${b.html}</div></section>`;
     case 'quote': return `<blockquote>${b.blocks.map(render).join('')}</blockquote>`;

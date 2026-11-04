@@ -1,12 +1,12 @@
 \chapter{Lifetimes Without Mysticism: Regions, Elision, and the Unsafe Boundary}
 
-Chapter~3 established the physical rules of Rust memory: every heap buffer or stack slot has a single owner, moving copies a small stack header to transfer ownership, and dropping runs deterministically at scope exit. Borrowing lets code read (\texttt{\&T}) or mutate (\texttt{\&mut T}) memory without taking ownership, under one aliasing rule --- at any point in execution, you may hold either any number of shared readers or one exclusive writer, never both at once.
+In Chapter~3, almost every borrow stayed inside one simple block. A caller owned an \texttt{Account} or a \texttt{Vec<i64>}, lent a reference down to a helper, and got control back as soon as the helper returned. The compiler could see both the owner and the borrow right next to each other.
 
-Sooner or later you write a function that accepts two string slices and returns one of them, or you define a parser struct holding slices into a network buffer, and the compiler asks for a \emph{lifetime annotation} written with a tick mark: \texttt{'a}. Engineers arriving from Java~6 or C++ often guess at first that \texttt{'a} tells the allocator how long to keep an object alive in memory.
+What happens when a function accepts \emph{two} string slices and returns one of them? How does the caller know which input must stay alive while the returned slice is in use? Or what happens when a parser struct stores a slice pointing into an external network buffer? At those boundaries, Rust asks for a \emph{lifetime annotation} written with a tick mark: \texttt{'a}.
 
-At the hardware level, nothing of the sort happens. A lifetime parameter \texttt{'a} generates \textbf{zero machine instructions} and \textbf{never extends or shortens when any value is created, moved, or freed}. Every local variable still drops at the exact point Chapter~3 described. Instead, \texttt{'a} is a compile-time region variable in a constraint solver: it states in a function or type signature which owner's memory a reference may point into, proving before code generation that no pointer ever outlives its referent.
+Engineers arriving from Java~6 or C++ often guess at first that \texttt{'a} tells the runtime how long to keep an object in memory. Nothing of the sort happens. A lifetime parameter emits \textbf{zero machine instructions} and never changes when any value is created, moved, or dropped. Every owner still frees its memory at the exact closing brace Chapter~3 described. A tick mark \texttt{'a} is simply a label linking inputs to outputs so the compiler can check, before generating code, that no pointer outlives the bytes it points to.
 
-Seeing lifetimes as region constraints over stack frames and control-flow graphs connects every topic in this chapter into one picture: why modern Rust ends borrows at their last read rather than at a closing brace, how the three elision rules fill in everyday signatures automatically, when zero-copy structs holding \texttt{\&'a str} beat heap allocation (and when owned types beat both), why \texttt{\&'static str} and \texttt{T:\ 'static} mean completely different things, why \texttt{\&'a mut T} refuses to shrink lifetimes inside \texttt{T}, and how six lines of audited \texttt{unsafe} code wrap raw pointer arithmetic behind a safe signature.
+This chapter builds that mental picture step by step. First we watch how Rust tracks borrows to their last read and fills in everyday signatures automatically. Next we store slices inside zero-copy structs and separate \texttt{\&'static str} from \texttt{T:\ 'static}. Finally, we see why mutable references are strict about lifetimes and how small, audited \texttt{unsafe} blocks hide raw pointer math behind safe APIs.
 
 \chapterline
 
@@ -297,7 +297,7 @@ Order ord = new Order(parts[0], parts[1], parts[2],
 \end{lstlisting}
 
 \begin{historybox}
-\textbf{Why Java~7 ripped zero-copy \texttt{substring} out of Java~6.} Java~6's \texttt{String} stored \texttt{(char[] value, int offset, int count)}, so \texttt{line.substring(0, 8)} shared the backing \texttt{char[]} without copying. Oracle removed that sharing in Java~7u6 (2012) and forced \texttt{substring} to copy \texttt{char[]} eagerly because Java lacked lifetime parameters: caching a 10-byte substring parsed from a 2~MB HTTP body quietly pinned the entire 2~MB \texttt{char[]} on the GC heap forever. With \texttt{'a}, Rust gives you zero-copy views while statically forbidding accidental long-lived retention.
+\textbf{Why Java~7 ripped zero-copy \texttt{substring} out of Java~6.} Java~6's \texttt{String} stored \texttt{(char[] value, int offset, int count)}, so \texttt{line.substring(0, 8)} shared the backing \texttt{char[]} without copying. Oracle removed that sharing in Java~7u6 (2012) and forced \texttt{substring} to copy \texttt{char[]} eagerly because Java lacked lifetime parameters. Caching a 10-byte substring parsed from a 2~MB HTTP body quietly pinned the entire 2~MB \texttt{char[]} on the GC heap forever. With \texttt{'a}, Rust gives you zero-copy views while statically forbidding accidental long-lived retention.
 \end{historybox}
 
 In Rust, \texttt{WireOrder<'a>} slices straight into \texttt{raw:\ \&'a [u8]}. Any \texttt{struct} or \texttt{enum} holding a borrow declares that lifetime on its type header:
@@ -406,7 +406,7 @@ Read \texttt{WireOrder<'a>} as a proof bound: \emph{no \texttt{WireOrder<'a>} in
 \label{ch04:fig-wireorder-layout}
 \end{figure}
 
-That region parameter catches a notorious C/C++ ring-buffer bug at compile time. If a loop reuses one stack buffer \texttt{rx\_buf} across \texttt{sock.read(\&mut rx\_buf)} calls while pushing parsed \texttt{WireOrder} views into an outer \texttt{Vec}, C++ \texttt{std::string\_view} silently corrupts every earlier order with bytes from the latest packet, whereas Rust rejects the loop immediately:
+That region parameter catches a notorious C/C++ ring-buffer bug at compile time. Suppose a loop reuses one stack buffer \texttt{rx\_buf} across \texttt{sock.read(\&mut rx\_buf)} calls while pushing parsed views into an outer \texttt{Vec}. C++ \texttt{std::string\_view} silently overwrites earlier orders with bytes from the latest packet; Rust rejects the loop at compile time:
 
 \begin{lstlisting}[language=Rust]
 fn broken_batch_reader(sock: &mut impl std::io::Read) {
@@ -430,7 +430,7 @@ Putting \texttt{\&'a str} into long-lived domain models, caches, and order books
 \textbf{When to borrow in structs vs.\ when to own.}
 \begin{itemize}
   \item \textbf{Borrow (\texttt{Struct<'a>}) for short-lived synchronous views:} wire parsers, serializers, iterators (\texttt{Iter<'a, T>}), and SQL query parameter tuples scoped to one buffer.
-  \item \textbf{Own at state and concurrency boundaries:} once validated orders enter an order book, cache, thread channel, or async task, convert text to fixed ASCII arrays (\texttt{[u8; 8]} for tickers --- \texttt{Copy} and heap-free), \texttt{Box<str>} (16 bytes, omitting \texttt{String}'s 8-byte capacity), \texttt{Arc<str>} for shared immutable identifiers, or \texttt{String} when mutating.
+  \item \textbf{Own at state and concurrency boundaries:} convert validated text before storing it in an order book, cache, channel, or async task. Use fixed ASCII arrays (\texttt{[u8; 8]} for tickers, \texttt{Copy} and heap-free), \texttt{Box<str>} (16 bytes without \texttt{String}'s capacity), \texttt{Arc<str>} for shared IDs, or \texttt{String} when mutating.
 \end{itemize}
 \end{applicationbox}
 
@@ -766,7 +766,7 @@ Definition~\ref{ch04:def-soundness} carries an architectural lesson shown in Fig
 \subsection{\texttt{UnsafeCell<T>}, Aliasing UB, \texttt{MaybeUninit<T>}, and Miri}
 \label{ch04:unsafecell-ub}
 
-Three habits from C and C++ cause \textbf{instant Undefined Behavior in Rust}, even inside \texttt{unsafe}, because Rust hands LLVM far stronger aliasing guarantees than C or C++:
+Recall from Chapter~1 (\S\ref{ch01:compiler-pipeline}) that \texttt{rustc} hands your checked program to the \textbf{LLVM} optimizer to generate machine code. Because safe Rust enforces Aliasing XOR Mutability, \texttt{rustc} attaches strict \texttt{noalias} and \texttt{readonly} tags to references in LLVM's intermediate representation. Those tags let LLVM cache values in CPU registers across pointer writes without re-reading RAM. Consequently, three habits from C and C++ cause \textbf{instant Undefined Behavior in Rust}, even inside \texttt{unsafe}:
 
 \textbf{1. Mutating behind \texttt{\&T} without \texttt{UnsafeCell<T>} is always UB.} Every \texttt{\&T} carries an LLVM \texttt{readonly}/\texttt{noalias} contract unless \texttt{T} wraps its mutable bytes inside \texttt{std::cell::UnsafeCell<U>} (the sole primitive underlying \texttt{Cell}, \texttt{RefCell}, \texttt{Mutex}, and \texttt{AtomicU64}). Casting \texttt{\&u64} to \texttt{*mut u64} and writing to it without \texttt{UnsafeCell} miscompiles under optimization:
 
@@ -790,7 +790,7 @@ impl CounterCell {
 
 \textbf{2. Two aliasing \texttt{\&mut T} references are instant UB --- even without writes.} Every \texttt{\&mut T} is emitted as an LLVM \texttt{noalias} pointer. Forming \texttt{let r1 = \&mut *p; let r2 = \&mut *p;} while \texttt{r1} remains live violates Rust's Stacked/Tree Borrows model immediately. Inside doubly linked lists or intrusive queues where pointers alias, keep raw \texttt{*mut Node} pointers until the exact instant of an unaliased access.
 
-\textbf{3. Every \texttt{\&T} and \texttt{\&mut T} must be non-null, aligned, and initialized.} Taking a reference to an unaligned packed network field is UB (use \texttt{std::ptr::\allowbreak{}addr\_of!(hdr.field).\allowbreak{}read\_unaligned()} instead), and materializing a \texttt{T} or \texttt{\&mut [u8]} over uninitialized memory is immediate UB. Use \texttt{std::mem::MaybeUninit<T>} to populate buffers safely before calling \texttt{assume\_init()}:
+\textbf{3. Every \texttt{\&T} and \texttt{\&mut T} must be non-null, aligned, and initialized.} Taking a reference to an unaligned packed network field is UB; use \texttt{core::ptr::addr\_of!(hdr.field)} with \texttt{read\_unaligned()} instead. Materializing a \texttt{T} or \texttt{\&mut [u8]} over uninitialized memory is also immediate UB. Use \texttt{std::mem::MaybeUninit<T>} to populate buffers safely before calling \texttt{assume\_init()}:
 
 \begin{lstlisting}[language=Rust]
 use std::mem::MaybeUninit;
@@ -825,12 +825,15 @@ Write a helper \texttt{pub fn head\_four<'a>(buf: \&'a [u8]) -> Option<\&'a [u8]
 \end{exercise}
 
 \begin{exercise}[Tracing Non-Lexical Lifetimes by hand]
-Given \texttt{let mut ledger = vec![100\_i64, -40, 250];}, predict whether each snippet below compiles under NLL; if it fails, identify the overlapping regions and fix it in two lines without cloning:
-\begin{enumerate}[label=(\alph*)]
-  \item \texttt{let r = \&ledger[0]; let x = *r; ledger.push(x); println!("\{\}", x);}
-  \item \texttt{let r = \&ledger[0]; ledger.push(50); println!("\{\}", *r);}
-  \item \texttt{let r = \&ledger[0]; if *r > 0 \{ ledger.push(10); \} else \{ println!("\{\}", *r); \}}
-\end{enumerate}
+Given \texttt{let mut ledger = vec![100\_i64, -40, 250];}, predict whether each snippet (a)--(c) compiles under NLL. If it fails, identify the overlapping regions and fix it in two lines without cloning:
+\begin{lstlisting}[language=Rust]
+// (a)
+let r = &ledger[0]; let x = *r; ledger.push(x); println!("{}", x);
+// (b)
+let r = &ledger[0]; ledger.push(50); println!("{}", *r);
+// (c)
+let r = &ledger[0]; if *r > 0 { ledger.push(10); } else { println!("{}", *r); }
+\end{lstlisting}
 \end{exercise}
 
 \begin{exercise}[Applying and overriding the Three Elision Rules]
@@ -844,7 +847,7 @@ In~(c), rewrite the signature with explicit lifetimes when the returned host sli
 \end{exercise}
 
 \begin{exercise}[Zero-copy HTTP header line parser]
-Define a struct \texttt{HttpHeader<'a>} with public fields \texttt{name: \&'a str} and \texttt{value: \&'a str}, and implement a function \texttt{parse\_header<'a>} that takes \texttt{line: \&'a [u8]}, returns \texttt{Option<HttpHeader<'a>>}, splits an ASCII header line like \texttt{b"Content-Length: 1024"} on the first \texttt{':'}, trims ASCII whitespace, rejects empty names, and performs zero heap allocations. Verify at compile time that \texttt{size\_of::<HttpHeader<'static>>() == 32}.
+Define \texttt{HttpHeader<'a>} with public fields \texttt{name: \&'a str} and \texttt{value: \&'a str}. Implement \texttt{parse\_header<'a>(line: \&'a [u8]) -> Option<HttpHeader<'a>>} to split an ASCII line like \texttt{b"Content-Length: 1024"} on the first \texttt{':'}, trim whitespace, and reject empty names with zero heap allocations. Verify at compile time that \texttt{size\_of::<HttpHeader<'static>>() == 32}.
 \end{exercise}
 
 \begin{exercise}[Diagnosing \texttt{\&'static str} vs.\ \texttt{T:\ 'static}]
