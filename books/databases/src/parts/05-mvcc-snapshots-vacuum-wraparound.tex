@@ -103,12 +103,12 @@ Michael Stonebraker originally built Postgres around an archival idea: never ove
 In PostgreSQL, an \texttt{UPDATE} is physically a \texttt{DELETE} (stamping an expiration transaction ID onto the existing tuple) paired with an \texttt{INSERT} (appending a brand-new tuple version). Because the old bytes were never overwritten, a \texttt{ROLLBACK} of a ten-million-row update takes less than a millisecond: PostgreSQL flips two status bits in the commit log to \texttt{ABORTED} and walks away. Future readers see the aborted transaction ID on the new tuples and ignore them on sight.
 \end{intuitionbox}
 
-Every strength and operational quirk of PostgreSQL comes back to Figure~\ref{ch05:undo-vs-inheap}. Rollbacks run in $O(1)$ time, historical reads inspect table pages directly, and queries never fail with ``undo segment full.'' The price is \emph{dead tuples}: once every active query moves past \texttt{742}, versions \texttt{(0,1)} and \texttt{(0,2)} sit on the page taking up space until pruning or \texttt{VACUUM} reclaims them.
+Every strength and operational quirk of PostgreSQL comes back to Figure~\ref{ch05:undo-vs-inheap}. Rollbacks run in $O(1)$ time, historical reads inspect table pages directly, and queries never abort over a full undo segment. The price is \emph{dead tuples}. Once every active query moves past transaction \texttt{742}, versions \texttt{(0,1)} and \texttt{(0,2)} sit on the page taking up space until pruning or \texttt{VACUUM} reclaims them.
 
 \section{Inside \texttt{HeapTupleHeaderData}: \texttt{xmin}, \texttt{xmax}, \texttt{cid}, and \texttt{ctid}}
 \label{ch05:tuple-header}
 
-To tell row versions apart without an undo log, every physical row version needs four small stamps on its front: which transaction created it, which transaction retired or locked it, which command inside a multi-step transaction wrote it, and where its next version lives. Chapter~2 showed that every row begins with a 23-byte header (\texttt{HeapTupleHeaderData} in \texttt{src/include/access/htup\_details.h}), padded to 24~bytes. Here are those exact fields:
+To tell row versions apart without an undo log, every physical row version carries four small stamps on its front. Two record which transaction created the version and which transaction retired or locked it. Two more record which step inside a multi-command transaction wrote it and where any newer version lives. Chapter~2 showed that every row begins with a 23-byte header (\texttt{HeapTupleHeaderData} in \texttt{src/include/access/htup\_details.h}), padded to 24~bytes. Here are those exact fields:
 
 \begin{lstlisting}[language=C]
 /* Simplified from src/include/access/htup_details.h */
@@ -138,7 +138,7 @@ Let us trace each of the four MVCC fields, because PostgreSQL packs a lot of sta
 
 \subsection{\texttt{t\_xmin} and Lazy Transaction ID Assignment}
 
-Every writing transaction receives an increasing 32-bit XID (\texttt{TransactionId}), such as \texttt{740}. When transaction \texttt{740} runs an \texttt{INSERT}, it stamps \texttt{t\_xmin = 740} and \texttt{t\_xmax = 0} (signaling ``no deleter yet'') into the new tuple's header.
+Every writing transaction receives an increasing 32-bit transaction ID (XID, C type \texttt{TransactionId}), such as \texttt{740}. When transaction \texttt{740} runs an \texttt{INSERT}, it stamps \texttt{t\_xmin = 740} and \texttt{t\_xmax = 0} (signaling ``no deleter yet'') into the new tuple's header.
 
 Notice the qualifier: \emph{every writing transaction}. What if your app runs five thousand read-only \texttt{SELECT} queries per second? Spending a 32-bit \texttt{xid} on every read would burn through four billion IDs in days. Instead, PostgreSQL assigns 32-bit XIDs \emph{lazily}. At \texttt{BEGIN}, a session gets only a cheap, backend-local virtual XID. PostgreSQL allocates a permanent 32-bit \texttt{xid} from shared memory only when the session runs its first \texttt{INSERT}, \texttt{UPDATE}, \texttt{DELETE}, \texttt{SELECT FOR UPDATE}, or \texttt{pg\_current\_xact\_id()}.
 
@@ -521,7 +521,7 @@ When a row is \texttt{DELETE}d, or when an \texttt{UPDATE} cannot use HOT, singl
 
 Plain \texttt{VACUUM} (``lazy vacuum'' in \texttt{src/backend/access/heap/vacuumlazy.c}) takes only a \texttt{SHARE UPDATE EXCLUSIVE} lock---\textbf{never blocking \texttt{SELECT}, \texttt{INSERT}, \texttt{UPDATE}, or \texttt{DELETE}}. It runs in three phases:
 \begin{enumerate}
-  \item \textbf{Phase 1 --- Heap Scan:} \texttt{VACUUM} finds \texttt{OldestXmin}, the oldest active snapshot across all sessions, replication slots, and prepared transactions. It scans the table sequentially while \emph{skipping} pages marked \texttt{ALL\_VISIBLE} in the \textbf{Visibility Map} (\texttt{\_vm}). Along the way, it prunes dead row payloads and collects dead 6-byte \texttt{(block, offset)} TIDs in RAM up to \texttt{autovacuum\_work\_mem}. PostgreSQL~17 replaced the old 1~GB flat TID array with a compact radix tree that holds far more TIDs per megabyte.
+  \item \textbf{Phase 1 --- Heap Scan:} \texttt{VACUUM} finds \texttt{OldestXmin}, the oldest active snapshot across all sessions, replication slots, and prepared transactions. It scans the table sequentially while \emph{skipping} pages marked \texttt{ALL\_VISIBLE} in the \textbf{Visibility Map} (\texttt{\_vm}). Along the way, it prunes dead row payloads and collects dead 6-byte tuple identifiers (TIDs, each a \texttt{(block, slot)} address) in RAM up to \texttt{autovacuum\_work\_mem}. PostgreSQL~17 replaced the old 1~GB flat TID array with a compact radix tree that holds far more TIDs per megabyte.
   \item \textbf{Phase 2 --- Index Vacuuming:} Whenever the dead-TID buffer fills (or Phase~1 ends), \texttt{VACUUM} scans every index on the table and deletes entries matching the dead-TID set. Memory sizing matters hugely here. If your dead-TID buffer holds only one-tenth of a bloated table's dead TIDs across 8 indexes, \texttt{VACUUM} must scan all 8 indexes \emph{ten times}. Sizing memory to fit all dead TIDs at once collapses ten passes into one.
   \item \textbf{Phase 3 --- Slot Cleanup, FSM, and VM:} Once no index points to those TIDs, \texttt{VACUUM} revisits the table pages and flips \texttt{LP\_DEAD} slots to reusable \texttt{LP\_UNUSED}. It then logs the freed space in the \textbf{Free Space Map} (\texttt{\_fsm}) for future writes and sets \texttt{ALL\_VISIBLE} / \texttt{ALL\_FROZEN} bits in the Visibility Map.
 \end{enumerate}

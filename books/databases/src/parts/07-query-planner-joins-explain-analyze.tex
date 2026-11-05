@@ -39,7 +39,7 @@ Every statement passes through four stages inside the backend process that owns 
 
 \begin{enumerate}
   \item \textbf{Parse.} The SQL text becomes a parse tree. Syntax errors are caught here. Nothing about tables has been checked yet.
-  \item \textbf{Analyze and rewrite.} Names are resolved against the system catalogs (\texttt{a.region} becomes ``column 4 of relation OID 16402''), types are checked, and views are expanded into their underlying queries. The result is a \emph{query tree}.
+  \item \textbf{Analyze and rewrite.} Names are resolved against the system catalogs (\texttt{a.region} becomes ``column 4 of relation object identifier (OID) 16402''), types are checked, and views are expanded into their underlying queries. The result is a \emph{query tree}.
   \item \textbf{Plan.} The planner turns the query tree into a \emph{plan tree}: a tree of physical operators such as \texttt{Seq Scan}, \texttt{Index Scan}, \texttt{Hash Join}, and \texttt{Sort}. This is the only stage that makes choices, and it is the subject of this chapter.
   \item \textbf{Execute.} The executor runs the plan tree. Each node is an iterator: a parent asks its child for the next row, the child asks \emph{its} child, and rows flow upward one at a time. (This is the ``Volcano'' iterator model; PostgreSQL also batches some work, such as building hash tables, but the pull-one-row interface is the mental model to keep.)
 \end{enumerate}
@@ -103,7 +103,7 @@ correlation       | 0.02
   \item \textbf{\texttt{null\_frac}}: the fraction of rows where the column is \texttt{NULL}. A predicate like \texttt{amount\_minor > 0} can never match those rows, so the planner removes them first.
   \item \textbf{\texttt{avg\_width}}: average stored bytes per value. The planner uses it to estimate how much memory a sort or hash table will need.
   \item \textbf{\texttt{n\_distinct}}: the number of distinct non-null values. A \emph{positive} number is an absolute count: \texttt{status} has 5 distinct values. A \emph{negative} number is a fraction of the row count: $-0.21$ means ``about 21\% of rows have a distinct value,'' so the planner computes $0.21 \times 20{,}000{,}000 = 4.2$ million distinct amounts. The negative form is used when the number of distinct values seems to grow with the table, so the estimate stays sensible as the table grows. A value of $-1$ means every row is distinct, as for a primary key.
-  \item \textbf{\texttt{most\_common\_vals}} and \textbf{\texttt{most\_common\_freqs}} (the MCV list): the most frequent values and their frequencies, as observed in the sample. Only values that are noticeably more common than average make the list.
+  \item \textbf{\texttt{most\_common\_vals}} and \textbf{\texttt{most\_common\_freqs}} (the most-common-values, or MCV, list): the most frequent values and their frequencies, as observed in the sample. Only values that are noticeably more common than average make the list.
   \item \textbf{\texttt{histogram\_bounds}}: boundaries of an \emph{equi-depth} histogram over the values that are \emph{not} in the MCV list. Equi-depth means each bucket holds the same number of rows, so buckets are narrow where values are dense and wide where they are sparse.
   \item \textbf{\texttt{correlation}}: how closely the physical order of rows on disk follows the sorted order of this column, from $-1$ (perfectly reversed) through $0$ (random) to $+1$ (perfectly sorted). We will see in Section~\ref{ch07:access-paths} why this one number can swing an index scan's cost by a factor of forty.
 \end{itemize}
@@ -350,7 +350,7 @@ Between ``a handful of rows'' (Index Scan) and ``a large fraction of the table''
 
 PostgreSQL's answer is to split the work into two nodes:
 \begin{enumerate}
-  \item \textbf{Bitmap Index Scan.} Walk the index and collect every matching \texttt{ctid}, but do \emph{not} visit the heap yet. Instead, record each \texttt{ctid} in an in-memory bitmap keyed by heap page number: ``page 17, tuples 1 and 9; page 812, tuples 3 and 7.''
+  \item \textbf{Bitmap Index Scan.} Walk the index and collect every matching 6-byte tuple identifier (\texttt{ctid}, or TID), but do \emph{not} visit the heap yet. Instead, record each TID in an in-memory bitmap keyed by heap page number: ``page 17, tuples 1 and 9; page 812, tuples 3 and 7.''
   \item \textbf{Bitmap Heap Scan.} Visit the heap pages listed in the bitmap \emph{in increasing page order}. Each page is read once, no matter how many matching tuples it holds, and the reads move steadily forward through the file, so the operating system's read-ahead helps and the drive sees something close to a sequential pattern.
 \end{enumerate}
 
@@ -491,7 +491,72 @@ Hash Join  (actual time=812.4..6411.9 rows=9840211 loops=1)
         ->  Seq Scan on accounts a  (actual rows=3000000 loops=1)
 \end{lstlisting}
 
-\texttt{Batches: 64} and the matching \texttt{temp read}/\texttt{written} counts tell you the hash spilled. If the planner \emph{expected} one batch but the build side turned out much larger, you will also see \texttt{(originally 1)} next to the batch count, which is a sign of an underestimated row count.
+\texttt{Batches: 64} and the matching \texttt{temp read}/\texttt{written} counts tell you the hash spilled. If the planner \emph{expected} one batch but the build side turned out much larger, you will also see \texttt{(originally 1)} next to the batch count, which is a sign of an underestimated row count. Figure~\ref{ch07:fig-grace-hash} traces how one hash function routes Batch~0 straight through RAM while pairing spilled batches $1 \dots 63$ on disk.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\scriptsize,
+  >=Latex,
+  box/.style={draw=#1!80!black, fill=#1!10, rounded corners=2.5pt, thick,
+              inner xsep=6pt, inner ysep=4.5pt, align=center}
+]
+  % Column 1: Build and Probe inputs
+  \node[box=targetgreen] (inb) at (0, 1.35)
+    {\textbf{1. Inner (Build)}\\3M \texttt{accounts}\\(400 MB $>$ 8 MB)};
+  \node[box=sourceblue] (inp) at (0, -1.35)
+    {\textbf{2. Outer (Probe)}\\20M \texttt{postings}\\(streamed once)};
+
+  % Column 2: Hash splitter
+  \node[box=structurepurple, fill=structurepurple!12] (hfn) at (3.65, 0)
+    {\textbf{Hash \texttt{h(key)}}\\high bits $\to$ \textbf{batch $k$}\\low bits $\to$ \textbf{bucket}};
+
+  % Column 3 top: Batch 0 in RAM
+  \node[box=targetgreen, fill=white] (b0) at (8.55, 1.35)
+    {\textbf{Batch 0 Hash Table}\\kept in 8 MB RAM\\probed immediately};
+  \node[font=\tiny\bfseries, text=targetgreen!80!black, above=2pt of b0] (ramlbl)
+    {8 MB RAM Budget (\texttt{work\_mem})};
+
+  % Column 3 bottom: Spilled batches 1..63
+  \node[box=quotientorange, fill=white] (sbin) at (8.55, -0.78)
+    {\textbf{Inner Temp Files}\\batches $B_1 \dots B_{63}$};
+  \node[box=quotientorange, fill=white] (sbout) at (8.55, -2.05)
+    {\textbf{Outer Temp Files}\\batches $P_1 \dots P_{63}$};
+  \node[font=\tiny\bfseries, text=quotientorange!85!black, above=2pt of sbin] (dsklbl)
+    {Disk Spill (\texttt{temp written})};
+
+  % Column 4: Output & Phase 2 replay
+  \node[box=targetgreen] (out0) at (12.65, 1.35)
+    {\textbf{Emit Batch 0}\\zero disk I/O};
+  \node[box=structurepurple] (replay) at (12.65, -1.42)
+    {\textbf{3. For $k = 1 \dots 63$}\\load $B_k$ into 8 MB RAM\\probe with $P_k \to$ emit};
+
+  % Self-sizing fit containers on background layer
+  \begin{scope}[on background layer]
+    \node[draw=targetgreen!65!black, fill=targetgreen!5, rounded corners=4pt,
+          dashed, thick, inner sep=5pt, fit=(b0)(ramlbl)] (ramfit) {};
+    \node[draw=quotientorange!80!black, fill=quotientorange!6, rounded corners=4pt,
+          dashed, thick, inner sep=5pt, fit=(sbin)(sbout)(dsklbl)] (dskfit) {};
+  \end{scope}
+
+  % Orthogonal and straight connectors with clear label margins
+  \draw[->, thick, targetgreen!80!black] (inb.east) -- ([yshift=6pt]hfn.west);
+  \draw[->, thick, sourceblue!80!black] (inp.east) -- ([yshift=-6pt]hfn.west);
+
+  \draw[->, thick, targetgreen!80!black] ([yshift=6pt]hfn.east) -- ++(0.40, 0) |- (b0.west);
+  \node[font=\tiny\bfseries, text=targetgreen!80!black] at (6.08, 1.58) {$k = 0$};
+
+  \draw[->, thick, quotientorange!85!black] ([yshift=-6pt]hfn.east) -- ++(0.40, 0) |- (sbin.west);
+  \node[font=\tiny\bfseries, text=quotientorange!85!black] at (6.08, -0.55) {$k = 1..63$};
+  \draw[->, thick, quotientorange!85!black] ([xshift=0.40cm, yshift=-6pt]hfn.east) |- (sbout.west);
+
+  \draw[->, thick, targetgreen!80!black] (b0.east) -- (out0.west);
+  \draw[->, thick, structurepurple!85!black] (sbin.east) -- ([yshift=6pt]replay.west);
+  \draw[->, thick, structurepurple!85!black] (sbout.east) -- ([yshift=-6pt]replay.west);
+\end{tikzpicture}
+\caption{Multi-batch (Grace) hash join when the build input exceeds memory. High bits of \texttt{h(key)} split both inputs into 64 matching batches. Batch~0 joins in RAM immediately, while batches $1 \dots 63$ spill to temporary files and replay one batch at a time.}
+\label{ch07:fig-grace-hash}
+\end{figure}
 
 \subsection{Merge Join}
 

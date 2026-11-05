@@ -224,7 +224,7 @@ When \texttt{rustc} expands the \texttt{query!} macro, the macro code does the f
 \begin{enumerate}
   \item Reads \texttt{DATABASE\_URL} from the environment (or from \texttt{.env}) and opens a connection to a development database that has your migrations applied.
   \item Sends the SQL text in a PostgreSQL \texttt{Parse} message followed by \texttt{Describe}. This is the same extended-protocol handshake used for prepared statements. PostgreSQL parses and plans the statement without running it. If the SQL has a syntax error or names a column that does not exist, the server replies with an error and the macro turns it into a \emph{compile error} pointing at your source line.
-  \item Reads the reply: a \texttt{ParameterDescription} listing the type OID of each \texttt{\$n} placeholder, and a \texttt{RowDescription} listing each output column's name and type OID.
+  \item Reads the reply: a \texttt{ParameterDescription} listing the type object identifier (\textbf{OID}, PostgreSQL's internal numeric ID for each data type) of each \texttt{\$n} placeholder, and a \texttt{RowDescription} listing each output column's name and type OID.
   \item Works out nullability. For a column read directly from a table, it looks up \texttt{attnotnull} in \texttt{pg\_attribute}. For expressions and joins, it inspects the query plan (via \texttt{EXPLAIN}) to see whether an outer join could produce \texttt{NULL}s.
   \item Generates an anonymous struct with one field per column, typed by a fixed mapping: \texttt{BIGINT} becomes \texttt{i64}, \texttt{UUID} becomes \texttt{uuid::Uuid}, \texttt{BOOLEAN} becomes \texttt{bool}, \texttt{TIMESTAMPTZ} becomes a \texttt{time} or \texttt{chrono} timestamp, \texttt{NUMERIC} becomes \texttt{Decimal}, \texttt{JSONB} becomes \texttt{serde\_json::Value}. A \texttt{NOT NULL} column becomes \texttt{T}; a nullable one becomes \texttt{Option<T>}.
   \item Checks that each Rust argument you passed can be encoded as the type PostgreSQL expects for its placeholder. Passing a \texttt{String} where \texttt{\$1} is a \texttt{UUID} is a compile error.
@@ -776,7 +776,7 @@ Walk through the cases this handles.
 \textbf{Why have an \texttt{in\_progress} status at all?} In the code above, an \texttt{in\_progress} row is never visible to anyone else, because it only exists inside an uncommitted transaction. The status earns its place when a request includes a side effect \emph{outside} the database, such as calling a card network. You cannot hold a database transaction open across a two-second HTTP call to a third party (it would hold row locks and trip \texttt{idle\_in\_transaction\_session\_timeout}). So you commit the \texttt{in\_progress} claim first, make the external call, and then complete the record in a second transaction. A retry that arrives in between sees \texttt{in\_progress} and gets \texttt{409 Conflict}, telling the client to wait and try again. Stripe describes this as splitting a request into atomic phases separated by recovery points.
 \end{intuitionbox}
 
-The request hash must be computed over a \emph{canonical} form of the request: the method, the path, and the parsed DTO serialized with a fixed field order. Hashing the raw body bytes would make two semantically identical requests (differing only in whitespace or key order) look different. Keys are scoped by tenant, so two customers can never collide, and a periodic job deletes keys older than 24 hours, which is the replay window we promise in the API documentation.
+The request hash must be computed over a \emph{canonical} form of the request: the method, the path, and the parsed data transfer object (DTO) serialized with a fixed field order. Hashing the raw body bytes would make two semantically identical requests (differing only in whitespace or key order) look different. Keys are scoped by tenant, so two customers can never collide, and a periodic job deletes keys older than 24 hours, which is the replay window we promise in the API documentation.
 
 \section{Axum and Tower: From Bytes to a Typed Handler}
 \label{ch14:axum}
@@ -798,43 +798,71 @@ pub trait Service<Request> {
 }
 \end{lstlisting}
 
-A \texttt{Service} is an asynchronous function from a request to a response. \texttt{poll\_ready} lets a service say ``not now'' (for example, because a concurrency limit is reached), which is how Tower expresses backpressure. A \emph{layer} is a function that takes one service and returns another service wrapping it. Timeouts, request IDs, tracing, body-size limits, and load shedding are all layers. The innermost service is your Axum router. Figure~\ref{ch14:fig-request-path} shows a request passing inward through the layers to the handler, and the response passing back out.
+A \texttt{Service} is an asynchronous function from a request to a response. \texttt{poll\_ready} lets a service say ``not now'' (for example, because a concurrency limit is reached), which is how Tower expresses backpressure. A \emph{layer} is a function that takes one service and returns another service wrapping it. Timeouts, request IDs, tracing, concurrency or rate limits, and body-size caps are all layers. The innermost service is your Axum router. Figure~\ref{ch14:fig-request-path} shows a request passing inward through the layers to the handler, and the response passing back out.
 
 If you know Java servlet filters, this is the same idea with one difference: each layer's type is known at compile time, so the whole stack is monomorphized into direct calls (Chapter~6) with no virtual dispatch between layers.
 
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}[font=\scriptsize,
-  layer/.style={draw, rounded corners=3pt, align=center},
-  stp/.style={draw=sourceblue!80, fill=sourceblue!8, rounded corners=2pt, minimum height=0.62cm, align=center, inner sep=3pt}
+  stp/.style={draw=sourceblue!80, fill=sourceblue!8, rounded corners=2pt, inner xsep=4.5pt, inner ysep=4pt, align=center},
+  endp/.style={rounded corners=3pt, inner xsep=5pt, inner ysep=4pt, align=center}
 ]
-% Nested Tower layers
-\draw[layer, draw=gray!70, fill=gray!5] (-6.9, -1.95) rectangle (3.2, 2.25);
-\node[anchor=north west, font=\scriptsize\bfseries] at (-6.8, 2.2) {\texttt{TraceLayer}: span with \texttt{request\_id}};
-\draw[layer, draw=gray!70, fill=gray!10] (-6.6, -1.65) rectangle (2.9, 1.75);
-\node[anchor=north west, font=\scriptsize\bfseries] at (-6.5, 1.7) {\texttt{TimeoutLayer} (5 s): drops the inner future};
-\draw[layer, draw=gray!70, fill=gray!16] (-6.3, -1.35) rectangle (2.6, 1.25);
-\node[anchor=north west, font=\scriptsize\bfseries] at (-6.2, 1.2) {\texttt{RequestBodyLimitLayer} (64 KiB)};
+% Innermost: Extractor Pipeline
+\node[stp] (e1) {\texttt{State<AppState>}\\\texttt{FromRequestParts}};
+\node[stp, right=0.30cm of e1] (e2) {\texttt{IdempotencyHeader}\\\texttt{FromRequestParts}};
+\node[stp, right=0.30cm of e2] (e3) {\texttt{Json<CreateTransferReq>}\\\texttt{FromRequest} (body)};
+\node[font=\scriptsize\bfseries, text=sourceblue!90!black, above=0.16cm of e2] (ehdr) {Extractor Pipeline (run in argument order)};
+\node[inner sep=8pt, fit=(ehdr) (e1) (e2) (e3)] (extfit) {};
 
-% Inside: extractors and handler
-\node[stp] (e1) at (-4.95, 0.2) {\texttt{State<AppState>}\\from parts};
-\node[stp] (e2) at (-2.25, 0.2) {\texttt{IdempotencyHeader}\\from parts};
-\node[stp] (e3) at (0.85, 0.2) {\texttt{Json<CreateTransferReq>}\\consumes body};
-\node[stp, draw=targetgreen!85, fill=targetgreen!12] (h) at (-0.45, -0.85) {\texttt{create\_transfer(...)} returns \texttt{Result<\_, ApiError>}};
+% Handler inside Axum router
+\node[draw=targetgreen!85, fill=targetgreen!12, rounded corners=3pt, inner xsep=7pt, inner ysep=5pt, align=center, minimum width=8.2cm, below=0.42cm of extfit] (h) {
+  \textbf{Handler:} \texttt{create\_transfer(...)} $\rightarrow$ \texttt{Result<(StatusCode, Json<\_>), ApiError>}
+};
+
+% Nested Tower Middleware Layers (inside-out fit bounds with 8pt padding)
+\node[font=\scriptsize\bfseries, text=quotientorange!90!black, above=0.16cm of extfit] (l3hdr) {\texttt{Governor / ConcurrencyLimit} + \texttt{RequestBodyLimitLayer} (64 KiB)};
+\node[inner sep=8pt, fit=(l3hdr) (extfit) (h)] (l3fit) {};
+
+\node[font=\scriptsize\bfseries, text=trapred!85!black, above=0.16cm of l3fit] (l2hdr) {\texttt{TimeoutLayer} (5 s): drops inner future on deadline, rolling back open \texttt{tx}};
+\node[inner sep=8pt, fit=(l2hdr) (l3fit)] (l2fit) {};
+
+\node[font=\scriptsize\bfseries, text=structurepurple!90!black, above=0.16cm of l2fit] (l1hdr) {\texttt{TraceLayer}: attaches \texttt{request\_id} span to task future};
+\node[inner sep=8pt, fit=(l1hdr) (l2fit)] (l1fit) {};
+
+% Background shells painted outer-to-inner
+\begin{scope}[on background layer]
+  \node[draw=structurepurple!75, fill=structurepurple!5, rounded corners=5pt, inner sep=0pt, fit=(l1fit)] {};
+  \node[draw=trapred!70, fill=trapred!5, rounded corners=4pt, inner sep=0pt, fit=(l2fit)] {};
+  \node[draw=quotientorange!80, fill=quotientorange!7, rounded corners=4pt, inner sep=0pt, fit=(l3fit)] {};
+  \node[draw=sourceblue!70, dashed, fill=white, rounded corners=3pt, inner sep=0pt, fit=(extfit)] {};
+\end{scope}
+
+% Internal extractor -> handler flow
 \draw[-{Stealth[length=1.8mm]}, thick, sourceblue] (e1) -- (e2);
 \draw[-{Stealth[length=1.8mm]}, thick, sourceblue] (e2) -- (e3);
 \draw[-{Stealth[length=1.8mm]}, thick, sourceblue] (e3.south) -- (e3.south |- h.north);
 
-% Postgres on the right
-\node[draw=structurepurple!85, fill=structurepurple!10, rounded corners=3pt, align=center, inner sep=4pt] (pg) at (5.0, -0.85) {\textbf{PostgreSQL}\\one transaction:\\locks, postings,\\idempotency, outbox};
-\draw[-{Stealth[length=2mm]}, thick, structurepurple] (h.east) -- (pg.west);
+% Left-side HTTP client request / response
+\coordinate (req_wall) at (l1fit.west |- e1.west);
+\coordinate (resp_wall) at (l1fit.west |- h.west);
+\node[endp, draw=sourceblue!80, fill=sourceblue!8, left=1.65cm of req_wall] (req) {\textbf{HTTP}\\request};
+\node[endp, draw=targetgreen!85, fill=targetgreen!10, left=1.65cm of resp_wall] (resp) {\textbf{HTTP}\\response};
 
-% Request and response arrows
-\node[font=\scriptsize\bfseries, text=sourceblue!90!black, align=center] at (-7.6, 1.15) {HTTP\\request};
-\draw[-{Stealth[length=2mm]}, very thick, sourceblue] (-7.6, 0.7) -- (e1.west);
-\draw[-{Stealth[length=2mm]}, very thick, targetgreen!80!black] (h.west) -- (-7.6, -0.85);
-\node[font=\scriptsize, text=targetgreen!80!black, fill=gray!16, inner sep=1pt, above=1pt] at (-4.8, -0.85) {\texttt{IntoResponse}};
-\node[font=\scriptsize\bfseries, text=targetgreen!80!black, align=center] at (-7.6, -1.3) {HTTP\\response};
+\draw[-{Stealth[length=2mm]}, very thick, sourceblue] (req.east) -- (e1.west);
+\draw[-{Stealth[length=2mm]}, very thick, targetgreen!80!black] (h.west) -- (resp.east);
+\coordinate (resp_mid) at ($(resp_wall)!0.5!(resp.east)$);
+\node[font=\tiny\ttfamily, text=targetgreen!80!black, above=2pt of resp_mid] {IntoResponse};
+
+% Bottom PostgreSQL transaction
+\node[endp, draw=structurepurple!85, fill=structurepurple!10, inner xsep=9pt, inner ysep=5pt, below=0.62cm of l1fit] (pg) {
+  \textbf{PostgreSQL (one ACID transaction)}\\
+  sorted \texttt{FOR UPDATE} locks, \texttt{postings}, \texttt{idempotency\_keys}, \texttt{outbox\_events}
+};
+\coordinate (pg_top) at (h.south |- pg.north);
+\draw[{Stealth[length=2mm]}-{Stealth[length=2mm]}, thick, structurepurple] (h.south) -- (pg_top);
+\coordinate (db_mid) at ($(l1fit.south)!0.5!(pg.north)$);
+\node[font=\scriptsize, text=structurepurple!90!black, right=4pt of db_mid] {\texttt{SQLx} \texttt{execute\_once}};
 \end{tikzpicture}
 \caption{The path of one request. Tower layers wrap the router from the outside in. Inside, Axum runs each extractor in argument order; only the last may consume the body. The handler's \texttt{Result} becomes an HTTP response through \texttt{IntoResponse}. If the timeout layer fires, it drops the inner future, and with it any open transaction.}
 \label{ch14:fig-request-path}
@@ -1028,7 +1056,7 @@ The \texttt{\#[from]} attributes generate \texttt{From} implementations, which i
 
 \subsection{Tracing Across Threads}
 
-In a Java~6 servlet, you might put the request ID in log4j's \texttt{MDC}, which is backed by a \texttt{ThreadLocal}. That works because one thread runs one request from start to finish. In Tokio it breaks: a task can start on worker~0, suspend at an \texttt{.await}, and resume on worker~3, and meanwhile worker~0 runs other requests. A thread-local would attach the wrong request ID to half your log lines.
+In a Java~6 servlet, you might put the request ID in log4j's \emph{Mapped Diagnostic Context} (\texttt{MDC}), which is backed by a \texttt{ThreadLocal}. That works because one thread runs one request from start to finish. In Tokio it breaks: a task can start on worker~0, suspend at an \texttt{.await}, and resume on worker~3, and meanwhile worker~0 runs other requests. A thread-local would attach the wrong request ID to half your log lines.
 
 The \texttt{tracing} crate attaches context to the \emph{future} instead of the thread. \texttt{\#[tracing::instrument]} wraps the handler's future in an \texttt{Instrumented} adapter whose \texttt{poll} method enters the span, polls the inner future, and exits the span. Whichever thread polls the task, the span is active for exactly as long as the task runs. Every log line emitted inside \texttt{create\_transfer} or anything it calls carries \texttt{request\_id}, \texttt{tenant}, and \texttt{idempotency\_key}, and a JSON log formatter makes them searchable fields.
 
