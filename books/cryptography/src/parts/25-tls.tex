@@ -9,35 +9,25 @@ that assembles all of these pieces to secure the web.
 
 When your browser shows a padlock and the address bar reads
 \texttt{https://}, you are speaking \textbf{TLS}: Transport Layer Security. It is
-the protocol underneath HTTPS, but also underneath secure email (SMTP over TLS),
-encrypted DNS, most VPNs, the control channel of countless mobile apps, and the
+the protocol underneath HTTPS, but also underneath secure email (Simple Mail Transfer Protocol (SMTP) over TLS),
+encrypted Domain Name System (DNS) queries, most Virtual Private Networks (VPNs), the control channel of countless mobile apps, and the
 back-end traffic of essentially every cloud service. Trillions of TLS handshakes
-happen every day. If you study one applied protocol in depth, make it this one: in TLS, a single
-mismatched assumption between two components has repeatedly become a real attack
-with a logo and a CVE number.
+happen every day. In TLS, a single mismatched assumption between components has repeatedly become a real
+attack with a logo and a CVE number.
 
 We will focus on \textbf{TLS 1.3}, standardized in 2018 as RFC 8446. It is the
-version you should deploy, it is dramatically cleaner than its predecessors, and
-its design choices read like a catalogue of lessons learned the hard way from two
-decades of attacks on TLS 1.0 through 1.2. We will trace a full handshake with
-small numbers, watch the key schedule derive a dozen keys from one shared secret,
-see how the record layer carries encrypted application data, and understand
-exactly which property each message protects. Then we will revisit the famous
-disasters --- BEAST, POODLE, Heartbleed, and a few cousins --- because the surest
-way to appreciate why TLS 1.3 looks the way it does is to see what the old designs
-let an attacker do.
+version you should deploy because its design fixes two decades of attacks on
+earlier versions.
 
 \chapterline
 
 \section{What TLS provides, and against whom}
 
-Before any protocol, pin down the threat model. TLS assumes the worst plausible
-network: the \textbf{Dolev--Yao} attacker. Eve is not merely listening. She sits
-on the wire and can read, drop, reorder, replay, and inject any packet she likes.
+TLS assumes a \textbf{Dolev--Yao} attacker: an adversary who controls the
+network and can read, drop, reorder, replay, and inject any packet.
 She controls the routers, the coffee-shop access point, possibly the ISP. The
 only thing she cannot do is break the cryptographic primitives or read memory
-inside Alice's and Bob's machines. This is the realistic model for the public
-Internet, and TLS is built to survive it.
+inside the endpoints. This models the public Internet.
 
 Against that attacker, a completed TLS connection between a client (Alice's
 browser) and a server (Bob's web server) promises three things.
@@ -56,21 +46,35 @@ the previous chapter. (By default only the server is authenticated; client
 authentication is optional and used in enterprise and mutual-TLS settings.)
 \end{itemize}
 
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\footnotesize, >=Stealth]
+  \node[draw=aliceblue!80, fill=aliceblue!15, rounded corners=2pt, minimum width=2.0cm, minimum height=0.6cm] (alice) at (0, 0) {Client};
+  \node[draw=bobgreen!80, fill=bobgreen!15, rounded corners=2pt, minimum width=2.0cm, minimum height=0.6cm] (bob) at (9, 0) {Server};
+  
+  \draw[thick, structurepurple!80!black, dashed] (alice.east) -- node[above=2pt, text=structurepurple!85!black]{Encrypted \& Authenticated Channel} (bob.west);
+  
+  \node[draw=trapred!80, fill=trapred!15, rounded corners=2pt, minimum width=2.0cm, minimum height=0.6cm] (eve) at (4.5, -1.8) {Attacker (Eve)};
+  \draw[->, thick, trapred!80] (eve.north) -- node[right=1pt, text=trapred!90!black, align=left, font=\scriptsize]{Intercepts,\\Drops,\\Injects,\\Replays} (4.5, -0.1);
+\end{tikzpicture}
+\caption{The Dolev--Yao threat model. Eve controls the network between the client and server, but the encrypted channel ensures confidentiality and integrity.}
+\label{ch25:fig-dolev-yao}
+\end{figure}
+
+
 \begin{focusbox}
 \textbf{What TLS does \emph{not} promise.} It does not hide \emph{that} you talked
-to a server, nor how much, nor when. The server's identity leaks through the SNI
-field (see later) and through the IP address itself. TLS protects the
+to a server, nor how much, nor when. The server's identity leaks through the Server Name Indication (SNI)
+field (where the client states the domain name it wants to reach) and through the IP address itself. TLS protects the
 \emph{contents and integrity} of a channel to an \emph{authenticated} endpoint. It
 says nothing about whether that endpoint is trustworthy --- a phishing site can
 get a perfectly valid certificate for \texttt{paypa1.com}. Anonymity is the job of
 Tor; endpoint trust is the job of the user and the browser's UI.
 \end{focusbox}
 
-There is a fourth property TLS 1.3 takes seriously enough that it deserves a
-name of its own: \textbf{forward secrecy}. If, a year from now, Eve breaks into
-Bob's server and steals his long-term private key, she should \emph{not} be able
-to decrypt the traffic she recorded today. We met this idea in Chapter~23; TLS
-1.3 makes it mandatory. We will see exactly how.
+TLS 1.3 also guarantees \textbf{forward secrecy} (Chapter~23): if an attacker
+later steals the server's long-term private key, they cannot decrypt past
+traffic recordings.
 
 \begin{intuitionbox}
 The handshake is the short, expensive phase in which client and server,
@@ -90,13 +94,10 @@ application data under fast symmetric authenticated encryption. The handshake is
 the expensive part (a few public-key operations and one network round trip); the
 record protocol is cheap and runs for the life of the connection.
 
-The headline achievement of TLS 1.3 is that the handshake takes a single round
-trip --- ``1-RTT'' --- before the client can send encrypted application data.
-TLS 1.2 needed two. The trick is that the client \emph{guesses} which key-exchange
-group the server will accept and sends its key share immediately, in its very
-first message. If it guesses right (it almost always does), the server can finish
-the key agreement in one reply. Figure~\ref{ch25:fig-handshake-comparison} contrasts the legacy TLS 1.2 two-round-trip flow
-with the modern TLS 1.3 one-round-trip protocol. We will then walk each message in detail.
+In TLS 1.3, the handshake takes a single round trip (1-RTT) before the client
+can send encrypted application data, whereas TLS 1.2 needed two. The client
+speculatively sends its key share for a common key-exchange group in its first
+message. Figure~\ref{ch25:fig-handshake-comparison} compares the two.
 
 \begin{figure}[H]
 \centering
@@ -177,7 +178,7 @@ collapsing connection latency to 1 RTT while encrypting the server's certificate
 \label{ch25:fig-handshake-comparison}
 \end{figure}
 
-The notation matters. Messages in the clear are sent before any key exists.
+In the text below, messages in the clear are sent before any key exists.
 Messages in braces $\{\cdots\}$ are encrypted under \emph{handshake} keys --- a key
 the two parties can compute the instant the ServerHello arrives, even though the
 server has not yet proven who it is. Messages in brackets $[\cdots]$ ride under the
@@ -187,241 +188,289 @@ certificate flew in plaintext for any eavesdropper to log.
 
 \section{Step 1: key exchange (the ClientHello)}
 
-The client opens with a \texttt{ClientHello}. Stripped to essentials it carries:
+The client opens with a \texttt{ClientHello}. It carries:
 
 \begin{itemize}
-\item a random nonce $r_C$ (32 bytes), to make every handshake unique;
-\item a list of \emph{cipher suites} it supports (e.g.
-\texttt{TLS\_AES\_128\_GCM\_SHA256});
-\item a list of \emph{supported groups} for key exchange (e.g. X25519,
-\texttt{secp256r1}, or finite-field groups);
-\item one or more \emph{key shares}: for each group it is betting on, an actual
-ephemeral public value. For an elliptic-curve group this is a point; for a
-classic finite-field group it is $g^a \bmod p$.
+\item a random nonce $r_C$ ($32$ bytes), to make every handshake unique;
+\item a list of \emph{cipher suites} it supports --- named bundles specifying the
+authenticated cipher and hash function, such as \texttt{TLS\_AES\_128\_GCM\_SHA256};
+\item a list of \emph{supported groups} for key exchange, such as X25519,
+\texttt{secp256r1} (TLS's wire name for the NIST P-256 elliptic curve from Chapter~21),
+or finite-field groups;
+\item one or more \emph{key shares}: for each group it is betting on, an
+ephemeral public value (a curve point for an elliptic-curve group, or $g^a \bmod p$
+for a finite-field group);
 \item the \emph{server name} it wants to reach (the SNI extension), so a server
 hosting many sites knows which certificate to present.
 \end{itemize}
 
-The key share is the most important field. The client picks a fresh random secret $a$,
-computes its public share, and ships it immediately. Because $a$ is fresh and
-thrown away when the connection ends, this is \textbf{ephemeral} Diffie--Hellman ---
-the source of forward secrecy. TLS 1.3 \emph{only} allows ephemeral
-(EC)DHE key exchange; the old static-RSA key transport, where the client encrypted
-a secret under the server's long-term RSA key, is gone, precisely because it had no
+The key share is the central field. The client picks a fresh random secret $a$,
+computes its public share, and sends it immediately. Because $a$ is used once and
+erased when the connection ends, this is \textbf{ephemeral} Diffie--Hellman ---
+written \textbf{DHE} over finite fields or \textbf{ECDHE} over elliptic curves ---
+which provides forward secrecy. TLS 1.3 allows \emph{only} ephemeral DHE or ECDHE
+key exchange; the older static-RSA key transport, where the client encrypted a
+secret under the server's long-term RSA public key, was removed because it lacked
 forward secrecy.
 
 \subsection{A worked exchange with tiny numbers}
 
-Real TLS uses X25519 or 256-bit curves, with numbers hundreds of bits long. To
-\emph{see} the arithmetic, shrink it to a finite-field group you can do by hand.
-Take the prime $p = 23$ and generator $g = 5$ (a generator of $\Zns{23}$).
+To see the arithmetic using a small multiplicative group, take the prime $p = 23$
+and generator $g = 5$ of $\Zns{23}$.
 
-The client picks secret $a = 6$ and sends
-\[
-A = g^{a} \bmod p = 5^{6} \bmod 23.
-\]
-Compute $5^2 = 25 \equiv 2$, so $5^4 \equiv 2^2 = 4$, and
-$5^6 = 5^4 \cdot 5^2 \equiv 4 \cdot 2 = 8$. The client sends $A = 8$.
+The client picks secret $a = 6$ and computes its key share $A = g^{a} \bmod p = 5^{6} \bmod 23$ by repeated squaring:
+\begin{align*}
+  5^2 &= 25 \equiv 2 \pmod{23}, \\
+  5^4 &\equiv 2^2 = 4 \pmod{23}, \\
+  A &= 5^6 = 5^4 \cdot 5^2 \\
+    &\equiv 4 \cdot 2 = 8 \pmod{23}.
+\end{align*}
+The client sends $A = 8$.
 
-The server picks secret $b = 15$ and sends
-\[
-B = g^{b} \bmod p = 5^{15} \bmod 23.
-\]
-Build it up: $5^4 \equiv 4$, $5^8 \equiv 4^2 = 16$, $5^{15} = 5^{8} \cdot 5^{4}
-\cdot 5^{2} \cdot 5^{1} \equiv 16 \cdot 4 \cdot 2 \cdot 5$. Now $16\cdot4 = 64
-\equiv 64 - 2\cdot23 = 18$; $18 \cdot 2 = 36 \equiv 13$; $13 \cdot 5 = 65 \equiv 65
-- 2\cdot23 = 19$. So $B = 19$.
+The server picks secret $b = 15$ (binary $1111_2 = 8 + 4 + 2 + 1$) and computes its key share $B = g^{b} \bmod p = 5^{15} \bmod 23$:
+\begin{align*}
+  5^8 &\equiv 4^2 = 16 \pmod{23}, \\
+  B &= 5^{15} = 5^8 \cdot 5^4 \cdot 5^2 \cdot 5^1 \\
+    &\equiv 16 \cdot 4 \cdot 2 \cdot 5 \pmod{23}.
+\end{align*}
+Reducing step by step modulo $23$: $16 \cdot 4 = 64 = 2 \cdot 23 + 18 \equiv 18$, then
+$18 \cdot 2 = 36 \equiv 13$, and $13 \cdot 5 = 65 = 2 \cdot 23 + 19 \equiv 19 \pmod{23}$.
+The server sends $B = 19$.
 
-Each side now raises the other's share to its own secret:
+Each side now raises the peer's public share to its own private exponent:
 \[
-\text{client: } B^{a} = 19^{6} \bmod 23, \qquad
-\text{server: } A^{b} = 8^{15} \bmod 23.
+\text{client computes } B^{a} \bmod 23 = 19^{6} \bmod 23, \qquad
+\text{server computes } A^{b} \bmod 23 = 8^{15} \bmod 23.
 \]
-The client: $19 \equiv -4$, so $19^2 \equiv 16$, $19^4 \equiv 16^2 = 256 \equiv
-256 - 11\cdot23 = 3$, $19^6 = 19^4\cdot19^2 \equiv 3\cdot16 = 48 \equiv 2$. The
-server: $8^2 = 64 \equiv 18$, $8^4 \equiv 18^2 = 324 \equiv 324 - 14\cdot23 = 2$,
-$8^8 \equiv 2^2 = 4$, $8^{15} = 8^8\cdot8^4\cdot8^2\cdot8 \equiv 4\cdot2\cdot18\cdot8$.
-Then $4\cdot2 = 8$; $8\cdot18 = 144 \equiv 144 - 6\cdot23 = 6$; $6\cdot8 = 48 \equiv
-2$. Both get the same shared secret
+On the client side, writing $19 \equiv -4 \pmod{23}$ keeps the numbers small:
+\begin{align*}
+  19^2 &\equiv (-4)^2 = 16 \pmod{23}, \\
+  19^4 &\equiv 16^2 = 256 \equiv 3 \pmod{23}, \\
+  19^6 &= 19^4 \cdot 19^2 \\
+       &\equiv 3 \cdot 16 = 48 \equiv 2 \pmod{23}.
+\end{align*}
+On the server side:
+\begin{align*}
+  8^2 &= 64 \equiv 18 \pmod{23}, \\
+  8^4 &\equiv 18^2 = 324 \equiv 2 \pmod{23}, \\
+  8^8 &\equiv 2^2 = 4 \pmod{23}, \\
+  8^{15} &= 8^8 \cdot 8^4 \cdot 8^2 \cdot 8 \\
+         &\equiv 4 \cdot 2 \cdot 18 \cdot 8 \equiv 2 \pmod{23},
+\end{align*}
+since $4 \cdot 2 = 8$, $8 \cdot 18 = 144 = 6 \cdot 23 + 6 \equiv 6$, and
+$6 \cdot 8 = 48 \equiv 2 \pmod{23}$. Both arrive at the same shared secret:
 \[
 Z = g^{ab} \bmod p = 2.
 \]
-Eve, who saw $p=23$, $g=5$, $A=8$, $B=19$, must solve the discrete log to recover
-$a$ or $b$. With $p=23$ she can; with a 256-bit curve she cannot, and the security
-of the exchange rests on that difference.
+Eve, watching the wire, sees $p = 23$, $g = 5$, $A = 8$, and $B = 19$; recovering $a$
+or $b$ requires solving the discrete logarithm. With $p = 23$ she can check all $22$
+exponents by hand; on a $256$-bit elliptic curve she cannot, and the confidentiality
+of the exchange rests on that gap.
 
 \begin{connectionbox}
-The cost of computing $g^a \bmod p$ is the modular-exponentiation cost from the
-algorithms companion: $O(\log a)$ multiplications by square-and-multiply, which is
-why we built up $5^{15}$ from $5^8, 5^4, 5^2$ rather than multiplying fifteen
-times. The security rests on the discrete-log assumption (Chapter~18)
-or, for X25519, the elliptic-curve discrete-log problem (Chapter~21). The
-shared secret $Z$ is \emph{not} used directly as a key --- raw $g^{ab}$ has algebraic
-structure and is not uniform. It is run through a key-derivation function, the
-subject of Section~\ref{ch25:schedule}, exactly as the ``hash the DH output''
-advice in Chapter~23 demanded.
+Computing $g^a \bmod p$ takes $O(\log a)$ modular multiplications via
+square-and-multiply (Chapter~3), which is why $5^{15}$ needed only four squarings
+and multiplications instead of fourteen. Security rests on the discrete-log
+assumption (Chapter~18) or, for X25519 and P-256, the elliptic-curve discrete-log
+problem (Chapter~21). Raw $Z = g^{ab}$ is \emph{not} used directly as an encryption
+key: group elements have algebraic structure and are not uniformly distributed bit
+strings. Instead, $Z$ is fed into a \textbf{key-derivation function (KDF)} in
+Section~\ref{ch25:schedule}, following Chapter~23's rule to hash Diffie--Hellman
+outputs before keying symmetric ciphers.
 \end{connectionbox}
 
 \section{Step 2: the ServerHello and the handshake key}
 
 The server receives the ClientHello, picks one of the offered groups, generates
 its own ephemeral secret $b$, and replies with a \texttt{ServerHello} containing
-its own random nonce $r_S$, the chosen cipher suite, and its key share $B$. The
-instant this message lands, both parties hold the same shared secret $Z = g^{ab}$
-and the same transcript of the two hellos.
+its random nonce $r_S$, the chosen cipher suite, and its key share $B$. Once
+this message arrives, both parties hold the same shared secret $Z = g^{ab}$
+and the same \textbf{transcript} --- the exact byte-for-byte sequence of handshake
+messages exchanged so far (here, the two hellos).
 
-From here, \emph{everything} is encrypted. The server immediately derives the
-handshake traffic keys (next section) and sends the rest of its messages under
-them. This is a sharp break from TLS 1.2, where the certificate was plaintext.
+From this point on, every message is encrypted. The server derives the handshake
+traffic keys (Section~\ref{ch25:schedule}) and sends the rest of its flight under
+them.
 
 \begin{trapbox}
-A subtle point that trips people up: at this moment the client has a confidential,
-integrity-protected channel to \emph{somebody}, but it does not yet know
-\emph{who}. The Diffie--Hellman exchange authenticates nothing; an active Eve could
-have run her own DH with the client. Confidentiality without authentication is a
-trap --- it gives a secure channel to the attacker. Authentication is the job of
-the next two messages (Certificate, CertificateVerify). Until those verify, the
-client must treat the peer as unproven.
+At this moment the client has a confidential, integrity-protected channel to
+\emph{somebody}, yet it does not know \emph{who}. Unauthenticated Diffie--Hellman
+proves nothing about identity: an active Eve could have completed her own exchange
+with the client. Confidentiality without authentication only gives a private line
+to the attacker. Authentication is the job of the next two messages
+(\texttt{Certificate} and \texttt{CertificateVerify}); until those verify, the
+client treats the peer as unverified.
 \end{trapbox}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\footnotesize, >=Stealth]
+  \node[draw=aliceblue!80, fill=aliceblue!15, rounded corners=2pt, minimum width=1.5cm, minimum height=0.6cm] (alice) at (0, 0) {Client (Alice)};
+  \node[draw=trapred!80, fill=trapred!15, rounded corners=2pt, minimum width=1.5cm, minimum height=0.6cm] (eve) at (5, 0) {Attacker (Eve)};
+  \node[draw=bobgreen!80, fill=bobgreen!15, rounded corners=2pt, minimum width=1.5cm, minimum height=0.6cm] (bob) at (10, 0) {Server (Bob)};
+  
+  \draw[->, thick, aliceblue!80!black] (0, -0.6) -- node[above=1pt]{$g^a$} (4.8, -0.9);
+  \draw[<-, thick, trapred!80!black] (0, -1.2) -- node[above=1pt]{$g^e$} (4.8, -1.5);
+  \node[text=trapred!90!black, font=\scriptsize] at (2.4, -1.9) {Shared secret $g^{ae}$};
+  
+  \draw[->, thick, trapred!80!black] (5.2, -0.9) -- node[above=1pt]{$g^{e'}$} (10, -0.6);
+  \draw[<-, thick, bobgreen!80!black] (5.2, -1.5) -- node[above=1pt]{$g^b$} (10, -1.2);
+  \node[text=trapred!90!black, font=\scriptsize] at (7.6, -1.9) {Shared secret $g^{e'b}$};
+  
+  \draw[thick, gray!55] (alice) -- (0, -2.2);
+  \draw[thick, gray!55] (eve) -- (5, -2.2);
+  \draw[thick, gray!55] (bob) -- (10, -2.2);
+\end{tikzpicture}
+\caption{The man-in-the-middle attack on unauthenticated Diffie--Hellman. Eve establishes separate secure channels with Alice and Bob, acting as an invisible relay.}
+\label{ch25:fig-unauth-dh}
+\end{figure}
+
 
 \section{Step 3: the key schedule}
 \label{ch25:schedule}
 
-We have a shared secret $Z$. We need many keys: one to encrypt the server's
-handshake messages, one for the client's, one for application data in each
-direction, plus keys to compute the Finished MACs. TLS 1.3 manufactures all of
-them from $Z$ with a single tool: \textbf{HKDF}, the HMAC-based key-derivation
-function from Chapter~23 (built on HMAC from Chapter~15).
+We have a shared secret $Z$, and from it we need separate keys to encrypt the
+server's handshake messages, the client's handshake messages, application data in
+each direction, and the \texttt{Finished} MACs. TLS 1.3 derives all of them with
+\textbf{HKDF}, the HMAC-based key-derivation function from Chapter~23 (built on
+HMAC from Chapter~15).
 
-HKDF has two halves. \emph{Extract} takes a salt and some input keying material
-and squeezes out a uniform pseudorandom key:
+HKDF has two stages. \emph{Extract} takes a non-secret $\text{salt}$ and raw input
+keying material ($\mathrm{IKM}$) and compresses them into a fixed-length, uniform
+pseudorandom key ($\mathrm{PRK}$):
 \[
-\mathrm{PRK} = \mathrm{HKDF\text{-}Extract}(\text{salt}, \text{IKM})
-= \operatorname{HMAC}(\text{salt}, \text{IKM}).
+\mathrm{PRK} = \operatorname{HKDF\text{-}Extract}(\text{salt}, \mathrm{IKM})
+= \operatorname{HMAC}(\text{salt}, \mathrm{IKM}).
 \]
-\emph{Expand} stretches that key into as many labelled output keys as you want,
-binding each to a label and to the handshake transcript:
+\emph{Expand} stretches a secret key into as many output keys as needed, binding
+each to a purpose string ($\text{label}$), a transcript hash ($\text{context}$),
+and a target byte length $L$:
 \[
-\mathrm{HKDF\text{-}Expand\text{-}Label}(\text{secret}, \text{label}, \text{context}, L).
+\operatorname{HKDF\text{-}Expand\text{-}Label}(\text{secret}, \text{label}, \text{context}, L).
 \]
-The label (a short ASCII string like \texttt{"c hs traffic"}) guarantees that two
-keys derived for different purposes are independent even though they came from the
-same secret. The context is usually a hash of the handshake transcript so far, so
-the keys are cryptographically bound to \emph{exactly} the messages that have been
-exchanged.
+Distinct ASCII labels such as \texttt{"c hs traffic"} and \texttt{"s hs traffic"}
+ensure that keys derived for different roles behave independently even though they
+come from the same secret. Setting $\text{context}$ to the hash $\Hash(\cdots)$ of
+all handshake messages exchanged so far (using the cipher suite's hash function,
+such as SHA-256) binds every derived key to the exact conversation transcript.
 
-TLS 1.3 arranges these derivations in a \textbf{schedule}: a chain of Extract and
-Expand steps, each feeding the next (Figure~\ref{ch25:fig-keyschedule}).
+TLS 1.3 chains three Extract-and-Expand stages into a \textbf{key schedule}
+(Figure~\ref{ch25:fig-keyschedule}). The first stage absorbs an optional
+\textbf{pre-shared key (PSK)} --- a secret saved from a previous session with the
+same server, replaced by a block of zero bytes on a fresh visit. The second stage
+mixes in the fresh Diffie--Hellman secret $Z$, and the third produces the
+application keys.
 
-\begin{figure}[H]
+\begin{figure}[htbp]
 \centering
-\begin{tikzpicture}[font=\scriptsize, >=stealth, node distance=10mm]
+\begin{tikzpicture}[font=\footnotesize, >=Stealth]
   % Stage 1: Early Secret
-  \node[draw=quotientorange!80, fill=quotientorange!15, rounded corners=2pt, font=\tiny\bfseries, align=center, text width=2.4cm] (psk) at (-4.2, 3.5) {Input Key Material:\\$\text{PSK}$ or $0$};
-  \node[draw=structurepurple!80, fill=structurepurple!15, rounded corners=2pt, font=\scriptsize\bfseries, align=center, text width=3.8cm] (es) at (0, 3.5) {
-    \textbf{Early Secret}\\
-    $\operatorname{HKDF-Extract}(0, \text{PSK})$
+  \node[draw=quotientorange!80, fill=quotientorange!15, rounded corners=2pt, align=center, text width=2.4cm, inner sep=4pt] (psk) at (-4.5, 3.6) {\textbf{Input IKM:}\\$\mathrm{PSK}$ or $0$};
+  \node[draw=structurepurple!80, fill=structurepurple!15, rounded corners=2pt, font=\small, align=center, text width=3.9cm, inner sep=4pt] (es) at (0, 3.6) {
+    \textbf{Early Secret ($\mathrm{ES}$)}\\
+    {\footnotesize$\operatorname{HKDF\text{-}Extract}(0, \mathrm{PSK})$}
   };
   \draw[->, thick, quotientorange!80!black] (psk) -- (es);
 
   % Outputs from Early Secret
-  \node[draw=aliceblue!80, fill=aliceblue!15, rounded corners=2pt, font=\tiny, align=left, text width=4.5cm] (early_out) at (5.55, 3.5) {
-    $\bullet$ \texttt{client\_early\_traffic\_secret} (0-RTT)\\
+  \node[draw=aliceblue!80, fill=aliceblue!12, rounded corners=2pt, align=left, text width=5.8cm, inner sep=4pt] (early_out) at (6.2, 3.6) {
+    $\bullet$ \texttt{client\_early\_traffic\_secret}\\
     $\bullet$ \texttt{early\_exporter\_master\_secret}
   };
-  \draw[->, thick, gray!70] (es) -- node[above=2pt, font=\tiny]{Expand} (early_out);
+  \draw[->, thick, gray!75] (es) -- node[above=1pt]{Expand} (early_out);
 
   % Derivation link 1 -> 2
-  \node[draw=gray!50, fill=gray!10, rounded corners=1pt, font=\tiny] (d1) at (0, 2.2) {$\operatorname{Derive-Secret}(\text{ES}, \text{"derived"})$};
+  \node[draw=gray!55, fill=gray!10, rounded corners=2pt, inner sep=3pt] (d1) at (0, 2.2) {$\mathrm{Salt}_1 = \operatorname{Derive\text{-}Secret}(\mathrm{ES}, \text{"derived"}, \text{""})$};
   \draw[->, thick, structurepurple!80] (es) -- (d1);
 
   % Stage 2: Handshake Secret
-  \node[draw=quotientorange!80, fill=quotientorange!15, rounded corners=2pt, font=\tiny\bfseries, align=center, text width=2.4cm] (dhe) at (-4.2, 0.9) {ECDHE Secret:\\$Z = g^{ab} = a b G$};
-  \node[draw=structurepurple!80, fill=structurepurple!15, rounded corners=2pt, font=\scriptsize\bfseries, align=center, text width=3.8cm] (hs) at (0, 0.9) {
-    \textbf{Handshake Secret}\\
-    $\operatorname{HKDF-Extract}(\text{Salt}_1, Z)$
+  \node[draw=quotientorange!80, fill=quotientorange!15, rounded corners=2pt, align=center, text width=2.4cm, inner sep=4pt] (dhe) at (-4.5, 0.8) {\textbf{(EC)DHE Secret:}\\$Z = g^{ab}$ (or $abG$)};
+  \node[draw=structurepurple!80, fill=structurepurple!15, rounded corners=2pt, font=\small, align=center, text width=3.9cm, inner sep=4pt] (hs) at (0, 0.8) {
+    \textbf{Handshake Secret ($\mathrm{HS}$)}\\
+    {\footnotesize$\operatorname{HKDF\text{-}Extract}(\mathrm{Salt}_1, Z)$}
   };
   \draw[->, thick, structurepurple!80] (d1) -- (hs);
   \draw[->, thick, quotientorange!80!black] (dhe) -- (hs);
 
   % Outputs from Handshake Secret
-  \node[draw=targetgreen!80, fill=targetgreen!10, rounded corners=2pt, font=\tiny, align=left, text width=4.5cm] (hs_out) at (5.55, 0.9) {
+  \node[draw=targetgreen!80!black, fill=targetgreen!10, rounded corners=2pt, align=left, text width=5.8cm, inner sep=4pt] (hs_out) at (6.2, 0.8) {
     $\bullet$ \texttt{client\_handshake\_traffic\_secret}\\
     $\bullet$ \texttt{server\_handshake\_traffic\_secret}\\
-    {\color{gray!80}$\to$ Protects EncryptedExtensions, Cert, Finished}
+    {\color{gray!85!black}(encrypts Cert, CertVerify, Finished)}
   };
-  \draw[->, thick, gray!70] (hs) -- node[above=2pt, font=\tiny]{Expand} (hs_out);
+  \draw[->, thick, gray!75] (hs) -- node[above=1pt]{Expand} (hs_out);
 
   % Derivation link 2 -> 3
-  \node[draw=gray!50, fill=gray!10, rounded corners=1pt, font=\tiny] (d2) at (0, -0.4) {$\operatorname{Derive-Secret}(\text{HS}, \text{"derived"})$};
+  \node[draw=gray!55, fill=gray!10, rounded corners=2pt, inner sep=3pt] (d2) at (0, -0.65) {$\mathrm{Salt}_2 = \operatorname{Derive\text{-}Secret}(\mathrm{HS}, \text{"derived"}, \text{""})$};
   \draw[->, thick, structurepurple!80] (hs) -- (d2);
 
   % Stage 3: Master Secret
-  \node[draw=quotientorange!80, fill=quotientorange!15, rounded corners=2pt, font=\tiny\bfseries, align=center, text width=2.4cm] (zero_ikm) at (-4.2, -1.7) {Empty Input:\\$0$};
-  \node[draw=structurepurple!80, fill=structurepurple!15, rounded corners=2pt, font=\scriptsize\bfseries, align=center, text width=3.8cm] (ms) at (0, -1.7) {
-    \textbf{Master Secret}\\
-    $\operatorname{HKDF-Extract}(\text{Salt}_2, 0)$
+  \node[draw=quotientorange!80, fill=quotientorange!15, rounded corners=2pt, align=center, text width=2.4cm, inner sep=4pt] (zero_ikm) at (-4.5, -2.05) {\textbf{Zero Input:}\\$0$};
+  \node[draw=structurepurple!80, fill=structurepurple!15, rounded corners=2pt, font=\small, align=center, text width=3.9cm, inner sep=4pt] (ms) at (0, -2.05) {
+    \textbf{Master Secret ($\mathrm{MS}$)}\\
+    {\footnotesize$\operatorname{HKDF\text{-}Extract}(\mathrm{Salt}_2, 0)$}
   };
   \draw[->, thick, structurepurple!80] (d2) -- (ms);
   \draw[->, thick, quotientorange!80!black] (zero_ikm) -- (ms);
 
   % Outputs from Master Secret
-  \node[draw=structurepurple!80, fill=structurepurple!10, rounded corners=2pt, font=\tiny, align=left, text width=4.5cm] (ms_out) at (5.55, -1.7) {
+  \node[draw=structurepurple!80, fill=structurepurple!10, rounded corners=2pt, align=left, text width=5.8cm, inner sep=4pt] (ms_out) at (6.2, -2.05) {
     $\bullet$ \texttt{client\_application\_traffic\_secret\_0}\\
     $\bullet$ \texttt{server\_application\_traffic\_secret\_0}\\
     $\bullet$ \texttt{exporter\_master\_secret}\\
     $\bullet$ \texttt{resumption\_master\_secret}
   };
-  \draw[->, thick, gray!70] (ms) -- node[above=2pt, font=\tiny]{Expand} (ms_out);
+  \draw[->, thick, gray!75] (ms) -- node[above=1pt]{Expand} (ms_out);
 
   % Context annotation
-  \node[draw=gray!50, fill=white, rounded corners=2pt, font=\tiny, align=center, text width=12.5cm] at (0.4, -3.0) {
-    \textbf{Transcript Binding}: Each $\operatorname{HKDF-Expand-Label}(\text{Secret}, \text{Label}, \text{Context}, L)$ mixes the hash of all prior handshake messages\\
-    $\text{Context} = \Hash(\text{ClientHello} \concat \cdots)$ into the derived key, preventing downgrade attacks and transcript tampering.
+  \node[draw=gray!55, fill=gray!6, rounded corners=2pt, align=center, text width=13.2cm, inner sep=4pt] at (0.95, -3.65) {
+    \textbf{Transcript binding:} Every traffic secret is expanded with $\text{context} = \Hash(\text{ClientHello} \concat \cdots)$, mixing the hash of all prior handshake messages into the derived key.
   };
 \end{tikzpicture}
-\caption{The TLS 1.3 HKDF key derivation schedule. Entropy from the optional pre-shared key (PSK)
-and ephemeral Diffie--Hellman exchange ($Z$) is absorbed in stages via \texttt{HKDF-Extract}.
-Intermediate secrets are expanded into cryptographically isolated traffic keys for the handshake,
-application data, and future session resumption.}
+\caption{The TLS 1.3 HKDF key schedule. Entropy from an optional pre-shared key ($\mathrm{PSK}$) and the ephemeral Diffie--Hellman secret ($Z$, written $g^{ab}$ in multiplicative notation or $abG$ on an elliptic curve with base point $G$) is extracted in stages and expanded into isolated traffic secrets.}
 \label{ch25:fig-keyschedule}
 \end{figure}
 
-The \textbf{Early Secret} is extracted from a pre-shared key (PSK) if one exists,
-or from a string of zeros if not. The \textbf{Handshake Secret} mixes in the actual
-Diffie--Hellman output $Z$; from it the two handshake traffic keys are expanded,
-and the server starts using its key right away. After the handshake completes, the
-\textbf{Master Secret} (extracted with the DH input already consumed, so the input
-is zeros) yields the application traffic keys that protect real data, plus a
-resumption secret for next time.
+In Figure~\ref{ch25:fig-keyschedule}: the
+\textbf{Early Secret} is extracted from the PSK (or a hash-length string of zero
+bytes if there is none). The \textbf{Handshake Secret} extracts the Diffie--Hellman
+shared secret $Z$, and from it both handshake traffic secrets are expanded so the
+server can encrypt immediately after \texttt{ServerHello}. Once the handshake
+finishes, the \textbf{Master Secret} (extracted with a zero-byte input because all
+fresh entropy has already entered) produces the application traffic secrets and a
+resumption secret for the next visit.
 
-How does one stage hand off to the next? Through the boxes marked
-$\operatorname{Derive-Secret}(\cdot, \text{"derived"})$ in Figure~\ref{ch25:fig-keyschedule}.
-$\operatorname{Derive-Secret}(S, \text{label}, \text{msgs})$ is just
-$\operatorname{HKDF-Expand-Label}(S, \text{label}, \Hash(\text{msgs}), 32)$. With the
-label \texttt{"derived"} and an empty message list, it turns the Early Secret into
-$\text{Salt}_1$, which becomes the salt for the next Extract that absorbs $Z$; the
-Handshake Secret is turned into $\text{Salt}_2$ the same way. Each stage's output is
-thus the key that seeds the next.
+Each stage hands off to the next via the helper function
+\[
+\operatorname{Derive\text{-}Secret}(S, \text{label}, \text{msgs})
+= \operatorname{HKDF\text{-}Expand\text{-}Label}\bigl(S, \text{label}, \Hash(\text{msgs}), L\bigr),
+\]
+where $S$ is the current stage's secret and $L$ is the hash output length ($32$
+bytes for SHA-256). Evaluated with label \texttt{"derived"} and an empty message
+string \texttt{""}, it turns the Early Secret into $\mathrm{Salt}_1$ for the
+Handshake Secret, and turns the Handshake Secret into $\mathrm{Salt}_2$ for the
+Master Secret.
 
 \begin{whybox}
-Why a chain instead of one Expand from $Z$? There are three reasons, each learned
-from older protocols. \textbf{(1) Domain separation:} distinct labels make the handshake
-keys provably independent from the application keys, so compromising one phase
-does not leak another. \textbf{(2) Transcript binding:} because each key is expanded
-with the hash of the messages so far, an attacker who tampers with any handshake
-message produces different keys on the two sides, and the Finished check (below)
-fails. \textbf{(3) PSK and DH composition:} the Extract steps let TLS fold in a
-pre-shared key \emph{and} fresh DH cleanly, so resumed connections still get forward
-secrecy from the new $g^{ab}$. TLS 1.2 derived everything in one ad-hoc PRF call
-and paid for it with attacks like Triple Handshake that this structure closes.
+Why use a three-stage chain instead of a single Expand from $Z$? Three properties
+motivate the design. \textbf{(1) Domain separation:} distinct labels keep handshake
+keys cryptographically independent of application keys, so exposing one phase's key
+does not expose another's. \textbf{(2) Transcript binding:} expanding each traffic
+secret with the hash of the handshake messages so far ensures that tampering with
+any message makes the two sides derive different keys, causing the \texttt{Finished}
+check to fail. \textbf{(3) Clean PSK + DH mixing:} chaining two Extract calls folds
+in both a resumed PSK and a fresh Diffie--Hellman secret $g^{ab}$, giving resumed
+sessions forward secrecy too. TLS~1.2 derived session keys in one custom
+pseudorandom-function (PRF) call without full transcript binding, enabling attacks
+such as Triple Handshake (2014), where an active attacker stitched three sessions
+together so two connections shared keys while disagreeing on who authenticated whom.
 \end{whybox}
 
 \begin{implementbox}
 A toy of the TLS 1.3 key schedule using Python's \texttt{hmac} and
-\texttt{hashlib}. It mirrors the real structure but is radically simplified --- no real
-labels, no transcript encoding, fixed lengths. \textbf{Learning only: never use
-this to secure anything.}
+\texttt{hashlib}. It mirrors the three-stage structure with simplified label
+formatting and fixed lengths. \textbf{Learning only: never use this to secure
+anything.}
 
 \begin{lstlisting}[language=Python]
 import hmac, hashlib
@@ -504,352 +553,472 @@ both pass does the client believe it is talking to the real server.
 
 \section{Step 5: Finished (the MAC that seals the handshake)}
 
-The server sends one more handshake message: \texttt{Finished}. It is a MAC ---
-specifically $\operatorname{HMAC}$ under a key derived from the handshake secret --- computed over
-the \emph{entire transcript up to this point}. The client, holding the same key
-and transcript, recomputes the MAC and checks it. Then the client sends its own
-\texttt{Finished}, a MAC over the transcript including the server's Finished, and
-the server checks that.
+The server sends one more handshake message: \texttt{Finished}. It is a MAC
+(specifically $\operatorname{HMAC}$ under a finished key expanded from the handshake
+traffic secret) computed over the hash of the \emph{entire transcript up to this
+point}. The client, holding the same secret and transcript, recomputes the MAC and
+checks it. Then the client sends its own \texttt{Finished} over the transcript
+including the server's \texttt{Finished}, and the server verifies that in turn.
 
-These two MACs protect the integrity of the entire handshake, for a reason worth
-spelling out.
+Figure~\ref{ch25:fig-downgrade-finished} traces what happens if an active attacker
+edits an earlier handshake message in transit.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\footnotesize, >=Stealth]
+  % Nodes at top
+  \node[draw=aliceblue!80, fill=aliceblue!15, rounded corners=2pt, minimum width=2.2cm, minimum height=0.6cm, font=\small\bfseries] (a) at (0, 0) {Client (Alice)};
+  \node[draw=trapred!80, fill=trapred!15, rounded corners=2pt, minimum width=2.2cm, minimum height=0.6cm, font=\small\bfseries] (e) at (5.8, 0) {Attacker (Eve)};
+  \node[draw=bobgreen!80, fill=bobgreen!15, rounded corners=2pt, minimum width=2.2cm, minimum height=0.6cm, font=\small\bfseries] (b) at (11.6, 0) {Server (Bob)};
+
+  \draw[thick, gray!55] (a) -- (0, -2.5);
+  \draw[thick, gray!55] (e) -- (5.8, -2.5);
+  \draw[thick, gray!55] (b) -- (11.6, -2.5);
+
+  % Tampered ClientHello
+  \draw[->, thick, aliceblue!85!black] (0, -0.9) -- node[above=1pt, align=center]{ClientHello:\\\texttt{[Strong, Weak]}} (5.8, -0.9);
+  \draw[->, thick, trapred!85!black, dashed] (5.8, -0.9) -- node[above=1pt, align=center, text=trapred!85!black]{Edited ClientHello$'$:\\\texttt{[Weak only]}} (11.6, -0.9);
+
+  % Server reply
+  \draw[<-, thick, bobgreen!85!black] (0, -1.9) -- node[above=1pt]{ServerHello (\texttt{Weak}) + encrypted flight + $\mathrm{Finished}_S$} (11.6, -1.9);
+
+  % Diverging transcripts below
+  \node[draw=aliceblue!80, fill=aliceblue!10, rounded corners=2pt, text width=5.2cm, inner sep=5pt, align=left] (ta) at (2.2, -3.55) {
+    \textbf{Alice's transcript $T_A$:}\\
+    $\Hash(\text{ClientHello\texttt{[Strong, Weak]}} \concat \cdots)$
+  };
+  \node[draw=bobgreen!80, fill=bobgreen!10, rounded corners=2pt, text width=5.2cm, inner sep=5pt, align=left] (tb) at (9.4, -3.55) {
+    \textbf{Bob's transcript $T_B$:}\\
+    $\Hash(\text{ClientHello$'$\texttt{[Weak only]}} \concat \cdots)$
+  };
+
+  % Mismatch box
+  \node[draw=trapred!85!black, fill=trapred!10, rounded corners=2pt, font=\small\bfseries, text=trapred!85!black, inner sep=4pt] (abort) at (5.8, -4.9) {
+    $T_A \neq T_B \;\Longrightarrow\;$ keys, \texttt{CertificateVerify}, and \texttt{Finished} MAC disagree $\;\Longrightarrow\;$ Abort
+  };
+  \draw[->, thick, aliceblue!80!black] (ta.south) |- (abort.west);
+  \draw[->, thick, bobgreen!80!black] (tb.south) |- (abort.east);
+\end{tikzpicture}
+\caption{How transcript authentication defeats downgrade tampering. When Eve strips strong cipher suites from the cleartext \texttt{ClientHello}, Alice and Bob accumulate different transcript hashes ($T_A \neq T_B$). Because handshake keys, \texttt{CertificateVerify}, and \texttt{Finished} all depend on that hash, verification fails and the connection aborts before any application data is sent.}
+\label{ch25:fig-downgrade-finished}
+\end{figure}
 
 \begin{whybox}
-\textbf{Why Finished defeats tampering and downgrades.} Every handshake message ---
-the cipher suite list, the supported groups, the key shares, the certificate ---
-feeds into the transcript hash. The Finished MAC is computed over that hash with a
-key that an attacker cannot derive (it depends on $g^{ab}$). So if Eve altered
-\emph{any} earlier message --- swapped a strong cipher suite for a weak one,
-stripped a group, flipped a bit in a key share --- the two sides' transcripts
-diverge, their Finished MACs do not match, and the handshake aborts. In particular
-this is TLS 1.3's \textbf{downgrade protection}: even though the negotiation
-happens in the clear, its result is authenticated after the fact. Eve cannot trick
-Alice and Bob into using weaker crypto than they both support, because the moment
-she edits the negotiation she breaks the Finished check. The lesson was learned the
-hard way: TLS 1.2's negotiation was not fully authenticated, and attacks like
-FREAK and Logjam forced servers down to deliberately weakened ``export-grade'' keys
-precisely by tampering with the unprotected handshake.
+\textbf{Why Finished defeats tampering and downgrades.} Every handshake message
+(cipher suite list, supported groups, key shares, certificate) feeds into the
+transcript hash. The \texttt{Finished} MAC covers that hash under a key derived
+from $g^{ab}$, which Eve does not know. If Eve alters \emph{any} earlier message ---
+swaps a strong cipher suite for a weak one, strips an elliptic-curve group, or flips
+a bit in an extension --- the two sides' transcripts diverge, their MACs disagree,
+and the handshake aborts. That mechanism gives TLS 1.3 \textbf{downgrade
+protection}: although initial negotiation happens in cleartext, its outcome is
+verified under the shared key before application data flows. TLS~1.2 did not
+authenticate the full negotiation cleanly, and attacks such as FREAK and Logjam
+(2015) forced connections down to 1990s U.S.-export-capped $512$-bit keys by
+editing unprotected handshake messages.
 \end{whybox}
 
 \begin{focusbox}
-\textbf{Putting the pieces together.} Each message contributes specific properties:
+\textbf{Summary of handshake guarantees.} Each flight pins down one of Section~1's
+promises:
 \begin{itemize}
-\item ClientHello / ServerHello key shares $\Rightarrow$ a \emph{shared secret}
-(confidentiality, forward secrecy).
-\item Certificate + CertificateVerify $\Rightarrow$ the server is \emph{who it
-claims} (authentication).
-\item Finished (both) $\Rightarrow$ \emph{nobody tampered} with the negotiation
-(integrity, downgrade protection).
+\item \texttt{ClientHello} / \texttt{ServerHello} key shares $\Rightarrow$ a fresh
+\emph{shared secret} (confidentiality and forward secrecy).
+\item \texttt{Certificate} + \texttt{CertificateVerify} $\Rightarrow$ the server
+holds the certified private key for the requested domain (authentication).
+\item \texttt{Finished} (both directions) $\Rightarrow$ both peers saw the exact
+same negotiation bytes (handshake integrity and downgrade protection).
 \end{itemize}
-Confidentiality, authentication, integrity --- the three promises of the first
-section, each pinned to a specific message, each built from a primitive you
-already understand.
 \end{focusbox}
 
 \section{The record protocol and AEAD}
 
 With the handshake done, the connection switches to the \textbf{record protocol}.
-Application data is split into records (up to $2^{14}$ bytes of plaintext each),
-and each record is sealed with an \textbf{AEAD} cipher --- authenticated
-encryption with associated data --- from Chapter~16. TLS 1.3 permits only
-AEAD suites: AES-GCM, AES-CCM, or ChaCha20-Poly1305. No more
-encrypt-then-separately-MAC bolt-ons, no unauthenticated CBC; the cipher provides
-confidentiality and integrity in one operation.
+Application data is split into records of up to $2^{14} = 16{,}384$ bytes of
+plaintext each, and each record is sealed with an \textbf{AEAD} cipher
+(authenticated encryption with associated data, Chapter~16). TLS 1.3 permits only
+AEAD suites: AES-GCM, AES-CCM (Counter with CBC-MAC), or ChaCha20-Poly1305. Older
+cipher-block-chaining (CBC, Chapter~13) and separate-MAC constructions are gone;
+one primitive provides both confidentiality and integrity.
 
-An AEAD seal takes four inputs: the traffic key $k$, a nonce, the plaintext, and
-some associated data that is authenticated but not encrypted. It returns
-ciphertext plus an authentication tag:
+An AEAD seal takes four inputs --- the traffic key $k$, a per-record $\text{nonce}$,
+associated data ($\mathrm{AD}$) that is authenticated without being encrypted, and
+the $\text{plaintext}$ --- and outputs ciphertext plus an authentication tag:
 \[
-\mathrm{Seal}_k(\text{nonce}, \text{AD}, \text{plaintext}) \to (\text{ciphertext},
-\text{tag}).
+\operatorname{Seal}_k(\text{nonce}, \mathrm{AD}, \text{plaintext})
+\longrightarrow (\text{ciphertext}, \text{tag}).
 \]
-Decryption recomputes the tag and refuses to output plaintext if it does not
-match. A single flipped bit anywhere in the record makes the tag check fail and
-the connection tears down. That is the integrity guarantee, per record.
+Decryption recomputes the tag and rejects the record before releasing any plaintext
+if verification fails, tearing down the connection on even a single flipped bit.
 
 \subsection{Nonces and the sequence number}
 
-GCM and ChaCha20-Poly1305 are catastrophically insecure if you ever reuse a
-(key, nonce) pair --- repeat a nonce under AES-GCM and you leak the XOR of two
-plaintexts and, worse, the authentication subkey, letting an attacker forge. TLS
-1.3 avoids the problem without transmitting nonces at all. Instead each side keeps
-a 64-bit \textbf{sequence number} that starts at zero and increments by one per
-record. The per-record nonce is that counter XORed into a fixed random
-\texttt{iv} derived from the traffic secret in the key schedule.
+AES-GCM and ChaCha20-Poly1305 fail catastrophically if a $(k, \text{nonce})$ pair
+ever repeats: reusing an AES-GCM nonce leaks the XOR of two plaintexts and exposes
+the authentication subkey, allowing tag forgeries (Chapter~16). TLS 1.3 prevents
+nonce reuse without transmitting nonces on the wire. Each side keeps an implicit
+$64$-bit \textbf{sequence number} $\mathrm{seq}_{64}$ starting at $0$ and
+incrementing by $1$ per record, left-padded with $32$ zero bits ($0^{32}$) to match
+the $96$-bit ($12$-byte) initialization vector (\texttt{static\_iv}) derived from
+that direction's traffic secret:
+\[
+\text{nonce} = \mathtt{static\_iv} \xor \bigl(0^{32} \concat \mathrm{seq}_{64}\bigr).
+\]
 
 \begin{focusbox}
-\textbf{Nonce $=$ static\_iv $\xor$ (sequence number).} The 64-bit sequence number is
-left-padded with zeros to the 96-bit \texttt{iv} length before the XOR. Because the sequence number
-never repeats within a connection and the \texttt{iv} is unique per direction per
-key, no (key, nonce) pair ever recurs. The counter is implicit --- never sent --- so
-it also costs zero bytes on the wire. Tiny example: with the last two bytes of the
-$\mathtt{static\_iv}$ equal to $\mathtt{A5C3}$ and record numbers $0,1,2$, the
-nonces end in $\mathtt{A5C3}, \mathtt{A5C2}, \mathtt{A5C1}$ --- distinct by
-construction. The counter itself will never wrap in practice; long before that,
-AES-GCM's usage limit (about $2^{24.5}$ full-size records per key) tells
-implementations to send a \texttt{KeyUpdate} and ratchet to a fresh traffic key.
+\textbf{Why this construction never repeats a nonce.} Within one key's lifetime,
+distinct sequence numbers XORed with the same fixed $\mathtt{static\_iv}$ produce
+distinct $96$-bit nonces, and client-to-server and server-to-client directions have
+independent keys and IVs. Because both peers count records in lockstep over
+reliable transport, the counter costs zero wire bytes. For instance, if the last
+two bytes of $\mathtt{static\_iv}$ are $\mathtt{A5C3}$, records $0, 1, 2$ use nonces
+ending in $\mathtt{A5C3}, \mathtt{A5C2}, \mathtt{A5C1}$. Long before the $64$-bit
+counter can wrap, AES-GCM's safety bound (about $2^{24.5} \approx 2.4 \times 10^7$
+full-size records per key) triggers a \texttt{KeyUpdate} message, which applies a
+one-way HKDF step (\emph{ratcheting}) to derive a fresh traffic secret and erase the
+old one.
 \end{focusbox}
 
 \subsection{What the record header authenticates}
 
-In TLS 1.3 the record's outer header is tiny: a content-type byte (set to
-\texttt{application\_data} even for handshake records, to hide what is inside), a
-legacy version field, and the length. The real content type is appended to the
-plaintext \emph{before} encryption and recovered after decryption, so an
-eavesdropper cannot tell handshake records from data records from alerts. The outer
-header is fed in as the AEAD associated data, so its length field is authenticated
-even though it travels in the clear: an attacker cannot lie about the record's
-length without breaking the tag (Figure~\ref{ch25:fig-aead-record}).
+In TLS 1.3, every encrypted record carries a $5$-byte cleartext outer header: a
+frozen content-type byte (\texttt{0x17}, the code for \texttt{application\_data},
+used even on encrypted handshake records), a legacy version field (\texttt{0x0303},
+TLS~1.2's version bytes, retained so older network equipment does not drop packets),
+and the $2$-byte ciphertext length. The true record type --- such as \texttt{0x16}
+for handshake messages, \texttt{0x17} for application data, or \texttt{0x15} for
+error and close notifications (\emph{alerts}) --- is appended to the plaintext
+\emph{before} encryption, hiding record types from eavesdroppers. Passing the
+$5$-byte outer header as the AEAD associated data ($\mathrm{AD}$) authenticates the
+cleartext length and header fields without encrypting them
+(Figure~\ref{ch25:fig-aead-record}).
 
-\begin{figure}[H]
+\begin{figure}[htbp]
 \centering
-\begin{tikzpicture}[font=\scriptsize, >=Stealth]
-  % Nonce derivation (left)
-  \node[draw=sourceblue!60, fill=sourceblue!12, rounded corners=2pt, align=center, inner sep=3pt, minimum width=2.8cm] (iv) at (0,2.2) {12-byte \texttt{static\_iv}\\(from HKDF)};
-  \node[draw=sourceblue!60, fill=sourceblue!12, rounded corners=2pt, align=center, inner sep=3pt, minimum width=2.8cm] (seq) at (0,1.0) {64-bit seq number\\(implicit counter)};
-  \node[draw=structurepurple!80, fill=structurepurple!15, circle, inner sep=1pt] (xor) at (2.2,1.6) {$\xor$};
-  \node[draw=structurepurple!70, fill=structurepurple!12, rounded corners=2pt, align=center, inner sep=3pt] (nonce) at (4.0,1.6) {Per-record\\12B Nonce};
+\begin{tikzpicture}[font=\footnotesize, >=Stealth]
+  % Nonce derivation (top left)
+  \node[draw=sourceblue!70, fill=sourceblue!12, rounded corners=2pt, align=center, inner sep=4pt, minimum width=3.1cm] (iv) at (1.55, 2.5) {12-byte \texttt{static\_iv}\\(from HKDF)};
+  \node[draw=sourceblue!70, fill=sourceblue!12, rounded corners=2pt, align=center, inner sep=4pt, minimum width=3.1cm] (seq) at (1.55, 1.15) {$0^{32} \concat \mathrm{seq}_{64}$\\(padded counter)};
+  \node[draw=structurepurple!80, fill=structurepurple!15, circle, inner sep=1.5pt, font=\small] (xor) at (3.85, 1.82) {$\xor$};
+  \node[draw=structurepurple!75, fill=structurepurple!12, rounded corners=2pt, align=center, inner sep=4pt] (nonce) at (5.45, 1.82) {12-byte\\Nonce};
 
-  \draw[->, thick, gray!70] (iv.east) -| (xor.north);
-  \draw[->, thick, gray!70] (seq.east) -| (xor.south);
-  \draw[->, thick, structurepurple!80!black] (xor.east) -- (nonce.west);
+  \draw[->, thick, gray!75] (iv.east) -| (xor.north);
+  \draw[->, thick, gray!75] (seq.east) -| (xor.south);
+  \draw[->, thick, structurepurple!85!black] (xor.east) -- (nonce.west);
 
   % Inner plaintext (top right)
-  \node[draw=bobgreen!60, fill=bobgreen!12, rounded corners=2pt, align=center, inner sep=3pt, minimum width=2.8cm] (pt) at (7.5,2.2) {Plaintext payload};
-  \node[draw=bobgreen!60, fill=bobgreen!20, rounded corners=2pt, align=center, inner sep=3pt, minimum width=1.8cm] (ct_type) at (10.0,2.2) {Inner Type\\(\texttt{0x16}/\texttt{0x17})};
+  \node[draw=bobgreen!75, fill=bobgreen!12, rounded corners=2pt, align=center, inner sep=4pt, minimum width=3.3cm, anchor=west] (pt) at (7.0, 2.5) {Plaintext payload\\($\le 2^{14}$ bytes)};
+  \node[draw=bobgreen!80, fill=bobgreen!22, rounded corners=2pt, align=center, inner sep=4pt, minimum width=2.8cm, anchor=west] (ct_type) at (10.35, 2.5) {True Type (1 B)\\\texttt{0x16} / \texttt{0x17} / \texttt{0x15}};
 
   % AEAD Seal box
-  \node[draw=quotientorange!80, fill=quotientorange!15, rounded corners=2pt, align=center, inner sep=4pt, minimum width=3.8cm] (aead) at (8.5,1.0) {\textbf{AEAD Seal}$_k(\text{Nonce}, \text{AD}, \text{Plaintext})$};
+  \node[draw=quotientorange!85!black, fill=quotientorange!15, rounded corners=2pt, font=\small, align=center, inner sep=5pt, minimum width=5.6cm] (aead) at (9.9, 1.15) {$\operatorname{Seal}_k(\text{Nonce}, \mathrm{AD}, \text{Inner Plaintext})$};
 
-  \draw[->, thick, structurepurple!80!black] (nonce.east) -- (aead.west);
-  \draw[->, thick, bobgreen!80!black] (pt.south) -- (aead.north);
-  \draw[->, thick, bobgreen!80!black] (ct_type.south) -- (aead.north east);
+  \draw[->, thick, structurepurple!85!black] (nonce.east) |- (aead.west);
+  \draw[->, thick, bobgreen!85!black] (pt.south) -- (pt.south |- aead.north);
+  \draw[->, thick, bobgreen!85!black] (ct_type.south) -- (ct_type.south |- aead.north);
 
-  % Wire record (bottom)
-  \node[draw=gray!70, fill=gray!12, rounded corners=2pt, align=center, inner sep=4pt, minimum width=3.2cm] (hdr) at (3.6,-0.4) {\textbf{Outer Header (AD)}\\\texttt{type=0x17}, \texttt{ver=0x0303}, \texttt{len}};
-  \node[draw=targetgreen!70, fill=targetgreen!12, rounded corners=2pt, align=center, inner sep=4pt, minimum width=4.5cm] (ciph) at (7.6,-0.4) {\textbf{Encrypted Inner Record}\\(Ciphertext)};
-  \node[draw=trapred!70, fill=trapred!12, rounded corners=2pt, align=center, inner sep=4pt, minimum width=2.3cm] (tag) at (11.2,-0.4) {\textbf{16B Auth Tag}\\(MAC over all)};
+  % Wire record (bottom: three abutting boxes, total width 13.4cm)
+  \node[draw=gray!75, fill=gray!12, align=center, inner sep=5pt, text width=4.0cm, minimum height=1.15cm, anchor=west] (hdr) at (0.0, -0.65) {
+    \textbf{Outer Header (5 B, AD)}\\
+    \texttt{0x17} \textbar\ \texttt{0x0303} \textbar\ \texttt{length}
+  };
+  \node[draw=targetgreen!80!black, fill=targetgreen!12, align=center, inner sep=5pt, text width=5.2cm, minimum height=1.15cm, anchor=west] (ciph) at (4.35, -0.65) {
+    \textbf{Ciphertext}\\
+    encrypted (payload $\concat$ true type)
+  };
+  \node[draw=trapred!80, fill=trapred!12, align=center, inner sep=5pt, text width=3.2cm, minimum height=1.15cm, anchor=west] (tag) at (9.9, -0.65) {
+    \textbf{Auth Tag (16 B)}\\
+    covers AD $+$ ciphertext
+  };
 
-  \draw[->, thick, gray!70, dashed] (hdr.north) |- node[pos=0.25, left, font=\tiny]{Authenticated (AD)} (aead.south west);
-  \draw[->, thick, quotientorange!80!black] (aead.south) -- (ciph.north);
-  \draw[->, thick, quotientorange!80!black] (aead.south east) -- (tag.north);
+  \draw[->, thick, gray!75, dashed] (hdr.north) |- node[pos=0.28, right, text=gray!85!black]{Authenticated as $\mathrm{AD}$} (aead.south west);
+  \draw[->, thick, quotientorange!85!black] (aead.south) -- (ciph.north -| aead.south);
+  \draw[->, thick, quotientorange!85!black] ([xshift=1.6cm]aead.south) -- (tag.north);
 \end{tikzpicture}
-\caption{TLS 1.3 record-layer AEAD sealing. The 64-bit sequence number is XORed with the static IV to form a unique 12-byte nonce without transmitting a counter on the wire. The true content type is hidden inside the encrypted payload, while the cleartext outer header is authenticated as Associated Data (AD).}
+\caption{TLS 1.3 record-layer AEAD sealing. The padded 64-bit sequence number is XORed with \texttt{static\_iv} to form a unique 12-byte nonce with zero wire overhead. The true content type is encrypted inside the payload, while the 5-byte cleartext outer header is authenticated as associated data ($\mathrm{AD}$).}
 \label{ch25:fig-aead-record}
 \end{figure}
 
 \begin{applicationbox}
-\textbf{This is the traffic under your padlock.} When you load a page over HTTPS,
-the TLS handshake runs once (often resumed in well under a millisecond on repeat
-visits), and then every HTTP request and response --- including HTTP/2 and HTTP/3
-framing --- rides inside AEAD-sealed TLS records. On a modern CPU
-with AES-NI, AES-GCM runs at gigabytes per second, so the record layer is
-essentially free; the handshake's public-key math is the only part you can feel,
-and even that is one round trip. ChaCha20-Poly1305 exists for the same reason but
-on phones and embedded chips without AES hardware, where its software speed and
-constant-time design (no secret-dependent table lookups) win. Google deployed it
-across Android and Chrome for exactly that mobile-battery, side-channel-safety
-combination.
+\textbf{Traffic under the browser padlock.} When you load a page over HTTPS, the
+handshake runs once (often resumed in under a millisecond on repeat visits), and
+every HTTP/1.1 or HTTP/2 request and response rides inside AEAD-sealed TLS records
+(HTTP/3 over QUIC reuses the same TLS~1.3 handshake and key schedule to key QUIC's
+own AEAD-protected packets). On CPUs with AES-NI (hardware AES instructions),
+AES-GCM runs at several gigabytes per second, adding negligible CPU overhead. On
+phones and embedded chips without AES hardware, ChaCha20-Poly1305 runs fast in pure
+software and uses only constant-time integer operations (no secret-indexed table
+lookups), saving battery while avoiding cache-timing leaks.
 \end{applicationbox}
 
 \section{Forward secrecy in TLS 1.3}
 
-We have mentioned forward secrecy several times; here is the precise statement. A protocol has forward
-secrecy if compromise of long-term secrets in the future does not compromise past
-session keys. In TLS 1.3 the long-term secret is the server's certificate private
-key. The session keys come from the \emph{ephemeral} Diffie--Hellman secret $Z =
-g^{ab}$, where $a$ and $b$ are random, used once, and erased when the connection
-closes.
+A protocol has \textbf{forward secrecy} if compromising long-term secrets in the
+future does not compromise past session keys. In TLS 1.3 the server's long-term
+secret is its certificate private key $sk_S$, while session keys come from the
+\emph{ephemeral} Diffie--Hellman secret $Z = g^{ab}$, whose private exponents $a$
+and $b$ are generated per connection and erased as soon as the handshake derives
+traffic keys (Figure~\ref{ch25:fig-forward-secrecy}).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\footnotesize, >=Stealth]
+  % Left panel: Legacy Static RSA
+  \node[draw=trapred!75, fill=trapred!6, rounded corners=3pt, text width=6.1cm, inner sep=7pt, align=left, anchor=north west] (rsa) at (0, 0) {
+    {\small\color{trapred!85!black}\textbf{(a) Legacy Static RSA (TLS $\le$ 1.2)}}\\[4pt]
+    \textbf{Today:} Client picks secret $S$, sends $C = \Enc_{pk_S}(S)$. Eve records $C$ and all encrypted records.\\[4pt]
+    \textbf{Years later:} Eve steals long-term key $sk_S$.\\[4pt]
+    {\color{trapred!85!black}\textbf{Outcome:}} Eve computes $S = \Dec_{sk_S}(C)$, re-derives session keys, and \textbf{decrypts every archived session}.
+  };
+
+  % Right panel: TLS 1.3 ECDHE
+  \node[draw=targetgreen!80!black, fill=targetgreen!6, rounded corners=3pt, text width=6.1cm, inner sep=7pt, align=left, anchor=north west] (ecdhe) at (6.75, 0) {
+    {\small\color{targetgreen!75!black}\textbf{(b) Ephemeral ECDHE (TLS 1.3)}}\\[4pt]
+    \textbf{Today:} Peers exchange $A = g^a, B = g^b$, sign transcript with $sk_S$, derive keys from $Z = g^{ab}$, and \textbf{erase $a, b$}.\\[4pt]
+    \textbf{Years later:} Eve steals long-term key $sk_S$.\\[4pt]
+    {\color{targetgreen!75!black}\textbf{Outcome:}} $sk_S$ only signed the transcript; recovering $a$ or $b$ from $(g^a, g^b)$ requires discrete log. \textbf{Past sessions stay sealed.}
+  };
+\end{tikzpicture}
+\caption{Why TLS 1.3 removed static RSA key transport. When the long-term key $sk_S$ directly decrypts the session secret (a), stealing $sk_S$ years later exposes every recorded conversation. When $sk_S$ only authenticates ephemeral Diffie--Hellman shares whose exponents are erased after key derivation (b), later key theft cannot open archived traffic.}
+\label{ch25:fig-forward-secrecy}
+\end{figure}
 
 \begin{intuitionbox}
-Suppose Eve records gigabytes of your encrypted TLS traffic today and files it
-away. Five years from now she steals Bob's server, including its certificate
-private key. Can she decrypt the old recordings? \textbf{No.} The certificate key
-was used only to \emph{sign} the handshake transcript, never to derive any
-encryption key. The encryption keys came from $g^{ab}$, and $a$ and $b$ were thrown
-away the moment those connections ended. To get $Z$ she would need $a$ or $b$, and
-the only thing on the wire was $g^a$ and $g^b$ --- recovering the exponents is the
-discrete-log problem she cannot solve. The stolen signing key lets her impersonate
-Bob \emph{going forward}, but it cannot retroactively open a single old session.
+Suppose Eve records gigabytes of your encrypted TLS 1.3 traffic today and archives
+it. Five years from now she steals Bob's server, including its certificate private
+key $sk_S$. Can she decrypt the old recordings? \textbf{No.} That key only
+\emph{signed} handshake transcripts; it never encrypted a session secret. The
+encryption keys came from $g^{ab}$, and $a$ and $b$ were erased when those
+connections closed. With only $g^a$ and $g^b$ on the recording, recovering $Z$
+still requires solving a discrete logarithm. The stolen signing key lets Eve
+impersonate Bob \emph{from now on} until the certificate expires or is revoked,
+not read old sessions.
 \end{intuitionbox}
 
 \begin{historybox}
-This is the property that static-RSA TLS lacked. TLS grew out of Netscape's Secure
-Sockets Layer (SSL~2.0 in 1995 and SSL~3.0 in 1996, designed by Paul Kocher, Taher
-ElGamal, and colleagues) and was standardized by the IETF as TLS~1.0 in 1999. In TLS
-up to 1.2, a common mode was \emph{RSA key transport}: the client picked the session
-secret and encrypted it under the server's long-term RSA public key from the
-certificate, making the session key recoverable by anyone holding that RSA private
-key --- \emph{forever}. The 2013 Snowden disclosures made the risk concrete: an
-adversary who recorded traffic in bulk and later obtained a server's private key (by
-subpoena, theft, or coercion) could decrypt years of archived sessions retroactively.
-Under editor Eric Rescorla, TLS~1.3 (2018, RFC~8446) finished the push toward
-ephemeral (EC)DHE by \emph{removing static RSA key transport from the protocol
-entirely}, over objections from enterprises whose monitoring middleboxes relied on
-passive decryption with a copy of the server's key. In TLS~1.3, forward secrecy is
-mandatory rather than an option you might forget to enable.
+TLS grew out of Netscape's Secure Sockets Layer (SSL~2.0 in 1995 and SSL~3.0 in
+1996, designed by Paul Kocher, Taher ElGamal, and colleagues) and was standardized
+by the IETF as TLS~1.0 in 1999. Through TLS~1.2, a widely deployed option was
+\emph{RSA key transport}: the client encrypted the session's premaster secret under
+the server's long-term RSA public key, leaving every recorded session decryptable by
+anyone who obtained that RSA private key at any point in the future. The 2013
+Snowden disclosures showed the operational danger: bulk traffic recording combined
+with later key compromise (by theft, subpoena, or coercion) exposed years of past
+traffic at once. Under editor Eric Rescorla, TLS~1.3 (RFC~8446, 2018) deleted static
+RSA key transport altogether, despite pushback from enterprises whose network
+appliances (\emph{middleboxes}, such as corporate firewalls and traffic inspectors
+placed between clients and servers) relied on copies of the server's RSA key to
+decrypt internal traffic passively. In TLS~1.3, forward secrecy is mandatory rather
+than an option an administrator can forget to turn on.
 \end{historybox}
 
 \section{Resumption and 0-RTT (and its one sharp edge)}
 
-Re-running a full handshake (with its signature and certificate verification) for
-every connection to a site you just visited is wasteful. TLS 1.3 lets the server
-issue a \textbf{session ticket} after a handshake: a pre-shared key (PSK) the client
-can present next time to skip the public-key authentication. A resumed handshake
-is faster and still mixes in fresh DH for forward secrecy (the Handshake Secret
-extracts both the PSK and the new $g^{ab}$).
+Re-running a full certificate signature and chain check for every connection to a
+site you recently visited wastes both CPU and latency. TLS 1.3 lets the server send
+a \textbf{session ticket} after a handshake: a pre-shared key (PSK) derived from the
+\texttt{resumption\_master\_secret} that the client can present on a return visit to
+skip certificate authentication. A resumed 1-RTT handshake still mixes fresh
+Diffie--Hellman shares into the Handshake Secret, preserving forward secrecy.
 
-TLS 1.3 also offers \textbf{0-RTT}: using a resumption PSK, the client can send
-encrypted application data \emph{in its very first flight}, before any round trip,
-shaving the last latency off a repeat visit. It is a genuine speedup, but it comes
-with a serious caveat.
+TLS 1.3 also offers \textbf{0-RTT} (zero round-trip time) early data: using a
+resumption PSK, the client can send encrypted application data in its first
+\textbf{flight} (the initial batch of packets sent before waiting for a server
+reply), eliminating handshake latency on repeat visits. That speedup comes at a
+concrete security cost.
 
 \begin{trapbox}
-\textbf{0-RTT data has no replay protection.} The early data is encrypted under a
-key derived from the PSK alone, with no fresh server contribution yet. Eve cannot
-read it, but she \emph{can} record the 0-RTT flight and replay it later --- the
-server has no per-connection nonce from itself to reject the duplicate. If that
-early request is a non-idempotent action (``transfer \$100,'' ``post this
-comment''), a replay executes it twice. The rule: \emph{only ever put idempotent,
-safe requests in 0-RTT} (a GET, a cacheable read), never a state-changing one.
-Application servers must enforce this; many simply forbid 0-RTT for anything but
-GETs. It is a textbook case of a performance feature trading away a security
-property, and you have to know which.
+\textbf{0-RTT data has no replay protection.} Early data is encrypted under a key
+derived from the PSK and the client's \texttt{ClientHello} alone, before the server
+has contributed a fresh nonce or ephemeral share. Eve cannot read the ciphertext,
+yet she \emph{can} copy the 0-RTT packets and send them to the server again. An
+operation is \textbf{idempotent} if repeating it has the same effect as running it
+once (such as an HTTP \texttt{GET} that fetches a static page), whereas a
+\textbf{non-idempotent} request changes state on each execution (such as an HTTP
+\texttt{POST} that transfers $\$100$ or posts a comment). Replaying a non-idempotent
+0-RTT request executes the action a second time. Applications must therefore send
+only idempotent read requests in 0-RTT, and many servers reject 0-RTT for everything
+except safe \texttt{GET} requests.
 \end{trapbox}
 
-Figure~\ref{ch25:fig-0rtt-replay} diagrams why this replay vulnerability occurs in practice.
+Figure~\ref{ch25:fig-0rtt-replay} traces how an active attacker exploits 0-RTT replay.
 
-\begin{figure}[H]
+\begin{figure}[htbp]
 \centering
-\begin{tikzpicture}[font=\scriptsize, >=stealth]
+\begin{tikzpicture}[font=\footnotesize, >=Stealth]
   % Parties
-  \node[draw=aliceblue!80, fill=aliceblue!15, rounded corners=2pt, minimum width=2.2cm, minimum height=0.7cm] (alice) at (0, 0) {Client (Alice)};
-  \node[draw=trapred!80, fill=trapred!15, rounded corners=2pt, minimum width=2.2cm, minimum height=0.7cm] (eve) at (5.2, 0) {Attacker (Eve)};
-  \node[draw=bobgreen!80, fill=bobgreen!15, rounded corners=2pt, minimum width=2.2cm, minimum height=0.7cm] (server) at (10.4, 0) {Server (Bank)};
+  \node[draw=aliceblue!80, fill=aliceblue!15, rounded corners=2pt, minimum width=2.3cm, minimum height=0.65cm, font=\small\bfseries] (alice) at (0, 0) {Client (Alice)};
+  \node[draw=trapred!80, fill=trapred!15, rounded corners=2pt, minimum width=2.3cm, minimum height=0.65cm, font=\small\bfseries] (eve) at (5.6, 0) {Attacker (Eve)};
+  \node[draw=bobgreen!80, fill=bobgreen!15, rounded corners=2pt, minimum width=2.3cm, minimum height=0.65cm, font=\small\bfseries] (server) at (11.2, 0) {Server (Bank)};
 
-  \draw[thick, gray!50] (alice) -- (0, -4.5);
-  \draw[thick, gray!50] (eve) -- (5.2, -4.5);
-  \draw[thick, gray!50] (server) -- (10.4, -4.5);
+  \draw[thick, gray!55] (alice) -- (0, -5.0);
+  \draw[thick, gray!55] (eve) -- (5.6, -5.0);
+  \draw[thick, gray!55] (server) -- (11.2, -5.0);
 
   % Legitimate 0-RTT flight
-  \draw[->, thick, aliceblue!80!black] (0, -0.85) -- node[above=1pt, font=\tiny, align=center]{1. 0-RTT Flight: ClientHello + PSK\\\{\texttt{POST /transfer?to=Bob\&amt=100}\}} (5.2, -0.85);
-  \node[draw=trapred!60, fill=trapred!10, rounded corners=1pt, font=\tiny, align=center] at (5.2, -1.35) {Eve records ciphertext};
-  \draw[->, thick, gray!80] (5.2, -1.75) -- (10.4, -1.75);
-  \node[anchor=west, font=\tiny, bobgreen!80!black] at (10.55, -1.75) {Transfer \#1};
+  \draw[->, thick, aliceblue!85!black] (0, -1.25) -- node[above=1pt, pos=0.5]{1. 0-RTT flight: \texttt{ClientHello + PSK + \{POST /transfer?amt=100\}}} (11.2, -1.25);
+  \node[draw=trapred!70, fill=trapred!10, rounded corners=2pt, inner sep=2.5pt] at (5.6, -1.75) {Eve copies ciphertext in transit};
+  \node[anchor=east, text=bobgreen!85!black, font=\footnotesize\bfseries] at (11.05, -1.75) {Executes transfer \#1};
 
   % Server reply
-  \draw[->, thick, bobgreen!80!black] (10.4, -2.3) -- node[above=1pt, font=\tiny]{2. ServerHello + Finished + HTTP 200 OK} (0, -2.3);
+  \draw[<-, thick, bobgreen!85!black] (0, -2.55) -- node[above=1pt]{2. \texttt{ServerHello + \{Finished\} + [HTTP 200 OK]}} (11.2, -2.55);
 
   % Replay flight by Eve
-  \draw[->, thick, trapred!90!black, dashed] (5.2, -3.1) -- node[above=1pt, font=\tiny\bfseries, text=trapred!90!black]{3. Eve REPLAYS recorded 0-RTT flight} (10.4, -3.1);
-  
-  \node[draw=trapred!70, fill=white, rounded corners=2pt, font=\tiny, align=left, text width=4.8cm, inner sep=2pt] at (7.8, -3.95) {
-    \textbf{Server Flaw}: Without a fresh server nonce in 0-RTT, server decrypts flight with valid PSK and \textbf{executes transfer \#2}!
+  \draw[->, very thick, trapred!90!black, dashed] (5.6, -3.45) -- node[above=1pt, text=trapred!90!black, font=\footnotesize\bfseries]{3. Eve replays recorded 0-RTT flight} (11.2, -3.45);
+
+  \node[draw=trapred!80, fill=trapred!8, rounded corners=2pt, align=left, text width=5.1cm, inner sep=4pt] at (8.35, -4.35) {
+    \textbf{Why the server accepts it:} 0-RTT keys contain no fresh server nonce, so the PSK decryption succeeds again and \textbf{executes transfer \#2}.
   };
 
   % Rule box
-  \node[draw=targetgreen!70, fill=targetgreen!10, rounded corners=2pt, font=\tiny, align=center, text width=12.0cm] at (5.2, -4.8) {
-    \textbf{The 0-RTT Security Boundary}: 0-RTT provides \emph{confidentiality} but \textbf{no replay protection}.\\
-    Protocols must restrict 0-RTT exclusively to idempotent operations (e.g., HTTP GET read requests), never financial or state-modifying actions.
+  \node[draw=targetgreen!80!black, fill=targetgreen!10, rounded corners=2pt, align=center, text width=12.8cm, inner sep=4pt] at (5.6, -5.65) {
+    \textbf{0-RTT rule:} 0-RTT provides confidentiality without replay resistance; restrict early data to idempotent reads (such as safe \texttt{GET}s) or enforce server-side single-use token caches.
   };
 \end{tikzpicture}
-\caption{The 0-RTT early data replay vulnerability in TLS 1.3. Because 0-RTT data is encrypted before
-receiving a fresh random nonce from the server, an active eavesdropper can capture and retransmit the flight.
-Unless application servers enforce idempotency or anti-replay caches, state-altering requests are duplicated.}
+\caption{The 0-RTT early-data replay vulnerability in TLS 1.3. Because 0-RTT data is encrypted before the server contributes a fresh random nonce, an attacker on the network can record and re-send the first flight, duplicating state-changing requests unless the server rejects or deduplicates them.}
 \label{ch25:fig-0rtt-replay}
 \end{figure}
 
 \section{Famous TLS attacks}
 
-The design of TLS 1.3 was shaped directly by two decades of attacks on its predecessors. Each
-of the following attacks broke a real deployment, and each maps to a concrete design
-decision in 1.3 that eliminated the vulnerability class. Studying them shows
-where protocol abstractions tend to leak.
+Two decades of attacks on SSL~3.0 and TLS~1.0--1.2 directly shaped TLS~1.3. Each
+attack below exploited a real deployment, and each maps to a specific change in
+TLS~1.3 that removed the underlying flaw.
 
 \begin{attackbox}
-\textbf{BEAST (2011) --- a predictable IV in CBC mode.} TLS 1.0 used CBC mode with a
-fatal shortcut: the IV for each record was the \emph{last ciphertext block of the
-previous record}, so it was predictable to an attacker watching the wire. Recall
-CBC encrypts block $i$ as $C_i = \Enc_k(P_i \xor C_{i-1})$. If Eve can predict
-$C_{i-1}$ \emph{and} influence the plaintext $P_i$ (she can, via malicious
-JavaScript making the browser send chosen data alongside a secret cookie), she can
-test guesses of a secret byte. Suppose she captured an earlier block
-$C^* = \Enc_k(S \xor C^*_{\text{prev}})$ whose plaintext $S$ holds one unknown
-cookie byte (the rest she has arranged to be known). For a guess $G$ she sends
-$P_i = G \xor C^*_{\text{prev}} \xor C_{i-1}$; the $C_{i-1}$ cancels, so the browser
-computes $\Enc_k(G \xor C^*_{\text{prev}})$, which equals $C^*$ exactly when $G = S$.
-At most $256$ guesses per byte, and byte by byte she recovers the cookie.
-\emph{Fix:} TLS 1.1 made the IV random and unpredictable per record; TLS 1.3
-abandons CBC entirely for AEAD, where this whole class of chosen-plaintext games
-against the mode does not exist.
+\textbf{BEAST (2011) --- a predictable IV in CBC mode.} TLS~1.0 used CBC mode with a
+shortcut: the IV for each record was the \emph{last ciphertext block of the previous
+record}, visible on the wire before the next plaintext was chosen. Recall from
+Chapter~13 that CBC encrypts block $i$ as $C_i = \Enc_k(P_i \xor C_{i-1})$. Suppose
+Eve recorded an earlier target block $C^* = \Enc_k(S \xor C^*_{\mathrm{prev}})$
+whose $16$-byte plaintext $S$ contains $15$ known bytes (such as an HTTP header
+prefix) and one unknown cookie byte. Using malicious JavaScript in Alice's browser
+to send chosen plaintext after a known previous ciphertext block $C_{i-1}$, Eve
+tests a byte guess $G$ by submitting $P_i = G \xor C^*_{\mathrm{prev}} \xor C_{i-1}$:
+\begin{align*}
+  C_i &= \Enc_k(P_i \xor C_{i-1}) \\
+      &= \Enc_k\bigl((G \xor C^*_{\mathrm{prev}} \xor C_{i-1}) \xor C_{i-1}\bigr) \\
+      &= \Enc_k(G \xor C^*_{\mathrm{prev}}).
+\end{align*}
+Because $C_{i-1} \xor C_{i-1} = 0$ cancels out and $\Enc_k$ is a permutation,
+$C_i = C^*$ holds if and only if $G = S$. Testing at most $256$ guesses recovers
+one secret byte, and sliding the boundary recovers the whole cookie. \emph{Fix:}
+TLS~1.1 switched to a fresh unpredictable IV per record; TLS~1.3 dropped CBC mode
+altogether in favor of nonce-based AEAD.
 \end{attackbox}
 
-\begin{figure}[H]
+\begin{figure}[htbp]
 \centering
-\begin{tikzpicture}[font=\small,>=Stealth,node distance=7mm]
-  \node (P0) at (0,1.6) {$P_{i-1}$};
-  \node (P1) at (3.6,1.6) {$P_i$};
-  \node[draw,circle,inner sep=1pt] (X0) at (0,0.8) {$\xor$};
-  \node[draw,circle,inner sep=1pt] (X1) at (3.6,0.8) {$\xor$};
-  \node[draw,rounded corners,fill=structurepurple!12] (E0) at (0,0) {$\Enc_k$};
-  \node[draw,rounded corners,fill=structurepurple!12] (E1) at (3.6,0) {$\Enc_k$};
-  \node (C0) at (0,-0.9) {$C_{i-1}$};
-  \node (C1) at (3.6,-0.9) {$C_i$};
-  \node[evered,font=\scriptsize,align=center] (IV) at (-2.4,0.8) {prev.\ block\\(predictable IV)};
-  \draw[->] (P0) -- (X0); \draw[->] (P1) -- (X1);
-  \draw[->] (X0) -- (E0); \draw[->] (X1) -- (E1);
-  \draw[->] (E0) -- (C0); \draw[->] (E1) -- (C1);
-  \draw[->] (IV) -- (X0);
-  \draw[->, evered] (C0.south) -- ++(0,-0.35) -- ++(1.8,0) |- (X1.west);
-  \node[evered,font=\scriptsize,below=1pt, fill=white, inner sep=1pt] at (1.0,-1.25) {$C_{i-1}$ feeds $C_i$};
+\begin{tikzpicture}[font=\footnotesize, >=Stealth]
+  % Left: Recorded target block
+  \node[font=\small\bfseries, text=aliceblue!85!black] at (1.5, 2.35) {(a) Recorded target block};
+  \node (S) at (1.5, 1.65) {Secret block $S$};
+  \node[draw, circle, inner sep=1.5pt, font=\small] (Xstar) at (1.5, 0.85) {$\xor$};
+  \node[text=gray!85!black, align=right] (Csprev) at (-0.35, 0.85) {known\\$C^*_{\mathrm{prev}}$};
+  \node[draw=structurepurple!80, fill=structurepurple!12, rounded corners=2pt, inner sep=4pt, font=\small] (Estar) at (1.5, 0.0) {$\Enc_k$};
+  \node[font=\small\bfseries] (Cstar) at (1.5, -0.9) {$C^* = \Enc_k(S \xor C^*_{\mathrm{prev}})$};
+
+  \draw[->, thick] (S) -- (Xstar);
+  \draw[->, thick] (Csprev) -- (Xstar);
+  \draw[->, thick] (Xstar) -- (Estar);
+  \draw[->, thick] (Estar) -- (Cstar);
+
+  % Divider
+  \draw[dashed, gray!45, thick] (4.1, 2.5) -- (4.1, -1.25);
+
+  % Right: Chosen-plaintext probe
+  \node[font=\small\bfseries, text=trapred!85!black] at (8.7, 2.35) {(b) Eve's chosen-plaintext probe in TLS 1.0};
+  \node (Pprev) at (5.8, 1.65) {$P_{i-1}$};
+  \node[text=trapred!85!black, align=center] (Pi) at (10.3, 1.65) {$P_i = G \xor C^*_{\mathrm{prev}} \xor C_{i-1}$};
+  \node[draw, circle, inner sep=1.5pt, font=\small] (X0) at (5.8, 0.85) {$\xor$};
+  \node[draw, circle, inner sep=1.5pt, font=\small] (X1) at (10.3, 0.85) {$\xor$};
+  \node[draw=structurepurple!80, fill=structurepurple!12, rounded corners=2pt, inner sep=4pt, font=\small] (E0) at (5.8, 0.0) {$\Enc_k$};
+  \node[draw=structurepurple!80, fill=structurepurple!12, rounded corners=2pt, inner sep=4pt, font=\small] (E1) at (10.3, 0.0) {$\Enc_k$};
+  \node[font=\small] (C0) at (5.8, -0.9) {$C_{i-1}$};
+  \node[font=\small\bfseries, text=trapred!85!black] (C1) at (10.3, -0.9) {$C_i = \Enc_k(G \xor C^*_{\mathrm{prev}})$};
+
+  \draw[->, thick] (Pprev) -- (X0);
+  \draw[->, thick, trapred!85!black] (Pi) -- (X1);
+  \draw[->, thick] (X0) -- (E0);
+  \draw[->, thick] (X1) -- (E1);
+  \draw[->, thick] (E0) -- (C0);
+  \draw[->, thick] (E1) -- (C1);
+  \draw[->, thick, trapred!85!black] (C0.east) -- node[below=2pt, align=center]{predictable IV\\cancels $C_{i-1}$} ++(1.65, 0) |- (X1.west);
 \end{tikzpicture}
-\caption{CBC chaining as BEAST exploits it: each ciphertext block is the IV for
-the next, so an attacker who has seen $C_{i-1}$ knows the value XORed into the
-chosen $P_i$ and can probe a secret byte through ciphertext collisions.}
+\caption{CBC chaining as BEAST exploits it. Because TLS 1.0 reuses the already-transmitted ciphertext block $C_{i-1}$ as the next IV (b), Eve can XOR $C_{i-1}$ into her chosen block $P_i$ so it cancels out, testing whether her byte guess $G$ matches the target block $S$ (a) via $C_i \stackrel{?}{=} C^*$.}
 \label{ch25:beast-cbc}
 \end{figure}
 
-Concretely (Figure~\ref{ch25:beast-cbc}): because Eve knows $C_{i-1}$ and chooses
-$P_i$, she controls $P_i \xor C_{i-1}$ exactly. A random IV unknown to her before
-she commits $P_i$ destroys that control, which is why TLS 1.1 patched it and TLS
-1.3 dropped the mode.
+Concretely (Figure~\ref{ch25:beast-cbc}): knowing $C_{i-1}$ before choosing $P_i$
+lets Eve dictate the exact input $P_i \xor C_{i-1}$ to the block cipher. Making the
+IV unpredictable before $P_i$ is fixed removes that control.
 
 \begin{attackbox}
-\textbf{POODLE (2014) --- padding you cannot trust.} SSL 3.0's CBC padding was
-\emph{unauthenticated} and its contents unspecified except for the last byte. Under
-MAC-then-encrypt, the receiver decrypts, strips padding, then checks the MAC --- so
-the padding is processed before authentication. Eve, as an active man-in-the-middle
-running a padding-oracle attack, replaces the last ciphertext block with an earlier
-block she wants to decrypt; with probability $1/256$ the mangled padding happens to
-be accepted, and that acceptance leaks one plaintext byte. By forcing many
-connections (again via injected JavaScript) she peels off a secret byte at a time.
-The deeper flaw was \textbf{MAC-then-encrypt}: integrity was checked too late, after
-the attacker-controlled padding had already influenced behaviour. \emph{Fix:} stop
-using SSL 3.0 (POODLE is also why downgrade protection matters --- the attack often
-began by forcing a downgrade to SSL 3.0), and structurally, move to AEAD and to
-encrypt-then-MAC ordering, both of which TLS 1.3 mandates. The padding-oracle
-lineage runs through Vaudenay's 2002 attack, Lucky Thirteen's timing variant, and
-POODLE --- all variants of the same flaw.
+\textbf{POODLE (2014) --- padding you cannot trust.} CBC mode pads messages out to a
+multiple of the block size, and a \emph{padding oracle} (Chapter~13) is any error or
+timing signal that reveals whether a tampered ciphertext decrypted to valid padding.
+In SSL~3.0, CBC padding bytes were \emph{unauthenticated} and unconstrained except
+for the final length byte, and SSL~3.0 used \textbf{MAC-then-encrypt} (Chapter~16):
+the receiver decrypted, stripped padding, and checked the MAC last. An active
+man-in-the-middle replaced the final ciphertext block with an earlier target block;
+with probability $1/256$ the decrypted final byte happened to indicate valid padding
+and valid MAC alignment, leaking one byte of plaintext per accepted probe. Because
+many browsers automatically retried failed TLS connections on SSL~3.0, attackers
+triggered POODLE via a forced version downgrade. \emph{Fix:} disable SSL~3.0,
+authenticate version negotiation, and mandate AEAD, which checks integrity before
+inspecting any decrypted bytes. (Serge Vaudenay's 2002 CBC attack, the 2013 Lucky
+Thirteen timing attack, and POODLE all exploited the same authenticate-too-late
+ordering.)
 \end{attackbox}
 
 \begin{attackbox}
-\textbf{Heartbleed (2014) --- not a protocol flaw at all.} Heartbleed was a buffer
-over-read in OpenSSL's implementation of the TLS heartbeat extension. The heartbeat
-request said ``echo back these $N$ bytes,'' and the code trusted $N$ without
-checking it against the actual payload length. An attacker sent a heartbeat
-claiming a 1-byte payload but a length of $64$KB; the server dutifully copied $64$KB
-of \emph{adjacent process memory} into the reply --- which could contain other
-users' requests, session cookies, or, devastatingly, the server's private key. No
-cryptography was broken; the math was perfect. A single missing bounds check in C
-exposed the long-term private keys of a large fraction of the web overnight,
-forcing mass certificate revocation and re-issuance. \emph{Lesson:} the protocol is
-only as strong as the code that implements it. This is the main motivation for
-Chapters~37--39 --- memory safety, bounds checks, and
-minimizing the attack surface are cryptographic concerns even when the
-cryptography is flawless. (It is also a sharp reminder of why forward secrecy
-matters: servers that used ephemeral key exchange at least did not retroactively
-expose past sessions when their keys leaked.)
+\textbf{Heartbleed (2014) --- a memory-safety bug, not a protocol flaw.} Heartbleed
+was a \textbf{buffer over-read} --- a bug in which a program reads past the end of
+the memory buffer allocated for an input --- in OpenSSL's C implementation of the
+TLS heartbeat extension (a keep-alive ping message). A heartbeat request says ``echo
+back these $N$ bytes of payload,'' and OpenSSL trusted the sender's claimed length
+$N$ without checking it against the actual packet length
+(Figure~\ref{ch25:fig-heartbleed}). Sending a $1$-byte payload with a claimed length
+of $64\,\text{KB}$ ($65{,}535$ bytes) made the server copy $65{,}534$ bytes of
+\emph{adjacent heap memory} into its encrypted reply --- leaking other users' HTTP
+requests, session cookies, and the server's own certificate private key. No
+cryptographic primitive failed: one missing bounds check exposed private keys across
+a large fraction of the web, forcing mass certificate revocation and re-issuance.
+\emph{Lesson:} a protocol is only as secure as its implementation. Chapters~37--39
+return to memory safety, bounds checks, and shrinking the \emph{attack surface} (the
+total exposed code and optional extensions an attacker can probe). Servers that used
+ephemeral key exchange at least kept archived sessions safe when their private keys
+leaked.
 \end{attackbox}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\footnotesize, >=Stealth]
+  % Request box
+  \node[draw=trapred!80, fill=trapred!10, rounded corners=2pt, align=left, inner sep=5pt, text width=12.8cm] (req) at (6.5, 1.55) {
+    \textbf{Malformed Heartbeat request from Eve:} \texttt{payload\_length = 65535} bytes, actual payload = \texttt{"A"} ($1$ byte)
+  };
+
+  % Server heap blocks (abutting, total width 13.0cm from x=0 to x=13.0)
+  \node[font=\footnotesize\bfseries, text=gray!80!black, anchor=west] at (0, 0.65) {Server heap memory layout:};
+  \node[draw=aliceblue!85!black, fill=aliceblue!15, align=center, minimum height=1.1cm, text width=2.0cm, inner sep=3pt, anchor=west] (buf) at (0, -0.1) {
+    \textbf{Payload}\\\texttt{"A"} ($1$ B)
+  };
+  \node[draw=trapred!85!black, fill=trapred!12, align=center, minimum height=1.1cm, text width=10.5cm, inner sep=3pt, anchor=west] (adj) at (2.2, -0.1) {
+    \textbf{Adjacent heap memory ($65{,}534$ bytes past buffer end)}\\
+    other users' requests $\cdot$ session cookies $\cdot$ server private key $sk_S$
+  };
+
+  % Brace below
+  \draw[decorate, decoration={brace, mirror, amplitude=6pt}, thick, trapred!85!black]
+    (0, -0.8) -- (12.9, -0.8)
+    node[midway, below=7pt, align=center, text=trapred!85!black, font=\footnotesize\bfseries] {
+      Unchecked \texttt{memcpy} copies all $65{,}535$ bytes into the Heartbeat response sent back to Eve
+    };
+\end{tikzpicture}
+\caption{The Heartbleed buffer over-read (CVE-2014-0160). Because OpenSSL copied \texttt{payload\_length} bytes without verifying that the request packet actually carried that many bytes, a 1-byte payload returned 64\,KB of neighboring server heap memory.}
+\label{ch25:fig-heartbleed}
+\end{figure}
 
 \begin{attackbox}
 \textbf{The downgrade family --- FREAK and Logjam (2015).} For 1990s export
@@ -877,40 +1046,43 @@ get wrong. Much of the 1.3 specification is a direct response to one of these.
 \section{How the pieces fit together}
 
 \begin{connectionbox}
-TLS uses nearly every primitive in this book. The (EC)DHE key exchange is
-Diffie--Hellman over the elliptic curves of Chapter~21, giving the shared
-secret and forward secrecy. The key schedule is HKDF (Chapter~23), built from the HMAC of
-Chapter~15. The server's CertificateVerify is a digital signature (ECDSA or
-RSA-PSS or Ed25519) from Chapter~22, verified against a certificate
-chain validated by the PKI of Chapter~24. The Finished messages are
-again HMAC. The record layer is AEAD --- AES-GCM or ChaCha20-Poly1305 --- from
-Chapter~16, with AES itself from Chapter~12. The random
-nonces and ephemeral secrets come from the CSPRNG of Chapter~17. Every
-one of them is required, which is why a vulnerability in any single
-primitive (a weak RNG, a broken hash, a signature forgery) becomes a TLS break.
+TLS uses nearly every primitive in this book. Ephemeral ECDHE key exchange runs
+Diffie--Hellman over the elliptic curves of Chapter~21, supplying the shared secret
+and forward secrecy. The key schedule is HKDF (Chapter~23), built from HMAC
+(Chapter~15). The server's \texttt{CertificateVerify} is a digital signature
+(ECDSA, RSA-PSS, or Ed25519) from Chapter~22, verified against a certificate chain
+validated by the PKI of Chapter~24. The \texttt{Finished} messages are HMACs over
+the transcript hash. The record layer uses AEAD (AES-GCM, AES-CCM, or
+ChaCha20-Poly1305) from Chapter~16, built on AES from Chapter~12 and ChaCha20 from
+Chapter~10. The nonces and ephemeral private exponents come from a
+cryptographically secure pseudorandom number generator (CSPRNG, Chapter~17). Every
+piece carries load: a flaw in any one of them (a predictable random-number
+generator, a broken hash, a signature forgery) breaks the connection.
 \end{connectionbox}
 
 \begin{marginnotebox}
-If you want to watch a real handshake, run \texttt{openssl s\_client -connect
-example.com:443 -tls1\_3} and read the messages, or capture port 443 in Wireshark
-and expand the TLS layer. You will see ClientHello with its key share and SNI in
-the clear, ServerHello, then a wall of encrypted handshake records, then
-application data. Everything in this chapter is sitting right there on the wire.
+To inspect a live handshake, run \texttt{openssl s\_client -connect example.com:443
+-tls1\_3} and read the printed messages, or capture TCP port $443$ (the standard
+port for HTTPS) in Wireshark (a network packet analyzer) and expand the TLS layer.
+You will see \texttt{ClientHello} with its key share and SNI in cleartext,
+\texttt{ServerHello}, a burst of encrypted handshake records, and then encrypted
+application data.
 \end{marginnotebox}
 
-TLS secures a byte stream once TCP is already moving packets between endpoints, but
-what protects the local radio hop before a single TCP packet reaches the router? In
-Chapter~26, we drop down to the link layer to see how WEP, WPA2, and WPA3 encrypt and
-authenticate WiFi frames broadcast through open air.
+TLS secures a byte stream carried by the Transmission Control Protocol (TCP, the
+transport layer that delivers reliable, ordered bytes over IP packets) once packets
+are already moving between endpoints. What protects the local wireless hop before a
+packet even reaches the router, where anyone within radio range can capture or
+inject traffic out of thin air? Chapter~26 takes up Wi-Fi security.
 
 \section{Exercises}
 
 \begin{exercise}
 \textbf{Trace a tiny handshake's key exchange.} Using $p = 23$, $g = 5$, let the
 client pick $a = 4$ and the server pick $b = 9$. Compute the public shares $A$ and
-$B$ and the shared secret $Z = g^{ab} \bmod 23$ two ways (as $B^a$ and as $A^b$),
-checking they agree. Then explain precisely what Eve sees on the wire and what hard
-problem she would have to solve to recover $Z$.
+$B$ and the shared secret $Z = g^{ab} \bmod 23$ two ways (as $B^a \bmod 23$ and as
+$A^b \bmod 23$), checking they agree. Then explain precisely what Eve sees on the
+wire and what hard problem she would have to solve to recover $Z$.
 \end{exercise}
 
 \begin{exercise}
@@ -949,7 +1121,7 @@ key.
 \textbf{Nonce arithmetic.} A TLS 1.3 connection uses a 12-byte
 \texttt{static\_iv} = \texttt{0x01020304\allowbreak 05060708\allowbreak 090A0B0C}. Give the AEAD nonces
 for record sequence numbers $0$, $1$, and $258$ (the nonce is
-\texttt{static\_iv} $\xor \text{seq}$, with the sequence number right-aligned in
+$\mathtt{static\_iv} \xor \mathrm{seq}$, with the sequence number right-aligned in
 the 12 bytes). Argue that within a single connection no (key, nonce) pair can ever
 repeat, and explain why that is essential for AES-GCM specifically.
 \end{exercise}
@@ -983,7 +1155,7 @@ and implementation security.
 \begin{exercise}
 \textbf{Trace the whole machine.} For a single TLS 1.3 connection, list every
 cryptographic primitive used and the exact purpose each serves: the key exchange,
-the KDF, the signature, the certificate validation, the record cipher, and the
-randomness source. For each, name one earlier chapter it came from and state what
-breaks in the handshake if that one primitive is broken.
+the key-derivation function (KDF), the signature, the certificate validation, the
+record cipher, and the randomness source. For each, name one earlier chapter it
+came from and state what breaks in the handshake if that one primitive is broken.
 \end{exercise}

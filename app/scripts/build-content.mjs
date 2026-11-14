@@ -637,7 +637,7 @@ function textToHtml(s) {
 
 const MATH_ENVS = /^(equation|align|alignat|gather|multline|flalign|eqnarray|displaymath|math)\*?$/;
 const LIST_ENVS = new Set(['itemize', 'enumerate', 'description', 'compactitem', 'compactenum']);
-const PASS_ENVS = new Set(['center', 'flushleft', 'flushright', 'minipage', 'multicols', 'samepage', 'small', 'footnotesize', 'adjustwidth', 'raggedright', 'tcolorbox', 'subfigure']);
+const PASS_ENVS = new Set(['sloppypar', 'center', 'flushleft', 'flushright', 'minipage', 'multicols', 'samepage', 'small', 'footnotesize', 'adjustwidth', 'raggedright', 'tcolorbox', 'subfigure']);
 
 function parseBlocks(body, level) {
   const blocks = [];
@@ -707,6 +707,9 @@ function parseBlocks(body, level) {
     const nl = s.indexOf('\n');
     let line = nl < 0 ? s : s.slice(0, nl);
     s = nl < 0 ? '' : s.slice(nl + 1);
+    // A blank line ends the paragraph (LaTeX semantics). Without this, every
+    // paragraph of a section ran together into one long block.
+    if (/^[ \t\r]*$/.test(line)) { flush(); continue; }
     const mid = blockStart(line);
     if (mid > 0) {
       para.push(line.slice(0, mid));
@@ -1404,6 +1407,9 @@ function buildChapter(ch, headings) {
   B.lstN = 0;
   B.eqN = 0;
   where = `${B.cfg.id} ch ${ch.label}`;
+  // A \label right after \chapter{...} names the chapter itself.
+  const chLab = /^\s*\\label\{([^}]*)\}/.exec(ch.content);
+  if (chLab) B.labels[chLab[1]] = { text: `Chapter ${ch.label}`, anchor: '' };
   const blocks = parseBlocks(ch.content, { headings });
   // number headings and assign ids/refs
   const out = [];

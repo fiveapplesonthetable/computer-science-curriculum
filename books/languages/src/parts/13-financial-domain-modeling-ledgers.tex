@@ -1,19 +1,19 @@
 \chapter{Modeling Money and Ledgers in Types: Fixed-Point Arithmetic, Double-Entry Accounting, and Typestate}
 
-In Chapter~12 we solved the \emph{timing} half of a financial backend. One Rust process can multiplex tens of thousands of HTTP and PostgreSQL sockets onto a few cores using \texttt{Future} state machines, while atomic transactions guard against mid-flight cancellation. Now we turn from how requests wait to \emph{what those requests compute and store}.
+In Chapter~12 we solved the \emph{timing} half of a financial backend. One Rust process can multiplex tens of thousands of HTTP and PostgreSQL sockets onto a few cores using \texttt{Future} state machines, while atomic transactions guard against mid-flight cancellation.
 
 In most web applications, small data glitches are harmless annoyances. If a video site miscounts views by two during a cache flush, nobody calls an auditor. Financial systems cannot afford that margin. Creating a single cent out of rounding noise, losing a cent during a fee split, or mixing currencies breaks the ledger's conservation law. Worse, tiny biases compound: a tenth-of-a-cent drift across forty million card settlements quietly shifts cash accounts by tens of thousands of dollars.
 
-This chapter builds the pure domain core of our ledger before we touch HTTP headers or SQL wire protocols in Chapter~14. Every Rust tool from Parts~II and~III---fixed-width integers, value structs, \texttt{\#[repr(transparent)]} newtypes, \texttt{PhantomData}, exhaustive enums, private fields, and typestate---serves one goal. \emph{Make illegal financial states unrepresentable at compile time.}
+This chapter builds the domain core of our ledger. We use fixed-width integers, value structs, \texttt{\#[repr(transparent)]} newtypes, \texttt{PhantomData}, exhaustive enums, private fields, and typestate to make illegal financial states unrepresentable at compile time.
 
 \chapterline
 
 \section{Rule 1 of Money: Why IEEE-754 Floats Fail and Fixed-Point Works}
 \label{ch13:fixed-point-and-decimals}
 
-Every engineer who has written a toy e-commerce checkout in C, C++, Java, or JavaScript has been tempted at least once to write \texttt{double price = 19.99;} or \texttt{balance: f64}. Rule~1 of financial engineering is absolute: \textbf{never represent monetary balances or ledger postings with binary floating-point types (\texttt{f32} or \texttt{f64})}.
+Every engineer who has written an e-commerce checkout in C, C++, Java, or JavaScript has been tempted to write \texttt{double price = 19.99;} or \texttt{balance: f64}. Rule~1 of financial engineering is absolute: \textbf{never represent monetary balances or ledger postings with binary floating-point types (\texttt{f32} or \texttt{f64})}.
 
-To understand why this rule admits zero exceptions, we should not stop at memorizing the famous snippet \texttt{0.1 + 0.2 == 0.30000000000000004}. Let us look directly at the hardware representation of an IEEE-754 binary64 (\texttt{f64} in Rust, \texttt{double} in Java~6 and C++) and see \emph{three distinct failure modes} that strike real payment systems.
+Let us look directly at the hardware representation of an IEEE-754 binary64 (the technical standard for floating-point computation, called \texttt{f64} in Rust and \texttt{double} in Java and C++) and see \emph{three distinct failure modes} that strike real payment systems.
 
 \subsection{The Three Financial Failures of Binary Floating-Point}
 
@@ -27,10 +27,11 @@ Now ask a basic number-theory question: when does a reduced fraction $p/q$ termi
 \[
   \frac{1}{10} = (0.000110011001100110011\overline{0011})_2.
 \]
-Hardware must chop that infinite bit string at $53$ significant bits. The nearest 64-bit binary float to $0.1$ is actually the exact rational number
-\[
-  \frac{3{,}602{,}879{,}701{,}896{,}397}{2^{55}} = 0.1000000000000000055511151231257827021181583404541015625.
-\]
+Hardware must chop that infinite bit string at $53$ significant bits. The nearest 64-bit binary float to $0.1$ is the exact rational number
+\begin{align*}
+  \frac{3{,}602{,}879{,}701{,}896{,}397}{2^{55}} \\
+  &= 0.1000000000000000055511151231257827021181583404541015625.
+\end{align*}
 That single mismatch triggers three production hazards:
 \begin{enumerate}
   \item \textbf{Inexact cent representation:} Adding ten copies of \texttt{0.1\_f64} does not equal \texttt{1.0\_f64}; \texttt{0.1\_f64 + 0.2\_f64 != 0.3\_f64}. Any equality check \texttt{sum\_debits == sum\_credits} fails unpredictably on valid transfers unless replaced by ad-hoc epsilon tolerances, and epsilon tolerances let genuine one-cent bugs slip through.
@@ -58,9 +59,9 @@ How do we make every currency amount an exact integer multiple of a base-10 unit
     \end{itemize}
     How large is a signed 64-bit integer? $\texttt{i64::MAX} = 9{,}223{,}372{,}036{,}854{,}775{,}807 \approx 9.22 \times 10^{18}$. In US cents, that exceeds \textbf{ninety-two quadrillion dollars}---roughly eight hundred times global GDP. It fits in one 8-byte CPU register and maps directly onto PostgreSQL's 8-byte \texttt{BIGINT} column. Systems tracking sub-cent micropayments (such as cloud billing at $\$0.000001$ per call or crypto wei) either scale \texttt{i64} to micro-units ($10^{-6}$) or step up to Rust's native \texttt{i128} ($\approx 1.7 \times 10^{38}$, used by the TigerBeetle ledger database).
 
-  \item \textbf{Base-10 scaled decimals (\texttt{rust\_decimal::Decimal}) for rates, prices, and percentages.} Settled balances live in integer minor units, yet fee schedules ($2.9\%$), FX rates ($\text{EUR/USD} = 1.08475$), and bond yields need varying decimal places. In Java~6, you reached for \texttt{java.math.BigDecimal}. Recall from Chapter~1 what \texttt{BigDecimal} costs on the JVM: a heap wrapper pointing to a \texttt{BigInteger} pointing to a heap \texttt{int[]} array, chasing two pointers per operation.
+  \item \textbf{Base-10 scaled decimals (\texttt{rust\_decimal::Decimal}) for rates, prices, and percentages.} Settled balances live in integer minor units, yet fee schedules ($2.9\%$), FX rates ($\text{EUR/USD} = 1.08475$), and bond yields need varying decimal places. In Java~6, you used \texttt{BigDecimal}. Recall from Chapter~1 what it costs on the JVM: a heap wrapper pointing to a \texttt{BigInteger} pointing to an \texttt{int[]} array, chasing two pointers per operation.
 
-  In Rust, \texttt{rust\_decimal::Decimal} is a \textbf{16-byte stack-inline \texttt{Copy} value} with zero heap pointers. It packs a 96-bit unsigned mantissa ($0 \le M < 2^{96} \approx 7.92 \times 10^{28}$), a sign bit, and a base-10 scale $s \in [0, 28]$ into four 32-bit words representing $(-1)^{\text{sign}} \cdot M \cdot 10^{-s}$. SQLx maps it directly to PostgreSQL \texttt{NUMERIC}---say \texttt{NUMERIC(20, 4)} for sub-cent prices and \texttt{NUMERIC(20, 8)} for FX rates.
+  In Rust, \texttt{rust\_decimal::Decimal} is a \textbf{16-byte stack-inline \texttt{Copy} value} with zero heap pointers. It packs a 96-bit mantissa ($0 \le M < 2^{96}$), a sign bit, and a base-10 scale $s \in [0, 28]$ into four 32-bit words. SQLx maps it directly to PostgreSQL \texttt{NUMERIC}---e.g. \texttt{NUMERIC(20, 4)} for prices and \texttt{NUMERIC(20, 8)} for FX rates.
 \end{enumerate}
 
 \begin{figure}[H]
@@ -108,10 +109,10 @@ How do we make every currency amount an exact integer multiple of a base-10 unit
 
 Switching from \texttt{f64} to \texttt{i64} closes the binary rounding hole, but immediately opens a classic systems-programming trap if you write careless operators like \texttt{a + b} or \texttt{a - b}.
 
-In Java~6, \texttt{Long.MAX\_VALUE + 1L} never throws an exception; it wraps silently via two's-complement arithmetic to \texttt{Long.MIN\_VALUE}, turning the largest possible positive balance into the most negative one. In C and C++, signed integer overflow is \emph{undefined behavior}, allowing optimizing compilers to delete bounds checks downstream. What does Rust do?
+In Java~6, \texttt{Long.MAX\_VALUE + 1L} never throws an exception; it wraps silently via two's-complement arithmetic to \texttt{Long.MIN\_VALUE}, turning the largest positive balance into the most negative one. In C and C++, signed integer overflow is \emph{undefined behavior}, allowing optimizing compilers to delete bounds checks downstream. What does Rust do?
 \begin{itemize}
   \item In \textbf{debug builds} (\texttt{cargo test}, \texttt{cargo build}), \texttt{a + b} panics on overflow.
-  \item In \textbf{release builds} (\texttt{cargo build --release}), ordinary \texttt{+}, \texttt{-}, and \texttt{*} wrap two's-complement just like Java unless you enable \texttt{overflow-checks} in \texttt{Cargo.toml}. You should enable \texttt{overflow-checks} in every financial release profile as a backstop, yet panics are still wrong for user input. Panicking a worker task when a JSON body sends \texttt{amount\_cents = 9223372036854775807} turns bad input into noisy crashes instead of a clean \texttt{422} error.
+  \item In \textbf{release builds} (\texttt{cargo build --release}), ordinary \texttt{+}, \texttt{-}, and \texttt{*} wrap two's-complement like Java unless you enable \texttt{overflow-checks} in \texttt{Cargo.toml}. Enable \texttt{overflow-checks} in every financial release profile as a backstop, but panics are wrong for user input. Crashing a worker task when a JSON body sends \texttt{amount\_cents = 9223372036854775807} turns bad input into a crash instead of a \texttt{422} error.
 \end{itemize}
 
 The Rust rule for financial code is simple: \textbf{avoid raw \texttt{+}, \texttt{-}, \texttt{*}, and \texttt{/} on domain money types}. Use \texttt{checked\_add}, \texttt{checked\_sub}, and widened \texttt{i128} intermediate products that return explicit \texttt{Option} or \texttt{Result} values.
@@ -157,10 +158,11 @@ Now suppose three marketplace sellers co-own a $\$100.00$ (\texttt{10\_000}-cent
 \]
 One cent vanished. Conversely, splitting $\$100.00$ across six equal shares of $16.666\dots\%$ rounded to $1{,}667\text{ cents}$ yields $6 \times 1{,}667 = 10{,}002\text{ cents}$ --- creating two phantom cents out of thin air.
 
-Whenever a single monetary quantity $T \ge 0$ is partitioned across $n$ legs with positive integer weights $w_1, \dots, w_n$ ($W = \sum_{i=1}^n w_i$), you must allocate shares \emph{jointly} so conservation holds identically. Write $T \cdot w_i = q_i W + r_i$ with $0 \le r_i < W$ by Euclidean division. Summing over all $i$ gives
-\[
-  T \cdot W = W \sum_{i=1}^n q_i + \sum_{i=1}^n r_i \quad \Longrightarrow \quad R = T - \sum_{i=1}^n q_i = \frac{1}{W}\sum_{i=1}^n r_i.
-\]
+Whenever a single monetary quantity $T \ge 0$ is partitioned across $n$ legs with positive integer weights $w_1, \dots, w_n$ ($W = \sum_{i=1}^n w_i$), you must allocate shares \emph{jointly} so conservation holds identically. Write $T \cdot w_i = q_i W + r_i$ with $0 \le r_i < W$ by division with remainder. Summing over all $i$ gives
+\begin{align*}
+  T \cdot W &= W \sum_{i=1}^n q_i + \sum_{i=1}^n r_i \\
+  \implies R &= T - \sum_{i=1}^n q_i = \frac{1}{W}\sum_{i=1}^n r_i.
+\end{align*}
 Because each $0 \le r_i < W$, the leftover penny count $R$ is an exact integer satisfying $0 \le R < n$. Awarding $+1$ minor unit to the $R$ legs with the largest remainders $r_i$ (breaking ties deterministically by index~$i$) guarantees $\sum_{i=1}^n s_i = T$ with zero rounding drift:
 
 \begin{lstlisting}[language=Rust, caption={Penny-exact proportional allocation guaranteeing \texttt{sum(shares) == total\_minor}.}]
@@ -201,6 +203,35 @@ pub fn allocate_proportionally(
 \end{lstlisting}
 
 Test \texttt{allocate\_proportionally(10\_000, \&[1, 1, 1])} by hand: $q = [3333, 3333, 3333]$, $R = 1$, remainders are all equal ($1$), tie-breaker picks index~$0$, and the returned vector is \texttt{[3334, 3333, 3333]}, summing to \texttt{10\_000} down to the last cent.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\footnotesize,
+  box/.style={draw=sourceblue!85, fill=sourceblue!10, rounded corners=2pt, minimum height=0.7cm, align=center},
+  rem/.style={draw=quotientorange!90, fill=quotientorange!12, rounded corners=2pt, minimum height=0.7cm, align=center}
+]
+
+\node[font=\bfseries] at (0, 1.5) {Total: 10,000 cents};
+\draw[thick, -{Stealth}] (0, 1.3) -- (0, 0.8);
+
+\node[box, minimum width=2.5cm] (q1) at (-3.5, 0) {Seller 1 ($w=1$)\\$q=3333$};
+\node[box, minimum width=2.5cm] (q2) at (0, 0) {Seller 2 ($w=1$)\\$q=3333$};
+\node[box, minimum width=2.5cm] (q3) at (3.5, 0) {Seller 3 ($w=1$)\\$q=3333$};
+
+\node[rem, minimum width=2.5cm] (r1) at (-3.5, -1) {rem=$1$ $\to$ \textbf{+1 cent}\\Total: 3334};
+\node[rem, minimum width=2.5cm] (r2) at (0, -1) {rem=$1$ $\to$ +0\\Total: 3333};
+\node[rem, minimum width=2.5cm] (r3) at (3.5, -1) {rem=$1$ $\to$ +0\\Total: 3333};
+
+\draw[->] (q1) -- (r1);
+\draw[->] (q2) -- (r2);
+\draw[->] (q3) -- (r3);
+
+\node[font=\footnotesize\itshape, align=center] at (0, -2) {The leftover 1 cent is awarded to the first seller\\to break the remainder tie, guaranteeing conservation.};
+
+\end{tikzpicture}
+\caption{Penny-exact proportional allocation. Splitting \texttt{10,000} cents into three equal shares by division yields \texttt{3,333} cents per share, leaving $R=1$ cent unallocated. Awarding $+1$ minor unit to the top $R$ remainders ensures the total exactly matches the input without inventing or destroying money.}
+\label{ch13:fig-penny-exact-allocation}
+\end{figure}
 
 \section{Type-Safe Identifiers and Multi-Currency Money}
 \label{ch13:currencies-and-newtypes}
@@ -311,7 +342,7 @@ impl<C: CurrencyTag> StaticMoney<C> {
 }
 \end{lstlisting}
 
-Look at the size of \texttt{StaticMoney<Usd>} in Figure~\ref{ch13:fig-phantom-currency}: the \texttt{PhantomData} field occupies \textbf{$0\text{ bytes}$}, so the whole struct compiles down to a bare 8-byte \texttt{i64} register value. Yet writing \texttt{usd\_price.checked\_add(jpy\_fee)} is a \textbf{compile-time type error}: the compiler expected \texttt{StaticMoney<Usd>} and found \texttt{StaticMoney<Jpy>}.
+The size of \texttt{StaticMoney<Usd>} in Figure~\ref{ch13:fig-phantom-currency} is small: the \texttt{PhantomData} field occupies \textbf{$0\text{ bytes}$}, so the struct compiles to an 8-byte \texttt{i64} register value. Writing \texttt{usd\_price.checked\_add(jpy\_fee)} is a \textbf{compile-time error}: the compiler expected \texttt{StaticMoney<Usd>} but found \texttt{StaticMoney<Jpy>}.
 
 \begin{figure}[H]
 \centering
@@ -471,7 +502,7 @@ Even if you add a third \texttt{UPDATE} to increment a corporate fee row, mutati
 \begin{enumerate}
   \item \textbf{No self-checking conservation law:} In that two-line snippet above, $\$1.50$ simply evaporated from the sum of all balances. If a bug in a promotion code credits Bob \texttt{10000} without debiting a marketing-expense account, total money in the database silently inflates with zero structural invariant to catch it.
   \item \textbf{Zero auditability or point-in-time reconstruction:} Six weeks later, an auditor or a customer disputes why Alice's balance on October~14 at \texttt{23:59:59 UTC} (Coordinated Universal Time) was $\$412.10$. An overwritten \texttt{balance\_cents} cell remembers only its current value; its causal history was destroyed by \texttt{UPDATE}.
-  \item \textbf{No place for holds, in-flight settlement, or partner bank reconciliation:} Real money rarely teleports instantaneously. An Automated Clearing House (\textbf{ACH}, the US batch bank-transfer network) pull or card capture moves through pending clearing states, custodial bank accounts, reserve holds, and chargeback liabilities.
+  \item \textbf{No place for holds, in-flight settlement, or partner bank reconciliation:} Real money rarely teleports instantaneously. An ACH pull (the US batch bank-transfer network from Chapter~8) or card capture moves through pending clearing states, custodial bank accounts, reserve holds, and chargeback liabilities.
 \end{enumerate}
 
 \begin{historybox}
@@ -893,6 +924,45 @@ error[E0382]: use of moved value: `hold`
 \end{lstlisting}
 (Error~(2) also fires a ``use of moved value'' for \texttt{draft}, since \texttt{seal} consumed it.) Each mistake that would be a production incident in a Java~6 ledger becomes a red line in the editor.
 
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\footnotesize,
+  state/.style={draw=sourceblue!85, fill=sourceblue!10, rounded corners=4pt, minimum width=2.8cm, minimum height=1cm, align=center, thick},
+  term/.style={draw=targetgreen!80!black, fill=targetgreen!12, rounded corners=4pt, minimum width=2.8cm, minimum height=1cm, align=center, thick},
+  voided/.style={draw=trapred!80!black, fill=trapred!12, rounded corners=4pt, minimum width=2.8cm, minimum height=1cm, align=center, thick},
+  action/.style={font=\scriptsize\ttfamily, align=center},
+  entry/.style={draw=gray!80, fill=gray!10, rounded corners=2pt, inner sep=3pt, font=\scriptsize, align=center}
+]
+
+\node[state] (auth) at (0, 0) {
+  \textbf{\texttt{AuthHold<Authorized>}}\\
+  \scriptsize (consumable by value)
+};
+
+\node[term] (cap) at (4, 1.5) {
+  \textbf{\texttt{AuthHold<Captured>}}\\
+  \scriptsize (terminal state)
+};
+
+\node[voided] (void) at (4, -1.5) {
+  \textbf{\texttt{AuthHold<Voided>}}\\
+  \scriptsize (terminal state)
+};
+
+\node[entry] (e1) at (9, 1.5) {\textbf{+ \texttt{BalancedEntry}}\\Dr Hold Subaccount\\Cr Merchant Wallet\\Cr Customer Wallet};
+\node[entry] (e2) at (9, -1.5) {\textbf{+ \texttt{BalancedEntry}}\\Dr Hold Subaccount\\Cr Customer Wallet};
+
+\draw[-{Stealth[length=2.5mm]}, thick, targetgreen!80!black] (auth.east) to[out=0, in=180] node[above left, action] {.capture()} (cap.west);
+\draw[-{Stealth[length=2.5mm]}, thick, trapred!80!black] (auth.east) to[out=0, in=180] node[below left, action] {.void\_hold()} (void.west);
+
+\draw[->, thick, dashed, gray] (cap.east) -- (e1.west);
+\draw[->, thick, dashed, gray] (void.east) -- (e2.west);
+
+\end{tikzpicture}
+\caption{The authorization hold state machine. Methods \texttt{capture} and \texttt{void\_hold} consume an \texttt{AuthHold<Authorized>} by value, returning a terminal type and a \texttt{BalancedEntry} side-effect. This makes double-captures a compile-time error.}
+\label{ch13:fig-auth-hold-state-machine}
+\end{figure}
+
 \subsection{Putting It Together: Domain Transfer Constructor With Optional Fee Split}
 
 Look how clean our high-level domain business rule becomes when built atop \texttt{PositiveMoney} and \texttt{BalancedEntry}. Suppose a customer transfers \texttt{gross} from \texttt{sender} to \texttt{recipient} with an optional platform fee going to \texttt{fee\_revenue\_account}:
@@ -1035,9 +1105,9 @@ impl AuthHold<Authorized> {
 }
 \end{lstlisting}
 
-Notice how subaccounts handle holds in \texttt{AuthHold<Authorized>::capture}. We never invent an error-prone ``available balance minus pending holds'' query across separate tables. Placing an authorization hold is \emph{itself} a balanced journal entry moving funds from \texttt{customer\_wallet} to \texttt{customer\_hold\_subaccount} (both Liabilities belonging to Alice). Suppose a gas pump holds $\$150.00$ and later captures $\$42.18$. One 3-leg entry drains the $\$150.00$ hold subaccount, credits $\$42.18$ to the merchant, and returns $\$107.82$ to Alice's wallet ($15{,}000 = 4{,}218 + 10{,}782$).
+Notice how subaccounts handle holds in \texttt{AuthHold<Authorized>::capture}. We never write an error-prone ``available balance minus holds'' query. Placing a hold is \emph{itself} a balanced journal entry moving funds from \texttt{customer\_wallet} to \texttt{customer\_hold\_subaccount} (both Liabilities of Alice). Suppose a gas pump holds $\$150.00$ and later captures $\$42.18$. One 3-leg entry drains the $\$150.00$ hold subaccount, credits $\$42.18$ to the merchant, and returns $\$107.82$ to Alice ($15{,}000 = 4{,}218 + 10{,}782$).
 
-Our domain invariants now live inside \texttt{Money}, \texttt{PositiveMoney}, \texttt{AccountId}, \texttt{IdempotencyKey}, and \texttt{BalancedEntry}. In Chapter~14 we wire this domain core into PostgreSQL, SQLx, Tower, and Axum---handling concurrent overdrafts, deadlocks, idempotency retries, and reliable event delivery end to end.
+Our invariants live inside \texttt{Money}, \texttt{PositiveMoney}, \texttt{AccountId}, \texttt{IdempotencyKey}, and \texttt{BalancedEntry}. In Chapter~14 we wire this domain core into PostgreSQL, SQLx, Tower, and Axum to handle concurrent overdrafts, deadlocks, retries, and reliable event delivery.
 
 \section{Exercises}
 \label{ch13:exercises}
@@ -1085,9 +1155,9 @@ Write three property tests (using logic suitable for the \texttt{proptest} crate
 \end{exercise}
 
 \begin{exercise}[Designing a Typestate Settlement Batch]
-At \texttt{23:00 UTC} each banking day, your settlement engine groups thousands of merchant payouts into a National Automated Clearing House Association (\textbf{NACHA}) ACH batch file:
+At \texttt{23:00 UTC} each banking day, your settlement engine groups thousands of merchant payouts into a National Automated Clearing House Association (\textbf{NACHA}) ACH batch file (the standard format for electronic bank transfers in the US):
 \begin{enumerate}
   \item Design a three-state typestate struct \texttt{PayoutBatch<State>} that moves from \texttt{Open} to \texttt{Sealed} to \texttt{Transmitted}. The method \texttt{add\_payout} exists only on \texttt{Open}; \texttt{compute\_control\_hash} and \texttt{render\_nacha} exist only on \texttt{Sealed}; and \texttt{mark\_transmitted}, which takes the bank's acknowledgement ID, consumes a \texttt{Sealed} batch by value and returns a \texttt{Transmitted} one.
-  \item Explain how storing \texttt{PhantomData<fn() -> State>} instead of \texttt{PhantomData<State>} makes the batch type automatically \texttt{Send} and \texttt{Sync} even if a marker struct such as \texttt{Open} ever held non-\texttt{Sync} metadata. Refer to variance and auto-traits from Chapter~4.
+  \item Explain how storing \texttt{PhantomData<fn() -> State>} instead of \texttt{PhantomData<State>} makes the batch type automatically \texttt{Send} and \texttt{Sync} even if a marker struct such as \texttt{Open} ever held non-\texttt{Sync} metadata. Refer to variance (Chapter~4) and auto traits (Chapter~8).
 \end{enumerate}
 \end{exercise}

@@ -89,7 +89,7 @@ An OS thread can call arbitrary C functions, native libraries, and recursive rou
 
 The operating system and JVM must therefore reserve a large contiguous address range up front for every single thread. On 64-bit HotSpot, each thread reserves $1\text{ MiB}$ by default (\texttt{-Xss1m}), while Linux C threads reserve $2\text{ MiB}$ to $8\text{ MiB}$. Physical RAM pages are committed lazily as the stack grows, yet deep web filters, TLS buffers, JSON parsers, and database drivers quickly touch $64\text{ KiB}$ to $256\text{ KiB}$ per thread. As long as that pooled thread stays alive, the kernel cannot reclaim those dirty stack pages or its own per-thread kernel stack ($16\text{ KiB}$ on x86-64 Linux).
 
-Do the multiplication for $15{,}000$ threads. You reserve $15\text{ GiB}$ of virtual address space and burn roughly $2\text{ GiB}$ of physical RAM \emph{just to hold the stacks of functions sleeping on idle sockets}. Capping your pool at \texttt{newFixedThreadPool(512)} avoids running out of RAM, only to trade a crash for head-of-line blocking. As soon as $512$ slow mobile clients tie up all $512$ worker threads uploading request bodies, request~$513$---even a local health check---stalls in a queue.
+Do the multiplication for $15{,}000$ threads. You reserve $15\text{ GiB}$ of virtual address space and burn roughly $2\text{ GiB}$ of physical RAM \emph{just to hold the stacks of functions sleeping on idle sockets}. Capping your pool at \texttt{newFixedThreadPool(512)} avoids running out of RAM, only to trade a crash for head-of-line blocking (where one slow request delays all others behind it). As soon as $512$ slow mobile clients tie up all $512$ worker threads uploading request bodies, request~$513$---even a local health check---stalls in a queue.
 
 \subsection{The Hidden Tax of Kernel Context Switches}
 
@@ -166,7 +166,7 @@ Calling non-blocking \texttt{read()} in a tight user-space loop across $50{,}000
 \label{ch12:fig-threads-vs-epoll}
 \end{figure}
 
-Figure~\ref{ch12:fig-threads-vs-epoll} shows the architectural shift. Kernel readiness notifications give us cheap multiplexing, \emph{provided} our user-space code can pause cleanly in the middle of request~$k$. When a socket returns \texttt{EAGAIN}, the handler must save just enough local state to remember where it stopped, switch to request~$m$, and resume request~$k$ once \texttt{epoll\_wait} reports socket~$k$ ready.
+Figure~\ref{ch12:fig-threads-vs-epoll} shows the architectural shift. Kernel readiness notifications give us cheap multiplexing, \emph{provided} our user-space code can pause cleanly in the middle of request~$k$. When a socket returns \texttt{EAGAIN}, the handler must save enough local state to remember where it stopped, switch to request~$m$, and resume request~$k$ once \texttt{epoll\_wait} reports socket~$k$ ready.
 
 In Java~6 NIO (using \texttt{Selector} from \texttt{java.nio}), pausing mid-request meant tearing \texttt{handleClient} apart by hand into callback classes and manual byte buffers. You lost local variables, structured \texttt{try}/\texttt{catch} blocks, and readable control flow. Rust's \texttt{async} and \texttt{.await} let you write ordinary sequential code while compiling down to the exact same lean state machine you would write by hand in C.
 
@@ -177,7 +177,7 @@ Once language designers decide not to park an OS thread on every waiting socket,
 
 Go (Chapter~11) and Java~21 Virtual Threads choose the \emph{stackful} route. Each goroutine allocates a small heap stack (starting at $2\text{ KiB}$ in modern Go) and runs ordinary function calls on it. If the call depth exceeds $2\text{ KiB}$, the runtime allocates a larger buffer, copies the stack, and adjusts internal pointers (requiring a language runtime that tightly controls pointer representations and garbage collection). Calling out to C via FFI cannot run directly on a tiny movable $2\text{ KiB}$ stack, so the runtime must switch onto a full-sized OS stack across C boundaries.
 
-Rust is a systems language with zero mandatory runtime, deterministic memory layout, and zero-overhead C FFI. Rust cannot assume a garbage collector or stack-rewriting runtime exists; an \texttt{async fn} must work just as well on a bare-metal microcontroller with $32\text{ KiB}$ of SRAM as on a 64-core Linux payment server. Rust therefore chooses the \emph{stackless} route:
+Rust is a systems language with zero mandatory runtime, deterministic memory layout, and zero-overhead C FFI. Rust cannot assume a garbage collector or stack-rewriting runtime exists; an \texttt{async fn} must work as well on a bare-metal microcontroller with $32\text{ KiB}$ of SRAM as on a 64-core Linux payment server. Rust therefore chooses the \emph{stackless} route:
 \begin{itemize}
   \item A running task uses the worker thread's ordinary native CPU stack \emph{only during the brief microseconds between two \texttt{.await} points}.
   \item The instant the task hits \texttt{.await} and cannot proceed yet, it unwinds cleanly back to the executor loop, leaving the native CPU stack completely empty for the next task.
@@ -277,12 +277,12 @@ impl Future for BackoffDelay {
 }
 \end{lstlisting}
 
-Why did \texttt{mut self: Pin<\&mut Self>} let us write \texttt{self.started = true} directly on line~34? Every field of \texttt{BackoffDelay} (\texttt{Duration}, \texttt{bool}, \texttt{Arc<AtomicBool>}) is a plain value with no internal self-pointers. Rust therefore implements the marker trait \texttt{Unpin} for \texttt{BackoffDelay} automatically, letting \texttt{Pin<\&mut BackoffDelay>} dereference mutably just like \texttt{\&mut BackoffDelay}.
+Why did \texttt{mut self: Pin<\&mut Self>} let us write \texttt{self.started = true} directly on line~34? Every field of \texttt{BackoffDelay} (\texttt{Duration}, \texttt{bool}, \texttt{Arc<AtomicBool>}) is a plain value with no internal self-pointers. Rust therefore implements the marker trait \texttt{Unpin} for \texttt{BackoffDelay} automatically, letting \texttt{Pin<\&mut BackoffDelay>} dereference mutably like \texttt{\&mut BackoffDelay}.
 
 \section{How \texttt{async}/\texttt{await} Compiles Into an Enum State Machine}
 \label{ch12:state-machine-desugaring}
 
-Writing \texttt{Future} by hand for one leaf timer took forty lines; writing it by hand for an HTTP handler with five sequential SQL queries, error propagation with \texttt{?}, and conditional branches would be just as painful as Java~6 NIO callbacks. That mechanical translation is what \texttt{async} and \texttt{.await} automate.
+Writing \texttt{Future} by hand for one leaf timer took forty lines; writing it by hand for an HTTP handler with five sequential SQL queries, error propagation with \texttt{?}, and conditional branches would be as painful as Java~6 NIO callbacks. That mechanical translation is what \texttt{async} and \texttt{.await} automate.
 
 Let us take a realistic ledger helper with two \texttt{.await} points and trace the exact state machine that \texttt{rustc} synthesizes for it. Suppose that before authorizing a card capture, we load the account's settled balance and then sum any active authorization holds that have not yet settled:
 
@@ -321,7 +321,7 @@ pub enum SpendableStateMachine<'a> {
         fut1: FetchSettledFut<'a>,
     },
     // State 2: suspended at the second .await point.
-    // Notice pool and account_id are gone -- only settled and fut2 remain!
+    // pool and account_id are gone -- only settled and fut2 remain!
     WaitingHolds {
         settled: i64,
         fut2: FetchHoldsFut<'a>,
@@ -401,7 +401,7 @@ impl<'a> Future for SpendableStateMachine<'a> {
 The \texttt{loop} around a \texttt{match} shows three properties of async Rust:
 
 \begin{enumerate}
-  \item \textbf{Zero intermediate heap allocations across nested \texttt{async} calls.} Notice that \texttt{fut1} and \texttt{fut2} live \emph{by value} directly inside the enum variants of \texttt{SpendableStateMachine}, not behind \texttt{Box<dyn Future>}. Suppose an Axum handler awaits a service method, which awaits a repository call, which awaits a SQLx socket read. At compile time, \texttt{rustc} flattens all four nested state machines into \emph{one contiguous struct} of known byte size. Calling \texttt{tokio::spawn} performs \textbf{one} heap allocation for that entire call tree, whereas JavaScript and Java allocate a fresh \texttt{Promise} or \texttt{CompletableFuture} on every \texttt{.await} step.
+  \item \textbf{Zero intermediate heap allocations across nested \texttt{async} calls.} \texttt{fut1} and \texttt{fut2} live \emph{by value} directly inside the enum variants of \texttt{SpendableStateMachine}, not behind \texttt{Box<dyn Future>}. Suppose an Axum handler awaits a service method, which awaits a repository call, which awaits a SQLx socket read. At compile time, \texttt{rustc} flattens all four nested state machines into \emph{one contiguous struct} of known byte size. Calling \texttt{tokio::spawn} performs \textbf{one} heap allocation for that entire call tree, whereas JavaScript and Java allocate a fresh \texttt{Promise} or \texttt{CompletableFuture} on every \texttt{.await} step.
   \item \textbf{Immediate fast-path fallthrough via \texttt{loop}.} Suppose \texttt{fetch\_settled\_balance} hits an in-memory cache or finds PostgreSQL's reply packet already waiting in the kernel socket buffer. Then \texttt{pinned\_fut1.poll(cx)} returns \texttt{Poll::Ready} on its first try. Because the state machine runs inside a \texttt{loop}, it transitions straight to \texttt{WaitingHolds} and polls \texttt{fut2} in the same CPU time slice without bouncing through the scheduler.
   \item \textbf{Union memory reuse across sequential \texttt{.await}s.} Recall from Chapter~5 that a Rust \texttt{enum} takes only the size of its tag plus its \emph{largest} variant, not the sum of all variants. Because \texttt{fut1} and \texttt{fut2} never live at the same time, they reuse the exact same byte offsets inside \texttt{SpendableStateMachine}.
 \end{enumerate}
@@ -469,7 +469,7 @@ async fn bad_audit_export(pool: &PgPool) -> Result<(), DbError> {
     Ok(())
 }
 \end{lstlisting}
-Here \texttt{size\_of\_val(\&bad\_audit\_export(\&pool))} exceeds $64\text{ KiB}$. Moving that future by value or copying it into a parent state machine copies $64\text{ KiB}$ on the CPU stack. Fix it either by restricting the buffer to an inner synchronous block \texttt{\{ let mut buf = ...; ... \}} that ends \emph{before} the \texttt{.await}, or by heap-allocating large buffers via \texttt{Vec<u8>} (whose stack handle inside the future is just $24\text{ bytes}$: \texttt{ptr}, \texttt{len}, \texttt{cap}).
+Here \texttt{size\_of\_val(\&bad\_audit\_export(\&pool))} exceeds $64\text{ KiB}$. Moving that future by value or copying it into a parent state machine copies $64\text{ KiB}$ on the CPU stack. Fix it either by restricting the buffer to an inner synchronous block \texttt{\{ let mut buf = ...; ... \}} that ends \emph{before} the \texttt{.await}, or by heap-allocating large buffers via \texttt{Vec<u8>} (whose stack handle inside the future is $24\text{ bytes}$: \texttt{ptr}, \texttt{len}, \texttt{cap}).
 \end{trapbox}
 
 \section{Self-Referential Futures and Why \texttt{Pin} Exists}
@@ -529,7 +529,7 @@ Let us trace concrete hexadecimal addresses to see what happens if we move the s
 \node[mem, fill=quotientorange!10]  (a4) at (-3.75, -0.43) {\texttt{+0x20}: \texttt{slice\_len = 2} (remaining)};
 
 % Self-pointer arrow on outer left
-\draw[-{Stealth[length=2.2mm]}, very thick, targetgreen!80!black]
+\draw[-{Stealth[length=2.2mm]}, thick, targetgreen!80!black]
   (a3.west) .. controls +(-0.65, 0) and +(-0.65, 0) .. node[left=2pt, font=\scriptsize\bfseries]{self-ref} (a2.west);
 
 % Right column: Broken moved state
@@ -541,7 +541,7 @@ Let us trace concrete hexadecimal addresses to see what happens if we move the s
 \node[mem, fill=quotientorange!10]  (b4) at (3.95, -0.43) {\texttt{+0x20}: \texttt{slice\_len = 2} (remaining)};
 
 % Dangling arrow across wide middle channel from right back to old address on left
-\draw[-{Stealth[length=2.5mm]}, very thick, trapred]
+\draw[-{Stealth[length=2.5mm]}, thick, trapred]
   (b3.west) -- (a2.east)
   node[pos=0.5, below=7pt, font=\scriptsize\bfseries, align=center, text=trapred]{stale ptr\\[-1pt]overwrites};
 \end{tikzpicture}
@@ -555,10 +555,10 @@ Figure~\ref{ch12:fig-self-ref-pin} is the entire reason \texttt{Pin} exists in R
 \textbf{The Pinning Guarantee.} A pointer \texttt{Pin<P>} (such as \texttt{Pin<\&mut T>} or \texttt{Pin<Box<T>>}) wraps a pointer \texttt{P} targeting a value of type \texttt{T}. Suppose \texttt{T} does \emph{not} implement the marker trait \texttt{Unpin}. Once a \texttt{Pin<P>} points to an instance of \texttt{T} at address $A$, \textbf{the bytes of that \texttt{T} must stay at address $A$}. They may never be moved, swapped, or freed before \texttt{T::drop} runs in place at address $A$.
 \end{formalbox}
 
-Notice how surgical that rule is:
+This rule is surgical:
 \begin{enumerate}
   \item \textbf{Before the first \texttt{poll}, a future can move freely.} When \texttt{read\_length\_prefix} returns \texttt{fut}, nobody has called \texttt{poll} yet, so \texttt{fut} is still in its \texttt{Start} variant with zero internal self-pointers. You can return \texttt{fut} from helper functions, store it in structs, or pass it by value into \texttt{tokio::spawn(fut)} without pinning it first.
-  \item \textbf{Calling \texttt{poll} requires \texttt{Pin<\&mut Self>}.} The very act of polling is what can create internal self-references, so the type signature \texttt{fn poll(self: Pin<\&mut Self>, ...)} refuses to run Step~2 until you have already placed the future somewhere its address is locked down.
+  \item \textbf{Calling \texttt{poll} requires \texttt{Pin<\&mut Self>}.} The act of polling is what can create internal self-references, so the type signature \texttt{fn poll(self: Pin<\&mut Self>, ...)} refuses to run Step~2 until you have already placed the future somewhere its address is locked down.
   \item \textbf{How \texttt{Pin<\&mut T>} prevents moving in safe Rust at zero runtime cost.} At the machine level, \texttt{Pin<\&mut T>} is \texttt{\#[repr(transparent)]} around a single 8-byte pointer \texttt{\&mut T}. How does a zero-cost wrapper stop safe code from calling \texttt{std::mem::swap(a, b)}? Because \texttt{mem::swap} requires \texttt{\&mut T}, and \textbf{\texttt{Pin<\&mut T>} refuses to hand out \texttt{\&mut T} in safe code unless \texttt{T: Unpin}.} Look at the standard library's conditional implementation:
 \begin{lstlisting}[language=Rust]
 impl<'a, T: Unpin> Pin<&'a mut T> {
@@ -587,7 +587,7 @@ What does \emph{not} implement \texttt{Unpin}?
 
 \subsection{The Two Ways You Pin a Future in Real Code}
 
-In $99\%$ of application code, you simply write \texttt{foo().await}, and the enclosing \texttt{async fn} state machine handles pinning automatically. When you \emph{do} manually drive a \texttt{!Unpin} future --- for example, polling a stream inside a custom Tower middleware or storing a dynamic future inside a struct --- you have two clean, safe idioms:
+In $99\%$ of application code, you write \texttt{foo().await}, and the enclosing \texttt{async fn} state machine handles pinning automatically. When you \emph{do} manually drive a \texttt{!Unpin} future --- for example, polling a stream inside a custom Tower middleware or storing a dynamic future inside a struct --- you have two clean, safe idioms:
 
 \begin{enumerate}
   \item \textbf{Heap pinning via \texttt{Box::pin(fut)}:} Allocates \texttt{fut} on the heap once and returns a \texttt{Pin<Box<F>>}. Because the future's bytes now sit at a fixed heap address (say \texttt{0x55a0\_0040}), \emph{you can move the 8-byte \texttt{Pin<Box<F>>} handle freely by value.} Even when \texttt{F} is \texttt{!Unpin}, \texttt{Pin<Box<F>>} itself implements \texttt{Unpin}, since moving the stack pointer never moves the heap block.
@@ -664,7 +664,7 @@ When you annotate \texttt{\#[tokio::main]} above \texttt{async fn main()}, the m
 \node[qbox, fill=white, minimum width=5.7cm] (poll1) at (3.57, 1.2) {Polls stolen tasks cleanly on Core 1 (\texttt{T: Send})};
 
 % Work-stealing arrow above panels (clears Worker titles completely)
-\draw[-{Stealth[length=2.4mm]}, very thick, quotientorange!90!black]
+\draw[-{Stealth[length=2.4mm]}, thick, quotientorange!90!black]
   (-1.3, 3.25) .. controls +(+0.8, 0.65) and +(-0.8, 0.65) ..
   node[above=2pt, font=\scriptsize\bfseries, text=quotientorange!85!black]{work-steals batch (\texttt{T6, T7})}
   (3.3, 3.25);
@@ -699,7 +699,7 @@ where
 Every single bound in that \texttt{where} clause comes straight out of Figure~\ref{ch12:fig-tokio-runtime} and Section~\ref{ch12:state-machine-desugaring}:
 \begin{enumerate}
   \item \textbf{Why \texttt{F: 'static}?} Recall Chapter~4's rule: \texttt{T: 'static} does \emph{not} mean \texttt{T} lives until process exit. It means \texttt{T} holds no borrowed references \texttt{\&'a X} pointing into a caller's temporary stack frame. A spawned task runs independently, so its caller may return immediately and pop its stack frame while the task continues. Therefore, a spawned future must own its data (\texttt{Uuid}, \texttt{String}, \texttt{PgPool}) or share state via \texttt{Arc<AppState>}.
-  \item \textbf{Why \texttt{F: Send}?} Look at the orange work-stealing arrow at the top of Figure~\ref{ch12:fig-tokio-runtime}. Task~T6 may start on Worker~0 (Core~0), hit \texttt{.await}, and pause inside its \texttt{WaitingHolds} variant. Two milliseconds later, Worker~0 is busy, so Worker~1 (Core~1) steals Task~T6 and calls \texttt{poll()} on Core~1. Task~T6 just moved across OS threads mid-function. To keep that move race-free, \textbf{every local variable stored across \texttt{.await} inside \texttt{F} must itself be \texttt{Send}}.
+  \item \textbf{Why \texttt{F: Send}?} Look at the orange work-stealing arrow at the top of Figure~\ref{ch12:fig-tokio-runtime}. Task~T6 may start on Worker~0 (Core~0), hit \texttt{.await}, and pause inside its \texttt{WaitingHolds} variant. Two milliseconds later, Worker~0 is busy, so Worker~1 (Core~1) steals Task~T6 and calls \texttt{poll()} on Core~1. Task~T6 moved across OS threads mid-function. To keep that move race-free, \textbf{every local variable stored across \texttt{.await} inside \texttt{F} must itself be \texttt{Send}}.
 \end{enumerate}
 
 \subsection{How the Compiler Saves You From a \texttt{MutexGuard} Worker Deadlock}
@@ -735,7 +735,7 @@ note: future is not `Send` as this value is used across an await
    | `guard` has type `MutexGuard<'_, RateTable>`, which is not `Send`
 \end{lstlisting}
 
-Why is \texttt{std::sync::MutexGuard} marked \texttt{!Send}? First, on POSIX systems (\texttt{pthread\_mutex\_t}), locking a mutex on OS Thread~0 and unlocking it after work-stealing onto OS Thread~1 is undefined behavior. Second --- and even more dangerous --- think about what would happen on Tokio \emph{even without} POSIX UB if you held a synchronous OS mutex across \texttt{.await}:
+Why is \texttt{std::sync::MutexGuard} marked \texttt{!Send}? First, on POSIX (Portable Operating System Interface) systems (\texttt{pthread\_mutex\_t}), locking a mutex on OS Thread~0 and unlocking it after work-stealing onto OS Thread~1 is undefined behavior (UB; see the Preface). Second --- and even more dangerous --- think about what would happen on Tokio \emph{even without} POSIX undefined behavior if you held a synchronous OS mutex across \texttt{.await}:
 \begin{enumerate}
   \item Task~A locks \texttt{rates} on Worker~0, hits \texttt{.await} on \texttt{record\_quote}, and yields \texttt{Poll::Pending} \emph{while still holding the locked OS mutex}.
   \item Worker~0 is now free to run the next task in its queue: Task~B.
@@ -769,7 +769,7 @@ What if you genuinely \emph{must} hold an exclusive lock across asynchronous I/O
 Because stackless futures yield control \emph{only} at \texttt{.await} points, Tokio uses \textbf{cooperative multitasking} between suspension points. That creates an operational rule every backend engineer must memorize:
 
 \begin{focusbox}
-\textbf{Never block or burn >100 microseconds of uninterrupted CPU on a Tokio async worker thread.} Calling synchronous \texttt{std::fs::read}, legacy blocking C FFI, or CPU-heavy cryptography such as Argon2id password verification ($80\text{ ms}$ of tight memory-hard hashing with zero \texttt{.await}s) directly inside an \texttt{async fn} hijacks that core's worker thread for $80\text{ ms}$. Every task sitting in that worker's LIFO slot --- which sibling workers \emph{cannot} steal --- freezes for $80\text{ ms}$, causing immediate p99 tail-latency spikes across unrelated payment endpoints.
+\textbf{Never block or burn >100 microseconds of uninterrupted CPU on a Tokio async worker thread.} Calling synchronous \texttt{std::fs::read}, legacy blocking C FFI (Foreign Function Interface), or CPU-heavy cryptography such as Argon2id (a cryptographic hash function) password verification ($80\text{ ms}$ of tight memory-hard hashing with zero \texttt{.await}s) directly inside an \texttt{async fn} hijacks that core's worker thread for $80\text{ ms}$. Every task sitting in that worker's LIFO slot --- which sibling workers \emph{cannot} steal --- freezes for $80\text{ ms}$, causing immediate p99 tail-latency spikes across unrelated payment endpoints.
 
 Offload CPU-heavy or blocking OS calls onto Tokio's dedicated elastic blocking pool via \texttt{tokio::task::spawn\_blocking}:
 \begin{lstlisting}[language=Rust]
@@ -791,25 +791,25 @@ Making individual tasks cheap is a double-edged sword. In Java~6, spawning $200{
 
 Production financial services enforce \textbf{bounded queues everywhere}:
 \begin{itemize}
-  \item \textbf{Bounded \texttt{mpsc::channel(capacity)}:} When all \texttt{capacity} slots are full, \texttt{tx.send(msg).await} suspends the producer (\texttt{Poll::Pending}) until a consumer frees a slot. For ingress load shedding, \texttt{tx.try\_send(msg)} fails immediately in $O(1)$ time with \texttt{TrySendError::Full}, letting your HTTP layer return \texttt{429 Too Many Requests} or \texttt{503 Service Unavailable}.
-  \item \textbf{Concurrency caps via \texttt{Semaphore}:} In \texttt{tokio::sync}, a \texttt{Semaphore} caps concurrent calls to a scarce downstream service---for instance, limiting an external card-network gateway to $64$ in-flight remote procedure calls (\textbf{RPCs}) across $10{,}000$ client connections. Calling \texttt{sem.acquire().await} returns a \texttt{SemaphorePermit} guard whose \texttt{Drop} destructor releases the permit automatically on return, \texttt{?}, or panic.
+  \item \textbf{Bounded \texttt{mpsc::channel}:} When full, \texttt{tx.send(msg).await} suspends the producer until a slot frees. For load shedding, \texttt{try\_send} fails instantly with \texttt{TrySendError::Full}, letting you return an HTTP \texttt{429} or \texttt{503} error.
+  \item \textbf{Concurrency caps via \texttt{Semaphore}:} In \texttt{tokio::sync}, a \texttt{Semaphore} caps concurrent calls to a scarce downstream service---for instance, limiting a payment gateway to $64$ in-flight remote procedure calls (\textbf{RPCs}) across $10{,}000$ clients. Calling \texttt{sem.acquire().await} returns a \texttt{SemaphorePermit} whose destructor releases the permit automatically on return, \texttt{?}, or panic.
 \end{itemize}
 
 \subsection{Async Cancellation in Rust: Dropping a \texttt{Future} Mid-Flight}
 
-This section covers the difference between Rust's async model and Java, Go, or Kotlin that most affects how we structure financial mutations in Chapters~13 and~14.
+
 
 Ask yourself: \emph{How do you cancel an asynchronous operation in Rust?}
 
 In Java, you call \texttt{future.cancel(true)}, which sets an interrupt flag; the worker thread keeps running until it hits an interruptible call or checks \texttt{Thread.interrupted()}. In Go, cancelling a \texttt{context.Context} closes its \texttt{Done()} channel; the goroutine keeps running in the background until its own code checks \texttt{ctx.Err()} and returns.
 
-In Rust, a running async operation \emph{is just a passive \texttt{Future} state-machine struct owned by its caller or executor}. \textbf{To cancel a future in Rust, the owner simply drops it (\texttt{drop(fut)}) and never calls \texttt{poll()} again.}
+In Rust, a running async operation \emph{is a passive \texttt{Future} state-machine struct owned by its caller or executor}. \textbf{To cancel a future in Rust, the owner drops it (\texttt{drop(fut)}) and never calls \texttt{poll()} again.}
 
 Think carefully about what happens at the machine level when Hyper/Axum detects that a mobile client's TCP socket closed (or a three-second \texttt{tokio::time::timeout} wrapper around your handler expires) while your \texttt{async fn} handler is parked at \texttt{.await}~\#1:
 \begin{enumerate}
   \item The timeout or HTTP connection loop drops \texttt{handler\_fut} right where it sits, inside its \texttt{WaitingStep1} enum variant.
-  \item \textbf{Zero lines of Rust code after \texttt{.await}~\#1 will ever execute.} No \texttt{InterruptedException} is thrown into the function body for you to catch; the paused state machine simply ceases to be polled.
-  \item \textbf{Every value currently alive inside the active \texttt{WaitingStep1} variant has its deterministic \texttt{Drop::drop} destructor run immediately in reverse declaration order} --- just like C++ RAII scope exit.
+  \item \textbf{Zero lines of Rust code after \texttt{.await}~\#1 will ever execute.} No \texttt{InterruptedException} is thrown into the function body for you to catch; the paused state machine ceases to be polled.
+  \item \textbf{Every value currently alive inside the active \texttt{WaitingStep1} variant has its deterministic \texttt{Drop::drop} destructor run immediately in reverse declaration order} --- like C++ RAII scope exit.
 \end{enumerate}
 
 Look at what happens if an engineer writes a naive, non-transactional two-step transfer that commits two separate SQL statements on a connection pool:
@@ -871,7 +871,52 @@ pub async fn atomic_transfer(
 }
 \end{lstlisting}
 
-Here is how ownership, destructive moves, RAII \texttt{Drop}, and stackless futures combine in the function above:
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\footnotesize,
+  box/.style={draw=sourceblue!85, fill=sourceblue!10, rounded corners=3pt, minimum width=3.5cm, minimum height=0.7cm, align=center},
+  db/.style={draw=structurepurple!85, fill=structurepurple!10, rounded corners=3pt, minimum width=3.5cm, minimum height=0.7cm, align=center},
+  dropbox/.style={draw=trapred!90, fill=trapred!12, rounded corners=3pt, minimum width=3.5cm, minimum height=0.7cm, align=center, text=trapred!80!black, font=\footnotesize\bfseries}
+]
+
+% Timeline nodes
+\node[font=\footnotesize\bfseries] at (0, 4.5) {Async Rust Task (Future)};
+\node[font=\footnotesize\bfseries] at (5, 4.5) {PostgreSQL Connection};
+
+\node[box] (t1) at (0, 3.5) {\texttt{pool.begin().await}};
+\node[db] (d1) at (5, 3.5) {\texttt{BEGIN}};
+
+\node[box] (t2) at (0, 2.3) {\texttt{debit\_within\_tx().await}};
+\node[db] (d2) at (5, 2.3) {\texttt{UPDATE} (Debit)};
+
+\node[box, fill=quotientorange!15, draw=quotientorange!85, dashed] (t3) at (0, 1.1) {Suspended in \texttt{credit\_within\_tx}};
+\node[db, dashed] (d3) at (5, 1.1) {Idle (Awaiting next query)};
+
+\node[dropbox] (drop) at (0, -0.1) {HTTP Timeout Fires!\\Future is DROPPED};
+\node[db] (d4) at (5, -0.1) {\texttt{ROLLBACK} (auto-sent)};
+
+\draw[-{Stealth[length=2mm]}, thick] (t1) -- node[above=1pt, font=\scriptsize]{\texttt{tx} created} (d1);
+\draw[-{Stealth[length=2mm]}, thick] (t2) -- node[above=1pt, font=\scriptsize]{SQL sent} (d2);
+\draw[-{Stealth[length=2mm]}, thick] (t3) -- node[above=1pt, font=\scriptsize]{Waiting on DB or Network} (d3);
+
+\draw[-{Stealth[length=2.5mm]}, very thick, trapred] (drop) -- node[above=1pt, font=\scriptsize, text=trapred!80!black]{\texttt{tx.drop()} runs} (d4);
+
+% Vertical time arrows
+\draw[-{Stealth[length=2mm]}, thick, gray] (t1) -- (t2);
+\draw[-{Stealth[length=2mm]}, thick, gray] (t2) -- (t3);
+\draw[-{Stealth[length=2mm]}, thick, gray] (t3) -- (drop);
+
+\draw[-{Stealth[length=2mm]}, thick, gray] (d1) -- (d2);
+\draw[-{Stealth[length=2mm]}, thick, gray] (d2) -- (d3);
+\draw[-{Stealth[length=2mm]}, thick, gray] (d3) -- (d4);
+
+\end{tikzpicture}
+\caption{Cancellation-safety via RAII and Drop. When a timeout or disconnect drops the HTTP handler's future mid-execution, execution stops instantly. The \texttt{Drop} implementation for the transaction (\texttt{tx}) automatically sends a \texttt{ROLLBACK} to the database, ensuring no partial transfers are ever committed.}
+\label{ch12:fig-cancellation-drop}
+\end{figure}
+
+Figure~\ref{ch12:fig-cancellation-drop} and the following list detail how ownership, destructive moves, RAII \texttt{Drop}, and stackless futures combine in the function above:
 \begin{itemize}
   \item \texttt{tx} is stored as a field inside \texttt{atomic\_transfer}'s compiler-generated \texttt{enum} variants across both \texttt{.await} points.
   \item If \emph{anything} aborts the operation early --- an early \texttt{?} error on \texttt{credit\_within\_tx}, a worker panic, a \texttt{tokio::time::timeout}, or a disconnected client dropping the future --- \texttt{tx.commit()} was never reached, so \texttt{Drop::drop} runs on \texttt{tx} and rolls back the PostgreSQL transaction automatically.

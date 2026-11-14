@@ -1,24 +1,24 @@
 \chapter{Modern C++: RAII, Moves, Smart Pointers, and Templates}
 \label{ch:modern-cpp}
 
-Chapter~1 left us facing an uncomfortable tension. Java~6 prevents stray pointer corruption, yet it pays heavily in 16-byte headers, pointer-chasing cache misses, GC pauses, shared mutable aliases, and dishonest \texttt{null}/exception signatures. Classic C offers flat byte layouts and zero GC pauses, yet it relies on human discipline to pair every \texttt{malloc} with one \texttt{free} and never touch a dead pointer.
+Java~6 prevents stray pointer corruption, yet it pays heavily in 16-byte headers, pointer-chasing cache misses, GC pauses, shared mutable aliases, and dishonest \texttt{null}/exception signatures. Classic C offers flat byte layouts and zero GC pauses, yet it relies on human discipline to pair every \texttt{malloc} with one \texttt{free} and never touch a dead pointer.
 
 To see where Rust got its best ideas and where it broke new ground, meet the language right between classic C and Rust: \textbf{Modern C++} (C++11 through C++20).
 
 If your picture of C++ stops at ``C with classes, \texttt{new}, and \texttt{delete},'' Modern C++ looks quite different. Idiomatic C++20 code almost never writes raw \texttt{new} or \texttt{delete}. Instead, it releases memory, files, locks, and database transactions deterministically via \textbf{RAII (Resource Acquisition Is Initialization)}. It hands off megabyte buffers in three register moves via \textbf{move semantics}. It encodes heap ownership in \textbf{smart pointers}, borrows slices via \texttt{std::span} and \texttt{std::string\_view}, and specializes generic algorithms via \textbf{templates} and \textbf{C++20 Concepts}.
 
-Every one of those mechanisms carried straight over into Rust. Yet Modern C++ left four compile-time blind spots: non-destructive moves leaving zombie shells, dangling views, \texttt{std::vector} reference invalidation, and unchecked shared mutability. Clean-looking C++20 code without a single raw pointer can still trigger undefined behavior through all four. In this chapter we master what Modern C++ gets right, and then watch those four blind spots motivate Part~II.
+Every one of those mechanisms carried straight over into Rust. Yet Modern C++ left four compile-time blind spots: non-destructive moves leaving zombie shells, dangling views, \texttt{std::vector} reference invalidation, and unchecked shared mutability. Clean-looking C++20 code without a single raw pointer can still trigger undefined behavior (see the Preface: the program may crash, corrupt memory, or seem fine) through all four. 
 
 \chapterline
 
 \section{From \texttt{malloc}/\texttt{free} and \texttt{finalize()} to Deterministic RAII}
 \label{ch02:raii}
 
-To see why RAII matters so much in systems programming, start by watching how resource cleanup fails in both classic C and Java~6 when a function manages more than one resource across multiple exit paths.
+Resource cleanup often fails in both classic C and Java~6 when a function manages more than one resource across multiple exit paths.
 
 \subsection{Why manual C cleanup and Java 6 \texttt{finalize()} both fall short}
 
-Suppose a C function opens a temporary audit file, allocates a scratch buffer, and begins a PostgreSQL transaction to record a settlement batch:
+Suppose a C function opens a temporary audit file, allocates a scratch buffer, and begins a PostgreSQL transaction (an all-or-nothing database operation) to record a settlement batch:
 
 \begin{lstlisting}[language=C]
 /* Classic C: every early return must remember exact reverse cleanup! */
@@ -56,7 +56,7 @@ Count the traps in twenty-five lines of C. With three resources ($R_1, R_2, R_3$
 
 Now ask: did Java~6's garbage collector actually solve this problem? \textbf{Only for RAM --- and it actively made non-memory resources harder to reason about.}
 
-A running server manages many scarce resources besides heap bytes: OS file descriptors (often capped at $1{,}024$ or $65{,}536$ per process), TCP sockets, mutex locks, off-heap direct byte buffers, and pooled PostgreSQL connections. Java~6 originally offered \texttt{protected void finalize()} on \texttt{Object}, tempting developers to close sockets or database connections inside \texttt{finalize()}. That failed badly in production:
+A running server manages many scarce resources besides heap bytes: OS file descriptors (integer handles given by the operating system to track open files, often capped at $1{,}024$ or $65{,}536$ per process), TCP sockets (network connections), mutex locks (mutual exclusion flags that prevent multiple threads from accessing data at the same time), off-heap direct byte buffers (memory allocated outside the JVM), and pooled PostgreSQL connections. Java~6 originally offered \texttt{protected void finalize()} on \texttt{Object}, tempting developers to close sockets or database connections inside \texttt{finalize()}. That failed badly in production:
 \begin{enumerate}
   \item \textbf{Garbage collection triggers on heap pressure, not file-descriptor exhaustion.} You can open $10{,}000$ tiny 48-byte \texttt{FileInputStream} wrappers consuming less than $500\text{ KB}$ of a $16\text{ GB}$ Eden space. The GC sees plenty of free RAM and never runs, while the Linux kernel refuses the $1{,}025$th \texttt{open()} syscall with \texttt{EMFILE (Too many open files)}, taking down your service.
   \item \textbf{No timeliness, ordering, or even execution guarantee.} The JVM specification makes zero promise about \emph{when} --- or even \emph{whether} --- a finalizer runs, and objects with finalizers survive extra GC cycles and slow allocation down by orders of magnitude.
@@ -92,7 +92,7 @@ C++ solved memory, files, sockets, locks, and database transactions with one uni
 \end{enumerate}
 \end{formalbox}
 
-Watch what happens to our brittle C settlement function when we wrap a PostgreSQL transaction in a twenty-line C++ RAII guard:
+We can wrap a PostgreSQL transaction in a twenty-line C++ RAII guard:
 
 \begin{lstlisting}[language=C++]
 // Modern C++ RAII guard for a PostgreSQL transaction
@@ -143,7 +143,7 @@ void settleBatchCpp(PGconn* db, const char* auditPath, size_t nOrders) {
 } // ~txn sees committed_ == true (no-op); ~buf frees RAM; ~auditFile closes!
 \end{lstlisting}
 
-Notice what is missing from those ten lines. There is not a single \texttt{free}, \texttt{fclose}, \texttt{rollback}, or \texttt{finally} at the call site. Yet every exit path --- early \texttt{return}, thrown exception, or normal completion --- releases \texttt{txn}, \texttt{buf}, and \texttt{auditFile} in reverse order as control leaves the scope. Remember this \texttt{PgTransaction} pattern: in Chapter~14, \texttt{sqlx::Transaction<'\_, Postgres>} uses the same uncommitted-rollback \texttt{Drop} design when a client disconnects mid-request.
+There is not a single \texttt{free}, \texttt{fclose}, \texttt{rollback}, or \texttt{finally} at the call site. Yet every exit path --- early \texttt{return}, thrown exception, or normal completion --- releases \texttt{txn}, \texttt{buf}, and \texttt{auditFile} in reverse order as control leaves the scope. Remember this \texttt{PgTransaction} pattern: in Chapter~14, \texttt{sqlx::Transaction<'\_, Postgres>} uses the same uncommitted-rollback \texttt{Drop} design when a client disconnects mid-request.
 
 \begin{trapbox}
 \textbf{Never allow an exception to escape a C++ destructor (\texttt{noexcept}).}
@@ -234,14 +234,14 @@ Why are \texttt{T\&} and \texttt{const T\&} called \emph{lvalue} references? The
   \item An \textbf{rvalue} is a fleeting temporary or literal without persistent identity, vanishing at the semicolon: \texttt{42}, a call result \texttt{serializeBatch(orders)}, or \texttt{s1 + s2}. Nobody else holds a name for that temporary, and it is moments away from destruction.
 \end{itemize}
 
-Before C++11, constructors could not distinguish copying a persistent variable \texttt{a} from initializing out of a dying temporary \texttt{serializeBatch(orders)} (outside copy-elision cases). Every heap-owning RAII class needed a \textbf{deep copy constructor} \texttt{ByteBuffer(const ByteBuffer\& other)} that allocated fresh heap RAM and ran \texttt{std::memcpy}. Reassigning \texttt{buf = buildPayload();} forced C++98 to allocate a second megabyte buffer, copy every byte out of the dying temporary, and immediately free the temporary's buffer.
+Before C++11, constructors could not distinguish copying a persistent variable \texttt{a} from initializing out of a dying temporary \texttt{serializeBatch(orders)} (outside cases where the compiler can optimize the temporary away, known as copy elision). Every heap-owning RAII class needed a \textbf{deep copy constructor} \texttt{ByteBuffer(const ByteBuffer\&\allowbreak\ other)} that allocated fresh heap RAM and ran \texttt{std::memcpy} (a direct byte-for-byte memory copy). Reassigning \texttt{buf = buildPayload();} forced C++98 to allocate a second megabyte buffer, copy every byte out of the dying temporary, and immediately free the temporary's buffer.
 
 \subsection{C++11 Move Semantics: \texttt{T\&\&} and \texttt{std::move}}
 
 C++11 fixed that waste by adding \textbf{rvalue references}, written with two ampersands: \texttt{T\&\&}. Overload resolution obeys a simple, intuitive rule:
 \begin{itemize}
   \item \texttt{const T\&} binds to anything, and is chosen when the argument is a persistent \textbf{lvalue} (\texttt{a}) that must be preserved via a deep copy.
-  \item \texttt{T\&\&} binds \emph{only} to modifiable \textbf{rvalues} (dying temporaries, or variables explicitly cast with \texttt{std::move}), giving the constructor permission to \textbf{pilfer (steal) the heap pointer in $\Oh(1)$ time} instead of copying the heap payload.
+  \item \texttt{T\&\&} binds \emph{only} to modifiable \textbf{rvalues} (dying temporaries, or variables explicitly cast with \texttt{std::move}), giving the constructor permission to \textbf{pilfer (steal) the heap pointer in $\Oh(1)$ time (time independent of buffer size)} instead of copying the heap payload.
 \end{itemize}
 
 Let us write a complete \texttt{ByteBuffer} class in Modern C++ showing both the deep copy constructor and the $\Oh(1)$ move constructor side by side:
@@ -272,7 +272,7 @@ public:
           len_(other.len_),
           cap_(other.cap_) {
         if (len_ > 0) {
-            std::memcpy(data_, other.data_, len_);
+            std::memcpy (a direct byte-for-byte memory copy)(data_, other.data_, len_);
         }
     }
 
@@ -331,7 +331,7 @@ Suppose \texttt{std::vector<ByteBuffer>} grows from capacity $4$ to $8$. To keep
 
 \subsection{The Central Contrast: C++ Non-Destructive Moves vs.\ Rust Destructive Moves}
 
-Now compare C++'s move model with the Rust move model you will meet in Chapter~3. Many experienced C++ programmers initially assume Rust moves work just like \texttt{std::move}. \textbf{They do not --- and the difference explains half of Rust's ergonomic and safety edge over C++.}
+C++'s move model differs from the Rust move model you will meet in Chapter~3.
 
 Consider what happens to \texttt{a} in C++ after \texttt{ByteBuffer c = std::move(a);}:
 \begin{enumerate}
@@ -343,9 +343,9 @@ Consider what happens to \texttt{a} in C++ after \texttt{ByteBuffer c = std::mov
   \end{itemize}
   \item \textbf{In Rust (Destructive Move, default on assignment \texttt{let c = a;}):}
   \begin{itemize}
-    \item Assigning \texttt{let c = a;} for a heap-owning type (\texttt{Vec<u8>} or \texttt{String}) is a \textbf{move by default}. Deep copies require an explicit \texttt{a.clone()} call, so $\Oh(N)$ heap allocations never happen by accident.
+    \item Assigning \texttt{let c = a;} for a heap-owning type (\texttt{Vec<u8>} or \texttt{String}) is a \textbf{move by default}. Deep copies require an explicit \texttt{a.clone()} call, so $\Oh(N)$ (proportional to data size) heap allocations  never happen by accident.
     \item At runtime, moving \texttt{a} into \texttt{c} is a blind 24-byte \texttt{memcpy} of \texttt{(ptr, len, cap)}; Rust does not even need to zero \texttt{a} in the static case.
-    \item Why doesn't \texttt{a} double-free? Rust marks \texttt{a} \textbf{statically uninitialized} in its control-flow graph: \textbf{\texttt{Drop} never runs on \texttt{a}}, and reading \texttt{a} later fails with \texttt{error[E0382]: borrow of moved value}. Consequently, a Rust type whose pointer or fd is never null \emph{never needs a zombie state}.
+    \item Why doesn't \texttt{a} double-free? Rust marks \texttt{a} \textbf{statically uninitialized} in its control-flow graph (the compiler's map of all possible execution paths): \textbf{\texttt{Drop} never runs on \texttt{a}}, and reading \texttt{a} later fails with \texttt{error[E0382]: borrow of moved value}. Consequently, a Rust type whose pointer or fd is never null \emph{never needs a zombie state}.
   \end{itemize}
 \end{enumerate}
 
@@ -477,8 +477,8 @@ Unlike 8-byte \texttt{unique\_ptr}, \texttt{sizeof(std::shared\_ptr<T>)} is \tex
 \begin{enumerate}
   \item \textbf{Two pointers on the stack (16 bytes):} Word~0 points directly to the \texttt{T} payload (so reading fields needs only 1 hop); Word~1 points to a heap-allocated \textbf{Control Block}.
   \item \textbf{Inside the Control Block:} It stores an \emph{atomic strong count} (live \texttt{shared\_ptr}s), an \emph{atomic weak count} (live \texttt{weak\_ptr}s keeping the header alive), and deleter metadata.
-  \item \textbf{Why \texttt{std::make\_shared<T>(...)} beats \texttt{std::shared\_ptr<T>(new T(...))}:} Calling \texttt{new T(...)} allocates \texttt{T} in one heap block and the Control Block in a second block. \texttt{std::make\_shared<T>(...)} performs a \textbf{single fused allocation} placing the Control Block and \texttt{T} side by side.
-  \item \textbf{The atomic refcount tax \emph{and} reference cycles:} C++ cannot tell statically whether a \texttt{shared\_ptr} crosses threads, so every copy and drop executes an atomic \texttt{lock xadd}. Even uncontended, \texttt{lock xadd} costs 10--20 cycles versus $\sim 1$ cycle for a plain copy, and far more under core contention (Rust splits single-threaded \texttt{Rc<T>} from atomic \texttt{Arc<T>}). Worse, if $A$ and $B$ hold \texttt{shared\_ptr}s to each other, neither count reaches $0$, leaking both unless one side uses \texttt{std::weak\_ptr} (\texttt{weakParent.lock()}).
+  \item \textbf{Why \texttt{std::make\_shared} beats \texttt{shared\_ptr(new T)}:} Calling \texttt{new T(...)} allocates \texttt{T} in one heap block and the Control Block in a second block. \texttt{std::make\_shared<T>(...)} performs a \textbf{single fused allocation} placing the Control Block and \texttt{T} side by side.
+  \item \textbf{The atomic refcount tax \emph{and} reference cycles:} C++ cannot tell statically whether a \texttt{shared\_ptr} crosses threads, so every copy and drop executes an atomic \texttt{lock xadd} (a CPU instruction for safe cross-thread updates). Even uncontended, \texttt{lock xadd} costs 10--20 cycles versus $\sim 1$ cycle for a plain copy, and far more under core contention (when CPU cores fight for memory) (Rust splits single-threaded \texttt{Rc<T>} from atomic \texttt{Arc<T>}). Worse, if $A$ and $B$ hold \texttt{shared\_ptr}s to each other, neither count reaches $0$, leaking both unless one side uses \texttt{std::weak\_ptr} (\texttt{weakParent.lock()}).
 \end{enumerate}
 
 \subsection{Non-owning fat-pointer views: \texttt{std::string\_view} and \texttt{std::span<T>}}
@@ -492,7 +492,7 @@ Consider a subtly wasteful pre-C++17 habit:
 bool isUsdPair(const std::string& symbol);
 
 // Calling isUsdPair("BTC-USD") constructs a temporary std::string just
-// to read 7 constant characters already sitting in .rodata!
+// to read 7 constant characters already sitting in .rodata (the read-only data section of the compiled binary)!
 \end{lstlisting}
 
 Modern C++ standard libraries mitigate short strings via \textbf{Small String Optimization (SSO)} --- a special case of \textbf{Small Buffer Optimization (SBO)} that packs up to 15--22 ASCII bytes directly inside \texttt{std::string}'s 24- or 32-byte stack header instead of calling \texttt{malloc}. Even with SSO, constructing a temporary \texttt{std::string} from a literal or substring still copies bytes and runs a destructor, and any string longer than the SSO threshold hits the heap. C++17 introduced \texttt{std::string\_view} and C++20 added \texttt{std::span<T>} to make read-only (or mutable slice) borrowing uniform and $100\%$ allocation-free:
@@ -516,7 +516,7 @@ int64_t sumNotional(std::span<const Order> window) noexcept {
 }
 \end{lstlisting}
 
-Look at the exact bytes of \texttt{std::string\_view} and \texttt{std::span<const Order>}. Both are flat \textbf{16-byte fat pointers} \texttt{(ptr, len)} passed by value in two CPU registers. One \texttt{sumNotional} function accepts a \texttt{std::vector<Order>}, a \texttt{std::array<Order, 64>}, a C array \texttt{Order[10]}, or a sub-window \texttt{std::span(vec).subspan(10, 5)} with zero copies. Hold onto that 16-byte \texttt{(ptr, len)} picture: Rust's \texttt{\&str} and \texttt{\&[T]} have the \emph{exact same 16-byte layout}.
+Look at the exact bytes of \texttt{std::string\_view} and \texttt{std::span<const Order>}. Both are flat \textbf{16-byte fat pointers (pointers that carry extra metadata, like length)} \texttt{(ptr, len)} passed by value in two CPU registers. One \texttt{sumNotional} function accepts a \texttt{std::vector<Order>}, a \texttt{std::array<Order, 64>}, a C array \texttt{Order[10]}, or a sub-window \texttt{std::span(vec).subspan(10, 5)} with zero copies. Hold onto that 16-byte \texttt{(ptr, len)} picture: Rust's \texttt{\&str} and \texttt{\&[T]} have the \emph{exact same 16-byte layout}.
 
 \begin{figure}[H]
 \centering
@@ -559,7 +559,7 @@ Look at the exact bytes of \texttt{std::string\_view} and \texttt{std::span<cons
 \section{Zero-Cost Generics, \texttt{constexpr}, C++20 Concepts, and Lambdas}
 \label{ch02:templates-concepts-lambdas}
 
-Now let us see how Modern C++ achieves generic abstraction and functional-style callbacks \emph{without} paying Java~6's heap-boxing and virtual-call penalties.
+Modern C++ achieves generic abstraction and functional-style callbacks without paying Java~6's heap-boxing and virtual-call penalties.
 
 \subsection{Templates via monomorphization vs.\ Java 6 type erasure}
 
@@ -574,11 +574,32 @@ T clampValue(T val, T lo, T hi) noexcept {
 }
 \end{lstlisting}
 
-the template itself emits zero machine code until called. Call \texttt{clampValue} once with \texttt{int64\_t} and once with \texttt{double}, and the compiler stamps out two separate functions. One uses integer \texttt{cmp}/\texttt{cmovg} on general-purpose registers. The other uses floating-point \texttt{maxsd}/\texttt{minsd} on 128-bit \texttt{XMM} floating-point/SIMD (\emph{Single Instruction, Multiple Data}) registers, and both inline into their callers. You pay zero heap boxing and zero vtable dispatch, trading larger binaries and slower builds when huge templates instantiate across many types.
+the template itself emits zero machine code until called. Call \texttt{clampValue} once with \texttt{int64\_t} and once with \texttt{double}, and the compiler stamps out two separate functions. One uses integer \texttt{cmp}/\texttt{cmovg} on general-purpose registers. The other uses floating-point \texttt{maxsd}/\texttt{minsd} on 128-bit \texttt{XMM} floating-point/SIMD (\emph{Single Instruction, Multiple Data}) registers, and both inline into their callers. You pay zero heap boxing and zero vtable dispatch (looking up which function implementation to call at runtime), trading larger binaries and slower builds when huge templates instantiate across many types.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    font=\small,
+    >=Stealth,
+    box/.style={draw=sourceblue!80!black, fill=sourceblue!10, rounded corners=2pt, thick, align=center, inner sep=5pt},
+    outbox/.style={draw=targetgreen!80!black, fill=targetgreen!12, rounded corners=2pt, thick, align=center, inner sep=5pt}
+  ]
+  \node[box, text width=6cm] (tmpl) at (0, 2) {\textbf{Template Source}\\ \texttt{template <typename T>}\\ \texttt{T clampValue(T, T, T)}};
+  
+  \node[outbox, text width=5cm] (int) at (-3.5, -1) {\textbf{Monomorphized: \texttt{int64\_t}}\\ \texttt{int64\_t clampValue(int64\_t...)}\\ \textit{Uses integer registers (cmp)}};
+  \node[outbox, text width=5cm] (dbl) at (3.5, -1) {\textbf{Monomorphized: \texttt{double}}\\ \texttt{double clampValue(double...)}\\ \textit{Uses XMM registers (maxsd)}};
+  
+  \draw[->, thick, sourceblue!80!black] (tmpl.south) -- node[left, font=\scriptsize\bfseries] {called with \texttt{int64\_t}} (int.north);
+  \draw[->, thick, sourceblue!80!black] (tmpl.south) -- node[right, font=\scriptsize\bfseries] {called with \texttt{double}} (dbl.north);
+\end{tikzpicture}
+\caption{Monomorphization generates a dedicated machine-code function for each concrete type used at compile time, eliminating runtime type checks and virtual dispatch.}
+\label{fig:monomorphization}
+\end{figure}
+
 
 \subsection{\texttt{constexpr} and C++20 Concepts: taming template chaos}
 
-Historically, C++ templates had an infamous dark side: \emph{unconstrained duck typing}. In C++98--C++17, \texttt{template <typename T>} accepted \emph{any} \texttt{T} at the front door and only discovered deep inside five nested standard-library headers that \texttt{T} lacked an \texttt{operator<}, dumping a 180-line substitution failure backtrace onto your terminal.
+Historically, C++ templates had an infamous dark side: \emph{unconstrained duck typing (accepting any type that happens to have the required methods, without a formal contract)}. In C++98--C++17, \texttt{template <typename T>} accepted \emph{any} \texttt{T} at the front door and only discovered deep inside five nested standard-library headers that \texttt{T} lacked an \texttt{operator<}, dumping a 180-line substitution failure backtrace onto your terminal.
 
 Modern C++ added two clean compile-time tools:
 \begin{enumerate}
@@ -659,6 +680,36 @@ struct __Lambda_Line9 {
 \end{lstlisting}
 
 \texttt{\_\_Lambda\_Line9} is a unique concrete struct known at compile time, and \texttt{std::count\_if} is a monomorphized template. The compiler keeps the 24-byte closure in registers or stack slots and inlines \texttt{operator()} straight into the loop, with zero heap allocation or indirect calls.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    font=\small,
+    >=Stealth,
+    codebox/.style={draw=gray!80, fill=gray!10, rounded corners=2pt, thick, align=left, inner sep=5pt, font=\ttfamily\scriptsize},
+    membox/.style={draw=structurepurple!80!black, fill=structurepurple!12, rounded corners=2pt, thick, align=left, inner sep=5pt, font=\ttfamily\scriptsize}
+  ]
+  \node[codebox] (lambda) at (-3.5, 0) {
+    [targetAcct, minCents, \&runningNotional]\\
+    (const Order\& o) \{ ... \}
+  };
+  
+  \node[membox] (closure) at (3.5, 0) {
+    \textbf{Anonymous Closure Struct}\\
+    \rule{5.5cm}{0.4pt}
+    uint64\_t targetAcct; \quad\ \ \ \ \textcolor{gray!80!black}{// 8 bytes (value)}\\
+    int64\_t  minCents;   \quad\ \ \ \ \textcolor{gray!80!black}{// 8 bytes (value)}\\
+    int64\_t\& runningNotional; \textcolor{gray!80!black}{// 8 bytes (ptr)}\\
+    \rule{5.5cm}{0.4pt}
+    \textbf{operator()(const Order\& o) const} \{ ... \}
+  };
+  
+  \draw[->, thick, structurepurple!80!black] (lambda.east) -- node[above, font=\scriptsize\bfseries] {Compiler} node[below, font=\scriptsize\bfseries] {Desugaring} (closure.west);
+\end{tikzpicture}
+\caption{The C++ compiler transforms a lambda expression into an anonymous stack-allocated struct. By-value captures become value fields; by-reference captures become reference (pointer) fields.}
+\label{fig:lambda-desugaring}
+\end{figure}
+
 
 Now look at the capture choices inside \texttt{[...]}:
 \begin{itemize}

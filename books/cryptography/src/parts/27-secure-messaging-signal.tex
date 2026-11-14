@@ -6,19 +6,19 @@ sees every plaintext message. Worse, every protocol so far in this series has as
 
 When Alice messages Bob on a phone, Bob is asleep. His screen is dark, his radio is off, he is in a tunnel. Alice wants to fire off ``running 10 min late'' and have it waiting when Bob wakes up, encrypted end-to-end so that not even the messaging company can read it. There is no handshake, because there is no Bob to handshake with. And Alice will send a hundred more messages over the next week, each of which must stay secret even if Bob's phone is stolen on Tuesday and Alice's is compromised on Friday.
 
-This is the \emph{asynchronous, long-lived, end-to-end} setting, and none of the tools so far handle it. The Signal Protocol -- born from Trevor Perrin and Moxie Marlinspike's work around 2013, descended from Off-the-Record Messaging -- is the design that solved it. WhatsApp's two billion users, Google's RCS, Facebook Messenger's secret conversations, and Signal itself all run it essentially unchanged. This chapter builds it from the ground up: the goals (forward secrecy and post-compromise security), the X3DH key agreement that bootstraps a session against an offline partner, and the Double Ratchet that keeps the session secure message after message, year after year. We trace tiny numeric examples, draw the ratchet, break a naive design to see why the real one is shaped the way it is, and finish with the metadata problem and Signal's deniability property.
+This is the \emph{asynchronous, long-lived, end-to-end} setting, and none of the tools so far handle it. The Signal Protocol -- born from Trevor Perrin and Moxie Marlinspike's work around 2013, descended from Off-the-Record Messaging -- is the design that solved it. WhatsApp's two billion users, Google's RCS, Facebook Messenger's secret conversations, and Signal itself all run it essentially unchanged. This chapter explains the goals (forward secrecy and post-compromise security), the X3DH key agreement that bootstraps a session against an offline partner, and the Double Ratchet that keeps the session secure.
 
 \chapterline
 
-\section{What End-to-End Really Promises}
+\section{What End-to-End Promises}
 \label{ch27:e2e-goals}
 
-Start with the threat model, because ``end-to-end encrypted'' is a phrase marketers abuse and engineers must pin down.
+We must define what end-to-end encryption promises against a specific threat model.
 
 The players are familiar. Alice and Bob want to chat. Eve sits on the network. But there is a new, important character: the \emph{server} -- the messaging company's infrastructure, which relays every message because Alice and Bob are rarely online at the same time. In ordinary transport encryption (TLS to the server), the server decrypts everything; it is a trusted middleman. \textbf{End-to-end encryption (E2EE)} removes that trust. The server becomes just another adversary -- an active one that sees all ciphertext and all timing, can drop or reorder or replay messages, and can lie about who is who -- but it must never see plaintext.
 
 \begin{intuitionbox}
-Think of the postal service. Transport encryption is an armored truck: your letter is safe \emph{on the road}, but the post office opens it at the sorting facility, reads it, reseals it, and sends it on. End-to-end encryption is a letter you wrote in a private code only your friend knows. The post office still carries it, still sees the envelope (who, when, how big), but the contents are gibberish to them. E2EE is about distrusting the carrier, not just the road.
+Think of the postal service. Transport encryption is an armored truck: your letter is safe \emph{on the road}, but the post office opens it at the sorting facility, reads it, reseals it, and sends it on. End-to-end encryption is a letter you wrote in a private code only your friend knows. The post office still carries it, still sees the envelope (who, when, how big), but the contents are gibberish to them. E2EE is about distrusting the carrier, not merely the road.
 \end{intuitionbox}
 
 What should E2EE guarantee? Four properties, in rough order of how hard they are to achieve:
@@ -34,6 +34,27 @@ What should E2EE guarantee? Four properties, in rough order of how hard they are
 Forward secrecy and post-compromise security point in opposite directions in time, and it is worth saying them side by side. Forward secrecy protects the \emph{past} from a \emph{future} break (``you cannot reach back''), while post-compromise security protects the \emph{future} from a \emph{past} break (``you cannot stay in''). A protocol with both treats every key as disposable -- old keys are deleted so they cannot be stolen, and new keys are mixed in so a stolen key goes stale. The Double Ratchet is the machine that does both, automatically, on every message.
 \end{focusbox}
 
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\small, >=stealth]
+  % Timeline
+  \draw[->, thick] (0, 0) -- (10, 0) node[right] {Time};
+
+  % Event: Compromise
+  \draw[thick, red] (5, 0.5) -- (5, -0.5) node[below, align=center] {\textbf{Compromise}\\(Keys stolen)};
+
+  % Forward Secrecy Arrow
+  \draw[->, thick, sourceblue!80] (4.5, 0.5) -- (1, 0.5) node[midway, above] {\textbf{Forward Secrecy}};
+  \node[font=\footnotesize, align=center, sourceblue!80] at (2.75, -0.5) {Past messages\\remain secure};
+
+  % Post-Compromise Security Arrow
+  \draw[->, thick, targetgreen!80] (5.5, 0.5) -- (9, 0.5) node[midway, above] {\textbf{Post-Compromise Security}};
+  \node[font=\footnotesize, align=center, targetgreen!80] at (7.25, -0.5) {Future messages\\become secure again\\(after a DH step)};
+\end{tikzpicture}
+\caption{Forward secrecy protects past messages from a future compromise. Post-compromise security (self-healing) ensures that a current compromise does not allow the attacker to read messages indefinitely into the future.}
+\label{fig:secrecy-timeline}
+\end{figure}
+
 \begin{connectionbox}
 Forward secrecy already appeared in Chapter~23 in the TLS setting: use an \emph{ephemeral} Diffie-Hellman key for each session and delete it afterward, so the long-term certificate key cannot decrypt recorded traffic. Signal pushes the same idea to its limit. Instead of one ephemeral key per session, it derives a fresh key per \emph{message}, and it does so without a live handshake. The underlying primitives -- Diffie-Hellman on the elliptic curve Curve25519 (Chapter~21) and HKDF key derivation built on HMAC (Chapter~15) -- are ones you have already met. What is new is how they are combined.
 \end{connectionbox}
@@ -41,9 +62,9 @@ Forward secrecy already appeared in Chapter~23 in the TLS setting: use an \emph{
 \section{Why the Old Tools Do Not Fit}
 \label{ch27:why-old-fails}
 
-Before building Signal, let us watch the obvious approaches fail, because each failure motivates a piece of the real design.
+Each of these properties is necessary because simpler designs fail.
 
-\textbf{Attempt 1: Just use a shared long-term key.} Alice and Bob agree on a key $k$ once (say by scanning a QR code in person) and AES-GCM every message under it forever. Confidential, authenticated, asynchronous -- and it has \emph{no} forward secrecy. Steal $k$ on Tuesday and you decrypt every message ever sent and every message that will ever be sent. A single stolen key exposes the whole conversation.
+\textbf{Attempt 1: Use a shared long-term key.} Alice and Bob agree on a key $k$ once (say by scanning a QR code in person) and AES-GCM every message under it forever. Confidential, authenticated, asynchronous -- and it has \emph{no} forward secrecy. Steal $k$ on Tuesday and you decrypt every message ever sent and every message that will ever be sent. A single stolen key exposes the whole conversation.
 
 \textbf{Attempt 2: Ephemeral Diffie-Hellman per message.} Borrow the TLS trick: for each message, Alice and Bob run a fresh DH exchange, derive a one-time key, encrypt, then delete the ephemeral private keys. Now forward secrecy holds -- old keys are gone. But DH needs \emph{both} parties to contribute a fresh public value, live. Bob is asleep, so nobody is there to send the second half of the handshake.
 
@@ -56,7 +77,7 @@ A tempting non-fix: ``rotate the key by hashing it.'' Set $k_{i+1} = \Hash(k_i)$
 \section{X3DH: Agreeing on a Key With Someone Who Is Asleep}
 \label{ch27:x3dh}
 
-The Extended Triple Diffie-Hellman key agreement, \textbf{X3DH}, is how a Signal session begins. Its job is to let Alice derive a shared secret with Bob and send her first encrypted message while Bob is offline. Three security goals are baked in: forward secrecy from the very first message, cryptographic proof to Alice that the keys belong to Bob, and deniability so neither party can prove to an outsider that the conversation happened.
+The Extended Triple Diffie-Hellman key agreement, \textbf{X3DH}, is how a Signal session begins. Its job is to let Alice derive a shared secret with Bob and send her first encrypted message while Bob is offline. It achieves three security goals: forward secrecy from the very first message, cryptographic proof to Alice that the keys belong to Bob, and deniability so neither party can prove to an outsider that the conversation happened.
 
 \subsection{The keys each party holds}
 \label{ch27:x3dh-keys}
@@ -77,14 +98,12 @@ Bob, while online at some quiet moment, uploads to the server a \emph{pre-key bu
 
 When Alice wants to start talking to Bob, she fetches one pre-key bundle from the server. The server gives her $IK_{\mathrm{pub}}^B$, the signed $SPK_{\mathrm{pub}}^B$, and \emph{one} fresh one-time pre-key $OPK_{\mathrm{pub}}^B$ (which the server then deletes from Bob's pile). Alice first verifies Bob's signature on $SPK_{\mathrm{pub}}^B$ using $IK_{\mathrm{pub}}^B$; if it fails she aborts -- the server tried to feed her a fake pre-key. Then she generates her ephemeral pair $EK = (ek, EK_{\mathrm{pub}})$ and computes \emph{four} Diffie-Hellman shared values:
 
-\[
-\begin{aligned}
+\begin{align*}
 DH_1 &= \mathrm{DH}(ik_A,\; SPK_{\mathrm{pub}}^B) &&\text{Alice identity}\;\times\;\text{Bob signed pre-key}\\
 DH_2 &= \mathrm{DH}(ek_A,\; IK_{\mathrm{pub}}^B) &&\text{Alice ephemeral}\;\times\;\text{Bob identity}\\
 DH_3 &= \mathrm{DH}(ek_A,\; SPK_{\mathrm{pub}}^B) &&\text{Alice ephemeral}\;\times\;\text{Bob signed pre-key}\\
 DH_4 &= \mathrm{DH}(ek_A,\; OPK_{\mathrm{pub}}^B) &&\text{Alice ephemeral}\;\times\;\text{Bob one-time pre-key}
-\end{aligned}
-\]
+\end{align*}
 
 Here $\mathrm{DH}(x, Y)$ means the Curve25519 shared point $x \cdot Y$ (or rather its $x$-coordinate, X25519's output). The shared secret is the HKDF of all four concatenated:
 \[
@@ -97,7 +116,7 @@ Alice now holds $SK$. She deletes $ek_A$ -- the ephemeral private key -- and sen
 \begin{whybox}
 \textbf{Why four DHs and not one?} Each DH binds in a different security property, and you need all of them:
 \begin{itemize}
-  \item $DH_1$ ($ik_A \times SPK^B$) mixes in \emph{Alice's} long-term identity, so the secret depends on who Alice really is. Combined with $DH_2$, it \emph{authenticates both parties} -- an attacker who does not know $ik_A$ cannot compute $DH_1$, and one who does not know $ik_B$ cannot compute $DH_2$.
+  \item $DH_1$ ($ik_A \times SPK^B$) mixes in \emph{Alice's} long-term identity, so the secret depends on who Alice is. Combined with $DH_2$, it \emph{authenticates both parties} -- an attacker who does not know $ik_A$ cannot compute $DH_1$, and one who does not know $ik_B$ cannot compute $DH_2$.
   \item $DH_2$ ($ek_A \times IK^B$) mixes in \emph{Bob's} long-term identity, so Alice knows the secret is shared with the real Bob and nobody else.
   \item $DH_3$ ($ek_A \times SPK^B$) and $DH_4$ ($ek_A \times OPK^B$) mix Alice's \emph{ephemeral} key with Bob's \emph{medium-} and \emph{short-lived} keys. These provide \textbf{forward secrecy}: once $ek_A$, $spk^B$, and $opk^B$ are deleted, nobody -- not even Alice and Bob -- can recompute $SK$ from the long-term identity keys alone.
 \end{itemize}
@@ -109,19 +128,17 @@ The crossed structure matters. $DH_1$ uses Alice's long-term and Bob's medium-te
 
 When Bob comes online, the server hands him Alice's first message. Bob now has everything he needs to compute the \emph{same} four DH values from his side, because Diffie-Hellman is symmetric: $\mathrm{DH}(ik_A, SPK^B_{\mathrm{pub}}) = ik_A \cdot spk_B \cdot G = \mathrm{DH}(spk_B, IK^A_{\mathrm{pub}})$. Concretely Bob computes
 
-\[
-\begin{aligned}
-DH_1 &= \mathrm{DH}(spk_B,\; IK_{\mathrm{pub}}^A), &\quad
+\begin{align*}
+DH_1 &= \mathrm{DH}(spk_B,\; IK_{\mathrm{pub}}^A), &
 DH_2 &= \mathrm{DH}(ik_B,\; EK_{\mathrm{pub}}),\\
-DH_3 &= \mathrm{DH}(spk_B,\; EK_{\mathrm{pub}}), &\quad
+DH_3 &= \mathrm{DH}(spk_B,\; EK_{\mathrm{pub}}), &
 DH_4 &= \mathrm{DH}(opk_B,\; EK_{\mathrm{pub}}),
-\end{aligned}
-\]
+\end{align*}
 
 feeds them through the same HKDF, and recovers the identical $SK$. He decrypts Alice's first message, deletes the one-time pre-key $opk_B$ he just used (so it can never be reused), and the session is open. Bob did \emph{nothing} ahead of time except upload a bundle; he ran zero live round trips. That is what makes the protocol asynchronous.
 
 \begin{walkbox}
-Convince yourself the four values match. $DH_3$ is $\mathrm{DH}(ek_A, SPK_{\mathrm{pub}}^B)$ for Alice and $\mathrm{DH}(spk_B, EK_{\mathrm{pub}})$ for Bob. Alice computes $ek_A \cdot (spk_B \cdot G)$; Bob computes $spk_B \cdot (ek_A \cdot G)$. Scalar multiplication on the curve is associative and commutative in the scalars, so both equal $(ek_A \cdot spk_B)\cdot G$. Same point, same $x$-coordinate, same DH output. The other three are identical in form. This is just ordinary Diffie-Hellman (Chapter~18) run four times with four pairings of the available keys.
+Convince yourself the four values match. $DH_3$ is $\mathrm{DH}(ek_A, SPK_{\mathrm{pub}}^B)$ for Alice and $\mathrm{DH}(spk_B, EK_{\mathrm{pub}})$ for Bob. Alice computes $ek_A \cdot (spk_B \cdot G)$; Bob computes $spk_B \cdot (ek_A \cdot G)$. Scalar multiplication on the curve is associative and commutative in the scalars, so both equal $(ek_A \cdot spk_B)\cdot G$. Same point, same $x$-coordinate, same DH output. The other three are identical in form. This is ordinary Diffie-Hellman (Chapter~18) run four times with four pairings of the available keys.
 \end{walkbox}
 
 The whole exchange has only three arrows, and not one of them needs Bob awake when Alice acts. Figure~\ref{ch27:fig-x3dh-flow} shows the full message flow.
@@ -199,14 +216,12 @@ IK^B &= 5^4 = 4, & SPK^B &= 5^7 = 17, & OPK^B &= 5^3 = 10 \pmod{23}.
 \end{aligned}
 \]
 (Check one: $5^3 = 125 = 5\cdot23 + 10$, so $5^3 \equiv 10$. And $5^4 = 5\cdot10 = 50 \equiv 4$.) Now the four DH values. A DH between private $x$ and public $g^y$ is $(g^y)^x = g^{xy}$.
-\[
-\begin{aligned}
-DH_1 &= (SPK^B)^{ik_A} = 17^{6} \bmod 23 = g^{7\cdot 6} = g^{42} = g^{42 \bmod 22}=g^{20},\\
-DH_2 &= (IK^B)^{ek_A} = 4^{9} = g^{4\cdot 9} = g^{36}=g^{36\bmod 22}=g^{14},\\
-DH_3 &= (SPK^B)^{ek_A} = 17^{9} = g^{7\cdot 9}=g^{63}=g^{63\bmod 22}=g^{19},\\
-DH_4 &= (OPK^B)^{ek_A} = 10^{9} = g^{3\cdot 9}=g^{27}=g^{27\bmod 22}=g^{5}.
-\end{aligned}
-\]
+\begin{align*}
+DH_1 &= (SPK^B)^{ik_A} \equiv 17^{6} \equiv (g^7)^6 = g^{42} \equiv g^{20} \pmod{23},\\
+DH_2 &= (IK^B)^{ek_A} \equiv 4^{9} \equiv (g^4)^9 = g^{36} \equiv g^{14} \pmod{23},\\
+DH_3 &= (SPK^B)^{ek_A} \equiv 17^{9} \equiv (g^7)^9 = g^{63} \equiv g^{19} \pmod{23},\\
+DH_4 &= (OPK^B)^{ek_A} \equiv 10^{9} \equiv (g^3)^9 = g^{27} \equiv g^{5} \pmod{23}.
+\end{align*}
 Reducing the exponents mod $\ord(g)=22$ and evaluating powers of $5$ mod $23$: $g^{20}=5^{20}\equiv 12$, $g^{14}=5^{14}\equiv 13$, $g^{19}=5^{19}\equiv 7$, and $g^{5}=5^{5}\equiv 20 \pmod{23}$. So
 \[
 SK = \mathrm{HKDF}(12 \concat 13 \concat 7 \concat 20).
@@ -224,7 +239,7 @@ X3DH descends from work by Trevor Perrin and Moxie Marlinspike at Open Whisper S
 \section{The Double Ratchet: Keys That Never Stop Moving}
 \label{ch27:double-ratchet}
 
-X3DH gives Alice and Bob one shared secret $SK$. If they just used $SK$ to key AES-GCM for every message, they would be back at Attempt~1, where one stolen key exposes everything. The \textbf{Double Ratchet} takes $SK$ as a seed and from it derives a fresh key for \emph{every single message}, in a way that gives both forward secrecy and post-compromise security. It is called ``double'' because it combines two distinct ratcheting mechanisms.
+X3DH gives Alice and Bob one shared secret $SK$. If they used $SK$ to key AES-GCM for every message, they would be back at Attempt~1, where one stolen key exposes everything. The \textbf{Double Ratchet} takes $SK$ as a seed and from it derives a fresh key for \emph{every single message}, in a way that gives both forward secrecy and post-compromise security. It is called ``double'' because it combines two distinct ratcheting mechanisms.
 
 \begin{intuitionbox}
 A ratchet is a gear that turns only one way -- a socket wrench, a zip tie, a car's parking pawl. Once it clicks forward it cannot click back. The cryptographic analogue: a key-derivation step you can run forward to get the next key but cannot reverse to recover the previous one. Run it on every message and the past is sealed off behind you. The Double Ratchet has a cheap one-way gear (a hash chain) for per-message keys and an asymmetric gear (Diffie-Hellman) that, in addition to turning forward, mixes in fresh randomness so a captured key goes stale. One gives forward secrecy; the other adds self-healing.
@@ -259,10 +274,10 @@ Concretely, the DH output feeds a \emph{root chain}. There is a long-lived \emph
 \]
 producing a new root key $RK'$ and a new \emph{sending} (or receiving) chain key $CK'$. That $CK'$ seeds a fresh symmetric ratchet. So the picture is a tree of chains: the root chain steps forward each time the conversation changes direction and injects new DH randomness; each step spits out a chain key that drives a symmetric ratchet of per-message keys.
 
-Each turn-around actually steps the root chain \emph{twice}. When Alice sees Bob's new public key $B_{\text{new}}$, she first combines it with her \emph{current} secret, $\mathrm{DH}(a_{\text{old}}, B_{\text{new}})$, to get the \emph{receiving} chain that decrypts Bob's message. Only when she replies does she generate a fresh pair $(a_{\text{new}}, A_{\text{new}})$ and compute $\mathrm{DH}(a_{\text{new}}, B_{\text{new}})$ for her new \emph{sending} chain. (If she threw away $a_{\text{old}}$ first, she could not read the very message that carried $B_{\text{new}}$.)
+Each turn-around steps the root chain \emph{twice}. When Alice sees Bob's new public key $B_{\text{new}}$, she first combines it with her \emph{current} secret, $\mathrm{DH}(a_{\text{old}}, B_{\text{new}})$, to get the \emph{receiving} chain that decrypts Bob's message. Only when she replies does she generate a fresh pair $(a_{\text{new}}, A_{\text{new}})$ and compute $\mathrm{DH}(a_{\text{new}}, B_{\text{new}})$ for her new \emph{sending} chain. (If she threw away $a_{\text{old}}$ first, she could not read the very message that carried $B_{\text{new}}$.)
 
 \begin{whybox}
-\textbf{Why this gives post-compromise security.} Suppose the attacker steals all of Bob's state right after message $i$ -- including his current ratchet private key and chain keys. She can read messages for a while. But the next time Alice sends \emph{her} current ratchet public key and Bob replies, Bob generates a \emph{fresh} ratchet key pair whose private half the attacker never saw. The new DH output $DH_{\mathrm{out}}$ depends on this fresh private key, so the attacker cannot compute it. The root key ratchets to an $RK'$ she cannot derive, the chain keys downstream of it are unknown to her, and she is locked out. The session healed itself with no human intervention -- just the normal back-and-forth of conversation injecting entropy she could not predict. One full DH round trip after the compromise ends, secrecy is restored.
+\textbf{Why this gives post-compromise security.} Suppose the attacker steals all of Bob's state right after message $i$ -- including his current ratchet private key and chain keys. She can read messages for a while. But the next time Alice sends \emph{her} current ratchet public key and Bob replies, Bob generates a \emph{fresh} ratchet key pair whose private half the attacker never saw. The new DH output $DH_{\mathrm{out}}$ depends on this fresh private key, so the attacker cannot compute it. The root key ratchets to an $RK'$ she cannot derive, the chain keys downstream of it are unknown to her, and she is locked out. The session healed itself with no human intervention -- the normal back-and-forth of conversation injecting entropy she could not predict. One full DH round trip after the compromise ends, secrecy is restored.
 \end{whybox}
 
 \subsection{Putting both gears together}
@@ -351,14 +366,36 @@ So a rapid-fire monologue is cheap (HMAC only), and a back-and-forth dialogue tr
 \subsection{Tracing the ratchet with tiny numbers}
 \label{ch27:ratchet-toy}
 
-Let us walk a few steps. To keep it by hand, model the symmetric ratchet's HMAC as a toy function $f(k, c) = (3k + c) \bmod 97$ -- \emph{not} cryptographic, just a deterministic mixer that lets us see the chain move. Start a sending chain with $CK_0 = 10$. Using the constants $\texttt{0x01}=1$ for message keys and $\texttt{0x02}=2$ for chain keys:
-\[
-\begin{aligned}
+Let us walk a few steps. To keep it by hand, model the symmetric ratchet's HMAC as a toy function $f(k, c) = (3k + c) \bmod 97$ -- \emph{not} cryptographic, a deterministic mixer that lets us see the chain move. Start a sending chain with $CK_0 = 10$. Using the constants $\texttt{0x01}=1$ for message keys and $\texttt{0x02}=2$ for chain keys:
+\begin{align*}
 MK_0 &= f(10,1) = (30 + 1)\bmod 97 = 31, & CK_1 &= f(10,2) = (30+2)\bmod 97 = 32,\\
 MK_1 &= f(32,1) = (96 + 1)\bmod 97 = 0, & CK_2 &= f(32,2) = (96+2)\bmod 97 = 1,\\
 MK_2 &= f(1,1) = 4, & CK_3 &= f(1,2) = 5.
-\end{aligned}
-\]
+\end{align*}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\small, >=stealth]
+  \node (ck0) [draw=sourceblue!80, fill=sourceblue!15, rounded corners=2pt, minimum width=1.5cm, minimum height=0.6cm] at (0, 0) {$CK_0 = 10$};
+  \node (ck1) [draw=sourceblue!80, fill=sourceblue!15, rounded corners=2pt, minimum width=1.5cm, minimum height=0.6cm] at (3, 0) {$CK_1 = 32$};
+  \node (ck2) [draw=sourceblue!80, fill=sourceblue!15, rounded corners=2pt, minimum width=1.5cm, minimum height=0.6cm] at (6, 0) {$CK_2 = 1$};
+  \node (ck3) [draw=sourceblue!80, fill=sourceblue!15, rounded corners=2pt, minimum width=1.5cm, minimum height=0.6cm] at (9, 0) {$CK_3 = 5$};
+
+  \node (mk0) [draw=targetgreen!80, fill=targetgreen!15, rounded corners=2pt, minimum width=1.5cm, minimum height=0.6cm] at (0, -1.5) {$MK_0 = 31$};
+  \node (mk1) [draw=targetgreen!80, fill=targetgreen!15, rounded corners=2pt, minimum width=1.5cm, minimum height=0.6cm] at (3, -1.5) {$MK_1 = 0$};
+  \node (mk2) [draw=targetgreen!80, fill=targetgreen!15, rounded corners=2pt, minimum width=1.5cm, minimum height=0.6cm] at (6, -1.5) {$MK_2 = 4$};
+
+  \draw[->, thick, sourceblue!80] (ck0) -- node[above] {$f(\cdot, 2)$} (ck1);
+  \draw[->, thick, sourceblue!80] (ck1) -- node[above] {$f(\cdot, 2)$} (ck2);
+  \draw[->, thick, sourceblue!80] (ck2) -- node[above] {$f(\cdot, 2)$} (ck3);
+
+  \draw[->, thick, targetgreen!80] (ck0) -- node[right] {$f(\cdot, 1)$} (mk0);
+  \draw[->, thick, targetgreen!80] (ck1) -- node[right] {$f(\cdot, 1)$} (mk1);
+  \draw[->, thick, targetgreen!80] (ck2) -- node[right] {$f(\cdot, 1)$} (mk2);
+\end{tikzpicture}
+\caption{A trace of the symmetric ratchet using the toy mixer function $f(k, c) = (3k + c) \bmod 97$. The chain keys ($CK_i$) step forward, while message keys ($MK_i$) drop down to encrypt individual messages.}
+\label{fig:toy-ratchet-trace}
+\end{figure}
 Alice encrypts message 0 under $MK_0 = 31$, deletes $CK_0$ and $MK_0$, keeps $CK_1 = 32$. Encrypts message 1 under $MK_1 = 0$, deletes, keeps $CK_2 = 1$. And so on. Now suppose her phone is seized right after message 1, leaking $CK_2 = 1$. The attacker computes $MK_2 = f(1,1) = 4$ and reads message 2 -- but to get $MK_1$ she would need $CK_1 = 32$, and from $CK_2 = 1$ she cannot run $f$ backward (with a real HMAC; our toy $f$ is invertible, which is exactly why $f$ must be a one-way PRF in reality). Messages 0 and 1 stay sealed.
 
 \begin{trapbox}
@@ -373,13 +410,16 @@ The symmetric trace above showed forward secrecy but, as warned, no self-healing
 Suppose the session is running with root value $RK_1 = 40$ and Alice currently holds ratchet key pair $a_1 = 4$ (so her public ratchet key is $5^{4} \equiv 4 \bmod 23$), while Bob's latest ratchet public key on file is $B_1 = 5^{6} \equiv 8$. The attacker compromises Bob right after message 10 and learns $RK_1 = 40$, Bob's ratchet private $b_1 = 6$, and the live chain keys. She can read messages on the current chain.
 
 Now the conversation turns around. Bob, replying, generates a \emph{fresh} ratchet pair $b_2 = 9$ (public $5^{9} \equiv 11$) -- a private scalar the attacker never saw. Alice receives $B_2 = 11$ and does a DH ratchet step against it with her current private $a_1 = 4$:
-\[
-DH_{\mathrm{out}} = (B_2)^{a_1} = 11^{4} = g^{9\cdot 4} = g^{36} = g^{36\bmod 22} = g^{14} = 5^{14} \equiv 13 \pmod{23}.
-\]
+\begin{align*}
+DH_{\mathrm{out}} &= (B_2)^{a_1} \pmod{23}\\
+&\equiv 11^{4} \equiv (g^9)^4 \pmod{23}\\
+&= g^{36} \equiv g^{14} \pmod{23}\\
+&\equiv 5^{14} \equiv 13 \pmod{23}.
+\end{align*}
 The root steps to $RK_2 = r(40, 13) = (5\cdot 40 + 7\cdot 13)\bmod 97 = (200 + 91)\bmod 97 = 291\bmod 97 = 0$, and that $RK_2 = 0$ seeds a brand-new symmetric chain for the new direction. The attacker, knowing $RK_1 = 40$, still cannot reach $RK_2$: she would need $DH_{\mathrm{out}} = (B_2)^{a_1}$, and although she sees both public values $B_2 = 11$ and $A_1 = 4$ on the wire, recovering the secret from them is the discrete-log problem. With the real X25519 group that is infeasible; her stolen $b_1 = 6$ is useless because Bob retired it. From message 11 onward she is locked out -- the session healed itself with one DH round trip's worth of fresh entropy.
 
 \begin{walkbox}
-Why could the attacker not just keep reading? She holds $RK_1$, Bob's \emph{old} private $b_1$, and the old chain keys. But the new chain hangs off $RK_2 = r(RK_1, DH_{\mathrm{out}})$, and $DH_{\mathrm{out}} = a_1 \cdot b_2 \cdot G$ depends on Bob's \emph{new} private $b_2$, which she never captured. She knows $RK_1$ -- the first argument to $r$ -- yet the second argument is exactly the value she cannot compute. One unknown input to a one-way mixer is enough: $RK_2$ is opaque, and every chain key below it with it. The lazy variant of Exercise~\ref{ch27:ex-rootkdf} that drops the old $RK$ would still self-heal \emph{here} (the fresh DH output is enough), but mixing $RK$ in additionally guards against an attacker who learns a single $DH_{\mathrm{out}}$; see that exercise for the case it saves.
+Why can the attacker not keep reading? She holds $RK_1$, Bob's \emph{old} private $b_1$, and the old chain keys. But the new chain hangs off $RK_2 = r(RK_1, DH_{\mathrm{out}})$, and $DH_{\mathrm{out}} = a_1 \cdot b_2 \cdot G$ depends on Bob's \emph{new} private $b_2$, which she never captured. She knows $RK_1$ -- the first argument to $r$ -- yet the second argument is exactly the value she cannot compute. One unknown input to a one-way mixer is enough: $RK_2$ is opaque, and every chain key below it with it. The lazy variant of Exercise~\ref{ch27:ex-rootkdf} that drops the old $RK$ would still self-heal \emph{here} (the fresh DH output is enough), but mixing $RK$ in additionally guards against an attacker who learns a single $DH_{\mathrm{out}}$; see that exercise for the case it saves.
 \end{walkbox}
 
 \subsection{Out-of-order and lost messages}
@@ -462,7 +502,7 @@ Sealed sender hides the sender's identity from the server but \emph{not} traffic
 \section{Authentication, Deniability, and the Safety Number}
 \label{ch27:deniability}
 
-Two subtle properties round out the design: how Alice knows she is really talking to Bob, and why -- despite that -- neither can prove to a court what the other said.
+Two subtle properties round out the design: how Alice knows she is talking to Bob, and why -- despite that -- neither can prove to a court what the other said.
 
 \subsection{Verifying you have the right Bob}
 \label{ch27:safety-number}
@@ -508,7 +548,7 @@ Trace one full session from cold start, naming each property as it is earned:
 Every guarantee from Section~\ref{ch27:e2e-goals} is delivered by a specific, nameable mechanism. This direct mapping from goal to mechanism, together with asynchronous operation and machine-checked proofs, is why most other secure messengers have adopted the Signal Protocol's design.
 
 \begin{aestheticbox}
-Signal requires very little machinery. Two familiar primitives -- Diffie-Hellman key agreement and a hash-based KDF -- are arranged in a loop to achieve guarantees neither provides alone: per-message forward secrecy from the one-way hash chain, post-compromise recovery from fresh Diffie-Hellman shares, asynchronous setup from pre-published keys, and deniability from shared-secret authentication. Nothing here relies on a new hardness assumption or an exotic primitive; all four properties come from the order in which standard operations run and when old keys are erased.
+Signal requires little machinery. Two familiar primitives -- Diffie-Hellman key agreement and a hash-based KDF -- are arranged in a loop to achieve guarantees neither provides alone: per-message forward secrecy from the one-way hash chain, post-compromise recovery from fresh Diffie-Hellman shares, asynchronous setup from pre-published keys, and deniability from shared-secret authentication. Nothing here relies on a new hardness assumption or an exotic primitive; all four properties come from the order in which standard operations run and when old keys are erased.
 \end{aestheticbox}
 
 Signal solves end-to-end messaging between people whose phones are only intermittently
@@ -536,7 +576,7 @@ An attacker fully compromises Bob's device (all keys) immediately after Bob send
 \end{exercise}
 
 \begin{exercise}[Skipped-key denial of service]
-Bob caps stored skipped message keys at $N = 2000$. Describe how an attacker who can inject one forged message header could try to exhaust Bob's memory, what field of the header she manipulates, and exactly what check Bob must perform to refuse the message. Why can Bob not simply remove the cap?
+Bob caps stored skipped message keys at $N = 2000$. Describe how an attacker who can inject one forged message header could try to exhaust Bob's memory, what field of the header she manipulates, and exactly what check Bob must perform to refuse the message. Why can Bob not remove the cap?
 \end{exercise}
 
 \begin{exercise}[Deniability versus signatures]

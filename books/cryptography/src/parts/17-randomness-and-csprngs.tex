@@ -1,36 +1,81 @@
 \chapter{Randomness and CSPRNGs}
 
-In Chapter~16 we saw how a single repeated nonce destroys AES-GCM, which points to a question we have put off for sixteen chapters: where do fresh random bits actually come from? Every secret in this book starts as a coin flip: an AES key is $128$ coin flips, while a nonce, initialization vector, password salt, or ephemeral key demands bits no adversary can predict. Producing those bits on a deterministic machine is a genuine engineering problem whose failure means broken plaintexts and exposed keys.
+In Chapter~16 we saw how a single repeated nonce destroys AES-GCM, which points to a question we have put off for sixteen chapters: where do fresh random bits come from? Every secret in this book starts as a coin flip: an AES key is $128$ coin flips, while a nonce, initialization vector, password salt, or \emph{ephemeral key} (a single-use key generated for one session and then discarded) demands bits no adversary can predict. Producing those bits on a deterministic machine is a genuine engineering problem whose failure means broken plaintexts and exposed keys.
 
-In this chapter we stop taking random bits for granted. We will separate \emph{true} physical randomness from \emph{pseudo} randomness stretched from a small seed, define what makes a generator \emph{cryptographically} secure, look at OS entropy pipelines and process forking, and examine three well-known randomness failures: the Debian OpenSSL key collapse, the \texttt{Dual\_EC\_DRBG} backdoor, and repeated-nonce signatures.
+A practical computer solves that problem in two stages: harvest a small amount of genuine physical noise from hardware, then feed that seed into a \emph{cryptographically secure pseudorandom number generator} (CSPRNG) that stretches it into all the keys and nonces applications need. When either stage fails -- a predictable seed, a backdoored generator, or a reused output -- even unbroken ciphers hand their secrets to an attacker.
 
 \chapterline
 
 \section{Why Cryptography Lives or Dies on Randomness}
 \label{ch17:why-randomness}
 
-Recall the one-time pad: it achieves perfect secrecy, but \emph{only} when the key is uniformly random and never reused. Without the randomness, the same algorithm gives no security at all. The same is true across cryptography. The algorithm is public (Kerckhoffs); the only thing standing between Eve and the plaintext is a quantity she cannot guess. If she \emph{can} guess it -- because it came from a predictable source -- the public algorithm becomes a public decryption procedure that she runs as easily as Bob does.
+Recall the one-time pad: it achieves perfect secrecy, but \emph{only} when the key is uniformly random and never reused. Without the randomness, the same algorithm gives no security at all. The same holds across cryptography. By Kerckhoffs's principle (\S\ref{ch01:kerckhoffs}), the algorithm is public; the only thing standing between Eve and the plaintext is a quantity she cannot guess. If she \emph{can} guess it -- because it came from a predictable source -- the public algorithm becomes a public decryption procedure that she runs as easily as Bob does.
 
 \begin{intuitionbox}
-A cipher is a lockbox whose combination is your key. Kerckhoffs says the lockbox design is printed on the side; security rests entirely on the combination being unguessable. Now suppose the factory sets every combination by reading the wall clock at manufacturing time. The boxes are still ``random'' in the loose sense that you cannot easily predict any one of them in advance -- but an attacker who knows the trick just tries the few thousand plausible timestamps and opens them all. The combination space did not shrink because the math changed; it shrank because the \emph{source} of the combination had far less unpredictability than its length suggested. In cryptography what matters is how far an adversary can narrow the value down, not how long it is.
+A cipher is a lockbox whose combination is your key. Kerckhoffs's principle says the lockbox design is printed on the side; security rests entirely on the combination being unguessable. Now suppose the factory sets every combination by reading the wall clock at manufacturing time. The boxes are still ``random'' in the loose sense that you cannot easily predict any one of them in advance -- yet an attacker who knows the trick tries the few thousand plausible timestamps and opens them all. The combination space did not shrink because the math changed; it shrank because the \emph{source} of the combination had far less unpredictability than its length suggested. In cryptography what matters is how far an adversary can narrow the value down, not how long it is.
 \end{intuitionbox}
 
-The quantity that matters is \emph{how many guesses the best attacker needs}, not how many bits long the value is. We measure that with min-entropy. If a random variable $X$ takes value $x$ with probability $p_x$, its min-entropy is
+The quantity that matters is \emph{how best-guess probability scales}, not how many bits long the value is. Recall min-entropy from Chapter~7: if a random variable $X$ takes each outcome $x$ with probability $p_x = \Pr[X = x]$, its min-entropy is
 \[
   H_\infty(X) \;=\; -\log_2 \max_x p_x .
 \]
-The max picks out the \emph{most likely} value -- the attacker's first guess. If the most likely outcome has probability $2^{-128}$, then $H_\infty = 128$ and even the optimal attacker needs about $2^{128}$ tries; the value is worth its full length. But if some outcome has probability $2^{-20}$ -- say a flawed generator only ever produces one of a million distinct keys -- then $H_\infty = 20$ no matter how many bits the key occupies in memory. A ``$256$-bit key'' with $20$ bits of min-entropy offers only $20$ bits of real security.
+Here $\max_x p_x$ picks out the \emph{most likely} outcome -- the attacker's best single guess. If the most likely outcome has probability $2^{-128}$, then $H_\infty(X) = 128$: no single guess succeeds with probability above $2^{-128}$, and finding $X$ takes roughly $2^{127}$ tries on average, so the value is worth its full length. If instead some outcome has probability $2^{-20}$ -- say a flawed generator only ever produces one of a million distinct keys -- then $H_\infty(X) = 20$ no matter how many bits the key occupies in memory. A ``$256$-bit key'' with $20$ bits of min-entropy offers only $20$ bits of real security.
 
 \begin{focusbox}
-Min-entropy, not Shannon entropy, is the right measure for cryptography. Shannon entropy $H = -\sum_x p_x \log_2 p_x$ averages over all outcomes and answers ``how many bits to encode this on average.'' An attacker does not care about the average; she guesses the \emph{single most likely} value first. Picture a broken generator that outputs the all-zero string $0^{256}$ half the time and a uniform $256$-bit string the other half. Its Shannon entropy is about $\tfrac12 \cdot 1 + \tfrac12 \cdot 257 = 129$ bits, which sounds like plenty for a $128$-bit key. Yet Eve guesses $0^{256}$ first and wins half the time. The min-entropy, $-\log_2(1/2) = 1$ bit, tells the truth. Always size a key by its worst case, which is min-entropy.
+Min-entropy, not Shannon entropy, is the right measure for cryptography. Shannon entropy $H(X) = -\sum_x p_x \log_2 p_x$ averages over all outcomes and answers ``how many bits to encode this on average.'' An attacker does not care about the average; she guesses the \emph{single most likely} value first. Picture a broken generator that outputs the $256$-bit all-zero string $0^{256}$ half the time and one of the remaining $2^{256} - 1$ strings uniformly at random the other half (Figure~\ref{ch17:fig-spiked-keyspace}). Its Shannon entropy is about $\tfrac12 \cdot 1 + \tfrac12 \cdot 257 = 129$ bits, which sounds ample for a $128$-bit key. Yet Eve guesses $0^{256}$ first and wins half the time. The min-entropy, $-\log_2(1/2) = 1$ bit, tells the truth. Always size a key by its worst case, which is min-entropy.
 \end{focusbox}
 
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\small, >=Latex]
+  % Left panel: Uniform 256-bit key
+  \begin{scope}[shift={(0,0)}]
+    \draw[thick, sourceblue!45, fill=sourceblue!4, rounded corners=4pt] (0, -0.55) rectangle (6.15, 3.55);
+    \node[font=\small\bfseries, sourceblue!90!black] at (3.08, 3.2) {Uniform $256$-bit Generator};
+
+    \draw[->, gray!80!black] (0.55, 0.25) -- (5.65, 0.25);
+    \draw[->, gray!80!black] (0.55, 0.25) -- (0.55, 2.75) node[above, font=\footnotesize] {$p_x$};
+
+    \filldraw[fill=sourceblue!25, draw=sourceblue!80!black, thick] (0.75, 0.25) rectangle (5.45, 0.95);
+    \node[font=\footnotesize, sourceblue!90!black] at (3.1, 0.6) {all $2^{256}$ strings at $p_x = 2^{-256}$};
+
+    \node[font=\footnotesize, align=center] at (3.1, 2.05) {Shannon $H = 256$ bits\\[2pt]Min-entropy $H_\infty = 256$ bits\\{\color{targetgreen!80!black}\textbf{Best guess wins w.p.\ $2^{-256}$}}};
+    \node[font=\footnotesize, text=gray!80!black] at (3.1, -0.2) {$0^{256} \qquad\qquad \cdots \qquad\qquad 1^{256}$};
+  \end{scope}
+
+  % Right panel: Spiked broken generator
+  \begin{scope}[shift={(6.85,0)}]
+    \draw[thick, trapred!55, fill=trapred!4, rounded corners=4pt] (0, -0.55) rectangle (6.35, 3.55);
+    \node[font=\small\bfseries, trapred!85!black] at (3.18, 3.2) {Spiked Broken Generator};
+
+    \draw[->, gray!80!black] (0.55, 0.25) -- (5.85, 0.25);
+    \draw[->, gray!80!black] (0.55, 0.25) -- (0.55, 2.75) node[above, font=\footnotesize] {$p_x$};
+
+    % Tall spike at 0^256
+    \filldraw[fill=trapred!65, draw=trapred!85!black, thick] (0.75, 0.25) rectangle (1.15, 2.45);
+    % Tiny flat tail
+    \filldraw[fill=sourceblue!25, draw=sourceblue!80!black, thick] (1.15, 0.25) rectangle (5.65, 0.43);
+
+    \node[font=\footnotesize\bfseries, text=trapred!90!black, anchor=west, align=left] (spk) at (1.55, 2.22) {Peak $p_{\max} = \tfrac12$ at $0^{256}$\\$H_\infty = -\log_2(\tfrac12) = 1$ bit};
+    \draw[->, thick, trapred!85!black] (spk.west) -- (1.2, 2.22);
+
+    \node[font=\footnotesize, text=sourceblue!85!black, align=center] at (3.65, 1.08) {Remaining $\tfrac12$ spread across\\$2^{256}-1$ strings pulls $H \approx 129$ bits};
+    \draw[->, sourceblue!80!black] (3.65, 0.72) -- (3.65, 0.46);
+
+    \node[font=\footnotesize, text=gray!80!black] at (0.95, -0.2) {$0^{256}$};
+    \node[font=\footnotesize, text=gray!80!black] at (3.55, -0.2) {remaining $2^{256}-1$ keys};
+  \end{scope}
+\end{tikzpicture}
+\caption{Why Shannon entropy misleads when a generator has a favored output. Spreading half the probability mass over $2^{256}-1$ keys inflates the average surprise to $H \approx 129$ bits (right), even though Eve guesses the single spike $0^{256}$ first and wins half the time ($H_\infty = 1$ bit).}
+\label{ch17:fig-spiked-keyspace}
+\end{figure}
+
 \begin{walkbox}
-Suppose a website generates ``random'' $6$-digit two-factor codes by seeding a generator with the current Unix time in seconds and reading one code out. Two users who request a code in the same second get correlated codes. Even ignoring that, how big is the real keyspace an attacker faces over a one-day window? (Hint: it is not $10^6$. Count seconds.) Keep the count in mind; it is the difference between $10^6$ guesses and roughly $86{,}400$.
+Suppose a website generates ``random'' six-digit login codes by seeding a generator with the current Unix time in seconds (seconds elapsed since January~1, 1970) and reading one code out. Two users who request a code in the same second get correlated codes. Even ignoring that, how big is the real keyspace an attacker faces over a one-day window? (Hint: it is not $10^6$. Count seconds.) Keep the count in mind; it is the difference between $10^6$ guesses and $86{,}400$.
 \end{walkbox}
 
 \begin{connectionbox}
-Min-entropy, Shannon entropy, and the collision/Renyi entropies are all instances of the Renyi entropy family $H_\alpha$ developed in the companion probability book. Min-entropy is $H_\infty$ (the $\alpha\to\infty$ limit), Shannon is $H_1$, and the collision entropy $H_2$ governs birthday bounds. The ordering $H_\infty \le H_2 \le H_1$ is exactly why min-entropy is the conservative choice: it is the smallest of the three, so sizing a key by it never overstates your security.
+Min-entropy, Shannon entropy, and collision entropy all belong to the R\'enyi entropy family $H_\alpha$ (Chapter~7). Min-entropy is $H_\infty$ (the $\alpha\to\infty$ limit), Shannon entropy is $H_1$, and \emph{collision entropy} $H_2(X) = -\log_2 \sum_x p_x^2$ measures the probability $\sum_x p_x^2$ that two independent draws match, governing birthday bounds. Because $H_\infty(X) \le H_2(X) \le H_1(X)$ for every distribution, sizing a key by min-entropy never overstates its security.
 \end{connectionbox}
 
 \section{True Randomness versus Pseudorandomness}
@@ -38,62 +83,73 @@ Min-entropy, Shannon entropy, and the collision/Renyi entropies are all instance
 
 There are two fundamentally different ways to get bits that look random, and a real system uses them in series. Confusing the two is one of the most common conceptual errors in applied cryptography.
 
-\textbf{True (physical) randomness} comes from a physical process believed to be genuinely unpredictable -- thermal noise across a resistor, jitter between independent clock oscillators, the timing of radioactive decay, the precise arrival times of network packets and keystrokes, shot noise in a reverse-biased diode. The defining feature is that the unpredictability is a property of the \emph{world}, not of any algorithm. There is no formula an attacker could run to reproduce it, because it was never computed. The downside: physical sources are slow, biased, and hard to test. A noisy diode might give you a few kilobits per second of raw entropy, heavily skewed toward $0$ or $1$, that you then have to clean up.
+\textbf{True (physical) randomness} comes from a physical process believed to be genuinely unpredictable: thermal noise across a resistor (voltage fluctuations from heat-driven electron motion), jitter between independent clock oscillators (tiny timing drift between two crystal clocks), radioactive decay timings, exact arrival times of network packets and keystrokes, or shot noise in a reverse-biased diode (electrons randomly crossing a semiconductor barrier). Its unpredictability is a property of the physical world rather than any algorithm; no formula can reproduce it, because it was never computed. Physical sources, however, are slow, biased, and hard to verify. A noisy diode might yield only a few kilobits per second of raw bits, skewed toward $0$ or $1$, that must be cleaned up before use.
 
-\textbf{Pseudorandomness} comes from a deterministic algorithm: feed in a short \emph{seed} and it stretches it into an arbitrarily long stream of bits that \emph{look} random to anyone who does not know the seed. The same seed always produces the same stream -- that determinism is a feature (reproducibility, speed) and a danger (predictability if the seed leaks). A pseudorandom generator manufactures no new entropy. If the seed has $128$ bits of min-entropy, the gigabyte of output it produces still has only $128$ bits of min-entropy; the generator has spread that unpredictability thin, not created more.
+\textbf{Pseudorandomness} comes from a deterministic algorithm: feed in a short \emph{seed} and it stretches that seed into a long stream of bits that \emph{look} random to anyone who does not know the seed. Identical seeds always produce identical streams -- determinism brings speed and reproducibility, yet makes everything predictable if the seed leaks. A pseudorandom generator manufactures no new entropy. If the seed has $128$ bits of min-entropy, a gigabyte of output still has at most $128$ bits of min-entropy; the generator spreads that unpredictability across its output rather than creating more.
 
 \begin{intuitionbox}
-Think of true randomness as mining raw ore and pseudorandomness as stamping coins. The mine (your diode, your interrupt timings) produces a trickle of irregular, impure metal -- real value, but slow and ugly. The mint (your CSPRNG) takes a lump of that metal as a seed and stamps out millions of identical-looking coins fast and cheaply. The mint creates no new gold; it only spreads the gold from the seed across all the coins. Spend the seed's gold twice -- reuse or leak the seed -- and every coin you ever stamped from it is counterfeit. So a real system uses both: gather enough true entropy \emph{once} to seed the mint, then let the mint do the bulk production.
+Think of true randomness as mining raw ore and pseudorandomness as stamping coins. The mine (your diode, your interrupt timings) produces a trickle of irregular, impure metal -- real value, slow to extract. The mint (your CSPRNG) takes a lump of that metal as a seed and stamps out millions of identical-looking coins fast and cheaply. The mint creates no new gold; it spreads the gold from the seed across all the coins. Spend the seed's gold twice -- reuse or leak the seed -- and every coin stamped from it is compromised. A real system uses both: gather enough true entropy \emph{once} to seed the mint, then let the mint do the bulk production.
 \end{intuitionbox}
 
 \begin{formalbox}
-A \emph{pseudorandom generator} (PRG) is a deterministic, efficiently computable function
+Recall from Chapter~10 that a \emph{pseudorandom generator} (PRG) is a deterministic, efficiently computable function
 \[
   G:\{0,1\}^n \;\to\; \{0,1\}^{\ell(n)}, \qquad \ell(n) > n,
 \]
-that maps an $n$-bit seed to a longer $\ell(n)$-bit output (it ``stretches'' the seed). The output is not random -- it ranges over at most $2^n$ of the $2^{\ell(n)}$ possible strings, a vanishing fraction. The goal is to make that tiny sparse subset \emph{look} indistinguishable from the full uniform distribution to any efficient observer. We make ``look indistinguishable'' precise in the next section.
+mapping an $n$-bit seed in $\{0,1\}^n$ to a longer $\ell(n)$-bit string. Its output ranges over at most $2^n$ of the $2^{\ell(n)}$ possible $\ell(n)$-bit strings, a tiny fraction when $\ell(n) \gg n$, yet must look indistinguishable from the uniform distribution on $\{0,1\}^{\ell(n)}$ to every efficient observer.
 \end{formalbox}
 
 \begin{trapbox}
-\textbf{``It passes the statistical tests, so it is secure.''} Statistical test batteries (Diehard, TestU01, NIST SP 800-22) check whether output is \emph{distinguishable from random by generic statistics} -- bias, runs, correlations. Passing them is necessary but nowhere near sufficient for cryptography. A linear congruential generator, $x_{i+1} = (a x_i + c) \bmod m$, can pass many such tests, yet given a handful of consecutive outputs you can solve for $a$, $c$, $m$ and predict every future and past value with linear algebra. The Mersenne Twister, default in Python's \texttt{random} and many languages, passes essentially every statistical test and is still completely predictable: observe $624$ consecutive $32$-bit outputs and you can reconstruct its entire internal state and clone it. Statistical randomness is a property of the \emph{output}; cryptographic randomness is a property of the output \emph{relative to an adversary who analyzes the generator}.
+\textbf{``It passes the statistical tests, so it is secure.''} Statistical test batteries (Diehard, TestU01, and the National Institute of Standards and Technology suite NIST SP 800-22) check whether output is distinguishable from coin flips by fixed surface statistics such as bit bias, run lengths, and short-range correlations. Passing them is necessary, never sufficient, for cryptography. A \emph{linear congruential generator} (LCG), which updates an integer state $x_i$ via $x_{i+1} = (a x_i + c) \bmod m$ for multiplier $a$, increment $c$, and modulus $m$, can pass many statistical checks, yet a handful of consecutive outputs reveal $a$, $c$, and every future and past value by modular algebra. The \emph{Mersenne Twister} -- a fast non-cryptographic generator with a $624$-word state, default in Python's \texttt{random} module and many other languages -- passes standard statistical suites and remains completely predictable: observing $624$ consecutive $32$-bit outputs lets an attacker reconstruct its internal state and clone the stream. Statistical randomness tests the output in isolation; cryptographic randomness tests the output against an adversary who knows the generator's code.
 \end{trapbox}
 
-\begin{example}[Breaking an LCG with two outputs]
+\begin{example}[Breaking an LCG from three outputs]
 \label{ch17:lcg-break}
-Let us verify that claim on a concrete example. Take an LCG $x_{i+1} = (a x_i + c) \bmod m$ with $m = 2^{31}$ and \emph{unknown} multiplier $a$ and increment $c$. Say we observe three consecutive outputs $x_0 = 5$, $x_1 = 33$, $x_2 = 117$. Two unknowns, so two equations suffice:
+Take an LCG $x_{i+1} = (a x_i + c) \bmod m$ with known modulus $m = 2^{31}$ and unknown multiplier $a$ and increment $c$. Suppose we observe three consecutive outputs $x_0 = 5$, $x_1 = 33$, and $x_2 = 117$. Two unknowns require two transition congruences:
 \[
-  33 \equiv 5a + c, \qquad 117 \equiv 33a + c \pmod{2^{31}}.
+  33 \equiv 5a + c \pmod{2^{31}}, \qquad 117 \equiv 33a + c \pmod{2^{31}}.
 \]
-Subtract the first from the second to kill $c$:
+Subtract the first congruence from the second to eliminate $c$, then solve for $a$:
+\begin{align*}
+  117 - 33 &\equiv (33 - 5)\,a \pmod{2^{31}} && \text{(subtract to cancel $c$)} \\
+  84 &\equiv 28\,a \pmod{2^{31}} && \text{($84 = 4 \cdot 21$, $28 = 4 \cdot 7$)} \\
+  21 &\equiv 7\,a \pmod{2^{29}} && \text{(divide modulus and both sides by $\gcd(4, 2^{31}) = 4$).}
+\end{align*}
+Because $7$ is odd, $\gcd(7, 2^{29}) = 1$, so $7$ has a unique inverse modulo $2^{29}$ (namely $7^{-1} \equiv 383{,}479{,}223 \pmod{2^{29}}$). Multiplying $7a \equiv 7 \cdot 3 \pmod{2^{29}}$ by $7^{-1}$ yields
 \[
-  117 - 33 \equiv (33 - 5)\,a \;\Longrightarrow\; 84 \equiv 28\,a \pmod{2^{31}}.
+  a \equiv 3 \pmod{2^{29}}.
 \]
-Now $28 = 4\cdot 7$ and $84 = 4\cdot 21$, and $\gcd(4,2^{31})=4$ divides $84$, so we can divide the congruence by $4$: $21 \equiv 7a \pmod{2^{29}}$. The inverse of $7$ modulo $2^{29}$ exists ($7$ is odd), and $7^{-1} \equiv 383479223 \pmod{2^{29}}$, giving $a \equiv 21 \cdot 383479223 \equiv 3 \pmod{2^{29}}$. That pins $a$ only up to four lifts $a = 3 + j\cdot 2^{29}$ mod $2^{31}$, each with its own $c = 33 - 5a$. Here it does not matter: every output is $\equiv 1 \pmod 4$, so the extra $j \cdot 2^{29}(x_i - 5)$ is a multiple of $2^{31}$ and all four pairs generate the same sequence. Take $a = 3$. Back-substitute: $c = 33 - 5\cdot 3 = 18$. Predict the next value: $x_3 = (3\cdot 117 + 18) \bmod 2^{31} = 369$. We recovered the entire generator and all of its future and past output from \emph{three} samples and a couple of modular operations. Better statistical behavior does not help: the single affine update that makes an LCG fast is also what lets two equations reveal its parameters. Cryptographic security is about resisting an adversary who solves equations, not one who runs chi-squared tests.
+Modulo $2^{31}$, this leaves four candidate values $a = 3 + j \cdot 2^{29}$ for $j \in \{0, 1, 2, 3\}$, each paired with $c = (33 - 5a) \bmod 2^{31}$. All four candidates generate the exact same output sequence: every $x_i$ satisfies $x_i \equiv 1 \pmod 4$, so $x_i - 5$ is a multiple of $4$ and the extra term $j \cdot 2^{29}(x_i - 5)$ vanishes modulo $2^{31}$. Choosing $j = 0$ gives $a = 3$, $c = 33 - 5 \cdot 3 = 18$, and the next output
+\[
+  x_3 \;=\; (3 \cdot 117 + 18) \bmod 2^{31} \;=\; 369.
+\]
+Three observed outputs and a few modular steps expose the entire future and past stream. The single affine update $x \mapsto ax + c$ that makes an LCG fast also lets two equations recover its parameters.
 \end{example}
 
 \section{What Makes a Generator \emph{Cryptographically} Secure}
 \label{ch17:csprng-def}
 
-An ordinary PRG (good enough for a physics simulation) and a \emph{cryptographically secure} PRG (CSPRNG) are held to different standards. The simulation only needs output that is unbiased and uncorrelated enough that statistical estimates converge. A CSPRNG must defeat an active, intelligent adversary who knows the algorithm, sees part of the output, and is trying to predict the rest. Two extra properties separate the two.
+A simulation generator (or \emph{pseudorandom number generator}, PRNG) only needs output unbiased and uncorrelated enough for numerical estimates to converge. A CSPRNG -- called a \emph{deterministic random bit generator} (DRBG) in NIST standards -- must defeat an adversary who knows the algorithm, sees part of the output, and tries to compute the rest. Chapter~10 formalized baseline PRG security in two ways; we recall both here before adding the state-compromise requirements that a long-running generator needs.
 
 \begin{definition}[Next-bit unpredictability]
 \label{ch17:def-nextbit}
-A generator is \emph{next-bit unpredictable} if no efficient ($\PPT$) algorithm, given the first $i$ output bits, can guess bit $i+1$ correctly with probability noticeably better than $1/2$. Formally, for every $\PPT$ predictor $A$ and every $i$,
+Let $G : \{0,1\}^n \to \{0,1\}^{\ell(n)}$ map a uniform $n$-bit seed $s \getsr \{0,1\}^n$ to output bits $(b_1, b_2, \dots, b_{\ell(n)}) = G(s)$. The generator $G$ is \emph{next-bit unpredictable} if no probabilistic polynomial-time ($\PPT$) algorithm $A$, given the first $i$ output bits, guesses bit $b_{i+1}$ with probability noticeably above $1/2$: for every $\PPT$ predictor $A$ and every $i \in \{0, 1, \dots, \ell(n)-1\}$,
 \[
-  \Pr\!\left[\,A\big(b_1 b_2 \cdots b_i\big) = b_{i+1}\,\right] \;\le\; \tfrac12 + \negl(n).
+  \Pr_{s \getsr \{0,1\}^n}\!\bigl[A(b_1, b_2, \dots, b_i) = b_{i+1}\bigr] \;\le\; \tfrac12 + \negl(n),
 \]
+where $\negl(n)$ is a negligible function of the seed length $n$ (Chapter~8).
 \end{definition}
 
 \begin{definition}[Indistinguishability / CSPRNG]
 \label{ch17:def-indist}
-A PRG $G$ is a \emph{CSPRNG} if its output on a uniform seed is computationally indistinguishable from a truly uniform string of the same length: for every $\PPT$ distinguisher $D$,
+A PRG $G : \{0,1\}^n \to \{0,1\}^{\ell(n)}$ with output length $\ell = \ell(n) > n$ is a \emph{CSPRNG} if its output on a uniform seed $s \getsr \{0,1\}^n$ is computationally indistinguishable from a uniform string $r \getsr \{0,1\}^{\ell}$: for every $\PPT$ distinguisher $D$,
 \[
-  \Big|\,\Pr_{s\getsr\{0,1\}^n}\!\big[D(G(s))=1\big] \;-\; \Pr_{r\getsr\{0,1\}^{\ell}}\!\big[D(r)=1\big]\,\Big| \;\le\; \negl(n).
+  \abs[\Big]{\,\Pr_{s\getsr\{0,1\}^n}\!\big[D(G(s))=1\big] \;-\; \Pr_{r\getsr\{0,1\}^{\ell}}\!\big[D(r)=1\big]\,} \;\le\; \negl(n).
 \]
-$D$ is handed a string that is either real $G$ output or true coin flips, and must decide which. If nobody efficient can do better than a coin flip, the generator passes.
+Handed either $G(s)$ or $\ell$ independent coin flips, no efficient algorithm $D$ can tell which it received better than guessing.
 \end{definition}
 
-These two definitions look different but are equivalent, a clean and famous result.
+As Chapter~10 proved for stream-cipher PRGs, these two definitions are equivalent.
 
 \begin{theorem}[Yao, 1982]
 \label{ch17:thm-yao}
@@ -101,82 +157,88 @@ A PRG is next-bit unpredictable if and only if it is indistinguishable from unif
 \end{theorem}
 
 \begin{whybox}
-\textbf{Why next-bit unpredictability already gives you indistinguishability.} One direction is intuitive, and it is the reason ``predict the next bit'' is the right informal test. Suppose some distinguisher $D$ \emph{can} tell $G$'s output from random with advantage $\eps$. Build a next-bit predictor from it via a \emph{hybrid argument}. Consider strings that are ``real for the first $i$ bits, then random for the rest,'' as $i$ slides from $0$ (fully random) to $\ell$ (fully real). $D$ behaves differently at the two ends by $\eps$, so by averaging there must be some position $i$ where swapping bit $i$ from random to real shifts $D$'s output by at least $\eps/\ell$. That single sensitive position is a leak: it means bit $i$ is \emph{correlated} with the earlier real bits in a way $D$ detects. Run $D$ on the first $i-1$ real bits, a random guess $g$ for bit $i$, and random bits after that. If $D$ says ``real,'' predict that bit $i$ equals $g$; if it says ``random,'' predict $1-g$. When $g$ happens to be right, $D$ is looking at the ``real for $i$ bits'' hybrid, so it leans ``real'' more often. That betting rule predicts bit $i$ from bits $1\ldots i{-}1$ with advantage $\eps/\ell$ over chance. So ``no distinguisher'' and ``no predictor'' stand or fall together: any statistical edge an adversary finds can be sharpened into a prediction, and any prediction is a statistical edge. This is why we can design CSPRNGs by asking only the local question -- ``can you guess the next bit?'' -- and get the global guarantee for free.
+\textbf{Why next-bit unpredictability gives indistinguishability.} Recall the hybrid argument of Chapter~10 (\S\ref{ch10:next-bit}): suppose a distinguisher $D$ tells $G(s)$ from uniform with advantage $\eps$ (flipping $D$'s output bit if needed so $D$ outputs $1$, ``real,'' more often on $G(s)$ than on uniform strings). Step across the $\ell + 1$ hybrid distributions that take their first $i$ bits from $G(s)$ and their remaining $\ell - i$ bits uniformly at random, from $i = 0$ (all uniform) to $i = \ell$ (all $G(s)$). Because $D$'s acceptance probability rises by $\eps$ across $\ell$ steps, at some position $i$ switching bit $i$ from random to $b_i$ increases $D$'s probability of outputting $1$ by at least $\eps/\ell$. A predictor given $(b_1, \dots, b_{i-1})$ exploits that jump by guessing a random bit $g$, filling bits $i+1, \dots, \ell$ with coin flips, and running $D$: outputting $g$ when $D$ says $1$ and $1 - g$ when $D$ says $0$ predicts $b_i$ with probability at least $\tfrac12 + \eps/\ell$. Any global distinguishing edge converts into a local next-bit prediction, and vice versa.
 \end{whybox}
 
-For a cryptographic generator we demand more than even these, because a CSPRNG holds long-lived internal state and the attacker may eventually compromise it. Two state-compromise properties:
+Unlike a one-shot stream cipher, an operating-system CSPRNG holds internal state in memory for hours or months, and an attacker may eventually read that state through a memory bug or snapshot. Two state-compromise properties, traced in Figure~\ref{ch17:fig-ratchet}, protect outputs around a leak:
 
 \begin{description}
-  \item[Backtracking resistance (forward secrecy).] An adversary who learns the generator's internal state at time $t$ \emph{cannot} recover bits it output \emph{before} $t$. Past output stays secret even after a state leak. This is achieved by updating the state through a one-way step so old states cannot be reconstructed from new ones.
-  \item[Prediction resistance / recovery (backward secrecy).] After a state compromise, if the generator is \emph{reseeded} with fresh entropy, its future output becomes unpredictable again -- the attacker who saw the old state is locked back out. Without reseeding, a state compromise is permanent: a deterministic generator with known state has no secrets left.
+  \item[Backtracking resistance (forward secrecy).] An adversary who learns the generator's internal state at step $t$ \emph{cannot} recover bits output \emph{before} $t$. Updating the state through a one-way function prevents inverting from $s_t$ back to $s_{t-1}$, keeping earlier keys safe.
+  \item[Prediction resistance / recovery (backward secrecy).] After a state leak, \emph{reseeding} with fresh physical entropy makes future output unpredictable again, locking out the attacker who captured the old state. Without reseeding, a state leak is permanent because a deterministic generator with known state has no remaining secrets.
 \end{description}
 
 \begin{intuitionbox}
-Backtracking resistance is a one-way ratchet on the state: each tick grinds the previous state through a hash-like step you cannot run backward, so capturing today's state tells you nothing about last week's output. Prediction resistance is a re-locking mechanism: stir in fresh physical entropy and the attacker who photographed your state is suddenly behind a new lock they never saw. A good CSPRNG has both -- it forgets its past on every step and can lock out an intruder on every reseed.
+Backtracking resistance is a one-way ratchet on the state: each step grinds the old state through a non-invertible update, so capturing today's state reveals nothing about yesterday's keys. Prediction resistance is a re-locking mechanism: stir in fresh physical entropy and an attacker holding a snapshot of the old state can no longer compute subsequent states. A production CSPRNG provides both.
 \end{intuitionbox}
 
-\begin{figure}[H]
+\begin{figure}[htbp]
 \centering
 \begin{tikzpicture}[
   font=\small, >=Latex,
-  st/.style={draw, rounded corners=2pt, minimum width=1.5cm, minimum height=0.75cm, align=center, inner sep=4pt},
-  state/.style={st, fill=sourceblue!15},
-  leaked/.style={st, fill=trapred!20, draw=trapred!80!black},
-  reseeded/.style={st, fill=targetgreen!18, draw=targetgreen!80!black},
-  outbox/.style={st, fill=structurepurple!12, minimum width=1.3cm, minimum height=0.65cm},
-  lbl/.style={font=\footnotesize\scshape, text=gray}
+  st/.style={draw, rounded corners=2.5pt, minimum width=1.85cm, minimum height=0.78cm, align=center, inner sep=4pt},
+  state/.style={st, fill=sourceblue!14, draw=sourceblue!80!black},
+  leaked/.style={st, fill=trapred!20, draw=trapred!85!black, thick},
+  reseeded/.style={st, fill=targetgreen!18, draw=targetgreen!80!black, thick},
+  outbox/.style={st, fill=structurepurple!12, draw=structurepurple!75!black, minimum width=1.65cm, minimum height=0.68cm},
+  outleak/.style={st, fill=trapred!12, draw=trapred!75!black, minimum width=1.65cm, minimum height=0.68cm},
+  outsafe/.style={st, fill=targetgreen!12, draw=targetgreen!75!black, minimum width=1.65cm, minimum height=0.68cm},
+  lbl/.style={font=\footnotesize, text=gray!85!black}
 ]
-  % Time ruler
-  \node[lbl] at (0,4.6) {Step $t=0$};
-  \node[lbl] at (2.8,4.6) {Step $t=1$};
-  \node[lbl] at (5.6,4.6) {Step $t=2$};
-  \node[lbl] at (8.4,4.6) {Step $t=3$};
-
   % State nodes
-  \node[state] (s0) at (0,1.5) {State $s_0$};
-  \node[state] (s1) at (2.8,1.5) {State $s_1$};
-  \node[leaked] (s2) at (5.6,1.5) {State $s_2$};
-  \node[reseeded] (s3) at (8.4,1.5) {State $s_3$};
+  \node[state] (s0) at (0, 1.55) {State $s_0$};
+  \node[state] (s1) at (3.4, 1.55) {State $s_1$};
+  \node[leaked] (s2) at (6.8, 1.55) {State $s_2$};
+  \node[reseeded] (s3) at (10.55, 1.55) {State $s_3$};
 
-  % Forward transitions
-  \draw[->, thick] (s0) -- node[above=2pt, font=\scriptsize] {$f(\cdot)$} (s1);
-  \draw[->, thick] (s1) -- node[above=2pt, font=\scriptsize] {$f(\cdot)$} (s2);
-  \draw[->, thick] (s2) -- node[above=2pt, font=\scriptsize] {$f(\cdot \xor e)$} (s3);
+  % Forward state transitions (labels below so top is clear for reverse arrow)
+  \draw[->, thick] (s0) -- node[below=2pt, font=\footnotesize] {$f(s_0)$} (s1);
+  \draw[->, thick] (s1) -- node[below=2pt, font=\footnotesize] {$f(s_1)$} (s2);
+  \draw[->, thick, targetgreen!80!black] (s2) -- node[below=2pt, font=\footnotesize, text=targetgreen!85!black] {$f(s_2 \xor e)$} (s3);
 
-  % Reseed injection
-  \draw[->, thick, targetgreen!80!black] (8.4,3.2) -- node[right=3pt, font=\scriptsize, align=left] {Reseed entropy $e$\\(Prediction resistance)} (s3);
-
-  % Outputs
-  \node[outbox] (b0) at (0,0.1) {Bits $b_0$};
-  \node[outbox] (b1) at (2.8,0.1) {Bits $b_1$};
-  \node[outbox] (b2) at (5.6,0.1) {Bits $b_2$};
-  \node[outbox] (b3) at (8.4,0.1) {Bits $b_3$};
-
-  \draw[->, thick, gray] (s0) -- (b0);
-  \draw[->, thick, gray] (s1) -- (b1);
-  \draw[->, thick, gray] (s2) -- (b2);
-  \draw[->, thick, gray] (s3) -- (b3);
-
-  % Compromise callout
-  \node[draw, rounded corners=2pt, dashed, trapred!80, fill=trapred!6, font=\scriptsize, align=center, inner sep=4pt] at (5.6,3.6) {
-    \textbf{State Compromise at $t=2$}\\Adversary captures $s_2$
+  % Compromise callout above s2 (well separated from reseed box and reverse label)
+  \node[draw=trapred!80!black, rounded corners=2pt, dashed, fill=trapred!7, font=\footnotesize, text=trapred!90!black, align=center, inner sep=3.5pt] (comp) at (6.8, 3.65) {
+    \textbf{Leak at $t=2$:}\\attacker reads $s_2$
   };
+  \draw[->, dashed, thick, trapred!80!black] (comp.south) -- (s2.north);
 
-  % Blocked reverse arrow
-  \draw[->, thick, dashed, trapred!80!black] (s2.north west) to[bend right=30] 
-    node[above=2pt, font=\scriptsize, align=center] {$\times$ One-way $f^{-1}$ impossible\\Past outputs ($b_0, b_1$) protected!} (s1.north east);
+  % Blocked reverse arrow above s1--s2, shifted toward x=4.6 so it stays clear of comp
+  \draw[->, thick, dashed, trapred!85!black] (s2.north west) to[bend right=24] (s1.north east);
+  \node[font=\footnotesize, text=trapred!90!black, align=center] at (4.45, 2.68) {One-way $f$ cannot invert:\\$b_0, b_1$ stay secret};
+
+  % Reseed injection into s3
+  \node[draw=targetgreen!80!black, rounded corners=2pt, fill=targetgreen!10, font=\footnotesize, text=targetgreen!85!black, align=center, inner sep=3.5pt] (reseed) at (10.55, 3.65) {
+    \textbf{Fresh entropy $e$}\\reseeds $s_3$
+  };
+  \draw[->, thick, targetgreen!80!black] (reseed.south) -- (s3.north);
+
+  % Outputs via one-way output map g
+  \node[outbox] (b0) at (0, 0) {Bits $b_0$};
+  \node[outbox] (b1) at (3.4, 0) {Bits $b_1$};
+  \node[outleak] (b2) at (6.8, 0) {Bits $b_2$};
+  \node[outsafe] (b3) at (10.55, 0) {Bits $b_3$};
+
+  \draw[->, thick, gray!80!black] (s0) -- node[left=1pt, font=\footnotesize] {$g(s_0)$} (b0);
+  \draw[->, thick, gray!80!black] (s1) -- node[left=1pt, font=\footnotesize] {$g(s_1)$} (b1);
+  \draw[->, thick, trapred!80!black] (s2) -- node[left=1pt, font=\footnotesize, text=trapred!85!black] {$g(s_2)$} (b2);
+  \draw[->, thick, targetgreen!80!black] (s3) -- node[left=1pt, font=\footnotesize, text=targetgreen!85!black] {$g(s_3)$} (b3);
+
+  % Step labels below
+  \node[lbl] at (0, -0.68) {Step $t=0$ (safe)};
+  \node[lbl] at (3.4, -0.68) {Step $t=1$ (safe)};
+  \node[lbl, text=trapred!85!black] at (6.8, -0.68) {Step $t=2$ (exposed)};
+  \node[lbl, text=targetgreen!85!black] at (10.55, -0.68) {Step $t=3$ (recovered)};
 \end{tikzpicture}
-\caption{CSPRNG state evolution and compromise properties. The one-way transition $f$ prevents inverting back from a leaked state $s_2$ to recover past states ($s_1, s_0$), providing backtracking resistance (forward secrecy). Folding in fresh entropy $e$ at $s_3$ locks out the attacker moving forward, providing prediction resistance.}
+\caption{Stateful CSPRNG evolution under a state leak at step $t=2$. One-way transitions $s_{t+1} = f(s_t)$ and output maps $b_t = g(s_t)$ prevent an attacker who captures $s_2$ from inverting backward to recover $s_1, s_0$ or earlier outputs $b_0, b_1$ (backtracking resistance). Mixing fresh physical entropy $e$ into $s_3$ locks the attacker out of $b_3$ onward (prediction resistance).}
 \label{ch17:fig-ratchet}
 \end{figure}
 
 \begin{example}[A CSPRNG you already have: AES in counter mode]
 \label{ch17:ctr-prg}
-You can turn any secure block cipher into a CSPRNG. Take a random $128$-bit key $k$ (the seed) and a counter $\textsf{ctr}$ starting at $0$, and output
+Any secure block cipher turns into a CSPRNG. Take a uniform $128$-bit key $k \getsr \{0,1\}^{128}$ as the seed and encrypt successive $128$-bit counter blocks $0, 1, 2, \dots$:
 \[
   G(k) \;=\; \Enc_k(0)\,\concat\,\Enc_k(1)\,\concat\,\Enc_k(2)\,\concat\cdots
 \]
-Each block is the cipher applied to a fresh counter value. If AES is a secure pseudorandom permutation -- which is exactly the assumption Chapter~12 rests on -- then its outputs on distinct inputs are indistinguishable from independent random blocks, so $G$ is a CSPRNG. This construction is used in practice: it is essentially the core of the CTR\_DRBG construction in NIST SP 800-90A, the most widely deployed CSPRNG family on the planet. Backtracking resistance is added by periodically replacing $k$ with fresh cipher output and discarding the old key.
+If AES is a secure pseudorandom permutation (Chapter~12), its outputs on distinct counter blocks are computationally indistinguishable from independent uniform blocks (so long as far fewer than $2^{64}$ blocks are drawn under one key, the birthday bound of Chapter~13), making $G$ a CSPRNG. This is the core of \texttt{CTR\_DRBG} in NIST SP 800-90A, one of the most widely deployed CSPRNG designs: after each request it generates a fresh key $k'$ from cipher output and overwrites the old key $k$, providing backtracking resistance.
 \end{example}
 
 \section{Where Entropy Actually Comes From}
@@ -185,137 +247,269 @@ Each block is the cipher applied to a fresh counter value. If AES is a secure ps
 A CSPRNG is a deterministic mint; it needs a seed of real, physical, unpredictable bits to stamp. Where does a computer -- a machine engineered to be perfectly deterministic and repeatable -- find unpredictability? It collects it from the few places where physical processes affect the machine's behavior.
 
 \begin{description}
-  \item[Hardware noise sources.] Modern CPUs ship a dedicated entropy source. Intel's \texttt{RDRAND}/\texttt{RDSEED} and AMD's equivalent sample thermal noise in a metastable latch (a circuit deliberately balanced on a knife edge so noise tips it $0$ or $1$). This is the fastest true-random source available, but it is opaque silicon you cannot audit -- which, as we will see, makes some people nervous.
-  \item[Interrupt and device timing.] The operating system records the precise cycle counter at each hardware interrupt: disk seeks completing, network packets arriving, keys pressed, mouse moved. The low bits of these timestamps are influenced by chaotic physical timing (head turbulence, thermal drift, human muscle jitter) and are hard to predict even for code running on the same machine.
-  \item[Uninitialized and chaotic state.] Historically, things like the contents of uninitialized memory or fine-grained scheduling races were tapped. These are weak and discouraged now -- they can be far more predictable than they look, especially right after boot. (One such trick caused the Debian disaster of \S\ref{ch17:debian}.)
+  \item[Hardware noise sources.] Modern CPUs include a dedicated \emph{random number generator} (RNG) circuit. Intel's \texttt{RDRAND}/\texttt{RDSEED} instructions and AMD's equivalents sample thermal noise in a \emph{metastable latch} (a circuit balanced between $0$ and $1$ until thermal fluctuations tip it to one side). Hardware instructions are the fastest physical entropy source on a server, though because the circuit sits inside opaque silicon that software cannot inspect, operating systems mix \texttt{RDSEED} with other sources rather than trusting it alone (\S\ref{ch17:dualec}).
+  \item[Interrupt and device timing.] At each \emph{hardware interrupt} -- a signal from a device requesting CPU attention as disk reads complete, network packets arrive, keys are pressed, or a mouse moves -- the operating system reads the CPU's high-frequency \emph{cycle counter} (which ticks billions of times per second). The low bits of those timestamps reflect chaotic physical variation (air turbulence in drives, oscillator drift, human muscle jitter) and remain unpredictable even to other processes on the machine.
+  \item[Uninitialized and chaotic state.] Older systems sometimes read \emph{uninitialized memory} (RAM cells read before being written) or thread-scheduling races. Both are weak and discouraged: right after boot they can repeat from run to run (and relying on uninitialized reads triggered the Debian failure of \S\ref{ch17:debian}).
 \end{description}
 
-The raw bits from any of these are \emph{biased} and \emph{correlated} -- a diode might emit $0$ sixty percent of the time, interrupt timestamps share high bits. You cannot use them directly as a key. You run them through an \emph{entropy extractor} (in practice a cryptographic hash or a keyed construction) that compresses many biased input bits into fewer, nearly uniform output bits.
+Raw bits from any physical source are \emph{biased} and \emph{correlated} -- a diode may emit $0$ sixty percent of the time, and consecutive interrupt timestamps share their upper bits. Using them directly as a key would leak structure. Instead, the system passes them through an \emph{entropy extractor} (in practice a cryptographic hash or HMAC) that compresses many biased input bits into a shorter, nearly uniform seed.
 
 \begin{whybox}
-\textbf{Why hashing concentrates entropy.} Suppose you collect $1000$ raw bits from a biased, correlated source, but you can argue they jointly contain at least $256$ bits of min-entropy -- meaning no particular $1000$-bit pattern has probability above $2^{-256}$. Feed them into SHA-256. The output is $256$ bits. The \emph{leftover hash lemma} (and in practice the random-oracle heuristic) tells us that hashing a source with $k$ bits of min-entropy down to somewhat fewer than $k$ bits yields output statistically close to uniform. Intuitively, a good hash spreads its input chaotically across all $2^{256}$ outputs, so the input's unpredictability -- however lumpily distributed across the raw bits -- gets stirred into near-uniform unpredictability across the digest. The catch is the bookkeeping: you must \emph{conservatively estimate} how much min-entropy the raw input really carries, because if you over-credit it (assume $256$ when it is really $40$), the polished output looks uniform but is only $40$ bits strong. Entropy estimation is the hardest and most error-prone part of the pipeline.
+\textbf{Why hashing concentrates entropy.} Suppose you collect $1000$ raw bits from a biased, correlated source whose joint distribution still has at least $256$ bits of min-entropy -- meaning no single $1000$-bit pattern occurs with probability above $2^{-256}$. Hash those $1000$ bits with SHA-256. A hash that behaves like a random oracle (Chapter~14) maps distinct inputs independently across $\{0,1\}^{256}$, stirring lumpy input unpredictability into a nearly uniform $256$-bit digest; without any random-oracle assumption, the \emph{leftover hash lemma} below gives a provable bound using universal hashing at the cost of a small output-length reduction. Either way, the hard step is \emph{estimating} how much min-entropy the raw samples carry: if you credit the source with $256$ bits when it holds only $40$, the SHA-256 digest looks uniform to every statistical test yet takes only $2^{40}$ guesses to brute-force from the seed side.
 \end{whybox}
 
 \begin{connectionbox}
-The leftover hash lemma is a probability result: if a source $X$ has min-entropy $\ge k$ and $H$ is drawn from a universal hash family with output length $m \le k - 2\log_2(1/\eps)$, then $(H, H(X))$ is within statistical distance $\eps$ of uniform. The $2\log_2(1/\eps)$ gap is the ``entropy tax'' you pay for a provable guarantee -- you must throw away a couple dozen bits to push the statistical distance down to cryptographic levels. The companion probability book derives this from the collision-entropy ($H_2$) bound; it is the same birthday-style counting that governs hash collisions.
+The \emph{leftover hash lemma} makes extraction unconditional. Let $X$ be a source with min-entropy $H_\infty(X) \ge k$, and choose $H$ uniformly at random from a \emph{universal hash family} with $m$-bit outputs -- a set of keyed functions such that any two distinct inputs $x \ne y$ collide, $\Pr_H[H(x) = H(y)] \le 2^{-m}$. Whenever
+\[
+  m \;\le\; k - 2\log_2\!\Bigl(\frac{1}{\eps}\Bigr),
+\]
+the pair $(H, H(X))$ has statistical distance at most $\eps$ from uniform (even to an attacker who knows which hash function $H$ was chosen). The $2\log_2(1/\eps)$ deduction is the ``entropy tax'' paid for an unconditional guarantee, derived in the companion probability book from collision entropy $H_2$.
 \end{connectionbox}
 
 \begin{example}[Estimating min-entropy from a biased coin]
 \label{ch17:biased-coin}
-Suppose your only entropy source is a coin that lands heads with probability $p = 0.6$, flips independent. How many flips to seed a $128$-bit key? The min-entropy \emph{per flip} is governed by the more likely outcome, heads:
+Suppose your entropy source flips an independent biased coin that lands heads ($1$) with probability $p = 0.6$ and tails ($0$) with probability $0.4$. How many flips are needed for $128$ bits of min-entropy? The per-flip min-entropy is set by the more likely outcome:
 \[
-  H_\infty(\text{one flip}) = -\log_2(0.6) \approx 0.737 \text{ bits}.
+  H_\infty(\text{one flip}) \;=\; -\log_2(0.6) \;\approx\; 0.737 \text{ bits}.
 \]
-For $n$ independent flips the min-entropy adds: $0.737\,n$ bits. To reach $128$ bits you need
+Across $n$ independent flips, min-entropy adds to $0.737\,n$ bits, so reaching $128$ bits requires
 \[
-  n \;\ge\; \frac{128}{0.737} \approx 174 \text{ flips}.
+  n \;\ge\; \frac{128}{0.737} \;\approx\; 174 \text{ flips}.
 \]
-Notice you need \emph{more} than $128$ flips even though each flip is one bit -- bias costs you. A naive engineer who assumed ``$128$ flips give $128$ bits'' would seed with only $128 \times 0.737 \approx 94$ bits of real strength, a $34$-bit shortfall that turns a $2^{128}$ search into a $2^{94}$ one. And $0.737$ is the \emph{optimistic} estimate that assumes perfect independence; real sources are correlated, so you discount further.
+You need $174$ flips rather than $128$ even though each flip produces one bit -- bias costs entropy, and as Figure~\ref{ch17:fig-biased-entropy} shows, min-entropy drops far more steeply with bias than Shannon entropy ($H(0.6) \approx 0.971$ bits). Assuming ``$128$ flips give $128$ bits'' leaves only $128 \times 0.737 \approx 94$ bits of strength, shrinking a $2^{128}$ search to $2^{94}$. Real physical sources also exhibit correlations between adjacent samples, requiring an additional safety discount.
 \end{example}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=11.0cm, height=5.9cm,
+  font=\small,
+  xmin=0.5, xmax=1.0,
+  ymin=0, ymax=1.12,
+  xtick={0.5,0.6,0.7,0.8,0.9,1.0},
+  ytick={0,0.2,0.4,0.6,0.8,1.0},
+  xlabel={Bias toward the more likely bit, $p = \max(\Pr[1], \Pr[0])$},
+  ylabel={Entropy per flip (bits)},
+  axis lines=left,
+  ymajorgrids, xmajorgrids, grid style={gray!20},
+  legend style={at={(0.03,0.06)}, anchor=south west, font=\footnotesize, draw=gray!50, fill=white}
+]
+  % Shannon entropy H(p)
+  \addplot[domain=0.5:0.999, samples=100, dashed, very thick, sourceblue]
+    {-x*ln(x)/ln(2) - (1-x)*ln(1-x)/ln(2)};
+  \addlegendentry{Shannon $H(p)$ (average)}
+
+  % Min-entropy H_inf(p)
+  \addplot[domain=0.5:1.0, samples=100, solid, very thick, trapred]
+    {-ln(x)/ln(2)};
+  \addlegendentry{Min-entropy $H_\infty(p) = -\log_2 p$}
+
+  % Vertical guide at p=0.6
+  \draw[dotted, thick, gray!80!black] (axis cs:0.6, 0) -- (axis cs:0.6, 0.971);
+  \fill[sourceblue] (axis cs:0.6, 0.971) circle (2pt);
+  \fill[trapred] (axis cs:0.6, 0.737) circle (2pt);
+
+  % Clean right-side annotations at p=0.6 (zero overlap with axes or legend)
+  \node[font=\footnotesize, text=sourceblue!90!black, anchor=west, fill=white, inner sep=1.5pt] at (axis cs:0.608, 0.99) {$H(0.6) = 0.971$};
+  \node[font=\footnotesize\bfseries, text=trapred!90!black, anchor=west, fill=white, inner sep=1.5pt] at (axis cs:0.608, 0.74) {$H_\infty(0.6) = 0.737$};
+
+  \draw[<->, thick, quotientorange!90!black] (axis cs:0.78, 0.358) -- node[right=2pt, font=\footnotesize, text=quotientorange!90!black, fill=white, inner sep=1pt] {overcredit gap} (axis cs:0.78, 0.76);
+\end{axis}
+\end{tikzpicture}
+\caption{Shannon entropy $H(p)$ versus min-entropy $H_\infty(p) = -\log_2 p$ for a biased coin as the dominant outcome probability $p$ grows from $0.5$ (fair) to $1.0$ (stuck). Because $H(p)$ is flat near $p = 0.5$, mild bias barely dents the average ($0.971$ bits at $p = 0.6$) while cutting min-entropy sharply ($0.737$ bits).}
+\label{ch17:fig-biased-entropy}
+\end{figure}
 
 \begin{example}[Sizing an extractor with the leftover-hash tax]
 \label{ch17:extractor-tax}
-Now run those biased flips through an extractor and see what the bookkeeping costs. From Example~\ref{ch17:biased-coin}, $174$ flips of the $p=0.6$ coin carry about $128$ bits of min-entropy. We want output within statistical distance $\eps = 2^{-64}$ of uniform -- a comfortable cryptographic margin. The leftover hash lemma caps the safe output length at
+Now pass those biased flips through a universal-hash extractor and track the bit budget (Figure~\ref{ch17:fig-extractor-budget}). From Example~\ref{ch17:biased-coin}, $174$ flips of the $p=0.6$ coin supply $k \approx 128$ bits of min-entropy. For a target statistical distance $\eps = 2^{-64}$ from uniform, the leftover hash lemma caps the provably uniform output length at
 \[
-  m \;\le\; k - 2\log_2\!\frac{1}{\eps} \;=\; 128 - 2\cdot 64 \;=\; 0 \text{ bits}.
+  m \;\le\; k - 2\log_2\!\Bigl(\frac{1}{\eps}\Bigr) \;=\; 128 - 2 \cdot 64 \;=\; 0 \text{ bits}.
 \]
-Zero usable bits: at this $\eps$ the entropy tax eats the entire seed. To extract a $128$-bit key you must instead collect enough input that $k \ge m + 2\log_2(1/\eps) = 128 + 128 = 256$ bits of min-entropy, i.e.
+At $\eps = 2^{-64}$ the $128$-bit safety margin consumes the entire $128$-bit budget. Extracting a $128$-bit key at this margin requires $k \ge m + 2\log_2(1/\eps) = 128 + 128 = 256$ bits of input min-entropy, which takes
 \[
-  n \;\ge\; \frac{256}{0.737} \approx 348 \text{ flips}.
+  n \;\ge\; \frac{256}{0.737} \;\approx\; 348 \text{ flips}.
 \]
-So provable extraction of a $128$-bit key from this source needs roughly $348$ flips, not $174$. In practice systems lean on the random-oracle heuristic (treat SHA-256 as ideal) to avoid paying the full $2\log_2(1/\eps)$ tax, but the lesson stands: a provable guarantee costs entropy, and the gap between ``looks uniform'' and ``provably uniform'' is real bits you must harvest.
+Provable extraction of a $128$-bit key from this coin therefore needs $348$ flips rather than $174$. Operating systems often model SHA-256 or BLAKE2s as a random oracle to avoid paying the full $2\log_2(1/\eps)$ universal-hash tax, yet still harvest conservative margins (for instance $256$ bits of estimated entropy before seeding) to absorb estimation error.
 \end{example}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\small, >=Latex]
+  % Scale: 1 bit = 0.028 cm -> 348 bits = 9.74 cm, 256 bits = 7.17 cm, 128 bits = 3.58 cm
+  % Row 1: 348 raw flips
+  \node[font=\small\bfseries, anchor=east] at (-0.25, 2.0) {1. Raw harvest:};
+  \filldraw[fill=sourceblue!18, draw=sourceblue!80!black, thick] (0, 1.65) rectangle (7.17, 2.35);
+  \node[font=\footnotesize\bfseries, text=sourceblue!90!black] at (3.58, 2.0) {$k = 256$ bits of min-entropy};
+  \filldraw[fill=gray!14, draw=gray!70!black, dashed, thick] (7.17, 1.65) rectangle (9.74, 2.35);
+  \node[font=\footnotesize, text=gray!85!black] at (8.45, 2.0) {$92$ lost (bias)};
+  \node[font=\footnotesize, anchor=west, text=gray!85!black] at (9.88, 2.0) {$348$ flips};
+
+  % Row 2: 174 flips (undersized)
+  \node[font=\small\bfseries, anchor=east] at (-0.25, 1.0) {2. If $174$ flips:};
+  \filldraw[fill=trapred!18, draw=trapred!80!black, thick] (0, 0.65) rectangle (3.58, 1.35);
+  \node[font=\footnotesize, text=trapred!90!black] at (1.79, 1.0) {$128$-bit extractor tax};
+  \node[font=\footnotesize\bfseries, anchor=west, text=trapred!85!black] at (3.75, 1.0) {$m = 0$ provable bits left ($2\log_2(1/\eps) = 128$)};
+
+  % Row 3: 348 flips (properly sized)
+  \node[font=\small\bfseries, anchor=east] at (-0.25, 0.0) {3. With $348$ flips:};
+  \filldraw[fill=targetgreen!20, draw=targetgreen!80!black, thick] (0, -0.35) rectangle (3.58, 0.35);
+  \node[font=\footnotesize\bfseries, text=targetgreen!85!black] at (1.79, 0.0) {$m = 128$-bit key};
+  \filldraw[fill=quotientorange!18, draw=quotientorange!85!black, thick] (3.58, -0.35) rectangle (7.17, 0.35);
+  \node[font=\footnotesize, text=quotientorange!90!black] at (5.38, 0.0) {$128$-bit margin};
+  \node[font=\footnotesize, anchor=west, text=targetgreen!85!black] at (7.32, 0.0) {within $\eps = 2^{-64}$ of uniform};
+\end{tikzpicture}
+\caption{Bit budget in Examples~\ref{ch17:biased-coin} and~\ref{ch17:extractor-tax} for extracting a $128$-bit key within statistical distance $\eps = 2^{-64}$ of uniform from a $p = 0.6$ coin. Bias shrinks $348$ raw flips down to $k = 256$ bits of min-entropy, half of which pays the leftover-hash margin $2\log_2(1/\eps) = 128$ bits, leaving $m = 128$ near-uniform key bits.}
+\label{ch17:fig-extractor-budget}
+\end{figure}
 
 \section{Seeding, Reseeding, and the OS CSPRNG}
 \label{ch17:seeding}
 
-Put the pieces together and you get the architecture every modern operating system uses. There is exactly one true-entropy collection problem, solved once (well) by the kernel, and then a fast CSPRNG that everyone draws from.
+Put the pieces together and you get the architecture every modern operating system uses (Figure~\ref{ch17:fig-arch}). Physical entropy collection is solved in one place by the \emph{kernel} (the privileged core of the operating system), which feeds a fast CSPRNG that applications share:
 
 \begin{enumerate}
   \item \textbf{Collect.} The kernel continuously harvests raw bits from interrupt timings, hardware RNG instructions, and device events into an \emph{entropy pool}, tracking a conservative estimate of how much min-entropy the pool holds.
-  \item \textbf{Seed.} When enough min-entropy has accumulated (Linux waits for a threshold before declaring the pool ``initialized''), the pool is hashed down to seed a CSPRNG -- on Linux, a ChaCha20-based generator.
-  \item \textbf{Stretch.} Applications call \texttt{getrandom()} / read \texttt{/dev/urandom} / call \texttt{BCryptGenRandom}, and the CSPRNG stamps out as many bits as asked, fast.
-  \item \textbf{Reseed.} The kernel periodically folds fresh harvested entropy back into the CSPRNG state, providing recovery (prediction resistance) in case the state ever leaked.
+  \item \textbf{Seed.} Once estimated min-entropy crosses an initialization threshold (on Linux, $256$ bits), the kernel hashes the pool to seed its CSPRNG -- on modern Linux, a ChaCha20-based generator.
+  \item \textbf{Stretch.} Applications call \texttt{getrandom()}, read \texttt{/dev/urandom}, or call \texttt{BCryptGenRandom}, and the CSPRNG produces as many bytes as requested at memory speed.
+  \item \textbf{Reseed.} The kernel periodically folds fresh harvested noise into the CSPRNG state, restoring security (prediction resistance) if an earlier state ever leaked.
 \end{enumerate}
 
 \begin{applicationbox}
-\textbf{What to actually call.} On Linux/modern Unix, call \texttt{getrandom()} (or read \texttt{/dev/urandom} once it is seeded); in Python use \texttt{secrets} or \texttt{os.urandom}; in Go use \texttt{crypto/rand}; in Java \texttt{SecureRandom}; in the browser \texttt{crypto.getRandomValues}; on Windows \texttt{BCryptGenRandom}. These all funnel to the OS CSPRNG. You should essentially \emph{never} build your own generator or seed one yourself -- the OS has already solved entropy collection, reseeding, and fork safety better than you will. The one caveat: at boot, before the pool is initialized, \texttt{/dev/urandom} historically returned low-entropy output without complaint. The modern fix is \texttt{getrandom()} with no flags, which \emph{blocks} until the pool is seeded. Use it.
+\textbf{Which interface to call.} On Linux and modern Unix, call \texttt{getrandom()} (or read \texttt{/dev/urandom} once initialized); in Python use \texttt{secrets} or \texttt{os.urandom}; in Go use \texttt{crypto/rand}; in Java use \texttt{SecureRandom}; in browsers use \texttt{crypto.getRandomValues}; on Windows use \texttt{BCryptGenRandom}. All of these route to the OS CSPRNG. Never build your own generator or seed one yourself -- the kernel already handles entropy collection, reseeding, and fork safety. One boot-time detail matters: before the pool reaches its initial threshold, \texttt{/dev/urandom} historically returned low-entropy bytes without warning, whereas \texttt{getrandom()} with default flags \emph{blocks} until the pool is seeded. Prefer \texttt{getrandom()}.
 \end{applicationbox}
 
 \begin{trapbox}
-\textbf{\texttt{/dev/random} versus \texttt{/dev/urandom}: the myth.} Folklore says \texttt{/dev/random} is ``more secure'' because it blocks when entropy is ``low.'' On modern Linux this is wrong and harmful. Once the CSPRNG is seeded with enough min-entropy (a few hundred bits, once), it produces cryptographically strong output forever -- entropy is not a fuel that gets ``used up'' as you read bits, because a CSPRNG is computational, not information-theoretic. The old blocking behavior of \texttt{/dev/random} caused real outages (servers hanging on key generation waiting for ``entropy'' that was a fiction) without adding security. The correct mental model: you need a sufficient seed \emph{once}; after that, read as much as you want from the unblocking interface. The only genuine concern is the very early boot window before that first seed exists.
+\textbf{\texttt{/dev/random} versus \texttt{/dev/urandom}: the myth.} Old advice claimed \texttt{/dev/random} was ``more secure'' because it blocked whenever an ``entropy counter'' ran low. On modern Linux that model has been retired. Once a CSPRNG is seeded with $256$ bits of min-entropy, it generates cryptographically strong output indefinitely -- reading bytes does not ``drain'' computational security the way a one-time pad consumes key bits. The legacy blocking behavior of \texttt{/dev/random} stalled servers during TLS handshakes and key generation without adding security. You need a strong seed \emph{once} at boot; after that, draw freely from \texttt{getrandom()} or \texttt{/dev/urandom}.
 \end{trapbox}
 
-\begin{figure}[H]
+\begin{figure}[htbp]
 \centering
 \begin{tikzpicture}[
   font=\small, >=Latex,
-  stage/.style={draw, rounded corners=2pt, minimum height=1.75cm, minimum width=2.3cm, align=center, inner sep=3.5pt},
-  srcbox/.style={stage, fill=structurepurple!12},
-  poolbox/.style={stage, fill=quotientorange!15},
-  corebox/.style={stage, fill=sourceblue!15},
-  outbox/.style={stage, fill=targetgreen!15},
-  lbl/.style={font=\footnotesize\scshape, text=gray}
+  stage/.style={draw, rounded corners=2.5pt, minimum height=1.85cm, minimum width=2.45cm, align=left, inner sep=4.5pt},
+  srcbox/.style={stage, fill=structurepurple!12, draw=structurepurple!80!black},
+  poolbox/.style={stage, fill=quotientorange!15, draw=quotientorange!85!black},
+  corebox/.style={stage, fill=sourceblue!14, draw=sourceblue!80!black},
+  outbox/.style={stage, fill=targetgreen!15, draw=targetgreen!80!black},
+  lbl/.style={font=\footnotesize\bfseries, text=gray!85!black}
 ]
-  % Stage Headers
-  \node[lbl] at (0, 1.45) {1. Physical Harvest};
-  \node[lbl] at (3.95, 1.45) {2. Kernel Pool};
-  \node[lbl] at (7.9, 1.45) {3. CSPRNG Core};
-  \node[lbl] at (11.85, 1.45) {4. System Interface};
+  % Stage headers
+  \node[lbl] at (0, 1.32) {1. Physical Harvest};
+  \node[lbl] at (3.75, 1.32) {2. Kernel Pool};
+  \node[lbl] at (7.50, 1.32) {3. CSPRNG Core};
+  \node[lbl] at (11.25, 1.32) {4. OS Interface};
 
-  % Main stage nodes
+  % Main stage nodes (every bullet fits on one line)
   \node[srcbox] (src) at (0, 0) {
-    \textbf{Raw Noise} \\
-    {\scriptsize $\bullet$ Interrupt jitter} \\
-    {\scriptsize $\bullet$ \texttt{RDSEED} / thermal} \\
-    {\scriptsize $\bullet$ Disk / input timings}
+    \textbf{Raw Noise}\\[1pt]
+    {\footnotesize $\bullet$ Interrupt time}\\
+    {\footnotesize $\bullet$ \texttt{RDSEED}}\\
+    {\footnotesize $\bullet$ Disk / input}
   };
 
-  \node[poolbox] (pool) at (3.95, 0) {
-    \textbf{Entropy Pool} \\
-    {\scriptsize $\bullet$ Online health tests} \\
-    {\scriptsize $\bullet$ Min-entropy gauge} \\
-    {\scriptsize $\bullet$ Hash extraction}
+  \node[poolbox] (pool) at (3.75, 0) {
+    \textbf{Entropy Pool}\\[1pt]
+    {\footnotesize $\bullet$ Health tests}\\
+    {\footnotesize $\bullet$ Min-entropy}\\
+    {\footnotesize $\bullet$ Hash extract}
   };
 
-  \node[corebox] (core) at (7.9, 0) {
-    \textbf{ChaCha20 State} \\
-    {\scriptsize $\bullet$ Seeded once at boot} \\
-    {\scriptsize $\bullet$ One-way ratchet} \\
-    {\scriptsize $\bullet$ High-speed stream}
+  \node[corebox] (core) at (7.50, 0) {
+    \textbf{ChaCha20}\\[1pt]
+    {\footnotesize $\bullet$ Seeded once}\\
+    {\footnotesize $\bullet$ State ratchet}\\
+    {\footnotesize $\bullet$ Fast stream}
   };
 
-  \node[outbox] (out) at (11.85, 0) {
-    \textbf{\texttt{getrandom()}} \\
-    {\scriptsize $\bullet$ Blocks until seeded} \\
-    {\scriptsize $\bullet$ Fork-safe kernel lock} \\
-    {\scriptsize $\bullet$ Keys, nonces, salts}
+  \node[outbox] (out) at (11.25, 0) {
+    \textbf{\texttt{getrandom()}}\\[1pt]
+    {\footnotesize $\bullet$ Waits for seed}\\
+    {\footnotesize $\bullet$ Fork-safe}\\
+    {\footnotesize $\bullet$ Keys, nonces}
   };
 
-  % Forward flow arrows
-  \draw[->, thick] (src) -- node[above=2pt, font=\tiny] {biased} (pool);
-  \draw[->, thick] (pool) -- node[above=2pt, font=\tiny] {extracted} (core);
-  \draw[->, thick] (core) -- node[above=2pt, font=\tiny] {expanded} (out);
+  % Forward flow arrows (1.30 cm gaps so labels sit with clear space)
+  \draw[->, thick] (src) -- node[above=2pt, font=\footnotesize] {raw} (pool);
+  \draw[->, thick] (pool) -- node[above=2pt, font=\footnotesize] {seed} (core);
+  \draw[->, thick] (core) -- node[above=2pt, font=\footnotesize] {bytes} (out);
 
   % Periodic reseed feedback loop
-  \draw[->, thick, targetgreen!80!black] (pool.south) -- ++(0,-0.65) -| (core.south)
-    node[pos=0.25, below=2pt, font=\scriptsize, align=center] {Periodic reseed folds fresh physical entropy\\into live state (Prediction Resistance)};
+  \draw[->, thick, targetgreen!80!black] (pool.south) -- ++(0,-0.62) -| (core.south)
+    node[pos=0.25, below=2pt, font=\footnotesize, text=targetgreen!85!black, align=center] {Periodic reseed mixes fresh physical entropy into live state (prediction resistance)};
 \end{tikzpicture}
-\caption{The operating system randomness pipeline. Physical noise is continually gathered into an entropy pool where online health tests and min-entropy accounting monitor source viability. Once initialized, the pool seeds a deterministic CSPRNG (such as ChaCha20 or AES-CTR), which emits unlimited high-speed cryptographic bits via \texttt{getrandom()}. Periodic reseeding restores security after a state leak.}
+\caption{The operating-system randomness pipeline. Raw hardware noise feeds the kernel entropy pool, where health tests and min-entropy accounting guard source quality. Once initialized, the pool hashes down to seed a fast kernel CSPRNG (such as ChaCha20 or AES-CTR) accessed via \texttt{getrandom()}, with periodic reseeds restoring security if state ever leaks.}
 \label{ch17:fig-arch}
 \end{figure}
 
 \subsection{Fork Safety: When One Becomes Two}
 \label{ch17:fork}
 
-A CSPRNG is deterministic: same state, same output. Usually that is fine -- the state keeps advancing. But \texttt{fork()} clones a process \emph{including its memory}, and that is exactly where determinism becomes a problem. If an application keeps a userspace CSPRNG (its own copy of the state, seeded once at startup) and then forks, parent and child now hold \emph{identical} generator state. They will produce the \emph{same} ``random'' stream -- the same session keys, the same nonces -- independently, each unaware of the other.
+A CSPRNG is deterministic: identical states emit identical bytes. On Unix-like operating systems, the \texttt{fork()} system call spawns a child process by cloning the parent process's memory byte for byte. If a program maintains a \emph{userspace} CSPRNG -- generator state stored in the program's own memory rather than inside the kernel, seeded once at startup -- and then calls \texttt{fork()}, parent and child inherit \emph{identical} generator state (left half of Figure~\ref{ch17:fig-fork-safety}). Both processes then step through the exact same ``random'' stream -- generating identical session keys and identical nonces -- without knowing the other exists.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\small, >=Latex]
+  % Left panel: Userspace CSPRNG + fork (unsafe)
+  \begin{scope}[shift={(0,0)}]
+    \draw[thick, trapred!55, fill=trapred!4, rounded corners=4pt] (0, -0.45) rectangle (6.55, 4.15);
+    \node[font=\small\bfseries, trapred!85!black] at (3.28, 3.8) {Userspace Cache + \texttt{fork()} (Unsafe)};
+
+    \node[draw=sourceblue!80!black, fill=sourceblue!12, rounded corners=2pt, minimum width=3.1cm, minimum height=0.65cm, font=\footnotesize\bfseries] (p0) at (3.28, 3.0) {Startup memory: state $s_0$};
+
+    \node[draw=trapred!80!black, fill=trapred!14, rounded corners=2pt, minimum width=2.35cm, minimum height=0.68cm, align=center, font=\footnotesize] (wa) at (1.72, 1.65) {Worker A\\cloned $s_0$};
+    \node[draw=trapred!80!black, fill=trapred!14, rounded corners=2pt, minimum width=2.35cm, minimum height=0.68cm, align=center, font=\footnotesize] (wb) at (4.84, 1.65) {Worker B\\cloned $s_0$};
+
+    \draw[->, thick, trapred!80!black] (2.45, 2.67) -- node[left=2pt, font=\footnotesize] {\texttt{fork()}} (wa.north);
+    \draw[->, thick, trapred!80!black] (4.11, 2.67) -- node[right=2pt, font=\footnotesize] {\texttt{fork()}} (wb.north);
+
+    \node[draw=trapred!85!black, fill=trapred!20, rounded corners=2pt, minimum width=2.05cm, minimum height=0.58cm, font=\footnotesize\bfseries, text=trapred!90!black] (na) at (1.72, 0.45) {Nonce $N_1$};
+    \node[draw=trapred!85!black, fill=trapred!20, rounded corners=2pt, minimum width=2.05cm, minimum height=0.58cm, font=\footnotesize\bfseries, text=trapred!90!black] (nb) at (4.84, 0.45) {Nonce $N_1$};
+
+    \draw[->, thick, trapred!80!black] (wa) -- (na);
+    \draw[->, thick, trapred!80!black] (wb) -- (nb);
+
+    \node[font=\footnotesize\bfseries, text=trapred!90!black] at (3.28, -0.15) {Duplicate nonces ($N_1 = N_1$)};
+  \end{scope}
+
+  % Right panel: Kernel getrandom() (safe)
+  \begin{scope}[shift={(7.10,0)}]
+    \draw[thick, targetgreen!65!black, fill=targetgreen!4, rounded corners=4pt] (0, -0.45) rectangle (6.65, 4.15);
+    \node[font=\small\bfseries, targetgreen!80!black] at (3.32, 3.8) {Kernel \texttt{getrandom()} (Fork-Safe)};
+
+    \node[draw=sourceblue!80!black, fill=sourceblue!12, rounded corners=2pt, minimum width=2.35cm, minimum height=0.65cm, align=center, font=\footnotesize] (ka) at (1.68, 3.0) {Worker A\\(no local state)};
+    \node[draw=sourceblue!80!black, fill=sourceblue!12, rounded corners=2pt, minimum width=2.35cm, minimum height=0.65cm, align=center, font=\footnotesize] (kb) at (4.96, 3.0) {Worker B\\(no local state)};
+
+    \node[draw=targetgreen!80!black, fill=targetgreen!16, rounded corners=2pt, minimum width=4.9cm, minimum height=0.72cm, align=center, font=\footnotesize\bfseries] (kern) at (3.32, 1.65) {Single kernel state: $s_0 \to s_1 \to s_2$};
+
+    \draw[->, thick, sourceblue!80!black] (ka.south) -- node[left=2pt, font=\footnotesize] {call 1} (2.25, 2.01);
+    \draw[->, thick, sourceblue!80!black] (kb.south) -- node[right=2pt, font=\footnotesize] {call 2} (4.39, 2.01);
+
+    \node[draw=targetgreen!80!black, fill=targetgreen!20, rounded corners=2pt, minimum width=2.05cm, minimum height=0.58cm, font=\footnotesize\bfseries, text=targetgreen!85!black] (kna) at (1.68, 0.45) {Nonce $N_1$};
+    \node[draw=targetgreen!80!black, fill=targetgreen!20, rounded corners=2pt, minimum width=2.15cm, minimum height=0.58cm, font=\footnotesize\bfseries, text=targetgreen!85!black] (knb) at (4.96, 0.45) {Nonce $N_2 \ne N_1$};
+
+    \draw[->, thick, targetgreen!80!black] (2.25, 1.29) -- (kna.north);
+    \draw[->, thick, targetgreen!80!black] (4.39, 1.29) -- (knb.north);
+
+    \node[font=\footnotesize\bfseries, text=targetgreen!85!black] at (3.32, -0.15) {Serialized reads emit distinct nonces};
+  \end{scope}
+\end{tikzpicture}
+\caption{Why userspace generator caches fail across \texttt{fork()}. Cloning process memory duplicates a userspace state $s_0$ into both workers so they emit the same nonce $N_1$ (left), whereas \texttt{getrandom()} queries a single kernel state that advances between calls and hands each worker distinct bytes (right).}
+\label{ch17:fig-fork-safety}
+\end{figure}
 
 \begin{attackbox}
-\textbf{Fork-induced nonce reuse.} Picture a web server that seeds an in-process CSPRNG at startup, then forks worker processes to handle connections. Every worker inherits the identical seed. Worker A and worker B each generate what they think is a fresh random nonce for AES-GCM -- and produce the \emph{same} nonce for different messages under the same key. A repeated GCM nonce is catastrophic: it leaks the XOR of the two plaintexts and, worse, lets an attacker recover the GHASH authentication key and forge tags. One careless fork turns a correct AEAD scheme into a broken one. The same bug sank some early TLS deployments and is a recurring cause of duplicate ECDSA nonces (see \S\ref{ch17:nonce-reuse}).
+\textbf{Fork-induced nonce reuse.} Picture a web server that seeds an in-process CSPRNG at startup, then forks worker processes to handle connections. Every worker inherits the identical seed. Worker A and worker B each generate what they think is a fresh random nonce for AES-GCM -- and produce the \emph{same} nonce for different messages under the same key. As Chapter~16 showed, a repeated GCM nonce leaks the XOR of the two plaintexts and exposes the GHASH authentication key, allowing tag forgeries. One unguarded fork breaks a sound AEAD cipher, and the same bug has repeatedly caused duplicate signature nonces (\S\ref{ch17:nonce-reuse}).
 \end{attackbox}
 
 \begin{whybox}
-\textbf{Why the OS interface is fork-safe and a userspace cache is not.} \texttt{getrandom()} and \texttt{/dev/urandom} go to the kernel, which has \emph{one} CSPRNG state shared across all processes; the kernel serializes access, so parent and child reading after a fork get different bytes -- there is no per-process copy to clone. A userspace library that caches generator state in process memory loses this for free. Three fixes exist. First, call the OS interface every time (simplest and recommended). Second, detect forks by comparing a cached PID against \texttt{getpid()} and reseeding on mismatch -- fragile, because PIDs wrap around and recycle. Third, on modern Linux, register the seed buffer with \texttt{MADV\_WIPEONFORK} so the child's copy is zeroed at fork, forcing a reseed before use. OpenSSL, after being hit by this bug, now mixes the PID and a fork-generation counter into its DRBG precisely to survive this.
+\textbf{Why the OS interface is fork-safe and a userspace cache is not.} \texttt{getrandom()} and \texttt{/dev/urandom} query the kernel, which holds \emph{one} CSPRNG state outside process memory and serializes reads, so parent and child receive distinct bytes after a fork (right half of Figure~\ref{ch17:fig-fork-safety}). A userspace library that caches generator state in process memory forfeits that guarantee. Three defenses exist:
+\begin{enumerate}
+  \item Call the OS interface directly on each request (simplest and recommended).
+  \item Record the \emph{process ID} (PID) at seed time, compare against \texttt{getpid()} on each draw, and reseed on mismatch -- fragile on its own because finite PIDs eventually wrap around and get reused by later descendants.
+  \item On Linux, mark the state buffer with \texttt{MADV\_WIPEONFORK} so the kernel zeroes the child's copy during \texttt{fork()}, forcing a fresh reseed before output. OpenSSL combines this with fork-generation counters in its userspace DRBG.
+\end{enumerate}
 \end{whybox}
 
 \begin{implementbox}
@@ -347,7 +541,7 @@ if pid == 0:                          # child
     os._exit(0)
 else:                                 # parent
     os.wait()
-    print("parent:", g.random_bytes(8).hex())  # SAME as child -- bug!
+    print("parent:", g.random_bytes(8).hex())  # SAME as child -- bug
 
 # THE FIX: ask the OS every time. Different in parent and child,
 # correctly seeded at boot, no state to clone.
@@ -359,16 +553,49 @@ Run it: the two \texttt{ToyDRBG} lines after the fork print \emph{identical} hex
 \subsection{Health Tests: Catching a Source That Dies}
 \label{ch17:health}
 
-A physical entropy source is a piece of hardware, and hardware fails -- a noise diode degrades, a ring oscillator locks to a fixed value, RDSEED returns all-ones because a power rail sagged. The danger is that a \emph{stuck} source still produces output; it just produces \emph{predictable} output. A CSPRNG dutifully stretches that into key material, and nothing downstream looks wrong. So a real entropy pipeline runs \emph{online health tests} on the raw source, before extraction, to catch a source that has died.
+A physical entropy source is hardware, and hardware fails: a noise diode degrades, a \emph{ring oscillator} (a loop of logic inverters whose timing jitter is sampled for noise) locks onto a periodic cycle, or \texttt{RDSEED} returns all-ones when a voltage rail droops. A failed source often keeps emitting bits -- predictable ones. Downstream, a hash and CSPRNG turn even all-ones input into balanced-looking key material with no complaint. Real entropy pipelines therefore run \emph{online health tests} directly on the raw samples, before extraction, to catch a dying source (Figure~\ref{ch17:fig-health-placement}):
 
 \begin{description}
-  \item[Repetition Count Test.] Flag if the same raw sample value repeats more than a cutoff number of times in a row -- the signature of a stuck output. NIST SP 800-90B sets the cutoff from the claimed per-sample min-entropy $H$: roughly $C = 1 + \lceil 20 / H \rceil$ for a false-positive rate near $2^{-20}$. A source claiming $H = 1$ bit/sample trips after about $21$ identical samples.
-  \item[Adaptive Proportion Test.] Over a sliding window (e.g.\ $512$ or $1024$ samples), count how often the window's first value reappears. If one value dominates beyond a binomial cutoff, the source has collapsed toward a biased or frozen state even though it is not perfectly stuck.
+  \item[Repetition Count Test.] Raise an alarm if the same raw sample value repeats $C$ times in a row, catching stuck hardware. NIST SP 800-90B sets $C = 1 + \ceil{20 / H}$ from the source's claimed per-sample min-entropy $H$ (for a false-alarm probability near $2^{-20}$); a source claiming $H = 1$ bit per sample trips on $21$ identical samples.
+  \item[Adaptive Proportion Test.] Across a sliding window (such as $512$ or $1024$ raw samples), count how often the window's first sample value recurs. If that count exceeds a threshold set from the binomial distribution (the count distribution of independent trials), the source has drifted toward heavy bias even if it is not completely stuck.
 \end{description}
 
 \begin{whybox}
-\textbf{Why test the raw source and not the CSPRNG output.} You cannot health-test the output of a good CSPRNG -- by design it looks uniform even when seeded from a totally dead source, so a statistical test on it tells you nothing about the seed. A failure is visible only \emph{upstream}, on the raw physical samples before they are whitened. This is why the architecture separates ``estimate and test the source'' from ``stretch with the CSPRNG'': the health test guards the one stage where degradation is still detectable. Put the test after the hash and you are testing your hash function, not your diode.
+\textbf{Why test the raw source and not the CSPRNG output.} A CSPRNG is built to emit uniform-looking bits from any seed, including a predictable seed from a dead diode. Statistical suites run on CSPRNG output therefore test the hash or cipher rather than the physical noise source. Hardware degradation is visible only \emph{upstream}, on the raw samples before extraction removes their surface bias (Figure~\ref{ch17:fig-health-placement}).
 \end{whybox}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\small, >=Latex]
+  % Upstream raw trace
+  \node[font=\small\bfseries, anchor=east] at (-0.2, 1.55) {Raw hardware bits:};
+  \node[draw=sourceblue!80!black, fill=sourceblue!12, rounded corners=2pt, minimum width=2.2cm, minimum height=0.65cm, font=\footnotesize\ttfamily] (rawok) at (1.15, 1.55) {0 1 1 0 1 0};
+  \node[draw=trapred!85!black, fill=trapred!18, thick, rounded corners=2pt, minimum width=2.65cm, minimum height=0.65cm, font=\footnotesize\ttfamily\bfseries, text=trapred!90!black] (rawbad) at (3.78, 1.55) {1 1 1 1 1 1 1};
+
+  % Health test watching raw bits
+  \node[draw=targetgreen!80!black, fill=targetgreen!14, rounded corners=2pt, align=center, inner sep=4pt, font=\footnotesize] (ht) at (8.75, 1.55) {
+    \textbf{Upstream Health Test (catches failure)}\\Repetition Count trips on stuck \texttt{1}s
+  };
+  \draw[->, thick, targetgreen!80!black] (rawbad.east) -- (ht.west);
+
+  % Extractor + CSPRNG
+  \node[draw=gray!75!black, fill=gray!12, rounded corners=2pt, minimum width=5.05cm, minimum height=0.62cm, font=\footnotesize\bfseries] (ext) at (2.58, 0.35) {SHA-256 Extractor $+$ CSPRNG};
+  \draw[->, thick, gray!75!black] (2.58, 1.22) -- (ext.north);
+
+  % Downstream output
+  \node[font=\small\bfseries, anchor=east] at (-0.2, -0.85) {CSPRNG output:};
+  \node[draw=sourceblue!80!black, fill=sourceblue!12, rounded corners=2pt, minimum width=5.05cm, minimum height=0.65cm, font=\footnotesize\ttfamily] (out) at (2.58, -0.85) {1 0 1 1 0 0 1 0 0 1 1 0 1};
+  \draw[->, thick, gray!75!black] (ext.south) -- (out.north);
+
+  % Downstream test blind
+  \node[draw=trapred!80!black, dashed, fill=trapred!7, rounded corners=2pt, align=center, inner sep=4pt, font=\footnotesize, text=trapred!90!black] (blind) at (8.75, -0.85) {
+    \textbf{Downstream Suite (blind to failure)}\\Output still looks uniform after diode dies
+  };
+  \draw[->, thick, dashed, trapred!80!black] (out.east) -- (blind.west);
+\end{tikzpicture}
+\caption{Why health tests belong on the raw physical source rather than on CSPRNG output. When a hardware diode freezes on \texttt{1}, the repetition run is obvious upstream, whereas hashing and stretching turn even stuck input into statistically balanced output that passes downstream randomness suites.}
+\label{ch17:fig-health-placement}
+\end{figure}
 
 \section{Famous RNG Failures}
 \label{ch17:failures}
@@ -379,63 +606,67 @@ The ideas of min-entropy and reseeding are easier to appreciate after seeing rea
 \label{ch17:debian}
 
 \begin{attackbox}
-\textbf{What happened.} In 2006 a Debian maintainer, chasing warnings from the Valgrind/Purify memory-analysis tools, commented out a line in OpenSSL's seeding code that mixed \emph{uninitialized} buffer contents into the entropy pool. The tools complained because reading uninitialized memory is normally a bug; here it was deliberate entropy gathering. The edit removed essentially all the unpredictability from OpenSSL's seeding on Debian and its derivatives (Ubuntu, etc.) for nearly two years. The PRG's only remaining real input was the process ID.
+\textbf{What happened.} In 2006 a Debian maintainer, silencing warnings from the Valgrind and Purify memory debuggers (tools that flag reads of memory locations that have not yet been written), commented out two lines in OpenSSL's seeding code that mixed uninitialized buffer bytes into its entropy pool -- including the buffer through which OpenSSL also passed its \texttt{/dev/urandom} bytes. That edit stripped nearly all physical entropy from OpenSSL on Debian and its derivatives (such as Ubuntu) for almost two years, leaving the process ID as the only varying seed input.
 
-\textbf{The damage.} A Linux PID is at most $32{,}768$ values. So every key OpenSSL generated on an affected system -- SSH host and user keys, TLS server keys, OpenVPN keys, DSA/RSA keypairs -- came from one of only about $2^{15}$ possible seeds (times a couple of architecture and key-size variants). Researchers simply \emph{pre-generated every possible key}. To attack a server you did not break any math; you looked its public key up in a table of $32{,}768$ candidates and read off the matching private key. Worse, any DSA or ECDSA \emph{signature} ever produced on an affected machine leaked the long-term private key, because the per-signature nonce was equally low-entropy (the same flaw that powers \S\ref{ch17:nonce-reuse}). Affected keys had to be revoked and regenerated worldwide.
+\textbf{The damage.} Default Linux PIDs ranged from $1$ to $32{,}768$ ($2^{15}$ values). Every key OpenSSL generated on an affected machine -- SSH, TLS, and virtual private network (OpenVPN) keys, as well as RSA and DSA/ECDSA public--private key pairs (Part~III) -- came from roughly $2^{15}$ possible seeds per architecture and key size. Researchers precomputed the entire table of candidate keys: given a server's public key, an attacker looked it up in the $32{,}768$-entry list and read off the matching private key without breaking any number theory. Worse, any DSA or ECDSA signature created on an affected system leaked the signer's long-term private key because its per-signature nonce came from the same tiny pool (\S\ref{ch17:nonce-reuse}). Millions of keys worldwide had to be revoked and replaced.
 \end{attackbox}
 
 \begin{intuitionbox}
-Nothing was wrong with the mathematics: RSA was as hard as ever and AES was unbroken. The keys were weak because the seed -- the one input that must be unpredictable -- had about $15$ bits of entropy instead of $128$+. A $2048$-bit RSA key with $15$ bits of seed entropy is, to an attacker with the table, a $15$-bit key. This incident illustrates the main point of this chapter: \emph{your cryptography is only as strong as the unpredictability of its random seed.}
+Nothing was wrong with the underlying ciphers: RSA and AES remained unbroken. The keys collapsed because the seed carried about $15$ bits of min-entropy instead of $128$ or more. To an attacker holding the precomputed table, a $2048$-bit RSA key generated from a $15$-bit seed is a $15$-bit key. Your cryptography is no stronger than the min-entropy of its seed.
 \end{intuitionbox}
 
 \begin{trapbox}
-\textbf{The meta-lesson: do not silence the tool by gutting the security.} The change looked like a clean fix for a memory-safety warning. The author had no way to know that the ``uninitialized read'' was an essential source of entropy. The takeaway is twofold: security-critical code needs comments explaining clearly \emph{why} unusual-looking lines exist, and changes to crypto libraries need review by people who understand the crypto, not just the C. ``It still compiles and the warning is gone'' is not a passing test for a CSPRNG.
+\textbf{The meta-lesson: do not silence a warning by gutting security.} Reading uninitialized memory is ordinarily a bug, so the patch looked like routine cleanup. Two engineering rules prevent repeats: subtle security-critical code needs comments explaining \emph{why} unusual lines exist, and changes to cryptographic libraries require review by someone who knows how the entropy pipeline works, not only whether the C code compiles cleanly.
 \end{trapbox}
 
 \subsection{Dual\_EC\_DRBG (c.\ 2006--2013): A Standardized Backdoor}
 \label{ch17:dualec}
 
 \begin{historybox}
-\texttt{Dual\_EC\_DRBG} was one of four CSPRNGs in NIST SP 800-90A (2006), alongside Hash\_DRBG, HMAC\_DRBG, and CTR\_DRBG. It generates pseudorandom bits using elliptic-curve point multiplication over two fixed public points $P$ and $Q$ on a NIST curve. It was always the odd one out: orders of magnitude slower than its siblings, with a measurable output bias. Nobody could explain why such a slow, slightly broken generator was in the standard at all. At the Crypto 2007 rump session, Dan Shumow and Niels Ferguson showed that the relationship between $P$ and $Q$ could hide a \emph{backdoor}: whoever chose the points could hold a secret scalar $d$ with $Q = d \cdot P$ that turns one observed output into the generator's internal state. In 2013, leaks revealed that the NSA had pushed the design into NIST and paid RSA Security \$10 million to make it the default in its BSAFE library. NIST withdrew \texttt{Dual\_EC\_DRBG} in 2014.
+\texttt{Dual\_EC\_DRBG} was one of four DRBGs standardized in NIST SP 800-90A (2006), alongside \texttt{Hash\_DRBG}, \texttt{HMAC\_DRBG}, and \texttt{CTR\_DRBG}. Recall from Chapter~5 that points on an elliptic curve over a finite field $\F_p$ form a cyclic group of prime order $q$, where \emph{scalar multiplication} $s \cdot P = P + P + \dots + P$ ($s$ summands) is fast to compute forward while recovering $s$ from $s \cdot P$ (the elliptic-curve discrete logarithm, Chapter~21) is infeasible. \texttt{Dual\_EC\_DRBG} stepped its state using two fixed public curve points $P$ and $Q$. From the start it stood out: it ran orders of magnitude slower than AES- or hash-based generators and had a measurable statistical bias. At Crypto~2007, Dan Shumow and Niels Ferguson showed that whoever generated the standard constants $P$ and $Q$ could know a secret integer $d$ satisfying $Q = d \cdot P$ that recovers the internal state from a single observed output. In 2013, disclosed documents indicated that the U.S.\ National Security Agency (NSA) had championed the design and paid RSA Security \$10 million to make it the default generator in its BSAFE library. NIST removed \texttt{Dual\_EC\_DRBG} from SP 800-90A in 2014.
 \end{historybox}
 
 \begin{attackbox}
-\textbf{How the backdoor works (the shape of it).} The generator's state $s$ advances and emits bits derived from two EC points. Output block $r$ is computed essentially as $r = x\big(s \cdot Q\big)$ -- the $x$-coordinate of the point $s\cdot Q$ -- truncated by a few bits. $P$ and $Q$ are fixed public points, but suppose they were chosen so that $Q = d \cdot P$ for a secret scalar $d$ known only to the designer. The state update uses $P$; the output uses $Q$. Someone who knows $d$ can take an observed output $r$, recover the full point $s\cdot Q$ (only a few truncated bits to brute-force, since the curve equation pins down the candidates), and then -- because $Q = dP$ -- compute $d^{-1}(s\cdot Q) = s\cdot P$, which is precisely the value used to derive the \emph{next} state. With the next state in hand, the backdoor holder predicts all future output. A single generator output therefore gives the holder of $d$ every later key and nonce.
+\textbf{How the backdoor works.} At step $t$, the generator holds a secret integer state $s_t$, updates to the next state $s_{t+1} = x(s_t \cdot P)$ (the $x$-coordinate of the curve point $s_t \cdot P$), and outputs $r_t$, formed by dropping the top $16$ bits of $x(s_t \cdot Q)$. To an ordinary observer who knows only the points $P$ and $Q$, recovering $s_t$ from $s_t \cdot Q$ requires solving an elliptic-curve discrete logarithm. Suppose, however, the designer chose $P$ and $Q$ by picking a secret scalar $d \in \{1, \dots, q-1\}$ and setting $Q = d \cdot P$. Given one output block $r_t$, the holder of $d$ tries all $2^{16}$ possibilities for the dropped top bits to get candidate $x$-coordinates, plugs each into the curve equation $y^2 \equiv x^3 + ax + b \pmod p$ to recover the few valid points $s_t \cdot Q$, and multiplies by $d^{-1} \bmod q$ (the modular inverse of $d$ modulo the group order $q$):
+\[
+  d^{-1}\,(s_t \cdot Q) \;=\; d^{-1}\,(s_t d \cdot P) \;=\; s_t \cdot P.
+\]
+Taking the $x$-coordinate of $s_t \cdot P$ hands the attacker $s_{t+1}$ directly, exposing every subsequent key and nonce the generator produces.
 \end{attackbox}
 
-Figure~\ref{ch17:fig-dualec} traces the asymmetry: normal advancement moves left-to-right from state $s_t$ through $s_t \cdot P$ to the next state $s_{t+1}$, while anyone holding the secret trapdoor $d^{-1}$ (where $Q = dP$) can invert the published output $x(s_t \cdot Q)$ upward into $s_t \cdot P$ and compute $s_{t+1}$ directly.
+Figure~\ref{ch17:fig-dualec} traces the asymmetry: normal operation advances along the top row from $s_t$ through $s_t \cdot P$ to $s_{t+1}$, while anyone holding the trapdoor $d^{-1} \bmod q$ lifts one published output $r_t$ back up to $s_t \cdot P$ and computes $s_{t+1}$ alongside the victim.
 
 \begin{figure}[htbp]
 \centering
 \begin{tikzpicture}[
-  font=\small, >=Stealth,
-  st/.style={draw=sourceblue!80!black, fill=sourceblue!12, rounded corners=2pt, minimum width=22mm, minimum height=8mm, align=center, font=\footnotesize\bfseries},
-  pt/.style={draw=structurepurple!80!black, fill=structurepurple!12, rounded corners=2pt, minimum width=26mm, minimum height=8mm, align=center, font=\footnotesize},
-  outnd/.style={draw=targetgreen!80!black, fill=targetgreen!14, rounded corners=2pt, minimum width=28mm, minimum height=8mm, align=center, font=\footnotesize},
-  trap/.style={draw=trapred!80!black, fill=trapred!10, dashed, rounded corners=2pt, font=\scriptsize, text=trapred!90!black, align=center, inner sep=3.5pt}
+  font=\small, >=Latex,
+  st/.style={draw=sourceblue!80!black, fill=sourceblue!12, rounded corners=2.5pt, minimum width=2.15cm, minimum height=0.88cm, align=center, font=\footnotesize\bfseries},
+  pt/.style={draw=structurepurple!80!black, fill=structurepurple!12, rounded corners=2.5pt, minimum width=2.35cm, minimum height=0.88cm, align=center, font=\footnotesize},
+  outnd/.style={draw=targetgreen!80!black, fill=targetgreen!14, rounded corners=2.5pt, minimum width=2.65cm, minimum height=0.88cm, align=center, font=\footnotesize},
+  trap/.style={draw=trapred!80!black, fill=trapred!9, dashed, rounded corners=2.5pt, font=\footnotesize, text=trapred!90!black, align=center, inner sep=4pt}
 ]
   % Top lane: internal state evolution
-  \node[st] (st0) at (0, 1.5) {State $s_t$};
-  \node[pt] (sp) at (3.8, 1.5) {Point $s_t \cdot P$};
-  \node[st] (st1) at (7.8, 1.5) {Next State $s_{t+1}$ \\ {\scriptsize $= x(s_t \cdot P)$}};
-  \node[outnd] (out2) at (11.5, 1.5) {Future Stream \\ {\scriptsize $x(s_{t+1} \cdot Q), \dots$}};
+  \node[st] (st0) at (0, 1.55) {State $s_t$};
+  \node[pt] (sp) at (3.4, 1.55) {Point $s_t \cdot P$};
+  \node[st] (st1) at (7.15, 1.55) {Next State $s_{t+1}$\\{\normalfont\footnotesize $= x(s_t \cdot P)$}};
+  \node[outnd] (out2) at (11.1, 1.55) {Future Stream\\{\footnotesize $x(s_{t+1} \cdot Q), \dots$}};
 
-  \draw[->, thick] (st0) -- node[above, font=\scriptsize] {$\cdot P$} (sp);
-  \draw[->, thick] (sp) -- node[above, font=\scriptsize] {$x$-coord} (st1);
-  \draw[->, thick] (st1) -- node[above, font=\scriptsize] {$\cdot Q$} (out2);
+  \draw[->, thick] (st0) -- node[above=1pt, font=\footnotesize] {$\cdot P$} (sp);
+  \draw[->, thick] (sp) -- node[above=1pt, font=\footnotesize] {$x$-coord} (st1);
+  \draw[->, thick] (st1) -- node[above=1pt, font=\footnotesize] {$\cdot Q$} (out2);
 
   % Bottom lane: public output
-  \node[outnd] (out1) at (0, -0.4) {Observed Output $r_t$ \\ {\scriptsize $\approx x(s_t \cdot Q)$}};
-  \node[pt] (sq) at (3.8, -0.4) {Point $s_t \cdot Q$ \\ {\scriptsize $= s_t(d \cdot P)$}};
+  \node[outnd] (out1) at (0, -0.45) {Output $r_t$\\{\footnotesize $\approx x(s_t \cdot Q)$}};
+  \node[pt] (sq) at (3.4, -0.45) {Point $s_t \cdot Q$\\{\footnotesize $= s_t(d \cdot P)$}};
 
-  \draw[->, thick] (st0) -- node[left, font=\scriptsize] {$\cdot Q$} (out1);
-  \draw[->, thick, trapred!85!black, dashed] (out1) -- node[above, font=\scriptsize, text=trapred!90!black] {lift $x$} (sq);
-  \draw[->, thick, trapred!85!black, dashed] (sq) -- node[right=2pt, font=\scriptsize\bfseries, text=trapred!90!black] {multiply by $d^{-1}$} (sp);
+  \draw[->, thick] (st0) -- node[left=1pt, font=\footnotesize] {$\cdot Q$} (out1);
+  \draw[->, thick, trapred!85!black, dashed] (out1) -- node[above=1pt, font=\footnotesize, text=trapred!90!black] {lift $x$} (sq);
+  \draw[->, thick, trapred!85!black, dashed] (sq) -- node[right=2pt, font=\footnotesize\bfseries, text=trapred!90!black] {$\cdot\, d^{-1} \bmod q$} (sp);
 
   % Callout box
-  \node[trap] at (8.5, -0.4) {\textbf{Secret Trapdoor ($Q = d \cdot P$):} \\ $d^{-1}(s_t \cdot Q) = d^{-1}(d \cdot s_t P) = s_t \cdot P \implies s_{t+1}$};
+  \node[trap] at (8.7, -0.45) {\textbf{Trapdoor ($Q = d \cdot P$):}\\$d^{-1}(s_t \cdot Q) = s_t \cdot P \implies s_{t+1}$};
 \end{tikzpicture}
-\caption{The \texttt{Dual\_EC\_DRBG} kleptographic backdoor. An observer who knows the secret discrete logarithm $d$ relating the standard points $Q = d \cdot P$ lifts one observed output $r_t$ to the curve point $s_t \cdot Q$ and multiplies by $d^{-1}$ to recover $s_t \cdot P$, exposing the next internal state $s_{t+1}$ and all subsequent outputs.}
+\caption{The \texttt{Dual\_EC\_DRBG} trapdoor. Anyone holding the secret scalar $d$ with $Q = d \cdot P$ lifts one observed output $r_t$ to candidate points $s_t \cdot Q$ and multiplies by $d^{-1} \bmod q$ to obtain $s_t \cdot P$, revealing the next internal state $s_{t+1}$ and all future outputs.}
 \label{ch17:fig-dualec}
 \end{figure}
 
@@ -450,116 +681,118 @@ The practical takeaway is not to avoid elliptic curves -- ECC is excellent and C
 \subsection{Repeated Nonces in Digital Signatures: The Secret Key Falls Out}
 \label{ch17:nonce-reuse}
 
-The previous two failures weakened a generator. This one shows what a weak generator \emph{does} to a real protocol -- and it is the most direct private-key leak in the book. Digital signatures such as DSA and ECDSA (which we study in Chapter~22) need a fresh secret random value, the \emph{nonce} $k$, for every signature. Reuse $k$ once, or even make it slightly predictable, and your long-term private key is recoverable from public signatures using only the modular arithmetic of Chapters~3 and~4.
+The previous two failures weakened a generator. This third case shows what a weak generator \emph{does} to a public-key protocol. Digital signature schemes such as the Digital Signature Algorithm (DSA) and its elliptic-curve counterpart ECDSA (developed in Chapter~22) require a fresh secret random value, the \emph{nonce} $k$, for every signature. Reuse $k$ once, and anyone who sees the two public signatures recovers the signer's long-term private key using only the modular arithmetic of Chapters~3 and~4.
 
-To sign a message hash $h$ modulo a prime $n$ with long-term private key $x \in \{1, \dots, n-1\}$, the signer picks a per-signature secret nonce $k \in \{1, \dots, n-1\}$, derives a public commitment $r$ deterministically from $k$, and computes
+To sign a message hash $h$ modulo a prime $n$ under a long-term private key $x \in \{1, \dots, n-1\}$, the signer chooses a per-signature secret nonce $k \in \{1, \dots, n-1\}$, computes a public value $r \in \{1, \dots, n-1\}$ deterministically from $k$ alone (for instance $r = (g^k \bmod p) \bmod n$ in DSA), and evaluates
 \[
   s \equiv k^{-1}\,(h + x\,r) \pmod n.
 \]
-The signature is $(r, s)$, and $r, s, h$ are public. The secret is $x$; $k$ must also stay secret \emph{and} be fresh.
+The signature is the pair $(r, s)$, and $r$, $s$, and $h$ are all public. Both the private key $x$ and the nonce $k$ must remain secret, and $k$ must never repeat.
 
 \begin{attackbox}
-\textbf{Two signatures, one nonce, and the key is yours.} Suppose Alice signs two different messages with hashes $h_1 \ne h_2$ but -- through a broken RNG, a fork, or a fixed ``random'' value -- reuses the \emph{same} secret nonce $k$. Because the commitment $r$ depends solely on $k$, both signatures share the same $r$, which is the visible tell that this happened. Write the two $s$ equations:
+\textbf{Two signatures, one nonce, and the private key falls out.} Suppose Alice signs two distinct messages with hashes $h_1 \not\equiv h_2 \pmod n$ while reusing the \emph{same} secret nonce $k$ -- because of a broken RNG, a forked worker process, or a hardcoded constant. Because $r$ is a deterministic function of $k$, both signatures carry the exact same $r$, advertising the mistake in public. Write out the two signature congruences:
 \[
-  s_1 \equiv k^{-1}(h_1 + x r), \qquad s_2 \equiv k^{-1}(h_2 + x r) \pmod n.
+  s_1 \equiv k^{-1}(h_1 + x r) \pmod n, \qquad s_2 \equiv k^{-1}(h_2 + x r) \pmod n.
 \]
-Subtract: $s_1 - s_2 \equiv k^{-1}(h_1 - h_2) \pmod n$, so
+Subtracting the second from the first cancels $x r$ and gives $s_1 - s_2 \equiv k^{-1}(h_1 - h_2) \pmod n$. Because $h_1 \not\equiv h_2 \pmod n$ and $n$ is prime, $s_1 - s_2 \not\equiv 0 \pmod n$ has a modular inverse $(s_1 - s_2)^{-1} \bmod n$, solving directly for the nonce:
 \[
-  \boxed{\,k \equiv \frac{h_1 - h_2}{s_1 - s_2} \bmod n\,}.
+  \boxed{\,k \equiv (h_1 - h_2)\,(s_1 - s_2)^{-1} \pmod n\,}.
 \]
-Now $k$ is known. Plug it back into $s_1 \equiv k^{-1}(h_1 + xr) \pmod n$ and solve for the private key:
+With $k$ known, multiply $s_1 \equiv k^{-1}(h_1 + xr) \pmod n$ by $k$ and invert $r \bmod n$ to solve for the long-term private key:
 \[
-  \boxed{\,x \equiv \frac{s_1\,k - h_1}{r} \bmod n\,}.
+  \boxed{\,x \equiv (s_1\,k - h_1)\,r^{-1} \pmod n\,}.
 \]
-Two public signatures with a repeated nonce, a handful of modular operations, and Alice's long-term private key is exposed (Figure~\ref{ch17:fig-nonce}). The attack needs no lattices, factoring, or brute force, only two linear equations in two unknowns.
+Two public signatures sharing $r$ and two modular inversions expose Alice's master signing key (Figure~\ref{ch17:fig-nonce}). No discrete logarithms or brute force are needed -- only two linear equations in two unknowns.
 \end{attackbox}
 
 \begin{example}[Working it with tiny numbers]
 \label{ch17:nonce-tiny}
-Work in modular arithmetic modulo the prime $n = 23$ (where we invert mod $23$ using the Euclidean algorithm from Chapter~4). Let the signer's secret key be $x = 7$ and the reused secret nonce be $k = 4$, with public commitment $r = 9$. Sign two message hashes $h_1 = 5$ and $h_2 = 11$. We need $k^{-1} \bmod 23$: since $4 \cdot 6 = 24 \equiv 1$, we have $k^{-1} = 6$.
-\[
-  s_1 = 6\,(5 + 7\cdot 9) = 6\,(5 + 63) = 6 \cdot 68 = 408 \equiv 408 - 17\cdot23 = 17 \pmod{23},
-\]
-\[
-  s_2 = 6\,(11 + 63) = 6 \cdot 74 = 444 \equiv 444 - 19\cdot23 = 7 \pmod{23}.
-\]
-The attacker sees $(r,s_1,h_1) = (9,17,5)$ and $(r,s_2,h_2) = (9,7,11)$ -- same $r$, so a reused nonce. Recover $k$:
-\[
-  k = \frac{h_1 - h_2}{s_1 - s_2} = \frac{5 - 11}{17 - 7} = \frac{-6}{10} \pmod{23}.
-\]
-Now $-6 \equiv 17$ and we need $10^{-1} \bmod 23$: $10 \cdot 7 = 70 \equiv 1$, so $10^{-1} = 7$. Then $k = 17 \cdot 7 = 119 \equiv 119 - 115 = 4 \pmod{23}$ -- correct, $k=4$. Recover the private key:
-\[
-  x = \frac{s_1 k - h_1}{r} = \frac{17\cdot 4 - 5}{9} = \frac{68 - 5}{9} = \frac{63}{9} \pmod{23}.
-\]
-Now $63 \equiv 63 - 46 = 17$ and $9^{-1} \bmod 23$: $9 \cdot 18 = 162 \equiv 1$, so $9^{-1}=18$. Then $x = 17 \cdot 18 = 306 \equiv 306 - 299 = 7 \pmod{23}$ -- the master private key, recovered exactly. Trace it once by hand; the whole attack is this short.
+Work modulo the prime $n = 23$ (computing modular inverses as in Chapters~3 and~4). Let the signer's secret key be $x = 7$ and the reused secret nonce be $k = 4$, with public $r = 9$, signing message hashes $h_1 = 5$ and $h_2 = 11$. Since $4 \cdot 6 = 24 \equiv 1 \pmod{23}$, we have $k^{-1} \equiv 6 \pmod{23}$, producing the two signatures:
+\begin{align*}
+  s_1 &\equiv 6\,(5 + 7 \cdot 9) = 6 \cdot 68 = 408 \equiv 17 \pmod{23} && \text{($408 = 17 \cdot 23 + 17$)}, \\
+  s_2 &\equiv 6\,(11 + 7 \cdot 9) = 6 \cdot 74 = 444 \equiv 7 \pmod{23} && \text{($444 = 19 \cdot 23 + 7$)}.
+\end{align*}
+An eavesdropper observes $(r, s_1, h_1) = (9, 17, 5)$ and $(r, s_2, h_2) = (9, 7, 11)$, spots the matching $r = 9$, and solves for $k$:
+\begin{align*}
+  k &\equiv (h_1 - h_2)\,(s_1 - s_2)^{-1} \equiv (5 - 11)\,(17 - 7)^{-1} \pmod{23} \\
+    &\equiv (-6)\cdot 10^{-1} \equiv 17 \cdot 7 \pmod{23} && \text{($-6 \equiv 17$, and $10 \cdot 7 = 70 \equiv 1$)} \\
+    &= 119 \equiv 4 \pmod{23} && \text{($119 = 5 \cdot 23 + 4$)}.
+\end{align*}
+Substituting $k = 4$ back into the first signature congruence recovers the private key $x$:
+\begin{align*}
+  x &\equiv (s_1 k - h_1)\,r^{-1} \equiv (17 \cdot 4 - 5)\cdot 9^{-1} \pmod{23} \\
+    &\equiv 63 \cdot 9^{-1} \equiv 17 \cdot 18 \pmod{23} && \text{($63 \equiv 17$, and $9 \cdot 18 = 162 \equiv 1$)} \\
+    &= 306 \equiv 7 \pmod{23} && \text{($306 = 13 \cdot 23 + 7$)}.
+\end{align*}
+The signer's private key $x = 7$ comes out in six lines of arithmetic.
 \end{example}
 
-\begin{figure}[H]
+\begin{figure}[htbp]
 \centering
 \begin{tikzpicture}[
   font=\small, >=Latex,
-  box/.style={draw, rounded corners=2pt, minimum height=0.72cm, align=center, inner sep=3.5pt},
-  sig/.style={box, fill=aliceblue!15, minimum width=2.1cm},
-  flag/.style={box, fill=trapred!18, draw=trapred!80!black, font=\scriptsize\bfseries, minimum width=2.1cm},
-  math/.style={box, fill=quotientorange!18, minimum width=2.9cm},
-  keybox/.style={box, fill=targetgreen!20, draw=targetgreen!80!black, font=\bfseries, minimum width=2.9cm}
+  box/.style={draw, rounded corners=2.5pt, minimum height=0.88cm, align=center, inner sep=4pt},
+  sig/.style={box, fill=aliceblue!14, draw=aliceblue!80!black, minimum width=2.05cm, font=\footnotesize},
+  flag/.style={box, fill=trapred!18, draw=trapred!80!black, font=\footnotesize\bfseries, text=trapred!90!black, minimum width=2.25cm},
+  math/.style={box, fill=quotientorange!16, draw=quotientorange!85!black, minimum width=3.35cm, font=\footnotesize},
+  keybox/.style={box, fill=targetgreen!18, draw=targetgreen!80!black, font=\footnotesize\bfseries, minimum width=3.15cm}
 ]
   % Signatures column
-  \node[sig] (s1) at (0, 1.1) {Signature 1:\\$(r,\,s_1,\,h_1)$};
-  \node[sig] (s2) at (0, -1.1) {Signature 2:\\$(r,\,s_2,\,h_2)$};
+  \node[sig] (s1) at (0, 1.05) {Signature 1:\\$(r,\,s_1,\,h_1)$};
+  \node[sig] (s2) at (0, -1.05) {Signature 2:\\$(r,\,s_2,\,h_2)$};
 
   % Detect repeated r
-  \node[flag] (det) at (2.8, 0) {Identical $r$ detected!\\$k_1 = k_2 = k$};
+  \node[flag] (det) at (2.95, 0) {Matching $r$:\\$k_1 = k_2 = k$};
 
-  \draw[->, thick, trapred!80!black] (s1) -| (det);
-  \draw[->, thick, trapred!80!black] (s2) -| (det);
+  \draw[->, thick, trapred!80!black] (s1.east) -| (det.north);
+  \draw[->, thick, trapred!80!black] (s2.east) -| (det.south);
 
   % Step 1: Recover nonce k
-  \node[math] (kstep) at (6.7, 0) {Step 1: Recover Nonce $k$\\$k \equiv \dfrac{h_1 - h_2}{s_1 - s_2} \pmod n$};
+  \node[math] (kstep) at (6.75, 0) {\textbf{1. Recover Nonce $k$}\\[2pt]$k \equiv (h_1 - h_2)(s_1 - s_2)^{-1}$};
   \draw[->, thick] (det) -- (kstep);
 
   % Step 2: Recover private key x
-  \node[keybox] (xstep) at (11.1, 0) {Step 2: Private Key $x$\\$x \equiv \dfrac{s_1 k - h_1}{r} \pmod n$};
+  \node[keybox] (xstep) at (11.0, 0) {2. Private Key $x$\\[2pt]{\normalfont\footnotesize $x \equiv (s_1 k - h_1)\,r^{-1}$}};
   \draw[->, thick] (kstep) -- (xstep);
 
   % Explanatory footer
-  \node[draw, rounded corners=2pt, dashed, trapred!80, fill=trapred!6, font=\scriptsize, align=center, inner sep=3.5pt] at (5.6, -2.1) {
-    \textbf{Total Compromise:} Both $k$ and private key $x$ fall out from two public signatures in $\mathcal{O}(1)$ modular ops.
+  \node[draw=trapred!80!black, rounded corners=2pt, dashed, fill=trapred!6, font=\footnotesize, text=trapred!90!black, align=center, inner sep=3.5pt] at (6.0, -2.0) {
+    \textbf{Result:} Two signatures sharing $r$ expose both $k$ and $x$ modulo $n$ with two modular inversions.
   };
 \end{tikzpicture}
-\caption{The repeated-nonce signature private key recovery. Because the commitment component $r$ depends solely on the nonce $k$, two signatures with the same $r$ immediately announce a repeated nonce. Subtracting the two signature equations cancels the private key $x$ and reveals $k$; back-substituting $k$ then extracts the signer's master private key $x$ using only public values and basic modular arithmetic.}
+\caption{Private-key recovery from a repeated signature nonce. Because $r$ depends only on the nonce $k$, two signatures sharing $r$ reveal a repeated nonce; subtracting the two signature equations modulo $n$ cancels $x$ to give $k$, and substituting $k$ back yields the long-term private key $x$.}
 \label{ch17:fig-nonce}
 \end{figure}
 
 \begin{attackbox}
-\textbf{This is not hypothetical.} The Sony PlayStation 3 (2010) signed all its software with ECDSA using a \emph{constant} nonce -- the same $k$ for every signature. The \texttt{fail0verflow} group applied exactly the equations above to two official Sony signatures and extracted Sony's master private signing key, allowing anyone to sign code the console would trust. Android's Java \texttt{SecureRandom} had a 2013 bug that produced repeated ECDSA nonces, draining Bitcoin wallets whose keys signed transactions on affected devices -- the blockchain is public, so every duplicate-$r$ pair was sitting in the open ledger waiting to be mined for private keys. The same flaw underlay the signature leaks in the Debian incident.
+\textbf{Real-world casualties.} In 2010, Sony's PlayStation~3 firmware-signing system was found to use ECDSA with a \emph{static} nonce -- the exact same $k$ on every update. The \texttt{fail0verflow} team applied the two equations above to two official Sony signatures and extracted Sony's master signing key, letting anyone sign custom code the console accepted as genuine. In 2013, a bug in Android's \texttt{SecureRandom} implementation caused Bitcoin wallet apps to generate duplicate ECDSA nonces; because Bitcoin records every transaction on a public ledger (blockchain), attackers scanned the ledger for matching $r$ values and swept funds from affected addresses.
 \end{attackbox}
 
 \begin{whybox}
-\textbf{The fix: make the nonce deterministic.} If a fresh random $k$ is so dangerous to get wrong, why gamble on the RNG at all? RFC 6979 specifies \emph{deterministic} (EC)DSA: derive $k$ as an HMAC of the message hash keyed by the private key, $k = \operatorname{HMAC}_x(h)$, run through a generation loop. This $k$ is unpredictable to anyone without $x$ (HMAC is a PRF), is automatically distinct for distinct messages, and requires \emph{no entropy at signing time}, so a broken or forked RNG cannot cause a repeat. Modern signing libraries default to it. EdDSA (Ed25519) bakes the same idea into its design: the nonce is a hash of the message and a secret key half, deterministic by construction. The lesson generalizes: when you can replace a fragile randomness requirement with a deterministic, key-bound derivation, do it.
+\textbf{The fix: deterministic nonces.} If a repeated random $k$ is fatal, remove the live RNG from signing altogether. Internet standard RFC~6979 specifies \emph{deterministic} DSA and ECDSA: compute $k$ from an HMAC of the message hash keyed by the private key $x$ (via a counter loop around $\operatorname{HMAC}_x(h)$). Because HMAC is a pseudorandom function (Chapter~15), $k$ is unpredictable to anyone without $x$; because $h$ changes when the message changes, distinct messages never share a nonce; and because signing reads zero random bytes at runtime, a broken or forked RNG cannot cause a repeat. The Edwards-curve signature scheme Ed25519 (Chapter~22) builds deterministic nonce derivation directly into its specification.
 \end{whybox}
 
 \begin{connectionbox}
-The recovery in Example~\ref{ch17:nonce-tiny} needed only that $n$ be prime so inverses exist mod $n$ -- the extended Euclidean algorithm computes each $k^{-1}, 10^{-1}, 9^{-1}$ in a few steps. Even \emph{partial} nonce leakage is fatal: if only the top few bits of each $k$ are predictable (a biased RNG), an attacker collecting a few hundred signatures recovers $x$ via lattice reduction (the ``hidden number problem,'' solved with LLL). Predictability does not have to be total to be lethal; a slow leak across many signatures is enough.
+Example~\ref{ch17:nonce-tiny} relied only on $n$ being prime so nonzero differences are invertible modulo $n$ via the extended Euclidean algorithm. Even \emph{partial} nonce bias is fatal: if a flawed RNG leaves only the top few bits of each $k$ predictable across a few hundred signatures, each signature imposes an approximate linear constraint on $x$ modulo $n$, and geometry-of-numbers algorithms (\emph{lattice reduction}, Chapter~35) combine those constraints to recover $x$ in full.
 \end{connectionbox}
 
 \section{Getting Randomness Right on a Real System}
 \label{ch17:getting-it-right}
 
-The checklist below pulls the chapter together. The good news is that the correct path is also the easy one: lean on the OS, and resist the urge to be clever.
+On a modern operating system, the safe path is also the simplest: rely on the kernel's generator rather than building your own.
 
 \begin{description}
-  \item[Use the OS CSPRNG, period.] Rely directly on platform APIs like \texttt{getrandom()}, \texttt{os.urandom}, \texttt{secrets}, \texttt{crypto/rand}, \texttt{SecureRandom}, or \texttt{BCryptGenRandom}. The kernel handles collection, extraction, reseeding, and fork safety. Do not reimplement it.
-  \item[Never seed a CSPRNG from time, PID, or counters.] Those are the Debian and clock-seeding failures. The seed must come from physical entropy via the OS.
-  \item[Never use non-cryptographic PRNGs for secrets.] Functions like \texttt{rand()}, \texttt{random()}, Mersenne Twister, or \texttt{java.util.Random} are fast and statistically fine, but \emph{completely} predictable to an adversary. Keys, nonces, IVs, salts, and session tokens all demand a vetted CSPRNG.
-  \item[Handle the boot window.] Before the pool is seeded, randomness is weak. Use the blocking \texttt{getrandom()} (no \texttt{GRND\_NONBLOCK}); in VMs and embedded devices, supply a seed via the hypervisor (virtio-rng) or a saved seed file, because freshly booted headless boxes have famously little entropy.
-  \item[Be fork-aware.] If you must cache generator state in userspace, reseed after \texttt{fork()}. Simpler: call the OS each time and let the kernel handle it.
-  \item[Make nonces robust.] Prefer deterministic nonces (RFC 6979, Ed25519) for signatures; for AEAD, use a counter or a sufficiently long random nonce (XChaCha20's $192$-bit nonce makes random collisions negligible) -- never a short random nonce generated by a possibly-broken RNG.
-  \item[Mistrust opaque primitives.] Avoid primitives like \texttt{Dual\_EC\_DRBG}. Prefer generators with transparent, nothing-up-my-sleeve constants. If you query hardware instructions like \texttt{RDRAND}, mix the output with OS entropy rather than trusting opaque silicon alone.
+  \item[Use the OS CSPRNG.] Call your operating system's cryptographic interface directly: Linux's \texttt{getrandom()}, Windows's \texttt{BCryptGenRandom}, Python's \texttt{secrets} or \texttt{os.urandom}, the Go package \texttt{crypto/rand}, or Java's \texttt{SecureRandom}. The kernel handles collection, extraction, reseeding, and fork safety.
+  \item[Never seed from time, PID, or counters.] Those caused the clock-seeding and Debian keyspace collapses. Every cryptographic seed must come from physical entropy via the OS.
+  \item[Never use simulation PRNGs for secrets.] Non-cryptographic generators such as C's \texttt{rand()}, Python's \texttt{random} module, Mersenne Twister, and \texttt{java.util.Random} are fast and statistically balanced yet predictable from observed output. Keys, nonces, IVs, salts, and session tokens require a CSPRNG.
+  \item[Guard the boot window.] Before the kernel entropy pool is initialized, early reads can lack entropy. Use blocking \texttt{getrandom()} (without \texttt{GRND\_NONBLOCK}); in virtual machines (VMs) and embedded devices -- headless boxes without a keyboard, mouse, or spinning disk -- feed boot entropy from the host hypervisor (via \texttt{virtio-rng}) or hardware RNG instructions.
+  \item[Stay fork-safe.] If an application caches DRBG state in userspace, wipe or reseed it across \texttt{fork()}. Calling the OS interface on each draw avoids the hazard altogether.
+  \item[Make nonces collision-safe.] Use deterministic nonces (RFC~6979, Ed25519) for signatures; for AEAD ciphers, use a monotonic counter or an extended random nonce such as XChaCha20-Poly1305's $192$-bit nonce (an extended-nonce variant of ChaCha20-Poly1305 from Chapter~16 whose $2^{192}$ space makes random collisions negligible), never a short nonce drawn from an unvetted RNG.
+  \item[Prefer auditable primitives.] Avoid opaque designs like \texttt{Dual\_EC\_DRBG} in favor of generators with nothing-up-my-sleeve constants, and mix hardware instructions like \texttt{RDRAND} into the OS pool rather than using them as your sole source.
 \end{description}
 
 \begin{applicationbox}
-\textbf{In the protocols you know.} TLS 1.3 draws the client and server random fields, the ephemeral ECDHE private keys, and session-ticket secrets from the OS CSPRNG; a predictable client-random or ECDHE key would let an eavesdropper derive the session keys. WiFi's WPA3 SAE and the older WPA2 four-way handshake need unpredictable nonces (the $A$nonce/$S$nonce) -- the KRACK family of attacks abused nonce \emph{reuse} forced by handshake replays, the same nonce-reuse theme from \S\ref{ch17:nonce-reuse}. Signal generates fresh ephemeral Diffie-Hellman keys for its Double Ratchet on every message; a compromised RNG there would break forward secrecy. In every case, the protocol's careful security proof silently assumes a uniform random tape, and the OS CSPRNG is what supplies it.
+\textbf{Where protocols spend random bits.} TLS~1.3 (Chapter~25) draws each connection's public handshake nonces, single-use key-exchange secrets, and resumption tickets from the OS CSPRNG; predicting the key-exchange secret exposes the session keys. WiFi's WPA2 and WPA3 handshakes (Chapter~26) exchange fresh random nonces when a device joins an access point -- the 2017 Key Reinstallation Attacks (KRACK) replayed handshake messages to force nonce reuse and reset stream-cipher counters, triggering the AEAD failure of Chapter~16. Signal (Chapter~27) generates a fresh Diffie--Hellman key pair on every turn of conversation so that a later phone compromise cannot decrypt old messages; a predictable RNG would forfeit that protection. Every protocol proof assumes an honest coin-flipping tape, and the OS CSPRNG is what provides it.
 \end{applicationbox}
 
 \begin{focusbox}
@@ -574,49 +807,49 @@ This chapter brings Part~II to a close. Every tool we have built so far -- strea
 \label{ch17:exercises}
 
 \begin{exercise}[Min-entropy versus length]
-A token generator produces $128$-bit values, but internally it picks a random English word from a $50{,}000$-word dictionary and hashes it with SHA-256 to get the token. The output is $128$ bits. What is the min-entropy of a token? How many guesses does the best attacker need, and how does that compare to the $2^{128}$ bound suggested by its length? State the general lesson in one sentence.
+A token generator produces $128$-bit values, yet internally it picks a word uniformly at random from a $50{,}000$-word English dictionary and takes the first $128$ bits of its SHA-256 hash. What is the min-entropy of a token? How many guesses does an optimal attacker need on average, and how does that compare to the $2^{128}$ space suggested by its bit-length? State the general lesson in one sentence.
 \end{exercise}
 
 \begin{exercise}[Biased-source seeding]
-A hardware source emits independent bits, each $1$ with probability $p = 0.75$. (a) Compute the min-entropy per bit. (b) How many bits must you collect to seed a $256$-bit key with full strength? (c) Compare to the Shannon entropy per bit $-(p\log_2 p + (1-p)\log_2(1-p))$, explain why the two numbers differ, and say which one you must use.
+A hardware source emits independent bits, each equal to $1$ with probability $p = 0.75$. (a) Compute the min-entropy per bit. (b) How many bits must you collect to seed a $256$-bit key with full min-entropy? (c) Compare with the Shannon entropy per bit $-\bigl(p\log_2 p + (1-p)\log_2(1-p)\bigr)$, explain why the two numbers differ, and say which one you must use.
 \end{exercise}
 
 \begin{exercise}[Predicting an LCG]
-A linear congruential generator outputs $x_{i+1} = (a x_i + c) \bmod m$ with unknown $a, c$ and known $m = 2^{31}$. You observe consecutive outputs $x_0 = 5$, $x_1 = 33$, $x_2 = 117$. Set up the two equations $x_1 \equiv a x_0 + c$ and $x_2 \equiv a x_1 + c \pmod m$, solve for $a$ and $c$ (here $x_1 - x_0 = 28$ is divisible by $4$, so several lifts of $a$ mod $2^{31}$ fit; check that they all predict the same $x_3$), and predict $x_3$. Why does this show an LCG is unusable for cryptography even though its output may pass statistical tests?
+A linear congruential generator outputs $x_{i+1} = (a x_i + c) \bmod m$ with unknown $a, c$ and known $m = 2^{31}$. You observe consecutive outputs $x_0 = 2$, $x_1 = 22$, $x_2 = 122$. Set up the two congruences $x_1 \equiv a x_0 + c$ and $x_2 \equiv a x_1 + c \pmod m$, solve for $a$ and $c$ (here $x_1 - x_0 = 20$ is divisible by $4$, so four candidate values $a + j \cdot 2^{29} \bmod 2^{31}$ fit; verify that all four predict the same $x_3$), and predict $x_3$. Why does this show an LCG is unusable for cryptography even when its output passes statistical suites?
 \end{exercise}
 
 \begin{exercise}[Break a reused signature nonce]
-Work in modular arithmetic modulo the prime $n = 29$. A signer with unknown private key $x$ reuses an ephemeral nonce $k$, producing commitment $r = 13$ on both signatures, with message hashes and signature components $(h_1, s_1) = (7, 21)$ and $(h_2, s_2) = (18, 5)$. Recover $k$ and then the master key $x$ using the modular elimination formulas of \S\ref{ch17:nonce-reuse}. Show each modular inverse mod $29$ you compute using the Euclidean algorithm from Chapter~4.
+Work modulo the prime $n = 29$. A signer with unknown private key $x$ reuses a secret nonce $k$, producing $r = 13$ on two signatures with $(h_1, s_1) = (7, 21)$ and $(h_2, s_2) = (18, 5)$. Recover $k$ and then the private key $x$ using the elimination formulas of \S\ref{ch17:nonce-reuse}. Show each modular inverse modulo $29$ using the extended Euclidean algorithm (Chapters~3 and~4).
 \end{exercise}
 
 \begin{exercise}[The Debian keyspace]
-On the affected Debian systems the effective seed was essentially the process ID (max $32{,}768$) plus a small number of architecture/key-size variants. Estimate the total number of distinct RSA-$2048$ keys an attacker would need to pre-generate to cover, say, $4$ architectures and $2$ key sizes. Roughly how long would building such a table take if generating one key costs $0.1$ s? What does this tell you about the relationship between key length and seed entropy?
+On affected Debian systems, the seed varied primarily with the process ID (at most $32{,}768$ values) plus architecture and key-size parameters. Estimate the total number of distinct RSA-$2048$ keys an attacker must pre-generate to cover $4$ architectures and $2$ key sizes. How long would building that table take on a single core if generating one key costs $0.1\,\text{s}$? What does this say about key length versus seed entropy?
 \end{exercise}
 
 \begin{exercise}[Fork detection]
-Sketch (in pseudocode) a userspace CSPRNG wrapper that stays safe across \texttt{fork()} by caching the PID and reseeding when \texttt{getpid()} changes. Then identify a concrete scenario where PID-comparison fails to detect a fork (hint: PIDs are finite and get recycled), and explain why ``just call the OS each time'' avoids the problem entirely.
+Sketch (in pseudocode) a userspace CSPRNG wrapper that stays safe across \texttt{fork()} by caching the PID and reseeding when \texttt{getpid()} changes. Then construct a scenario in which PID comparison fails to detect a fork (hint: PIDs are finite and get recycled), and explain why calling the OS interface on each draw avoids the problem.
 \end{exercise}
 
 \begin{exercise}[Why deterministic nonces are safe]
-RFC 6979 sets $k = \operatorname{HMAC}_x(h)$ where $h$ is the message hash and $x$ the private key. (a) Argue why an attacker who does not know $x$ cannot predict $k$. (b) Argue why two \emph{different} messages cannot accidentally share a nonce. (c) Argue why this construction needs zero entropy at signing time, and why that is exactly what makes it immune to the failures in \S\ref{ch17:nonce-reuse}. (d) Could an attacker who learns one nonce $k$ recover $x$? Relate your answer to the recovery formula.
+RFC~6979 derives $k$ deterministically from $\operatorname{HMAC}_x(h)$, where $h$ is the message hash and $x$ is the private key. (a) Argue why an attacker who does not know $x$ cannot predict $k$. (b) Argue why two distinct messages do not share a nonce. (c) Explain why needing zero entropy at signing time prevents the failures in \S\ref{ch17:nonce-reuse}. (d) If an attacker somehow learned one deterministic nonce $k$, could they still recover $x$? Relate your answer to the recovery formula.
 \end{exercise}
 
 \begin{exercise}[Nothing-up-my-sleeve]
-The \texttt{Dual\_EC\_DRBG} backdoor lived in the relationship $Q = dP$ between two ``random-looking'' public points. (a) Explain why publishing $d$ would have defused the backdoor. (b) Propose a procedure for generating $P$ and $Q$ that would convince a skeptic no trapdoor could be hidden, using only public, arbitrary inputs. (c) Why does deriving constants from, say, the binary digits of $\sqrt{2}$ help, and what residual assumption are you still making about the designer's choices?
+The \texttt{Dual\_EC\_DRBG} trapdoor lived in the secret relationship $Q = d \cdot P$ between two public curve points. (a) Explain why publishing $d$ would have made the generator insecure for everyone, not only the designer. (b) Propose a public procedure for deriving $P$ and $Q$ from fixed arbitrary strings (such as hashes of ASCII labels) so that nobody could know $d$ with $Q = d \cdot P$. (c) When constants are derived from the digits of $\sqrt{2}$ or $\pi$, what residual freedom could a designer still abuse, and how do you limit it?
 \end{exercise}
 
 \begin{exercise}[State compromise]
-Define backtracking resistance and prediction resistance precisely. (a) For the toy hash-chain DRBG in the \S\ref{ch17:fork} code (\texttt{state = SHA256("S" + state)}), argue informally why it has backtracking resistance -- learning the current state does not reveal past output. (b) Show it has \emph{no} prediction resistance without reseeding: an attacker who learns the state predicts all future output. (c) What minimal change restores prediction resistance?
+State backtracking resistance and prediction resistance precisely. (a) For the toy hash-chain DRBG in \S\ref{ch17:fork} (\texttt{state = sha256(b"S" + state).digest()}), argue why learning the current state does not reveal earlier outputs. (b) Show that without reseeding it lacks prediction resistance: an attacker who learns \texttt{state} predicts all subsequent outputs. (c) What change restores prediction resistance after a state leak?
 \end{exercise}
 
 \begin{exercise}[The leftover-hash tax]
-A source delivers $200$ bits of min-entropy. (a) Using $m \le k - 2\log_2(1/\eps)$, what is the longest output you can extract that is within $\eps = 2^{-80}$ of uniform? (b) You need a $128$-bit key at that $\eps$; how much source min-entropy must you collect? (c) Why does the random-oracle heuristic let practical systems ignore most of this tax, and what do they give up in exchange? Relate your answer to Example~\ref{ch17:extractor-tax}.
+A physical source delivers $k = 200$ bits of min-entropy. (a) Using $m \le k - 2\log_2(1/\eps)$, what is the longest provably near-uniform output you can extract at statistical distance $\eps = 2^{-80}$? (b) To extract a $128$-bit key at $\eps = 2^{-80}$, how many bits of source min-entropy must you collect? (c) Why does modeling SHA-256 as a random oracle let practical systems avoid most of this $2\log_2(1/\eps)$ tax, and what guarantee do they trade away? Compare with Example~\ref{ch17:extractor-tax}.
 \end{exercise}
 
 \begin{exercise}[A stuck source]
-A hardware noise source claims $H = 0.5$ bits of min-entropy per raw sample. (a) Using the Repetition Count cutoff $C = 1 + \lceil 20/H \rceil$, after how many identical consecutive samples does the test fire? (b) Explain why running this test on the \emph{raw} samples catches a frozen diode but running an equivalent test on the post-SHA-256 CSPRNG output would not. (c) A reviewer proposes ``just run NIST SP 800-22 on \texttt{/dev/urandom} nightly to confirm the RNG is healthy.'' Explain why this provides essentially no assurance about the entropy source.
+A hardware noise source claims $H = 0.5$ bits of min-entropy per raw sample. (a) Using the Repetition Count cutoff $C = 1 + \ceil{20/H}$, after how many identical consecutive samples does the alarm fire? (b) Explain why running this test on raw samples catches a frozen diode whereas running an equivalent test on post-SHA-256 CSPRNG output does not. (c) A colleague proposes running NIST SP 800-22 nightly on \texttt{/dev/urandom} to verify that the hardware noise source is healthy. Explain why that test cannot detect a dead source.
 \end{exercise}
 
 \begin{exercise}[Birthday bound on random nonces]
-You generate random $96$-bit nonces for AES-GCM under a fixed key. (a) Using the birthday approximation, roughly how many nonces can you generate before the probability of any collision reaches $2^{-32}$? (b) Why is a collision catastrophic for GCM specifically? (c) How does switching to XChaCha20-Poly1305's $192$-bit nonce change the calculation, and why does that make random nonce generation safe again?
+Suppose you generate uniform $96$-bit nonces for AES-GCM under a fixed key. (a) Using the birthday approximation $\Pr[\text{collision}] \approx q^2 / (2 \cdot 2^{96})$ across $q$ messages (Chapter~7), roughly how many nonces can you draw before the collision probability reaches $2^{-32}$? (b) Why is a single nonce collision catastrophic for AES-GCM? (c) Repeat part~(a) for XChaCha20-Poly1305's $192$-bit nonce, and explain why $192$ bits make random nonce generation safe at any realistic message volume.
 \end{exercise}

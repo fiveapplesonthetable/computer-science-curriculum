@@ -17,12 +17,10 @@ The query says \emph{what} answer we want. It says nothing about \emph{how} to g
 
 The piece of PostgreSQL that chooses among those plans is the \emph{query planner} (also called the optimizer). It never runs the candidates. It \emph{predicts} what each would cost using statistics about your data and a small set of cost constants, and then hands the cheapest prediction to the executor. When the prediction is right, you never think about it. When it is wrong, a query that ran in 3~ms yesterday runs for 40 seconds today, and the only way to see why is to read \texttt{EXPLAIN (ANALYZE, BUFFERS)} output.
 
-This chapter builds the planner's reasoning from the ground up. We start with the column statistics it collects and the cost units it uses as currency. Then we trace the four ways it reads a single table, the three ways it joins two tables, and how it searches join orders. Finally, we read \texttt{EXPLAIN (ANALYZE, BUFFERS)} output line by line to spot exactly where a slow plan went wrong.
-
 \begin{focusbox}
 By the end of this chapter you will be able to answer five practical engineering questions:
 \begin{itemize}
-  \item How can sampling just $30{,}000$ random rows let PostgreSQL estimate filter matches on a five-billion-row table?
+  \item How can sampling $30{,}000$ random rows let PostgreSQL estimate filter matches on a five-billion-row table?
   \item Why does an index scan on a timestamp column run thirty times faster than the exact same $1\%$ index scan on a random amount column?
   \item When does PostgreSQL build an in-memory page bitmap instead of using a plain index scan or reading the whole table?
   \item How does the planner choose between a Nested Loop, a Hash Join, and a Merge Join---and what happens when a Hash Join runs out of RAM?
@@ -43,6 +41,37 @@ Every statement passes through four stages inside the backend process that owns 
   \item \textbf{Plan.} The planner turns the query tree into a \emph{plan tree}: a tree of physical operators such as \texttt{Seq Scan}, \texttt{Index Scan}, \texttt{Hash Join}, and \texttt{Sort}. This is the only stage that makes choices, and it is the subject of this chapter.
   \item \textbf{Execute.} The executor runs the plan tree. Each node is an iterator: a parent asks its child for the next row, the child asks \emph{its} child, and rows flow upward one at a time. (This is the ``Volcano'' iterator model; PostgreSQL also batches some work, such as building hash tables, but the pull-one-row interface is the mental model to keep.)
 \end{enumerate}
+
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex,
+  stage/.style={draw=sourceblue!80,fill=sourceblue!10,rounded corners=3pt,thick,align=center,minimum width=2.5cm,minimum height=0.8cm},
+  doc/.style={font=\scriptsize\ttfamily,align=center}]
+  
+  \node[doc] (sql) at (0,0) {SQL Text};
+  \node[stage] (parse) at (3,0) {1. Parse};
+  \node[doc] (ptree) at (6,0) {Parse Tree};
+  \node[stage] (analyze) at (3,-1.5) {2. Analyze\\\& Rewrite};
+  \node[doc] (qtree) at (6,-1.5) {Query Tree};
+  \node[stage] (plan) at (9,-1.5) {3. Plan};
+  \node[doc] (plantree) at (9,-3) {Plan Tree};
+  \node[stage] (execute) at (6,-3) {4. Execute};
+  \node[doc] (rows) at (3,-3) {Rows};
+  
+  \draw[->,thick] (sql) -- (parse);
+  \draw[->,thick] (parse) -- (ptree);
+  \draw[->,thick] (ptree) -- (analyze);
+  \draw[->,thick] (analyze) -- (qtree);
+  \draw[->,thick] (qtree) -- (plan);
+  \draw[->,thick] (plan) -- (plantree);
+  \draw[->,thick] (plantree) -- (execute);
+  \draw[->,thick] (execute) -- (rows);
+  
+\end{tikzpicture}
+\caption{The four stages of query processing. The planner (Stage 3) is responsible for turning the logical query tree into a physical plan tree.}
+\label{ch07:fig-pipeline}
+\end{figure}
 
 The relational algebra from Chapter~1 lives in stage~3. A join is commutative and associative, a selection $\sigma$ can be pushed below a join, and a projection $\pi$ can drop columns early. Those algebraic laws generate many logically equivalent trees. The planner's job is to attach a physical algorithm to every node of every reasonable tree, estimate the cost, and keep the cheapest.
 
@@ -114,15 +143,17 @@ The planner's central quantity is \emph{selectivity}: the fraction of a table's 
 
 \begin{example}[Equality on a value in the MCV list]
 \label{ch07:ex-mcv-hit}
-For \texttt{WHERE status = 'pending'}, the value is in the MCV list with frequency $0.12$. The selectivity is simply $0.12$, and the estimate is $0.12 \times 20{,}000{,}000 = 2{,}400{,}000$ rows.
+For \texttt{WHERE status = 'pending'}, the value is in the MCV list with frequency $0.12$. The selectivity is $0.12$, and the estimate is $0.12 \times 20{,}000{,}000 = 2{,}400{,}000$ rows.
 \end{example}
 
 \begin{example}[Equality on a value not in the MCV list]
 \label{ch07:ex-mcv-miss}
 For \texttt{WHERE status = 'reversed'}, the value is not in the MCV list. The planner reasons: the MCVs account for $0.82 + 0.12 + 0.04 = 0.98$ of rows, and there are no \texttt{NULL}s, so $1 - 0.98 = 0.02$ of rows hold the \emph{other} values. There are $5 - 3 = 2$ other distinct values. Assume they split the remainder evenly:
-\[
-  \text{sel} \;=\; \frac{1 - \text{null\_frac} - \sum \text{mcv\_freqs}}{\text{n\_distinct} - |\text{MCV}|} \;=\; \frac{1 - 0 - 0.98}{5 - 3} \;=\; 0.01.
-\]
+\begin{align*}
+  \text{sel} &= \frac{1 - \text{null\_frac} - \sum \text{mcv\_freqs}}{\text{n\_distinct} - |\text{MCV}|} \\
+  &= \frac{1 - 0 - 0.98}{5 - 3} \\
+  &= 0.01.
+\end{align*}
 Estimate: $0.01 \times 20{,}000{,}000 = 200{,}000$ rows.
 \end{example}
 
@@ -131,9 +162,10 @@ Estimate: $0.01 \times 20{,}000{,}000 = 200{,}000$ rows.
 For \texttt{WHERE amount\_minor < 3500}, there is no MCV list for this column, so every non-null row is covered by the histogram with bounds $\{0, 1000, 2000, 5000, 20000\}$. Each of the four buckets holds $\tfrac14$ of the non-null rows.
 
 The value $3500$ falls inside the third bucket $[2000, 5000)$. Buckets one and two lie entirely below $3500$: that is $\tfrac24$. Within bucket three, PostgreSQL assumes values are spread uniformly and interpolates linearly: $3500$ sits $\tfrac{3500 - 2000}{5000 - 2000} = 0.5$ of the way across, contributing $0.5 \times \tfrac14 = \tfrac18$. So the histogram fraction is $\tfrac24 + \tfrac18 = 0.625$. Finally, remove the $0.2\%$ of \texttt{NULL}s:
-\[
-  \text{sel} = 0.625 \times (1 - 0.002) \approx 0.624, \qquad \text{rows} \approx 12{,}475{,}000.
-\]
+\begin{align*}
+  \text{sel} &= 0.625 \times (1 - 0.002) \approx 0.624, \\
+  \text{rows} &\approx 12{,}475{,}000.
+\end{align*}
 A \texttt{BETWEEN 1500 AND 3500} predicate works the same way: compute the fraction below $3500$ ($0.625$), subtract the fraction below $1500$ ($\tfrac14 + 0.5 \times \tfrac14 = 0.375$), and get $0.25$ of non-null rows.
 \end{example}
 
@@ -222,6 +254,34 @@ That is often fine. It is badly wrong when the columns are related. Consider a \
 \]
 but almost every US transfer is in dollars, so the true fraction with both is about $0.54$. The planner underestimates by about 40\%. That is survivable. Now take \texttt{city = 'Lyon' AND postal\_code = '69001'}: if each has selectivity $0.001$, independence predicts $10^{-6}$, yet every row in that postal code is in Lyon, so the truth is close to $10^{-3}$. The estimate is \emph{a thousand times} too small, and a thousand-times-too-small row count is exactly what makes the planner pick a nested loop that runs for minutes (we will see why in Section~\ref{ch07:joins}).
 
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small]
+  % Independent
+  \begin{scope}[shift={(0,0)}]
+    \node[font=\bfseries\scriptsize] at (1.5, 3.2) {Independent Assumption};
+    \draw[thick,sourceblue!80,fill=sourceblue!10,fill opacity=0.5] (1,1.5) circle (1.2cm);
+    \draw[thick,targetgreen!80!black,fill=targetgreen!10,fill opacity=0.5] (2,1.5) circle (1.1cm);
+    \node[sourceblue!90!black,font=\scriptsize] at (0.4, 2.2) {US (55\%)};
+    \node[targetgreen!80!black,font=\scriptsize] at (2.7, 2.2) {USD (60\%)};
+    \node[font=\scriptsize] at (1.5, 1.5) {33\%};
+  \end{scope}
+  
+  % Correlated
+  \begin{scope}[shift={(6,0)}]
+    \node[font=\bfseries\scriptsize] at (1.5, 3.2) {Real Data (Correlated)};
+    \draw[thick,sourceblue!80,fill=sourceblue!10,fill opacity=0.5] (1,1.5) circle (1.2cm);
+    \draw[thick,targetgreen!80!black,fill=targetgreen!10,fill opacity=0.5] (1.3,1.5) circle (1.1cm);
+    \node[sourceblue!90!black,font=\scriptsize] at (0.2, 2.2) {US};
+    \node[targetgreen!80!black,font=\scriptsize] at (2.4, 2.2) {USD};
+    \node[font=\scriptsize] at (1.2, 1.5) {54\%};
+  \end{scope}
+\end{tikzpicture}
+\caption{When predicates are assumed independent, their probabilities are multiplied (left). If they are correlated, the true overlap is much larger (right), and the planner's estimate will be far too small.}
+\label{ch07:fig-correlation}
+\end{figure}
+
 PostgreSQL cannot discover such relationships on its own, because \texttt{pg\_stats} describes each column separately. You can tell it to look at a group of columns together with \emph{extended statistics}:
 
 \begin{lstlisting}[language=SQL]
@@ -271,9 +331,11 @@ Two of these deserve a comment.
 \subsection{Pricing a Sequential Scan by Hand}
 
 Take a \texttt{ledger\_lines} table that occupies $10{,}000$ pages and holds $500{,}000$ rows (50 rows per 8~KB page). The cost of reading every row and testing one \texttt{WHERE} predicate is
-\[
-  \underbrace{10{,}000 \times 1.0}_{\text{pages}} \;+\; \underbrace{500{,}000 \times 0.01}_{\text{rows}} \;+\; \underbrace{500{,}000 \times 0.0025}_{\text{one predicate per row}} \;=\; 10{,}000 + 5{,}000 + 1{,}250 \;=\; 16{,}250.
-\]
+\begin{align*}
+  \text{cost} &= \underbrace{10{,}000 \times 1.0}_{\text{pages}} + \underbrace{500{,}000 \times 0.01}_{\text{rows}} + \underbrace{500{,}000 \times 0.0025}_{\text{one predicate per row}} \\
+  &= 10{,}000 + 5{,}000 + 1{,}250 \\
+  &= 16{,}250.
+\end{align*}
 You can check this against PostgreSQL directly:
 
 \begin{lstlisting}[language=SQL]
@@ -330,10 +392,13 @@ CPU cost is added on top: \texttt{cpu\_index\_tuple\_cost} plus one \texttt{cpu\
 Use the \texttt{ledger\_lines} table again: $T = 10{,}000$ pages, $500{,}000$ rows. A predicate keeps 1\%, so $N = 5{,}000$ rows.
 
 \emph{Uncorrelated column ($c = 0.02$, effectively $0$).} Mackert--Lohman gives
-\[
-  P_{\max} = \frac{2 \times 10{,}000 \times 5{,}000}{20{,}000 + 5{,}000} = \frac{10^8}{25{,}000} = 4{,}000 \text{ pages}, \qquad \text{IO} \approx 4{,}000 \times 4.0 = 16{,}000.
-\]
-Add about $5{,}000 \times (0.005 + 0.0025) = 37.5$ for index entries, $5{,}000 \times 0.01 = 50$ for heap rows, and a few dozen for index pages, and the total lands near $16{,}150$. The sequential scan costs $16{,}250$. At 1\%, on an uncorrelated column, the two plans are essentially tied.
+\begin{align*}
+  P_{\max} &= \frac{2 \times 10{,}000 \times 5{,}000}{20{,}000 + 5{,}000} \\
+  &= \frac{10^8}{25{,}000} \\
+  &= 4{,}000 \text{ pages}, \\[6pt]
+  \text{IO} &\approx 4{,}000 \times 4.0 = 16{,}000.
+\end{align*}
+Add about $5{,}000 \times (0.005 + 0.0025) = 37.5$ for index entries, $5{,}000 \times 0.01 = 50$ for heap rows, and a few dozen for index pages, and the total lands near $16{,}150$. The sequential scan costs $16{,}250$. At 1\%, on an uncorrelated column, the two plans are tied.
 
 \emph{Correlated column ($c = 0.99$, such as \texttt{created\_at} on an append-only table).} Now $P_{\min} = 100$ pages and $\text{IO}_{\min} = 4 + 99 = 103$. With $c^2 = 0.98$:
 \[
@@ -560,7 +625,7 @@ Hash Join  (actual time=812.4..6411.9 rows=9840211 loops=1)
 
 \subsection{Merge Join}
 
-If both inputs arrive sorted on the join key, they can be joined like a zipper. Keep a cursor on each input. Compare the two current keys; advance whichever is smaller; when the keys are equal, emit the matching rows (handling runs of duplicates on both sides) and advance. Each input is read once, so the cost is proportional to $N_{\text{outer}} + N_{\text{inner}}$, with very little memory.
+If both inputs arrive sorted on the join key, they can be joined like a zipper. Keep a cursor on each input. Compare the two current keys; advance whichever is smaller; when the keys are equal, emit the matching rows (handling runs of duplicates on both sides) and advance. Each input is read once, so the cost is proportional to $N_{\text{outer}} + N_{\text{inner}}$, with little memory.
 
 Merge join is attractive when sorted input is free: both sides come from B-tree indexes on the join key, or the query needs the result ordered by that key anyway. Otherwise each side needs a \texttt{Sort} node. Sorts report how they ran:
 \begin{itemize}
@@ -635,7 +700,7 @@ Every one of these decisions depends on the estimated row counts. If the estimat
 \section{Searching Join Orders}
 \label{ch07:join-order}
 
-A query that joins $n$ tables can be evaluated in many orders. How many? Count the binary join trees whose leaves are the $n$ tables. The shapes of binary trees with $n$ leaves are counted by the Catalan number $C_{n-1}$, and the tables can be assigned to the leaves in $n!$ ways, so there are $n! \cdot C_{n-1}$ trees:
+A query that joins $n$ tables can be evaluated in many orders. How many? Count the binary join trees whose leaves are the $n$ tables. The shapes of binary trees with $n$ leaves are counted by the Catalan number $C_{n-1}$ (a sequence from combinatorics that counts things like valid bracket arrangements or tree structures), and the tables can be assigned to the leaves in $n!$ ways, so there are $n! \cdot C_{n-1}$ trees:
 
 \begin{center}
 \small
@@ -655,7 +720,7 @@ Each tree also needs a join algorithm at every node and an access path at every 
 
 \subsection{Dynamic Programming over Subsets}
 
-PostgreSQL's standard join search, inherited from IBM's System~R optimizer (Selinger et al., 1979), builds plans bottom-up over \emph{sets of tables}:
+PostgreSQL's standard join search, inherited from IBM's System~R optimizer (Selinger et al., 1979), builds plans bottom-up over \emph{sets of tables} using \emph{dynamic programming} (an algorithm technique that solves a large problem by solving smaller subproblems and remembering their answers):
 \begin{enumerate}
   \item \textbf{Level 1:} for each single table, find the cheapest access path (Section~\ref{ch07:access-paths}).
   \item \textbf{Level 2:} for each pair of tables $\{A, B\}$ that are connected by a join condition, consider joining the best plan for $\{A\}$ with the best plan for $\{B\}$, in both orders and with all three join algorithms. Keep the cheapest plan for the set $\{A, B\}$.
@@ -669,11 +734,11 @@ The key insight is that the best plan for $\{A, B, C\}$ only needs the best plan
 $2^n$ is still exponential. Two settings keep planning time in check:
 \begin{itemize}
   \item \textbf{\texttt{join\_collapse\_limit}} and \textbf{\texttt{from\_collapse\_limit}} (default 8): the planner only reorders up to 8 items freely. Beyond that, explicit \texttt{JOIN} syntax order and subquery boundaries are partially respected as written.
-  \item \textbf{\texttt{geqo\_threshold}} (default 12): when a query has 12 or more items in \texttt{FROM}, PostgreSQL switches to the \emph{Genetic Query Optimizer} (GEQO). GEQO treats a join order as a chromosome, generates a population of random orders, and repeatedly combines the cheaper ones. It finds a good plan quickly but not necessarily the best one, and because it is randomized, plans for very large joins can vary between runs (set \texttt{geqo\_seed} to make them reproducible).
+  \item \textbf{\texttt{geqo\_threshold}} (default 12): when a query has 12 or more items in \texttt{FROM}, PostgreSQL switches to the \emph{Genetic Query Optimizer} (GEQO). GEQO treats a join order as a chromosome, generates a population of random orders, and repeatedly combines the cheaper ones. It finds a good plan quickly but not necessarily the best one, and because it is randomized, plans for large joins can vary between runs (set \texttt{geqo\_seed} to make them reproducible).
 \end{itemize}
 
 \begin{applicationbox}
-ORMs and reporting tools sometimes generate queries joining 15 or 20 tables, many of them small lookup tables. If such a query plans slowly or chooses erratic plans, check the \texttt{Planning Time} line in \texttt{EXPLAIN ANALYZE}. Splitting the query, or writing explicit \texttt{JOIN}s in a sensible order and lowering \texttt{join\_collapse\_limit} for that session, gives you a stable plan and a planning time measured in milliseconds rather than seconds.
+Object-relational mappers (ORMs) and reporting tools sometimes generate queries joining 15 or 20 tables, many of them small lookup tables. If such a query plans slowly or chooses erratic plans, check the \texttt{Planning Time} line in \texttt{EXPLAIN ANALYZE}. Splitting the query, or writing explicit \texttt{JOIN}s in a sensible order and lowering \texttt{join\_collapse\_limit} for that session, gives you a stable plan and a planning time measured in milliseconds rather than seconds.
 \end{applicationbox}
 
 \section{Reading \texttt{EXPLAIN (ANALYZE, BUFFERS)} Line by Line}
@@ -682,7 +747,7 @@ ORMs and reporting tools sometimes generate queries joining 15 or 20 tables, man
 Plain \texttt{EXPLAIN} shows the plan the planner chose and its predictions. \texttt{EXPLAIN ANALYZE} \emph{runs} the query and adds what actually happened at every node. \texttt{BUFFERS} adds how many pages each node touched and where they came from. Use all three together.
 
 \begin{trapbox}
-\texttt{EXPLAIN ANALYZE} really executes the statement. \texttt{EXPLAIN ANALYZE DELETE FROM postings WHERE ...} deletes the rows. Wrap data-modifying statements in a transaction you roll back:
+\texttt{EXPLAIN ANALYZE} executes the statement. \texttt{EXPLAIN ANALYZE DELETE FROM postings WHERE ...} deletes the rows. Wrap data-modifying statements in a transaction you roll back:
 \begin{lstlisting}[language=SQL]
 BEGIN;
 EXPLAIN (ANALYZE, BUFFERS) DELETE FROM postings WHERE ...;
@@ -736,10 +801,11 @@ Execution Time: 212.533 ms
 \paragraph{\texttt{actual time} is in milliseconds, per loop.} \texttt{actual time=0.031..6.211} means the node returned its first row after 0.031~ms and its last row after 6.211~ms. Unlike \texttt{cost}, these are real milliseconds.
 
 \paragraph{The \texttt{loops} multiplier.} Look at the inner index scan on \texttt{postings}: \texttt{actual time=0.004..0.011 rows=25 loops=11842}. This node ran 11,842 times, once for each EU account from the outer side. \textbf{Both \texttt{actual time} and \texttt{rows} are averages per loop}, so the totals are
-\[
-  \text{rows} = 25 \times 11{,}842 = 296{,}050, \qquad \text{time} \approx 0.011\text{ ms} \times 11{,}842 \approx 130\text{ ms}.
-\]
-That 130~ms is most of the query's 212~ms. If you read only the per-loop number, you would conclude this node costs 0.011~ms and is irrelevant. It is actually the most expensive node in the plan. Whenever you see \texttt{loops} greater than 1, multiply.
+\begin{align*}
+  \text{rows} &= 25 \times 11{,}842 = 296{,}050, \\
+  \text{time} &\approx 0.011\text{ ms} \times 11{,}842 \approx 130\text{ ms}.
+\end{align*}
+That 130~ms is most of the query's 212~ms. If you read only the per-loop number, you would conclude this node costs 0.011~ms and is irrelevant. It is the most expensive node in the plan. Whenever you see \texttt{loops} greater than 1, multiply.
 
 \paragraph{Buffers.} \texttt{Buffers: shared hit=39903 read=6025} on the inner scan means it touched 45,928 pages in total: 39,903 were already in \texttt{shared\_buffers} (\texttt{hit}), and 6,025 had to be requested from the operating system (\texttt{read}). A \texttt{read} may still be served from the OS page cache rather than the disk; \texttt{BUFFERS} cannot tell the difference, but \texttt{track\_io\_timing = on} adds an \texttt{I/O Timings} line that can. Other counters you will meet:
 \begin{itemize}
@@ -853,7 +919,7 @@ EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t WHERE rnd < 5;
 EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t WHERE seq < 10;
 EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t WHERE rnd < 300;
 \end{lstlisting}
-Both of the first two predicates match about 10,000 rows. Notice how differently they are planned and how many buffers each touches, and connect what you see to the \texttt{correlation} values. Then set \texttt{work\_mem = '64kB'} and rerun the \texttt{rnd < 300} query to make the bitmap go lossy.
+Both of the first two predicates match about 10,000 rows. Observe how differently they are planned and how many buffers each touches, and connect what you see to the \texttt{correlation} values. Then set \texttt{work\_mem = '64kB'} and rerun the \texttt{rnd < 300} query to make the bitmap go lossy.
 \end{labbox}
 
 The planner turns SQL into a plan; MVCC and locking keep concurrent plans correct; WAL keeps their results durable. In Chapter~8 we put all of it to work: designing financial schemas whose constraints make invalid states unrepresentable, replicating them across machines, and serving them to thousands of application tasks through a connection pooler.

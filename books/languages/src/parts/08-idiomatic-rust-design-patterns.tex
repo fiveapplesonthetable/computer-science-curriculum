@@ -3,13 +3,13 @@
 
 Chapters~3 through~7 were about single functions: what each byte on the stack and heap is doing, how borrows and lifetimes are checked, how enums, traits, and iterators compile. This chapter is about the next problem: putting a few thousand lines together.
 
-When you build a five-thousand-line service of your own, a different set of errors appears. You try to wire up a hierarchical chart of accounts where each child account points back to its parent and each parent holds a list of children, and the borrow checker blocks every edge. You reach for \texttt{Rc<RefCell<Account>>} to make the compiler stop complaining, only to watch a subtle re-entrant call panic at runtime. You write a \texttt{SettlementEngine} struct with ten fields, call \texttt{self.\allowbreak{}apply\_posting(\&self.fee\_schedule)} inside a \texttt{\&mut self} method, and hit compiler error \texttt{E0502}: cannot borrow \texttt{self.fee\_schedule} as immutable because it is also borrowed as mutable. You pass \texttt{\&String} and \texttt{\&Vec<Posting>} across helper functions, sprinkle defensive \texttt{if amount <= 0} checks at the top of every method, and end up with more checks than logic.
+When you build a five-thousand-line service of your own, a different set of errors appears. You try to wire up a hierarchical chart of accounts (a categorized tree of all accounts used by an organization) where each child account points back to its parent and each parent holds a list of children, and the borrow checker blocks every edge. You reach for \texttt{Rc<RefCell<Account>>} to make the compiler stop complaining, only to watch a subtle re-entrant call panic at runtime. You write a \texttt{SettlementEngine} struct with ten fields, call \texttt{self.\allowbreak{}apply\_posting(\&self.fee\_schedule)} inside a \texttt{\&mut self} method, and hit compiler error \texttt{E0502}: cannot borrow \texttt{self.fee\_schedule} as immutable because it is also borrowed as mutable. You pass \texttt{\&String} and \texttt{\&Vec<Posting>} across helper functions, sprinkle defensive \texttt{if amount <= 0} checks at the top of every method, and end up with more checks than logic.
 
 \begin{intuitionbox}
 Fighting the borrow checker is almost never a sign that you forgot a lifetime annotation. Nine times out of ten, it is an architectural diagnostic. You are sketching a \emph{Java object graph} --- cyclic pointers, shared mutable state, runtime flags, and raw primitive arguments --- and asking Rust to prove no two pointers alias mutably. Idiomatic Rust does not patch Java architectures with extra lifetime syntax or \texttt{RefCell} wrappers. It reshapes data ownership, state transitions, and module boundaries so that the hardware layout is flat and invalid states cannot even be written down.
 \end{intuitionbox}
 
-This chapter answers the central question of Part~III: \emph{how do experienced engineers structure production Rust?} Each section contrasts a familiar Java~6 or C++ instinct against the idiomatic Rust design that replaces it. Every pattern comes from the financial ledger, payment routing, and settlement domain we will take into a live Axum, SQLx, and PostgreSQL backend in Part~V.
+This chapter answers the central question of Part~III: \emph{how do experienced engineers structure production Rust?} Each section contrasts a familiar Java~6 or C++ instinct against the idiomatic Rust design that replaces it. Every pattern comes from the financial ledger, payment routing, and settlement domain we will take into a live Axum (a web framework), SQLx (a database tool), and PostgreSQL (a relational database) backend in Part~V.
 
 \chapterline
 
@@ -39,7 +39,7 @@ public class AccountNode {
 }
 \end{lstlisting}
 
-In Java, object identity and object access are fused into a single concept: a garbage-collected heap pointer. Every \texttt{AccountNode} floats independently on the heap, \texttt{parent} points upward, \texttt{children} points downward, an order-book map holds another reference from the side, and an audit listener holds a fourth. Because the JVM makes no compile-time promises about aliasing, any method can mutate any reachable node at any instant.
+In Java, object identity and object access are fused into a single concept: a garbage-collected heap pointer. Every \texttt{AccountNode} floats independently on the heap, \texttt{parent} points upward, \texttt{children} points downward, an order-book (a record of outstanding orders) map holds another reference from the side, and an audit listener holds a fourth. Because the JVM makes no compile-time promises about aliasing, any method can mutate any reachable node at any instant.
 
 Here is what happens when an engineer translates \texttt{AccountNode} line for line into Rust.
 
@@ -68,7 +68,7 @@ struct BadAccountNode {
 It compiles. But wrapping a domain graph in \texttt{Rc<RefCell<T>>} forfeits almost every advantage you came to Rust to get, while introducing failure modes Java~6 never had:
 
 \begin{enumerate}
-  \item \textbf{Heap fragmentation and CPU cache misses.} Every \texttt{Rc::new(RefCell::new(...))} performs an individual allocator request. Inside each heap block sits a 16-byte reference-count header (\texttt{strong: usize}, \texttt{weak: usize}) plus an 8-byte \texttt{BorrowFlag} (\texttt{isize}) before your fields even begin. Walking 10,000 accounts chases arbitrary 64-bit addresses scattered across megabytes of virtual memory, stalling the CPU pipeline for $\sim 100\text{--}200$ cycles on L3/DRAM misses instead of streaming sequential 64-byte cache lines.
+  \item \textbf{Heap fragmentation and CPU cache misses.} Every \texttt{Rc::new(RefCell::new(...))} performs an individual allocator request. Inside each heap block sits a 16-byte reference-count header (\texttt{strong: usize}, \texttt{weak: usize}) plus an 8-byte \texttt{BorrowFlag} (\texttt{isize}) before your fields even begin. Walking 10,000 accounts chases arbitrary 64-bit addresses scattered across megabytes of virtual memory, stalling the CPU pipeline for $\sim 100\text{--}200$ cycles on Level 3 cache or Dynamic Random-Access Memory (L3/DRAM) misses instead of streaming sequential 64-byte cache lines.
   \item \textbf{Accidental reference-cycle memory leaks.} If a developer later adds a cross-reference field \texttt{counterparty:\allowbreak\ Option<SharedAccount>} using strong \texttt{Rc} instead of \texttt{Weak}, two accounts pointing at each other keep their strong counts $\ge 1$ forever. Rust has no tracing garbage collector; those nodes and everything they own leak silently for the lifetime of the process.
   \item \textbf{Thread hostility.} \texttt{Rc} and \texttt{RefCell} use non-atomic integer increments, so the compiler strips \texttt{Send} and \texttt{Sync} from the entire graph. Passing this chart of accounts into a multi-threaded Tokio server in Part~V would force wrapping every node in \texttt{Arc<Mutex<T>>} or \texttt{Arc<RwLock<T>>}. Every field read would acquire an atomic lock, and two transfers locking nodes in opposite orders would deadlock.
   \item \textbf{Delayed runtime \texttt{BorrowMutError} panics.} \texttt{RefCell} does not remove the aliasing rule --- it merely moves enforcement from compile time to runtime.
@@ -105,7 +105,7 @@ The compiler approves both functions without a single warning. Everything passes
 
 \subsection{The Rust Architectural Shift: Separate Identity from Ownership}
 
-Ask what \texttt{parent} and \texttt{children} in our chart of accounts actually mean. Does a child account \emph{own the lifetime of} its parent account's memory? No. In a database, the \texttt{accounts} table owns all rows, and \texttt{parent\_account\_id} is simply an integer foreign key naming another row in that same table.
+Ask what \texttt{parent} and \texttt{children} in our chart of accounts mean. Does a child account \emph{own the lifetime of} its parent account's memory? No. In a database, the \texttt{accounts} table owns all rows, and \texttt{parent\_account\_id} is an integer foreign key naming another row in that same table.
 
 Idiomatic Rust applies that exact relational insight directly to in-memory data structures:
 
@@ -115,8 +115,8 @@ Idiomatic Rust applies that exact relational insight directly to in-memory data 
 
 Every problem from the \texttt{Rc<RefCell<T>>} list goes away with this shift:
 \begin{itemize}
-  \item \textbf{One clear owner, automatic cleanup.} When the \texttt{AccountArena} struct goes out of scope, dropping its single \texttt{Vec} frees every node at once. Cycles among integer handles are just numbers; they can never leak memory.
-  \item \textbf{Hardware sympathy.} Every \texttt{AccountNode} sits back to back in one contiguous slab of RAM. Scanning balances streams straight through the CPU hardware prefetcher, and handles shrink from 8-byte aligned pointers (plus 24 bytes of \texttt{Rc}/\texttt{RefCell} metadata) down to compact 4-byte or 8-byte values.
+  \item \textbf{One clear owner, automatic cleanup.} When the \texttt{AccountArena} struct goes out of scope, dropping its single \texttt{Vec} frees every node at once. Cycles among integer handles are numbers; they can never leak memory.
+  \item \textbf{Hardware sympathy.} Every \texttt{AccountNode} sits back to back in one contiguous slab of Random-Access Memory (RAM). Scanning balances streams straight through the CPU hardware prefetcher, and handles shrink from 8-byte aligned pointers (plus 24 bytes of \texttt{Rc}/\texttt{RefCell} metadata) down to compact 4-byte or 8-byte values.
   \item \textbf{Automatic \texttt{Send} and \texttt{Sync}.} Plain structs holding integers, \texttt{Vec}s, and \texttt{String}s are automatically \texttt{Send + Sync} with zero atomic refcount overhead.
   \item \textbf{Compile-time borrow checking restored.} Instead of hidden per-node \texttt{RefCell} flags, borrowing happens at the arena boundary: \texttt{arena.get(key)} takes \texttt{\&self} (allowing unlimited simultaneous readers), and \texttt{arena.get\_mut(key)} takes \texttt{\&mut self} (making mutation explicit in the function signature).
 \end{itemize}
@@ -192,7 +192,7 @@ Every problem from the \texttt{Rc<RefCell<T>>} list goes away with this shift:
 
 \subsection{Generational Indices: Solving the Stale-Handle (ABA) Problem}
 
-A C programmer looking at Figure~\ref{ch08:fig-arena-vs-rc} immediately asks a sharp question. \emph{``If an index handle is just \texttt{struct AccountKey(u32)}, what happens when account \texttt{1} closes and its slot is reused for a new customer?''}
+A C programmer looking at Figure~\ref{ch08:fig-arena-vs-rc} immediately asks a sharp question. \emph{``If an index handle is \texttt{struct AccountKey(u32)}, what happens when account \texttt{1} closes and its slot is reused for a new customer?''}
 
 Suppose a queued settlement batch still holds the old \texttt{AccountKey(1)}. Indexing into slot \texttt{1} will not corrupt raw memory like a C dangling pointer, yet it commits a nasty \emph{logical} bug: crediting money to the wrong customer. In systems programming, this is the classic \textbf{ABA problem} (the \emph{A-to-B-to-A} recycled-slot hazard, where a slot holds occupant~$A$, transitions through an intermediate free state~$B$, and is reused while a stale handle from the first occupant still points to it). Here slot~$1$ went from Customer~$A$, to free, to a new occupant, and a bare integer index cannot tell the recycled slot apart from the original account.
 
@@ -202,12 +202,12 @@ The cure --- used for entity handles in Rust game engines, in compilers (\texttt
 A \emph{generational arena} pairs each array slot $i \in \{0, \dots, n-1\}$ with a monotonically increasing counter $\text{gen}_i \in \N$. Every handle handed to callers is an 8-byte pair $(\text{index}: \texttt{u32},\; \text{generation}: \texttt{u32})$.
 \begin{itemize}
   \item On \textbf{lookup} of $(\text{idx}, g)$, the arena checks both $\text{idx} < n$ and that slot $\text{idx}$ is currently \texttt{Occupied} with $\text{gen}_{\text{idx}} == g$. If either fails, lookup cleanly returns \texttt{None}.
-  \item On \textbf{removal} of $(\text{idx}, g)$, slot $\text{idx}$ transitions to \texttt{Vacant}, increments its generation to $g + 1$ (using wrapping or checked arithmetic), and pushes $\text{idx}$ onto an embedded singly linked free-list of reusable slots.
+  \item On \textbf{removal} of $(\text{idx}, g)$, slot $\text{idx}$ transitions to \texttt{Vacant}, increments its generation to $g + 1$ (using wrapping or checked arithmetic), and pushes $\text{idx}$ onto an embedded singly linked free-list (a list tracking available memory slots) of reusable slots.
 \end{itemize}
 Any stale handle still holding $(\text{idx}, g)$ will forever see $g \neq g + 1$ and fail closed as \texttt{None}, even after the slot is recycled millions of times.
 \end{definition}
 
-Notice how neatly the free-list fits inside the vacant slots themselves without a second \texttt{Vec}: when a slot is empty, its payload space stores \texttt{next\_free: Option<u32>} pointing to the next available index.
+Observe how neatly the free-list fits inside the vacant slots themselves without a second \texttt{Vec}: when a slot is empty, its payload space stores \texttt{next\_free: Option<u32>} pointing to the next available index.
 
 \subsection{Mutating Two Nodes Safely with \texttt{split\_at\_mut}}
 
@@ -410,7 +410,7 @@ Trace why the re-entrancy crash from \texttt{Rc<RefCell<T>>} cannot happen here.
 \label{ch08:parse-dont-validate}
 % ======================================================================
 
-Look back at the signature of \texttt{ChartOfAccounts::transfer} above. Notice how we already replaced raw \texttt{u32} account indices with \texttt{AccountKey}, yet the final parameter is still \texttt{cents: i64}, forcing the method to open with \texttt{if cents <= 0 \{ return Err(...); \}}. Now imagine scaling that style to an international wire-submission function written in the ``primitive obsession'' style common in Java~6 and C codebases:
+Look back at the signature of \texttt{ChartOfAccounts::transfer} above. Observe how we already replaced raw \texttt{u32} account indices with \texttt{AccountKey}, yet the final parameter is still \texttt{cents: i64}, forcing the method to open with \texttt{if cents <= 0 \{ return Err(...); \}}. Now imagine scaling that style to an international wire-submission function written in the ``primitive obsession'' style common in Java~6 and C codebases:
 
 \begin{lstlisting}[language=Rust]
 // Anti-pattern: Primitive Obsession & Shotgun Validation
@@ -434,7 +434,7 @@ pub fn submit_international_wire(
 
 Count the structural hazards hiding inside those seven primitive parameters:
 \begin{enumerate}
-  \item \textbf{Silent argument-swap bugs.} Three adjacent parameters have type \texttt{u64}, two have type \texttt{\&str}, and two have type \texttt{i64}. If a caller invokes \texttt{submit\_international\_wire(\allowbreak{}acct\_id,\allowbreak\ cust\_id,\allowbreak\ recip\_id,\allowbreak\ currency,\allowbreak\ iban,\allowbreak\ fee,\allowbreak\ amount)}, \texttt{rustc} sees \texttt{(u64,\allowbreak\ u64,\allowbreak\ u64,\allowbreak\ \&str,\allowbreak\ \&str,\allowbreak\ i64,\allowbreak\ i64)} --- a type-perfect match. In production, you have just debited the wrong account or swapped the transfer principal with the wire fee.
+  \item \textbf{Silent argument-swap bugs.} Three adjacent parameters have type \texttt{u64}, two have type \texttt{\&str}, and two have type \texttt{i64}. If a caller invokes \texttt{submit\_international\_wire(\allowbreak{}acct\_id,\allowbreak\ cust\_id,\allowbreak\ recip\_id,\allowbreak\ currency,\allowbreak\ iban,\allowbreak\ fee,\allowbreak\ amount)}, \texttt{rustc} sees \texttt{(u64,\allowbreak\ u64,\allowbreak\ u64,\allowbreak\ \&str,\allowbreak\ \&str,\allowbreak\ i64,\allowbreak\ i64)} --- a type-perfect match. In production, you have debited the wrong account or swapped the transfer principal with the wire fee.
   \item \textbf{Shotgun validation.} Suppose \texttt{submit\_\allowbreak{}international\_\allowbreak{}wire} calls \texttt{is\_\allowbreak{}valid\_\allowbreak{}iban\_\allowbreak{}checksum} on the recipient's International Bank Account Number (\textbf{IBAN}) and passes \texttt{destination\_\allowbreak{}iban: \&str} down to \texttt{route\_\allowbreak{}correspondent\_\allowbreak{}bank} and \texttt{format\_\allowbreak{}swift\_\allowbreak{}mt103}. When you read \texttt{format\_\allowbreak{}swift\_\allowbreak{}mt103} six months later, how do you know its caller remembered to validate the IBAN? You don't. The type \texttt{\&str} includes \texttt{""}, \texttt{"hello\textbackslash nworld"}, and a 10-megabyte novel. So defensive programmers paste the exact same validation \texttt{if} checks at the top of every downstream helper --- scattering domain rules across dozens of files while paying repeated runtime CPU checks.
 \end{enumerate}
 
@@ -448,7 +448,7 @@ Compare two function signatures operating on raw untrusted input:
   \text{Validate:} &\quad \texttt{\small fn validate\_iban(raw: \&str) -> Result<(), IbanError>} \\
   \text{Parse:}    &\quad \texttt{\small fn parse\_iban(raw: \&str) -> Result<Iban, IbanError>}
 \end{align*}
-Both inspect the exact same characters and reject the exact same malformed strings. Yet \texttt{validate\_\allowbreak{}iban} returns \texttt{()} --- the zero-byte unit type from Chapter~7 --- \emph{evaporating} the knowledge it just worked to establish and leaving the caller holding the same unrefined \texttt{\&str}. By contrast, \texttt{parse\_\allowbreak{}iban} narrows the output into a distinct type \texttt{Iban} whose only constructors enforce the invariant. Downstream functions accepting \texttt{iban:\allowbreak\ \&Iban} neither re-check the string nor return \texttt{Result} for malformed syntax; possessing an \texttt{Iban} value \emph{is} a machine-checked proof that parsing succeeded.
+Both inspect the exact same characters and reject the exact same malformed strings. Yet \texttt{validate\_\allowbreak{}iban} returns \texttt{()} --- the zero-byte unit type from Chapter~5 --- \emph{evaporating} the knowledge it worked to establish and leaving the caller holding the same unrefined \texttt{\&str}. By contrast, \texttt{parse\_\allowbreak{}iban} narrows the output into a distinct type \texttt{Iban} whose only constructors enforce the invariant. Downstream functions accepting \texttt{iban:\allowbreak\ \&Iban} neither re-check the string nor return \texttt{Result} for malformed syntax; possessing an \texttt{Iban} value \emph{is} a machine-checked proof that parsing succeeded.
 \end{definition}
 
 \begin{figure}[H]
@@ -556,7 +556,7 @@ pub mod domain {
             if cents <= 0 {
                 return Err(MoneyError::NonPositiveAmount(cents));
             }
-            // Safe: we just proved cents > 0, so NonZeroI64::new is Some
+            // Safe: we proved cents > 0, so NonZeroI64::new is Some
             let nz = NonZeroI64::new(cents)
                 .ok_or(MoneyError::NonPositiveAmount(cents))?;
             Ok(Self(nz))
@@ -654,7 +654,7 @@ Examine three architectural details working together in \texttt{mod domain}:
 On 64-bit x86-64 Linux/macOS (System V AMD64 ABI):
 \begin{itemize}
   \item \texttt{size\_of::<AccountId>() == 8} and \texttt{align\_of::<AccountId>() == 8}. Passing \texttt{(CustomerId, AccountId, PositiveCents)} passes three plain 64-bit integers directly in CPU registers \texttt{rdi}, \texttt{rsi}, and \texttt{rdx} --- zero pointers, zero heap headers, zero indirection.
-  \item Because \texttt{PositiveCents} wraps \texttt{std::num::NonZeroI64} (which forbids the bit pattern \texttt{0x0000\_0000\_0000\_0000}), the compiler uses \texttt{0} as the \emph{niche discriminant} for \texttt{None}: \texttt{size\_of::<Option<PositiveCents>>() == 8}. An optional validated positive dollar amount takes the exact same 8 bytes on the stack as a bare C \texttt{int64\_t}.
+  \item Because \texttt{PositiveCents} wraps \texttt{std::num::NonZeroI64} (which forbids the bit pattern \texttt{0x0000\_0000\_0000\_0000}), the compiler uses \texttt{0} as the \emph{niche discriminant} (a reserved invalid bit pattern used to represent \texttt{None} without extra memory) for \texttt{None}: \texttt{size\_of::<Option<PositiveCents>>() == 8}. An optional validated positive dollar amount takes the exact same 8 bytes on the stack as a bare C \texttt{int64\_t}.
 \end{itemize}
 Once \texttt{rustc} finishes type-checking, \texttt{AccountId} and \texttt{CustomerId} erase completely from the emitted machine instructions. All the safety lives at compile time; zero bytes remain at runtime.
 \end{happeningbox}
@@ -675,7 +675,7 @@ pub fn submit_international_wire(
 ) -> Result<WireReceipt, WireError>
 \end{lstlisting}
 
-Swapping \texttt{customer} with \texttt{sender} is an immediate compiler error. Passing a negative or zero amount is impossible. Re-checking the IBAN checksum inside \texttt{submit\_international\_wire} is unnecessary because \texttt{\&Iban} already proves ISO~13616 validity. Validation happened once, at the HTTP JSON deserialization edge, and the type system carried the proof everywhere else for free.
+Swapping \texttt{customer} with \texttt{sender} is an immediate compiler error. Passing a negative or zero amount is impossible. Re-checking the IBAN checksum inside \texttt{submit\_international\_wire} is unnecessary because \texttt{\&Iban} already proves ISO~13616 validity. Validation happened once, at the HTTP JavaScript Object Notation (JSON) deserialization edge, and the type system carried the proof everywhere else for free.
 
 % ======================================================================
 \section{Compile-Time State Machines: The Typestate Pattern and Builders}
@@ -686,7 +686,7 @@ Newtypes enforce invariants on \emph{individual values}. What about invariants a
 
 Think about the lifecycle of a high-value wire order inside a bank:
 \begin{enumerate}
-  \item An API handler creates a \textbf{Draft} wire order holding the sender ID, recipient IBAN, and \texttt{PositiveCents} amount.
+  \item An Application Programming Interface (API) handler creates a \textbf{Draft} wire order holding the sender ID, recipient IBAN, and \texttt{PositiveCents} amount.
   \item A sanctions and anti-money-laundering (\textbf{AML}) engine screens the counterparties against watchlists from the US Office of Foreign Assets Control (\textbf{OFAC}). Only if screening passes does the order become \textbf{ComplianceCleared}, acquiring a cryptographic officer/screening stamp.
   \item A settlement worker transmits a cleared order to the central clearing rail, producing a \textbf{Settled} wire with a rail transaction sequence number.
 \end{enumerate}
@@ -723,7 +723,7 @@ public class WireOrder {
 }
 \end{lstlisting}
 
-Every caller can invoke \texttt{order.settle(999L)} on a fresh draft. The Java compiler accepts it without complaint, and you only discover the mistake when \texttt{IllegalStateException} fires in production. Worse, if someone forgets \texttt{if (!this.complianceCleared)} inside a new batch-settlement helper, an unscreened wire hits the SWIFT network. Notice those two nullable fields \texttt{ofacTicket} and \texttt{railTxId}: two booleans plus two nullable fields create $2 \times 2 \times 2 \times 2 = 16$ representable combinations in memory when only $3$ states are legal.
+Every caller can invoke \texttt{order.settle(999L)} on a fresh draft. The Java compiler accepts it without complaint, and you only discover the mistake when \texttt{IllegalStateException} fires in production. Worse, if someone forgets \texttt{if (!this.complianceCleared)} inside a new batch-settlement helper, an unscreened wire hits the Society for Worldwide Interbank Financial Telecommunication (SWIFT) network. Notice those two nullable fields \texttt{ofacTicket} and \texttt{railTxId}: two booleans plus two nullable fields create $2 \times 2 \times 2 \times 2 = 16$ representable combinations in memory when only $3$ states are legal.
 
 \subsection{Encoding Protocol States in Type Parameters and \texttt{PhantomData}}
 
@@ -732,7 +732,7 @@ In Rust, we can lift the state of the protocol out of runtime booleans and put i
 You actually have two complementary ways to represent the state parameter \texttt{S}, and you should know both:
 
 \begin{enumerate}
-  \item \textbf{Pure Zero-Sized Marker Types + \texttt{PhantomData<S>}.} Suppose two states store the exact same runtime fields and differ only in which methods are legal (such as \texttt{RawQuery} versus \texttt{SanitizedQuery}). Define empty unit structs \texttt{pub struct Draft;} and \texttt{pub struct Verified;} that occupy \textbf{0 bytes} in RAM. Rust requires every generic type parameter \texttt{S} on \texttt{struct Thing<S>} to appear in at least one field so the compiler knows variance and drop rules (Chapter~4). We satisfy that rule with a zero-byte marker field \texttt{\_state:\allowbreak\ std::marker::PhantomData<S>}.
+  \item \textbf{Pure Zero-Sized Marker Types + \texttt{PhantomData<S>}.} Suppose two states store the exact same runtime fields and differ only in which methods are legal (such as \texttt{RawQuery} versus \texttt{SanitizedQuery}). Define empty unit structs \texttt{pub struct Draft;} and \texttt{pub struct Verified;} that occupy \textbf{0 bytes} in RAM. Rust requires every generic type parameter \texttt{S} on \texttt{struct Thing<S>} to appear in at least one field so the compiler knows variance and drop rules (Chapter~4). We satisfy that rule with a zero-byte marker field \texttt{\_state:\allowbreak\ std::marker::\allowbreak{}PhantomData<S>}.
   \item \textbf{State-Specific Payload Structs (\texttt{state: S}).} Even better, when entering a state \emph{produces new data} that did not exist before --- such as \texttt{ComplianceCleared} acquiring an \texttt{ofac\_ticket} and \texttt{Settled} acquiring a \texttt{rail\_tx\_id} --- we store \texttt{state: S} directly as a field. For \texttt{Draft}, \texttt{pub struct Draft;} is still a 0-byte zero-sized type (ZST), so \texttt{WireOrder<Draft>} pays zero bytes for \texttt{state}. For \texttt{ComplianceCleared}, \texttt{state} holds the \texttt{ApprovalStamp} directly without any \texttt{Option<...>} wrapper.
 \end{enumerate}
 
@@ -743,7 +743,7 @@ Inside \texttt{core::marker}, \texttt{PhantomData<T>} is a compiler-intrinsic ze
   \texttt{std::mem::size\_of::<PhantomData<S>>()} &= 0, \\
   \texttt{std::mem::align\_of::<PhantomData<S>>()} &= 1.
 \end{align*}
-At runtime, a \texttt{PhantomData<S>} field emits \emph{zero bits} in memory and \emph{zero instructions} during moves or copies. At compile time, it tells \texttt{rustc} to treat the enclosing struct ``as if'' it logically owned a value of type \texttt{S} for type discrimination, lifetime variance, and \texttt{Send}/\texttt{Sync} auto-trait derivation. (If you want invariance without drop/send ownership effects, a common systems idiom is \texttt{PhantomData<fn(S) -> S>}, which is always \texttt{Copy + Send + Sync} regardless of \texttt{S}.)
+At runtime, a \texttt{PhantomData<S>} field emits \emph{zero bits} in memory and \emph{zero instructions} during moves or copies. At compile time, it tells \texttt{rustc} to treat the enclosing struct ``as if'' it logically owned a value of type \texttt{S} for type discrimination, lifetime variance, and \texttt{Send}/\texttt{Sync} auto-trait derivation. (An \emph{auto trait} is a marker trait such as \texttt{Send} or \texttt{Sync} that the compiler implements for a struct automatically when every field implements it.) (If you want invariance without drop/send ownership effects, a common systems idiom is \texttt{PhantomData<fn(S) -> S>}, which is always \texttt{Copy + Send + Sync} regardless of \texttt{S}.)
 \end{formalbox}
 
 \subsection{Why Rust's Destructive Move Makes Typestate Airtight}
@@ -881,7 +881,7 @@ let done_1 = cleared.settle(90001); // `cleared` is MOVED here!
 \end{lstlisting}
 \end{itemize}
 
-\texttt{WireOrder} deliberately omits \texttt{Clone}, and \texttt{settle(self, ...)} takes ownership by value. Rust's ownership rules therefore enforce \emph{linear state progression}: one \texttt{Draft} token enters, one \texttt{ComplianceCleared} token emerges, and the \texttt{Draft} binding vanishes from the compiler's live-variable table.
+\texttt{WireOrder} deliberately omits \texttt{Clone}, and \texttt{settle(self, ...)} takes ownership by value. Rust's ownership rules therefore enforce \emph{linear state progression}: one \texttt{Draft} token enters, one \texttt{Compliance\allowbreak{}Cleared} token emerges, and the \texttt{Draft} binding vanishes from the compiler's live-variable table.
 
 \begin{figure}[H]
 \centering
@@ -1097,7 +1097,7 @@ impl LedgerPoolBuilder<Provided<String>, Provided<[u8; 32]>> {
 }
 \end{lstlisting}
 
-Notice that the caller can supply \texttt{.signing\_key(...)} and \texttt{.postgres\_url(...)} in \emph{either} order, interleave \texttt{.max\_connections(32)} anywhere, and \texttt{.build()} returns an infallible \texttt{LedgerPoolConfig} directly --- no \texttt{Option}, no \texttt{Result}, no runtime \texttt{.unwrap()}.
+Observe that the caller can supply \texttt{.signing\_key(...)} and \texttt{.postgres\_url(...)} in \emph{either} order, interleave \texttt{.max\_connections(32)} anywhere, and \texttt{.build()} returns an infallible \texttt{LedgerPoolConfig} directly --- no \texttt{Option}, no \texttt{Result}, no runtime \texttt{.unwrap()}.
 
 % ======================================================================
 \section{Ergonomic, Zero-Copy API Boundaries and Borrow-Splitting Idioms}
@@ -1128,8 +1128,8 @@ pub fn audit_fee_rule(rule: &Box<FeeSchedule>) -> i64 {
 Every seasoned Rust reviewer flags \texttt{\&String}, \texttt{\&Vec<T>}, and \texttt{\&Box<T>} immediately. Look at what is wrong on \emph{both} the caller side and the hardware side:
 
 \begin{enumerate}
-  \item \textbf{You lock out valid callers who do not own a \texttt{String} or \texttt{Vec}.} Suppose a caller wants to check \texttt{is\_sepa\_country(\allowbreak{}"DE89370400440532013000")} using a string literal in read-only \texttt{.rodata} memory (\texttt{\&'static str}), or slice an IBAN field directly out of a 4-kilobyte network socket buffer (\texttt{\&packet\_str[8..30]}). Neither caller possesses a heap-allocated \texttt{String}. Forcing \texttt{\&String} makes them call \texttt{.to\_string()} just to allocate a throwaway heap copy so your read-only function can glance at two bytes and immediately drop it. Similarly, \texttt{\&Vec<i64>} rejects a fixed-size stack array \texttt{[100, -50, -50]} or a window slice \texttt{\&all\_postings[10..20]}.
-  \item \textbf{You introduce a pointless double pointer dereference.} Recall the stack layout from Chapter~3: a \texttt{String} on the stack is 24 bytes \texttt{(ptr, len, cap)}. Passing \texttt{iban: \&String} passes an 8-byte pointer to that 24-byte stack \texttt{String}, which the CPU must first dereference just to load \texttt{ptr} and \texttt{len} before dereferencing \texttt{ptr} a second time to read the UTF-8 characters on the heap.
+  \item \textbf{You lock out valid callers who do not own a \texttt{String} or \texttt{Vec}.} Suppose a caller wants to check \texttt{is\_sepa\_country(\allowbreak{}"DE89370400440532013000")} using a string literal in read-only \texttt{.rodata} memory (\texttt{\&'static str}), or slice an IBAN field directly out of a 4-kilobyte network socket buffer (\texttt{\&packet\_str[8..30]}). Neither caller possesses a heap-allocated \texttt{String}. Forcing \texttt{\&String} makes them call \texttt{.to\_string()} to allocate a throwaway heap copy so your read-only function can glance at two bytes and immediately drop it. Similarly, \texttt{\&Vec<i64>} rejects a fixed-size stack array \texttt{[100, -50, -50]} or a window slice \texttt{\&all\_postings[10..20]}.
+  \item \textbf{You introduce a pointless double pointer dereference.} Recall the stack layout from Chapter~3: a \texttt{String} on the stack is 24 bytes \texttt{(ptr, len, cap)}. Passing \texttt{iban: \&String} passes an 8-byte pointer to that 24-byte stack \texttt{String}, which the CPU must first dereference to load \texttt{ptr} and \texttt{len} before dereferencing \texttt{ptr} a second time to read the UTF-8 characters on the heap.
 \end{enumerate}
 
 The idiomatic replacement is universal: \textbf{whenever a function only reads data without growing or shrinking its backing allocation, accept the borrowed unsized view}:
@@ -1180,7 +1180,7 @@ Compare what happens when an HTTP JSON parser has \emph{already} allocated \text
 
 What about the trickiest middle ground of all: a function that \textbf{99 percent of the time can return a slice of its input untouched, and 1 percent of the time needs to allocate a modified string}?
 
-In payment processing, every incoming Automated Clearing House (\textbf{ACH}) or SWIFT remittance memo must be normalized before ledger ingestion. Leading and trailing ASCII whitespace is trimmed, and any internal ASCII control character (such as \texttt{\textbackslash r}, \texttt{\textbackslash n}, or \texttt{\textbackslash t}) is replaced by a single space \texttt{' '}. In production traffic, 99 percent of bank memos are already clean printable ASCII. Returning \texttt{String} would force \texttt{malloc + memcpy} on all 100 percent of requests just to handle the dirty 1 percent.
+In payment processing, every incoming Automated Clearing House (\textbf{ACH}, the US batch bank-transfer network) or SWIFT (Chapter~6) remittance memo must be normalized before ledger ingestion. Leading and trailing ASCII whitespace is trimmed, and any internal ASCII control character (such as \texttt{\textbackslash r}, \texttt{\textbackslash n}, or \texttt{\textbackslash t}) is replaced by a single space \texttt{' '}. In production traffic, 99 percent of bank memos are already clean printable ASCII. Returning \texttt{String} would force \texttt{malloc + memcpy} on all 100 percent of requests to handle the dirty 1 percent.
 
 Rust's standard library solves this with \textbf{\texttt{std::borrow::Cow<'a, B>}} (\emph{Clone-on-Write}):
 
@@ -1192,7 +1192,7 @@ pub enum Cow<'a, B: ?Sized + ToOwned> {
 }
 \end{lstlisting}
 
-Because \texttt{Cow<'a, str>} implements \texttt{Deref<Target = str>}, callers can read it just like any \texttt{\&str} regardless of which variant came back. If a caller later decides to persist an owned \texttt{String}, calling \texttt{.into\_owned()} moves the existing \texttt{String} out of \texttt{Cow::Owned} without re-allocating, or allocates once if it was \texttt{Cow::Borrowed}.
+Because \texttt{Cow<'a, str>} implements \texttt{Deref<Target = str>}, callers can read it like any \texttt{\&str} regardless of which variant came back. If a caller later decides to persist an owned \texttt{String}, calling \texttt{.into\_owned()} moves the existing \texttt{String} out of \texttt{Cow::Owned} without re-allocating, or allocates once if it was \texttt{Cow::Borrowed}.
 
 Here is \texttt{sanitize\_remittance\_memo} handling both paths:
 
@@ -1322,7 +1322,7 @@ impl SettlementEngine {
 }
 \end{lstlisting}
 
-The body of \texttt{apply\_fee} only mutates the ledger and the audit log; it never touches the fee schedule. Why can't \texttt{rustc} just peek inside \texttt{apply\_fee} and see that the fields are disjoint?
+The body of \texttt{apply\_fee} only mutates the ledger and the audit log; it never touches the fee schedule. Why can't \texttt{rustc} peek inside \texttt{apply\_fee} and see that the fields are disjoint?
 
 \begin{whybox}
 \textbf{Signature Modularity Is Deliberate.} In Rust, borrow checking is strictly \emph{modular across function boundaries}: \texttt{rustc} checks a caller against the callee's \textbf{signature alone}, never its body. Why? Suppose \texttt{apply\_fee(\&mut self, rules: \&FeeSchedule)} were allowed today because its body didn't mutate \texttt{self.fee\_schedule}. Six months later, a teammate adds \texttt{self.fee\_schedule.flat\_wire\_fee\_cents += 1;} inside \texttt{apply\_fee}. That edit would silently create an active mutable alias against \texttt{rules: \&FeeSchedule} \emph{or} break distant callers across the codebase without the method signature ever changing. Writing \texttt{\&mut self} is a contract claiming exclusive access to \textbf{every field} of \texttt{Self}.
@@ -1401,6 +1401,36 @@ impl SettlementEngine {
 
 Look at what \texttt{PostingView<'a>} achieves: the signature itself documents \emph{exact field-level permissions} (mutable ledger and audit log, read-only fee schedule), and every helper on \texttt{PostingView} enjoys clean \texttt{\&mut self} method syntax with zero borrow conflicts.
 
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    font=\small,
+    box/.style={draw, rounded corners=2pt, thick, align=center, inner xsep=6pt, inner ysep=4pt},
+    arr/.style={-{Stealth[length=2.5mm,width=1.8mm]}, thick, draw=sourceblue!85!black},
+    mutarr/.style={-{Stealth[length=2.5mm,width=1.8mm]}, thick, draw=trapred!85!black, dashed}
+]
+  \node[box, draw=gray!80, fill=gray!5, minimum width=3cm] (engine) at (0, 3) {\textbf{\texttt{SettlementEngine}}};
+  
+  \node[box, draw=trapred!80, fill=trapred!5, minimum width=2.5cm] (ledger) at (-2.5, 0) {\texttt{ledger}};
+  \node[box, draw=sourceblue!80, fill=sourceblue!5, minimum width=2.5cm] (fees) at (0, 0) {\texttt{fee\_schedule}};
+  \node[box, draw=trapred!80, fill=trapred!5, minimum width=2.5cm] (audit) at (2.5, 0) {\texttt{audit\_log}};
+  
+  \draw[gray, thick] (engine.south) -- (ledger.north);
+  \draw[gray, thick] (engine.south) -- (fees.north);
+  \draw[gray, thick] (engine.south) -- (audit.north);
+
+  \node[box, draw=targetgreen!80!black, fill=targetgreen!4, minimum width=3cm] (view) at (0, -3) {\textbf{\texttt{PostingView<'a>}}};
+  
+  \draw[mutarr] (view.north) -- node[left, font=\scriptsize\ttfamily] {\&mut} (ledger.south);
+  \draw[arr] (view.north) -- node[right, pos=0.6, font=\scriptsize\ttfamily] {\&} (fees.south);
+  \draw[mutarr] (view.north) -- node[right, font=\scriptsize\ttfamily] {\&mut} (audit.south);
+
+\end{tikzpicture}
+\caption{Borrow splitting with a View Struct. Instead of taking \texttt{\&mut self} on the entire \texttt{SettlementEngine}, \texttt{PostingView} explicitly borrows only the fields it needs, preventing conflicts with other disjoint borrows.}
+\label{ch08:fig-split-borrow}
+\end{figure}
+
+
 % ======================================================================
 \section{Idiomatic Error Handling: \texttt{thiserror} vs \texttt{anyhow}, and \texttt{Result} vs \texttt{panic!}}
 \label{ch08:error-design}
@@ -1408,7 +1438,7 @@ Look at what \texttt{PostingView<'a>} achieves: the signature itself documents \
 
 In Chapter~5 we saw how \texttt{Result<T, E>} and the \texttt{?} operator replace both C's silent integer error codes and Java~6's stack-unwinding exceptions. Yet knowing how \texttt{Result<T, E>} works mechanically leaves open an architectural question that trips up many new Rust teams: \emph{what should the error type \texttt{E} actually be across a multi-layer codebase?}
 
-If you make \texttt{E = String} everywhere, callers cannot \texttt{match} on failure causes without fragile substring searches. Conversely, if you force an ops CLI migration script to define a 25-variant custom \texttt{enum} just to print an error message and exit with code~1, you drown in ceremony.
+If you make \texttt{E = String} everywhere, callers cannot \texttt{match} on failure causes without fragile substring searches. Conversely, if you force an ops command-line interface (CLI) migration script to define a 25-variant custom \texttt{enum} to print an error message and exit with code~1, you drown in ceremony.
 
 The Rust ecosystem converged on a two-zone rule based on a single question: \textbf{will the caller programmatically branch on which failure occurred, or will it report/log the failure up the stack?}
 
@@ -1416,7 +1446,7 @@ The Rust ecosystem converged on a two-zone rule based on a single question: \tex
 
 Inside your domain logic, database repositories, and reusable library crates, callers \emph{act differently} depending on what failed:
 \begin{itemize}
-  \item In our Part~V Axum HTTP API, \texttt{TransferError::InsufficientFunds} maps to HTTP \texttt{422 Unprocessable Entity} with a JSON body telling the client their available balance, and \textbf{must not} wake the on-call SRE at 3:00~AM.
+  \item In our Part~V Axum HTTP API, \texttt{TransferError::InsufficientFunds} maps to HTTP \texttt{422 Unprocessable Entity} with a JSON body telling the client their available balance, and \textbf{must not} wake the on-call Site Reliability Engineer (SRE) at 3:00~AM.
   \item \texttt{TransferError::AccountFrozen} maps to HTTP \texttt{403 Forbidden} and emits a compliance audit event.
   \item \texttt{TransferError::Storage(sql\_err)} means PostgreSQL dropped a connection or timed out; it maps to HTTP \texttt{503 Service Unavailable}, hides internal SQL table names from external clients, and increments a critical Prometheus alert counter.
 \end{itemize}
@@ -1489,7 +1519,7 @@ impl From<SqlError> for TransferError {
 }
 \end{lstlisting}
 
-Notice how clean those three trait implementations are --- zero hidden runtime reflection, zero stack-trace capture overhead on the \texttt{InsufficientFunds} path. Because writing \texttt{Display}, \texttt{Error::source}, and \texttt{From} by hand across twenty enums gets repetitive, David Tolnay's \texttt{thiserror} crate generates \textbf{those exact three trait \texttt{impl} blocks at compile time} with zero runtime dependency overhead:
+Observe how clean those three trait implementations are --- zero hidden runtime reflection, zero stack-trace capture overhead on the \texttt{InsufficientFunds} path. Because writing \texttt{Display}, \texttt{Error::source}, and \texttt{From} by hand across twenty enums gets repetitive, David Tolnay's \texttt{thiserror} crate generates \textbf{those exact three trait \texttt{impl} blocks at compile time} with zero runtime dependency overhead:
 
 \begin{lstlisting}[language=Rust]
 // Identical compiled machine code using `thiserror`:
@@ -1614,7 +1644,7 @@ Alongside private (default) and \texttt{pub} (exported to the entire world), use
 
 \subsection{Compiler Guardrails with \texttt{\#[must\_use]}}
 
-Have you ever wondered how \texttt{rustc} knows to print \texttt{warning: unused `Result` that must be used} whenever you forget \texttt{?} on a fallible call? There is no compiler special-casing for \texttt{Result}. In the standard library, \texttt{Result} is simply annotated with the attribute \texttt{\#[must\_use]}.
+Have you ever wondered how \texttt{rustc} knows to print \texttt{warning: unused `Result` that must be used} whenever you forget \texttt{?} on a fallible call? There is no compiler special-casing for \texttt{Result}. In the standard library, \texttt{Result} is annotated with the attribute \texttt{\#[must\_use]}.
 
 You can --- and should --- place \texttt{\#[must\_use = "reason"]} on your own pure value transformations, builders, and domain receipts. Consider an immutable money operation or settlement receipt:
 
@@ -1712,6 +1742,29 @@ Rust ships a first-class test runner inside \texttt{cargo test} with zero extern
 
 Let us see conservation-law testing in action on a classic ledger problem: splitting a total fee of \texttt{total\_cents} equally across \texttt{n} participating sub-accounts without floating-point rounding drift. Using integer division and remainder (\texttt{div\_euclid} and \texttt{rem\_euclid}), the first \texttt{rem} accounts receive \texttt{q + 1} cents and the remaining \texttt{n - rem} accounts receive \texttt{q} cents:
 
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    font=\small,
+    box/.style={draw, rounded corners=2pt, thick, align=center, inner xsep=8pt, inner ysep=6pt},
+    arr/.style={-{Stealth[length=2.5mm,width=1.8mm]}, thick, draw=sourceblue!85!black}
+]
+  \node[box, draw=sourceblue!85!black, fill=sourceblue!4] (total) at (0, 0) {\textbf{Total Fee}\\100 cents};
+  \node[box, draw=targetgreen!80!black, fill=targetgreen!4] (b1) at (5, 1.5) {Bucket 0\\ \textbf{34 cents}};
+  \node[box, draw=targetgreen!80!black, fill=targetgreen!4] (b2) at (5, 0) {Bucket 1\\ \textbf{33 cents}};
+  \node[box, draw=targetgreen!80!black, fill=targetgreen!4] (b3) at (5, -1.5) {Bucket 2\\ \textbf{33 cents}};
+
+  \draw[arr] (total.east) -- (b1.west);
+  \draw[arr] (total.east) -- (b2.west);
+  \draw[arr] (total.east) -- (b3.west);
+  
+  \node[right=0.2cm of b2] (sum) {\textbf{$\Sigma = 100$}};
+\end{tikzpicture}
+\caption{Conservation of money during fee allocation. The total of 100 cents is split exactly across 3 accounts, distributing the remainder of 1 cent to the first bucket and avoiding any fractional cent losses.}
+\label{ch08:fig-conservation}
+\end{figure}
+
+
 \begin{lstlisting}[language=Rust]
 /// Splits `total_cents >= 0` across `buckets > 0` accounts so the shares
 /// sum to `total_cents` to the exact cent with at most 1-cent difference.
@@ -1804,12 +1857,12 @@ A teammate ported a Java~6 parent-child order-slicing graph (where cancelling a 
 \begin{enumerate}[label=(\alph*)]
   \item Replace the pointer graph with an \texttt{OrderArena} owning \texttt{Vec<Slot<OrderNode>>} and an 8-byte \texttt{Copy} handle \texttt{OrderKey \{ index: u32, generation: u32 \}}.
   \item Implement \texttt{insert}, \texttt{remove} (with embedded free-list and saturating generation increment), \texttt{get}, \texttt{get\_mut}, and \texttt{get\_two\_mut} using \texttt{split\_at\_mut}.
-  \item Implement \texttt{fill\_\allowbreak{}slice(\&mut self,\allowbreak\ slice: OrderKey,\allowbreak\ qty: u64)} and write two unit tests. The first test should verify parent \texttt{remaining\_\allowbreak{}qty} rollup without panicking, and the second should prove that recycling a removed slot causes the old \texttt{OrderKey} to return \texttt{None} (ABA protection).
+  \item Implement \texttt{fill\_slice} (taking \texttt{\&mut self}, \texttt{slice: OrderKey}, \texttt{qty: u64}) and write two unit tests. The first tests parent \texttt{remaining\_qty} rollup safely. The second tests ABA protection (recycling a removed slot makes old keys return \texttt{None}).
 \end{enumerate}
 \end{exercise}
 
 \begin{exercise}[Zero-Cost ABA \texttt{RoutingNumber} Newtype]
-US Automated Clearing House (ACH) transfers identify banks via a 9-digit American Bankers Association (ABA) routing transit number $d_1 d_2 d_3 d_4 d_5 d_6 d_7 d_8 d_9$. A string is a valid routing number if and only if it consists of exactly 9 ASCII digits (\texttt{'0'..='9'}) and satisfies the weighted checksum identity
+ACH transfers identify banks via a 9-digit American Bankers Association (ABA) routing transit number $d_1 d_2 d_3 d_4 d_5 d_6 d_7 d_8 d_9$. A string is a valid routing number if and only if it consists of exactly 9 ASCII digits (\texttt{'0'..='9'}) and satisfies the weighted checksum identity
 \[
   \bigl(3(d_1 + d_4 + d_7) + 7(d_2 + d_5 + d_8) + (d_3 + d_6 + d_9)\bigr) \bmod 10 \;=\; 0.
 \]

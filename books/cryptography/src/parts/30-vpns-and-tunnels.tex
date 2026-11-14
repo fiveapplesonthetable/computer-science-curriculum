@@ -1,17 +1,16 @@
 \chapter{VPNs and Tunnels}
 
-In the previous chapter, we secured the radio hop between cellular handsets and base stations. Once traffic leaves the base station and enters the wider internet---or when a remote worker needs to reach an internal network across untrusted links---protection has to span arbitrary IP hops. A virtual private network exposes an encrypted tunnel to the operating system as an ordinary virtual network interface. Its goal is simple to state: carry packets across a public network as if the endpoint were plugged directly into a private one, and protect them in transit. Everything subtle about VPNs lies in the gap between what that abstraction suggests and what the cryptography actually guarantees.
+In the previous chapter, we secured the radio hop between cellular handsets and base stations. Once traffic leaves the base station and enters the wider internet---or when a remote worker needs to reach an internal network across untrusted links---protection has to span arbitrary IP hops. A virtual private network exposes an encrypted tunnel to the operating system as an ordinary virtual network interface. It carries packets across a public network as if the endpoint were plugged directly into a private one, and protects them in transit.
 
-Earlier chapters developed the core primitives: authenticated encryption (Chapter~16), Diffie--Hellman key exchange (Chapter~18), forward secrecy (Chapter~23), elliptic curves (Chapter~21), and the way TLS stitches them into a transport protocol (Chapter~25). A VPN is what you get when you point those same tools at a different target. Instead of protecting one TCP connection between a browser and a web server, a VPN protects \emph{whole packets}---and sometimes whole networks---between two endpoints that have agreed to trust each other.
+Instead of protecting one TCP connection between a browser and a web server (like TLS), a VPN protects \emph{whole packets}---and sometimes whole networks---between two endpoints that have agreed to trust each other. This chapter examines how tunnels work, the threat model they defend against, and the three protocol families used in practice: IPsec, WireGuard, and TLS-based VPNs.
 
-This chapter does three things. First, it nails down precisely what a tunnel is and states the threat model: what a VPN protects, what it leaks anyway, and the popular fictions sold as ``privacy'' features. Second, it works through the three families that matter in practice---IPsec (the old, sprawling, standards-body design), WireGuard (the modern minimal design built on the Noise protocol and Curve25519), and TLS-based VPNs (OpenVPN and friends). Third, it shows you concrete failure modes: a downgrade, a replay, a key-reuse catastrophe, and the difference between encrypting a packet and hiding that you sent it.
 
 \chapterline
 
 \section{What a tunnel actually is}
 \label{ch30:tunnel}
 
-Start with the bare mechanism, no crypto yet. A packet on the Internet has a destination address in its header, and routers along the way read that address to forward it. A \emph{tunnel} is the trick of taking a whole packet---header and all---and stuffing it inside the payload of \emph{another} packet addressed somewhere else. The outer packet travels to that somewhere-else, which unwraps it and releases the inner packet onto a different network. This is called \emph{encapsulation}.
+A packet on the Internet has a destination address in its header, and routers along the way read that address to forward it. A \emph{tunnel} is the trick of taking a whole packet---header and all---and stuffing it inside the payload of \emph{another} packet addressed somewhere else. The outer packet travels to that somewhere-else, which unwraps it and releases the inner packet onto a different network. This is called \emph{encapsulation}.
 
 \begin{intuitionbox}
 Think of mailing a sealed envelope inside another envelope. The inner envelope says ``To Bob, Apartment 4, Internal Mailroom.'' The post office never sees that; it only reads the outer envelope, ``To the Mailroom Building, 5th Avenue.'' The mailroom opens the outer envelope and drops the inner one into Bob's slot. The public postal system routed a letter to an address it could not itself deliver to, by wrapping it in one it could.
@@ -31,17 +30,34 @@ The VPN software encrypts that entire inner packet, then wraps it in an outer pa
 \ttfamily src=198.51.100.4\quad dst=203.0.113.9\quad [ENCRYPTED inner packet]
 \end{center}
 
-\begin{center}
-\begin{tikzpicture}[font=\small,>=Stealth,node distance=4mm]
-\node[draw,rounded corners,fill=blue!4,minimum width=2.4cm,minimum height=1cm,align=center] (alice) {Alice laptop\\\ttfamily 10.0.0.7};
-\node[draw,fill=gray!8,right=22mm of alice,minimum height=1cm,align=center] (net) {coffee-shop\\Wi-Fi + ISP\\\textit{(untrusted)}};
-\node[draw,rounded corners,fill=green!4,right=22mm of net,minimum width=2.4cm,minimum height=1cm,align=center] (gw) {Gateway\\\ttfamily 203.0.113.9};
-\node[draw,rounded corners,fill=green!6,right=14mm of gw,minimum height=1cm,align=center] (srv) {Server\\\ttfamily 10.0.0.50};
-\draw[->] (alice) -- node[above,align=center]{\scriptsize outer pkt\\\scriptsize \{enc inner\}} (net);
-\draw[->] (net) -- node[above,align=center]{\scriptsize same\\\scriptsize ciphertext} (gw);
-\draw[->] (gw) -- node[above,align=center]{\scriptsize decrypted\\\scriptsize inner pkt} (srv);
+Figure~\ref{fig:ch30:tunnel-encapsulation} shows how this encapsulation travels across the network.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\footnotesize, >=Stealth,
+  host/.style={draw, rounded corners=3pt, fill=sourceblue!10, draw=sourceblue!70!black, minimum width=2.3cm, minimum height=1.0cm, align=center},
+  pkt/.style={draw, minimum height=0.5cm, inner sep=2pt, font=\scriptsize\ttfamily}]
+  \node[host] (alice) at (0,0) {Alice's laptop\\\texttt{10.0.0.7}\\(via \texttt{198.51.100.4})};
+  \node[draw=evered!70!black, fill=evered!8, ellipse, minimum width=3.6cm, minimum height=1.2cm, align=center] (net) at (4.6,0) {Untrusted Internet\\(Eve watches here)};
+  \node[host] (gw) at (9.2,0) {VPN gateway\\\texttt{203.0.113.9}};
+  \node[host, fill=targetgreen!10, draw=targetgreen!70!black] (srv) at (13.2,0) {Internal server\\\texttt{10.0.0.50}};
+  \draw[->, thick] (alice) -- (net);
+  \draw[->, thick] (net) -- (gw);
+  \draw[->, thick] (gw) -- (srv);
+  % outer packet on the untrusted path
+  \node[pkt, fill=gray!15, anchor=west] (oh) at (-1.1,-1.6) {src=198.51.100.4 dst=203.0.113.9};
+  \node[pkt, fill=evered!20, right=0pt of oh] (enc) {ENCRYPTED inner packet};
+  \node[font=\scriptsize, right=4pt of enc] {outer packet (what Eve sees)};
+  % inner packet inside the trusted network
+  \node[pkt, fill=targetgreen!15, anchor=west] (ih) at (1.0,-2.5) {src=10.0.0.7 dst=10.0.0.50};
+  \node[pkt, fill=targetgreen!8, right=0pt of ih] (tp) {TCP payload};
+  \node[font=\scriptsize, right=4pt of tp] {inner packet (after the gateway decrypts)};
 \end{tikzpicture}
-\end{center}
+\caption{Tunnel-mode encapsulation. Alice's machine encrypts the whole inner packet (addressed to \texttt{10.0.0.50}) and wraps it in an outer packet addressed to the gateway. On the untrusted path Eve sees only the outer header and ciphertext; the gateway decrypts, unwraps, and forwards the original inner packet onto the internal network.}
+\label{fig:ch30:tunnel-encapsulation}
+\end{figure}
+
+
 
 Two design dimensions fall out of this picture, and they recur in every VPN technology:
 
@@ -57,8 +73,6 @@ A VPN is two ideas glued together: (1) \emph{encapsulation}, a pure networking t
 \section{The threat model, stated precisely}
 \label{ch30:threat}
 
-Before any protocol, pin down who Eve is and what she can do. This is where most public confusion about VPNs lives, so we will be precise.
-
 \textbf{The channel adversary.} The classic VPN adversary is a Dolev--Yao network attacker who controls the path between Alice and the gateway: she sees every outer packet, can drop, reorder, replay, and inject packets, and can read and rewrite anything not cryptographically protected. This is the coffee-shop Wi-Fi snoop, the malicious ISP, the airport router, the nation-state tapping a backbone link. Against \emph{this} adversary a good VPN delivers a lot.
 
 \begin{formalbox}
@@ -69,10 +83,9 @@ A VPN tunnel should provide, for the encapsulated traffic, the same guarantees a
 \item \textbf{Replay resistance.} Eve cannot resubmit a previously valid packet and have it accepted as fresh.
 \item \textbf{Forward secrecy} (for good designs). Compromise of long-term keys today does not decrypt traffic Eve recorded yesterday.
 \end{itemize}
-We will hold every scheme below up to this list.
 \end{formalbox}
 
-Now the part the marketing leaves out. A VPN moves the trust boundary; it does not abolish it.
+A VPN moves the trust boundary; it does not abolish it.
 
 \begin{trapbox}
 \textbf{What a VPN does \emph{not} protect.}
@@ -96,38 +109,42 @@ The first widely deployed tunneling protocol, the Point-to-Point Tunneling Proto
 \section{IPsec: the standards-body design}
 \label{ch30:ipsec}
 
-IPsec is the IETF's answer to ``encrypt IP itself.'' It is not one protocol but a suite, and it is notoriously sprawling---negotiable algorithms, two key-exchange protocol versions, multiple modes. We will extract the usable core.
-
+IPsec is the IETF's answer to ``encrypt IP itself.'' It is not one protocol but a suite, and it is notoriously sprawling---negotiable algorithms, two key-exchange protocol versions, multiple modes. 
 IPsec has two data-plane protocols and a control-plane protocol:
 
 \begin{itemize}
-\item \textbf{AH (Authentication Header)} authenticates a packet but does not encrypt it. Almost nobody uses AH today; it conflicts badly with NAT (it authenticates parts of the outer header that NAT rewrites). We mention it and move on.
+\item \textbf{AH (Authentication Header)} authenticates a packet but does not encrypt it. Almost nobody uses AH today; it conflicts badly with NAT (Network Address Translation, where routers rewrite IP addresses in the outer header), because it authenticates parts of the outer header that NAT rewrites. We mention it and move on.
 \item \textbf{ESP (Encapsulating Security Payload)} is the primary payload carrier: it encrypts \emph{and} authenticates the payload. This is what carries your data.
 \item \textbf{IKE (Internet Key Exchange)} is the handshake that authenticates the peers and derives the keys ESP uses. IKEv2 (RFC 7296) is the modern version; use it, not IKEv1.
 \end{itemize}
 
 \subsection{ESP: the data plane}
 
-A modern ESP packet in tunnel mode, using an AEAD cipher (AES-GCM is the standard choice), looks like this:
+A modern ESP packet in tunnel mode, using an AEAD cipher (AES-GCM is the standard choice), looks like Figure~\ref{fig:ch30:esp-packet}:
 
-\begin{center}
-\begin{tikzpicture}[font=\footnotesize,>=Stealth]
-\def\h{0.9cm}
-\foreach \x/\w/\lbl/\col in {
-  0/2.0/{New IP hdr\\(outer)}/gray!12,
-  2.0/2.1/{ESP hdr:\\SPI \(\concat\) seq}/blue!10,
-  4.1/1.6/{IV /\\nonce}/orange!12,
-  5.7/4.8/{Encrypted:\\inner IP pkt + pad + next-hdr}/green!12,
-  10.5/1.9/{ICV\\(auth tag)}/red!10}{
-  \draw[fill=\col] (\x,0) rectangle (\x+\w,\h);
-  \node[align=center] at (\x+\w/2,\h/2) {\lbl};
-}
-\draw[decorate,decoration={brace,amplitude=5pt,mirror},red!60!black] (2.0,-0.15) -- (10.5,-0.15)
-  node[midway,below=5pt,red!60!black]{\scriptsize covered by integrity check (authenticated)};
-\draw[decorate,decoration={brace,amplitude=5pt},green!50!black] (5.7,\h+0.1) -- (10.5,\h+0.1)
-  node[midway,above=4pt,green!50!black]{\scriptsize encrypted};
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\scriptsize,
+  f/.style={draw, minimum height=0.9cm, align=center, inner sep=2pt}]
+  \node[f, fill=gray!15, minimum width=1.7cm] (ip) at (0,0) {Outer IP\\header};
+  \node[f, fill=sourceblue!15, minimum width=1.1cm, right=0pt of ip] (spi) {SPI\\(32 bits)};
+  \node[f, fill=sourceblue!15, minimum width=1.3cm, right=0pt of spi] (seq) {Sequence\\number};
+  \node[f, fill=quotientorange!15, minimum width=1.2cm, right=0pt of seq] (iv) {IV /\\nonce part};
+  \node[f, fill=evered!15, minimum width=2.2cm, right=0pt of iv] (inner) {Inner IP header\\+ payload};
+  \node[f, fill=evered!15, minimum width=1.6cm, right=0pt of inner] (pad) {Padding, pad\\length, next hdr};
+  \node[f, fill=targetgreen!20, minimum width=1.5cm, right=0pt of pad] (icv) {ICV\\(AEAD tag)};
+  \draw[decorate, decoration={brace, amplitude=5pt}] (spi.north west) -- (seq.north east)
+    node[midway, above=6pt, align=center] {authenticated, not encrypted\\(associated data)};
+  \draw[decorate, decoration={brace, amplitude=5pt, mirror}] (inner.south west) -- (pad.south east)
+    node[midway, below=6pt] {encrypted and authenticated};
+  \draw[decorate, decoration={brace, amplitude=5pt}] (icv.north west) -- (icv.north east)
+    node[midway, above=6pt, align=center] {integrity\\check};
 \end{tikzpicture}
-\end{center}
+\caption{An ESP packet in tunnel mode with an AEAD cipher such as AES-GCM. The SPI and sequence number travel in the clear but are covered by the authentication tag as associated data; the inner packet, padding, and trailer are encrypted; the integrity check value (ICV) is the AEAD tag.}
+\label{fig:ch30:esp-packet}
+\end{figure}
+
+
 
 Two unencrypted header fields carry the state the receiver needs:
 
@@ -139,32 +156,39 @@ Two unencrypted header fields carry the state the receiver needs:
 \begin{whybox}
 \textbf{Why ESP-with-AEAD is secure (as a channel).} ESP with AES-GCM is, packet by packet, just authenticated encryption with associated data. The plaintext is the inner IP packet plus padding plus a ``next header'' byte; the associated data is the ESP header (SPI and sequence number); the nonce is derived from the sequence number. Under the standard AEAD security definition, an adversary without the key cannot (a) distinguish the ciphertext of two equal-length inner packets, giving confidentiality, nor (b) produce any new (header, ciphertext, tag) triple the receiver accepts except with negligible probability, giving integrity. The sequence number, fed into the integrity check and checked against the replay window, upgrades per-packet integrity to \emph{stream} integrity: Eve cannot replay, reorder undetectably, or splice.
 
-The single most important rule: \textbf{the GCM nonce must never repeat under one key.} Because the nonce is built from the per-packet sequence number and the sequence number strictly increases, it never repeats \emph{within} a security association---which is exactly why IKE must rekey before the counter wraps. Repeat a GCM nonce and you leak the XOR of two plaintexts and, far worse, you leak the GHASH authentication key, letting Eve forge arbitrary packets. We will see this failure concretely below.
+The single most important rule: \textbf{the GCM nonce must never repeat under one key.} Because the nonce is built from the per-packet sequence number and the sequence number strictly increases, it never repeats \emph{within} a security association---which is exactly why IKE must rekey before the counter wraps. Repeat a GCM nonce and you leak the XOR of two plaintexts and, far worse, you leak the GHASH authentication key, letting Eve forge arbitrary packets. 
 \end{whybox}
 
 \subsection{IKE: the control plane}
 
-ESP needs keys. IKE is a Diffie--Hellman handshake that authenticates both peers and produces a shared secret, from which all the ESP keys are derived. IKEv2 runs in two exchanges:
+ESP needs keys. IKE is a Diffie--Hellman handshake that authenticates both peers and produces a shared secret, from which all the ESP keys are derived. IKEv2 runs in two exchanges, shown in Figure~\ref{fig:ch30:ikev2-handshake}:
 
 \begin{enumerate}
 \item \textbf{IKE\_SA\_INIT.} The peers do an (anonymous) Diffie--Hellman exchange and negotiate algorithms. After this exchange they share a secret but have not yet proven who they are.
 \item \textbf{IKE\_AUTH.} Under the encryption keys from step 1, each peer proves its identity---by a pre-shared key (PSK), an RSA/ECDSA signature, or EAP---and they set up the first ESP security association.
 \end{enumerate}
 
-\begin{center}
-\begin{tikzpicture}[font=\small,>=Stealth]
-\node[draw=aliceblue!80, fill=aliceblue!12, rounded corners=2pt, minimum width=2.8cm, minimum height=0.6cm] (a) at (0,3.5) {\textbf{Alice (initiator)}};
-\node[draw=bobgreen!80, fill=bobgreen!12, rounded corners=2pt, minimum width=3.2cm, minimum height=0.6cm] (b) at (8.2,3.5) {\textbf{Gateway (responder)}};
-\draw[very thick,aliceblue] (a.south) -- (0,-0.4);
-\draw[very thick,bobgreen] (b.south) -- (8.2,-0.4);
-\draw[->] (0,2.75) -- node[above,font=\scriptsize]{$\mathrm{SA}_i,\ g^a,\ n_i$ \ (proposals + DH share + nonce)} (8.2,2.75);
-\draw[->] (8.2,2.15) -- node[above,font=\scriptsize]{$\mathrm{SA}_r,\ g^b,\ n_r$} (0,2.15);
-\node[draw=structurepurple!70, fill=structurepurple!8, rounded corners=2pt, font=\scriptsize, align=center] at (4.1,1.6) {now both know $g^{ab}$;\ derive $\mathrm{SK}$ keys via PRF};
-\draw[->] (0,1.0) -- node[above,font=\scriptsize]{$\{\,\mathrm{ID}_i,\ \mathrm{AUTH}_i,\ \mathrm{SA}_2,\ \mathrm{TS}\,\}_{\mathrm{SK}}$} (8.2,1.0);
-\draw[->] (8.2,0.4) -- node[above,font=\scriptsize]{$\{\,\mathrm{ID}_r,\ \mathrm{AUTH}_r,\ \mathrm{SA}_2,\ \mathrm{TS}\,\}_{\mathrm{SK}}$} (0,0.4);
-\node[draw=gray!60, fill=gray!8, rounded corners=2pt, font=\scriptsize] at (4.1,-0.15) {child SA established; ESP traffic flows};
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\footnotesize, >=Stealth]
+  \node[draw, fill=aliceblue!12, rounded corners=3pt, minimum width=2.4cm] (I) at (0,0) {Initiator};
+  \node[draw, fill=bobgreen!12, rounded corners=3pt, minimum width=2.4cm] (R) at (9,0) {Responder};
+  \draw[thick, gray] (I.south) -- (0,-6.0);
+  \draw[thick, gray] (R.south) -- (9,-6.0);
+  \node[font=\scriptsize\bfseries, anchor=west] at (-1.9,-0.85) {IKE\_SA\_INIT};
+  \draw[->, thick] (0,-1.3) -- node[above] {HDR, SAi1, KEi $= g^{a}$, Ni} (9,-1.6);
+  \draw[->, thick] (9,-2.2) -- node[above] {HDR, SAr1, KEr $= g^{b}$, Nr} (0,-2.5);
+  \node[font=\scriptsize, align=center, fill=white] at (4.5,-3.05) {both compute $g^{ab}$ and derive $\mathrm{SK}_d, \mathrm{SK}_{a\ast}, \mathrm{SK}_{e\ast}, \mathrm{SK}_{p\ast}$};
+  \node[font=\scriptsize\bfseries, anchor=west] at (-1.9,-3.65) {IKE\_AUTH};
+  \draw[->, thick] (0,-4.1) -- node[above] {HDR, SK\{IDi, AUTH, SAi2, TSi, TSr\}} (9,-4.4);
+  \draw[->, thick] (9,-5.0) -- node[above] {HDR, SK\{IDr, AUTH, SAr2, TSi, TSr\}} (0,-5.3);
+  \node[font=\scriptsize, align=center] at (4.5,-5.8) {first ESP security association (child SA) established};
 \end{tikzpicture}
-\end{center}
+\caption{The IKEv2 handshake. IKE\_SA\_INIT performs an unauthenticated Diffie--Hellman exchange (KE payloads) with fresh nonces Ni and Nr; IKE\_AUTH, protected by the derived keys (SK\{\ldots\}), carries each side's identity and AUTH proof over the transcript and sets up the first ESP security association.}
+\label{fig:ch30:ikev2-handshake}
+\end{figure}
+
+
 
 The shared secret \(g^{ab}\) is fed into a PRF (an HMAC, typically) together with the nonces to derive a key tree: \(\mathrm{SK}_d\) (for deriving child SA keys), \(\mathrm{SK}_{ai}, \mathrm{SK}_{ar}\) (integrity, each direction), \(\mathrm{SK}_{ei}, \mathrm{SK}_{er}\) (encryption, each direction), and \(\mathrm{SK}_{pi}, \mathrm{SK}_{pr}\) (for the AUTH payload). Because the DH exponents \(a,b\) are ephemeral and discarded after the handshake, IKEv2 gives \textbf{forward secrecy}: recording the traffic and later stealing the PSK or signing key does not recover \(g^{ab}\).
 
@@ -287,7 +311,7 @@ In WireGuard there are no certificates, no usernames, no PKI. A peer \emph{is} i
 
 WireGuard's handshake is the \textbf{Noise\_IK} pattern. The names encode the situation: \emph{I} = the initiator's static key is \emph{Immediately} transmitted (encrypted), \emph{K} = the responder's static key is \emph{Known} to the initiator in advance (you configured it). Because the responder's key is known up front, the initiator can encrypt to it from the very first message---no round trip wasted establishing who the responder is.
 
-A Noise handshake threads every key through a running hash and a chaining key. Let us write the core in compact multiplicative group notation (where \(g\) is the Curve25519 base point and \(g^{x}\) stands for the scalar multiple \(xG\) of Chapter~21). Each party has a static keypair \((s, S=g^{s})\) and generates an ephemeral keypair \((e, E=g^{e})\) per handshake. Write \(\mathrm{DH}(x, Y) = Y^{x}\) for the shared point. The handshake performs a sequence of DH operations and mixes each result into a chaining key \(C\) via HKDF:
+A Noise handshake threads every key through a running hash and a chaining key. The core can be written in compact multiplicative group notation (where \(g\) is the Curve25519 base point and \(g^{x}\) stands for the scalar multiple \(xG\) of Chapter~21). Each party has a static keypair \((s, S=g^{s})\) and generates an ephemeral keypair \((e, E=g^{e})\) per handshake. Write \(\mathrm{DH}(x, Y) = Y^{x}\) for the shared point. The handshake performs a sequence of DH operations and mixes each result into a chaining key \(C\) via HKDF:
 
 Figure~\ref{ch30:fig-wireguard-noise} illustrates the Noise\_IK message ladder, showing the sequence of DH
 operations and how each result is folded into the chaining key.
@@ -436,7 +460,7 @@ WireGuard is now in the mainline Linux kernel (since 5.6), and consumer ``VPN ap
 \section{A worked nonce-reuse catastrophe}
 \label{ch30:noncereuse}
 
-The single most important crypto rule in any of these tunnels is ``never reuse a nonce under one key.'' Let us show, with tiny numbers, exactly why a VPN that violates it is not merely weakened but \emph{forgeable}.
+Reusing a nonce under one key makes a VPN not merely weakened but \emph{forgeable}.
 
 Both ChaCha20-Poly1305 and AES-GCM are stream-cipher-plus-polynomial-MAC constructions. The cipher produces a keystream \(Z\) depending only on \((\text{key}, \text{nonce})\); the ciphertext is \(C = P \xor Z\). The tag is a polynomial in the ciphertext evaluated at a secret point.
 
@@ -500,7 +524,7 @@ Everything but \(r\) is known (Eve sees the ciphertexts and tags). She solves th
 \end{figure}
 
 \begin{intuitionbox}
-A miniature of the same algebra over \(\F_{17}\). Imagine a one-block ``tag'' \( \mathrm{tag} = c\cdot r + s \pmod{17}\). One observation is useless: one equation, two unknowns \((r,s)\). But two messages reusing the nonce share \(r,s\):
+A miniature of the same algebra over \(\F_{17}\) uses a one-block ``tag'' \( \mathrm{tag} = c\cdot r + s \pmod{17}\). One observation is useless: one equation, two unknowns \((r,s)\). But two messages reusing the nonce share \(r,s\):
 \[
 \mathrm{tag}_1 = c_1 r + s,\qquad \mathrm{tag}_2 = c_2 r + s \pmod{17}.
 \]
@@ -520,7 +544,7 @@ That \(2^{48}\)-packet figure is the birthday bound from the probability compani
 
 The third family wraps the tunnel inside TLS instead of inventing its own record layer. OpenVPN is the canonical example; ``SSL VPN'' web portals and protocols like AnyConnect are cousins.
 
-The idea: open a TLS connection from client to gateway (Chapter~25 gives you the handshake and record layer for free), then run the encapsulated IP packets \emph{through} that connection. TLS already provides authenticated encryption, forward secrecy (with ephemeral DH), certificate-based authentication, and a battle-tested handshake; the VPN just has to move packets across it.
+The client opens a TLS connection to the gateway, then run the encapsulated IP packets \emph{through} that connection. TLS already provides authenticated encryption, forward secrecy (with ephemeral DH), certificate-based authentication, and a battle-tested handshake; the VPN just has to move packets across it.
 
 OpenVPN actually uses \emph{two} channels: a TLS \emph{control} channel that does the handshake and key negotiation, and a \emph{data} channel that carries the tunneled packets under keys derived from the TLS session. Historically the data channel could run over UDP (lower latency, no head-of-line blocking) with its own packet format, or over TCP.
 
@@ -542,8 +566,37 @@ The split in practice: \textbf{WireGuard} when you control both ends and want sp
 Suppose every primitive is flawless: AEAD with fresh nonces, authenticated forward-secret key exchange, no implementation bugs. Eve \emph{still} sees the outer packets---their sizes, counts, and timing---and that side channel is rich.
 
 \begin{attackbox}
-\textbf{Website fingerprinting.} Loading a web page generates a characteristic burst pattern: a small request, then a sequence of responses whose sizes reflect the page's resources. Even fully encrypted and padded into the tunnel, the \emph{sequence of packet sizes and inter-arrival times} forms a fingerprint. A classifier trained on a closed set of sites can identify which of them you visited through the VPN with accuracy that has been reported above 90\% in lab conditions. The tunnel hid the bytes; it did not hide the shape of the traffic. Defenses (constant-rate padding, traffic shaping) cost bandwidth and latency, which is why most VPNs do not deploy them---and why VPN \(\neq\) anonymity.
+\textbf{Website fingerprinting.} Loading a web page generates a characteristic burst pattern: a small request, then a sequence of responses whose sizes reflect the page's resources. Even fully encrypted and padded into the tunnel, the \emph{sequence of packet sizes and inter-arrival times} forms a fingerprint. A classifier trained on a closed set of sites can identify which of them you visited through the VPN with accuracy that has been reported above 90\% in lab conditions (Figure~\ref{fig:ch30:fingerprinting}). The tunnel hid the bytes; it did not hide the shape of the traffic.
+Defenses (constant-rate padding, traffic shaping) cost bandwidth and latency, which is why most VPNs do not deploy them---and why VPN \(\neq\) anonymity.
 \end{attackbox}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\scriptsize, >=Stealth]
+  % Draw axes
+  \draw[->] (0,0) -- (6,0) node[right] {Time};
+  \draw[->] (0,0) -- (0,2) node[above] {Packet size};
+  
+  % Burst 1 (HTML)
+  \draw[fill=blue!40] (0.2,0) rectangle (0.4,1.5);
+  \draw[fill=blue!40] (0.5,0) rectangle (0.7,0.8);
+  
+  % Burst 2 (Images)
+  \draw[fill=red!40] (1.5,0) rectangle (1.7,1.8);
+  \draw[fill=red!40] (1.8,0) rectangle (2.0,1.9);
+  \draw[fill=red!40] (2.1,0) rectangle (2.3,1.7);
+  
+  % Burst 3 (JS/CSS)
+  \draw[fill=green!40] (3.5,0) rectangle (3.7,1.2);
+  \draw[fill=green!40] (3.8,0) rectangle (4.0,0.6);
+  
+  \node[align=center] at (1, 1.8) {HTML};
+  \node[align=center] at (2, 2.2) {Images};
+  \node[align=center] at (3.8, 1.5) {Scripts};
+\end{tikzpicture}
+\caption{Website fingerprinting. Even though the traffic is encrypted, the sequence of packet sizes and the gaps between bursts create a recognizable signature for a specific web page.}
+\label{fig:ch30:fingerprinting}
+\end{figure}
 
 \begin{attackbox}
 \textbf{The DNS leak and the kill-switch gap.} Two classic operational failures. (1) If the OS resolves hostnames using a configured DNS server \emph{outside} the tunnel, every site name you visit travels in cleartext to that resolver even though the page traffic is encrypted---Eve reads your browsing history from the DNS alone. Fix: route DNS through the tunnel and use the gateway's resolver. (2) If the VPN drops (handshake re-key fails, Wi-Fi flaps) and traffic silently falls back to the raw interface, you leak your real IP and plaintext until it reconnects. The fix is a \emph{kill switch}: a firewall rule that forbids any traffic except through the tunnel, so a dropped VPN means no connectivity rather than a silent leak. These are configuration bugs, not crypto bugs, and they account for most real-world VPN privacy failures.

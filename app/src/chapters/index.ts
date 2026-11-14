@@ -35,7 +35,7 @@ export const chapters: Record<string, Placement[]> = {
   ],
   'algorithms/4': [
     {
-      ref: 'focusbox-2',
+      ref: 'focusbox-1',
       where: 'after',
       fig: 'merge-recursion-tree',
       caption: 'Compare branching factor a against work-decay b^k across recursion levels to see the three regimes of the Master Theorem.',

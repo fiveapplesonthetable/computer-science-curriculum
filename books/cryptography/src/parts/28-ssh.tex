@@ -2,20 +2,20 @@
 
 In Chapter~27, we saw how secure messaging protects asynchronous conversations between people across untrusted relays. Remote system administration poses a related problem: protecting a live, interactive session between an engineer and a machine across an untrusted network. SSH, the \emph{Secure Shell}, brings together nearly every primitive we have built so far -- Diffie-Hellman, RSA, elliptic curves, authenticated encryption, hashes, signatures, and certificates. Together they answer one practical question: \emph{how do I get a trustworthy command line on a machine across a room or across an ocean, over a network I do not control?}
 
-When you type \texttt{ssh alice@server.example.com} and a moment later you are looking at a shell prompt on a machine three thousand miles away, an enormous amount of cryptography has just happened in under a second. A fresh key was negotiated over a hostile network. The remote machine proved it is the one you meant to reach. You proved you are allowed in. And every keystroke from that point forward is encrypted and authenticated, immune to a passive eavesdropper and -- if you set it up right -- to an active attacker sitting in the middle. This chapter takes that second apart.
+When you type \texttt{ssh alice@server.example.com} and a moment later you are looking at a shell prompt on a machine three thousand miles away, the protocol negotiates a fresh key over a hostile network. The remote machine proves it is the one you meant to reach, and you prove you are allowed in. Every keystroke from that point forward is encrypted and authenticated, immune to a passive eavesdropper and to an active attacker sitting in the middle. This chapter explains how.
 
-We will meet Alice (you, at your laptop), the server she wants to reach, and Eve, who controls the network in between -- she can read every packet, drop packets, inject packets, and impersonate either endpoint. Our job is to understand exactly what SSH does to defeat her, where the math comes from, and the fragile moment where SSH quietly hands the security decision back to a human and how often that human gets it wrong.
+Alice (at her laptop) wants to reach a server. Eve controls the network in between: she can read every packet, drop packets, inject packets, and impersonate either endpoint. We will examine what SSH does to defeat Eve, where the math comes from, and the moments where SSH hands the security decision to a human.
 
 \section{What problem SSH solves}
 
 \begin{historybox}
-Before SSH there was \texttt{telnet}, \texttt{rlogin}, \texttt{rsh}, and \texttt{rcp}. All of them sent your password, and then your entire session, in cleartext. On a shared Ethernet segment or a compromised router, anyone running a packet sniffer harvested credentials for free. In 1995 Tatu Ylonen, a researcher at Helsinki University of Technology, watched exactly such a password-sniffing attack run against his network and wrote SSH-1 as a direct replacement. It spread quickly. SSH-1 had real cryptographic flaws (including a CRC-32 integrity check, an unkeyed polynomial checksum that enabled plaintext-insertion attacks), so the protocol was redesigned from scratch as SSH-2, standardized by the IETF in RFCs 4250--4254 (2006). Today ``SSH'' means SSH-2; SSH-1 is dead and should be refused. The dominant implementation, OpenSSH, grew out of the OpenBSD project and now ships on essentially every server on Earth. The primary open challenge today is migrating the installed base to post-quantum hybrid key exchange (combining X25519 with ML-KEM) before store-now-decrypt-later adversaries record traffic for future quantum decryption.
+Before SSH there was \texttt{telnet}, \texttt{rlogin}, \texttt{rsh}, and \texttt{rcp}. All of them sent your password, and then your entire session, in cleartext. On a shared Ethernet segment or a compromised router, anyone running a packet sniffer harvested credentials for free. In 1995 Tatu Ylonen, a researcher at Helsinki University of Technology, watched exactly such a password-sniffing attack run against his network and wrote SSH-1 as a direct replacement. It spread quickly. SSH-1 had real cryptographic flaws (including a CRC-32 integrity check, an unkeyed polynomial checksum that enabled plaintext-insertion attacks), so the protocol was redesigned from scratch as SSH-2, standardized by the IETF (Internet Engineering Task Force) in RFCs 4250--4254 (2006). Today ``SSH'' means SSH-2; SSH-1 is dead and should be refused. The dominant implementation, OpenSSH, grew out of the OpenBSD project and now ships on nearly every server on Earth. The primary open challenge today is migrating the installed base to post-quantum hybrid key exchange (combining X25519 with ML-KEM) before store-now-decrypt-later adversaries record traffic for future quantum decryption.
 \end{historybox}
 
 Every design choice in SSH follows from a single threat model: the network between your laptop and the remote machine is completely untrusted.
 
 \begin{focusbox}
-\textbf{Threat model.} The network between Alice and the server is fully controlled by Eve (a \emph{Dolev-Yao} attacker). She can:
+\textbf{Threat model.} The network between Alice and the server is fully controlled by Eve (a \emph{Dolev-Yao} attacker, named for the 1983 model where the attacker is the network itself). She can:
 \begin{itemize}
   \item read every byte that crosses the wire (passive eavesdropping);
   \item modify, delete, reorder, or replay packets;
@@ -24,13 +24,14 @@ Every design choice in SSH follows from a single threat model: the network betwe
 What Eve \emph{cannot} do: break the underlying primitives (factor RSA moduli, compute discrete logs in the chosen group, find AES keys, find hash collisions in a strong hash), and she cannot read the private keys stored on Alice's laptop or the server. The security goals SSH must meet against this Eve are: \emph{confidentiality} (she learns nothing about the session contents), \emph{integrity} (she cannot alter the session undetected), \emph{server authentication} (Alice reaches the machine she intended, not Eve's impostor), and \emph{client authentication} (only authorized users get a shell).
 \end{focusbox}
 
-There is an asymmetry in ``server authentication.'' For TLS on the web, a certificate authority vouches for \texttt{example.com} so your browser can verify a server it has never seen before. SSH usually has no such authority. That single missing piece -- how Alice knows the server is the real server the very first time she connects -- is the most interesting and most abused part of the whole system, and we will spend a full section on it.
+There is an asymmetry in ``server authentication.'' For TLS on the web, a certificate authority vouches for \texttt{example.com} so your browser can verify a server it has never seen before. SSH usually has no such authority. That single missing piece -- how Alice knows the server is the real server the very first time she connects -- is frequently misconfigured, and we will cover it in a dedicated section.
 
 \section{The three layers of SSH}
 
-SSH-2 is deliberately built as three stacked protocols, each with one job. Keeping them separate is what lets you reason about the system at all.
+SSH-2 is deliberately built as three stacked protocols, each with one job (Figure~\ref{fig:ssh-layers}). Keeping them separate is what lets you reason about the system at all.
 
-\begin{center}
+\begin{figure}[htbp]
+\centering
 \begin{tikzpicture}[font=\small,every node/.style={align=center}]
   \node[draw, fill=blue!6, minimum width=10.5cm, minimum height=1.0cm] (conn) at (0,0)
     {\textbf{Connection protocol} (RFC 4254)\\ multiplexes the encrypted pipe into channels: shells, port forwards, \texttt{scp}, agent};
@@ -44,12 +45,14 @@ SSH-2 is deliberately built as three stacked protocols, each with one job. Keepi
   \draw[->,thick] (trans) -- (auth);
   \draw[->,thick] (auth) -- (conn);
 \end{tikzpicture}
-\end{center}
+\caption{The three stacked protocols of SSH-2. Each layer assumes the layer below it provides a secure foundation.}
+\label{fig:ssh-layers}
+\end{figure}
 
 Read it bottom to top, which is the order events happen:
 
 \begin{enumerate}
-  \item \textbf{Transport layer.} Runs first, on the raw TCP connection. It performs the key exchange, authenticates the \emph{server} (via its host key), and from then on encrypts and MAC-protects everything above it. After this layer finishes you have a secure pipe -- but the server still has no idea who you are.
+  \item \textbf{Transport layer.} Runs first, on the raw TCP (Transmission Control Protocol, the standard for reliable byte streams) connection. It performs the key exchange, authenticates the \emph{server} (via its host key), and from then on encrypts and MAC-protects everything above it. After this layer finishes you have a secure pipe -- but the server still has no idea who you are.
   \item \textbf{User authentication.} Runs \emph{inside} the secure pipe the transport layer built. Now that nobody can eavesdrop, Alice can safely send a password or, far better, prove possession of a private key. This is where \emph{client} authentication lives.
   \item \textbf{Connection protocol.} Once you are authenticated, this layer slices the single encrypted pipe into multiple logical \emph{channels}. One channel carries your interactive shell; another might forward a TCP port; another tunnels your SSH agent. They share the one key-exchanged, encrypted connection.
 \end{enumerate}
@@ -86,11 +89,11 @@ The classic SSH key exchange is Diffie-Hellman; modern OpenSSH defaults to \emph
   signs it: $s = \Sign_{\textit{sk}_H}(H)$, and sends $(\textit{pk}_H,\, f,\, s)$.
   \item Client computes $K = f^{x} \bmod p$, reconstructs the \emph{same} $H$ from the values it already has, and verifies $\Vrfy_{\textit{pk}_H}(H, s)$. If the signature checks out, the server is authenticated.
 \end{enumerate}
-The shared secret is $K$ because $e^{y} = g^{xy} = f^{x} \pmod p$. On the wire and inside $H$, SSH encodes $K$ as an \texttt{mpint} -- a 4-byte length-prefixed, big-endian signed two's-complement integer that prepends a \texttt{0x00} byte whenever $K$'s top bit is $1$. Forgetting that sign byte broke half of all handshakes in several early Curve25519 SSH implementations. The session key material is derived from $H$ and $K$ by hashing, described below. The first exchange hash $H$ doubles as the permanent \emph{session identifier} for the life of the connection.
+The shared secret is $K$ because $e^{y} = g^{xy} = f^{x} \pmod p$. On the wire and inside $H$, SSH encodes $K$ as an \texttt{mpint} -- a 4-byte length-prefixed, big-endian signed two's-complement integer that prepends a \texttt{0x00} byte whenever $K$'s top bit is $1$. Omitting that sign byte broke many handshakes in early Curve25519 SSH implementations. The session key material is derived from $H$ and $K$ by hashing, described below. The first exchange hash $H$ doubles as the permanent \emph{session identifier} for the life of the connection.
 \end{formalbox}
 
 \begin{whybox}
-Why is this man-in-the-middle proof? Plain Diffie-Hellman is \emph{not} -- Eve can run one DH with the client and another with the server, sitting in the middle and reading everything. The single ingredient that fixes this is the server's signature over $H$. Because $H$ commits to $f$ (the server's DH share), to $\textit{pk}_H$, and to both \texttt{KEXINIT} payloads, a valid signature under the host key proves that the owner of $\textit{sk}_H$ chose this DH share $f$ under these negotiated algorithms. If Eve substitutes her own $f' = g^{y'}$ to set up her half of the tunnel, she would have to produce a signature on the corresponding $H'$ under $\textit{sk}_H$ -- which she does not have. Her only option is to present her \emph{own} host key $\textit{pk}_H'$ and sign with it. That signature verifies, and the protocol cannot stop her; the defense moves to the human: \emph{does Alice recognize that host key?} That is trust-on-first-use, and it is the subject of the next section.
+Why is this man-in-the-middle proof? Plain Diffie-Hellman is \emph{not} -- Eve can run one DH with the client and another with the server, sitting in the middle and reading everything. The ingredient that fixes this is the server's signature over $H$. Because $H$ commits to $f$ (the server's DH share), to $\textit{pk}_H$, and to both \texttt{KEXINIT} payloads, a valid signature under the host key proves that the owner of $\textit{sk}_H$ chose this DH share $f$ under these negotiated algorithms. If Eve substitutes her own $f' = g^{y'}$ to set up her half of the tunnel, she would have to produce a signature on the corresponding $H'$ under $\textit{sk}_H$ -- which she does not have. Her only option is to present her \emph{own} host key $\textit{pk}_H'$ and sign with it. That signature verifies, and the protocol cannot stop her; the defense moves to the human: \emph{does Alice recognize that host key?} That is trust-on-first-use, and it is the subject of the next section.
 \end{whybox}
 
 \begin{connectionbox}
@@ -108,7 +111,7 @@ A session needs more than one key. Each direction (client-to-server and server-t
 \text{Enckey}_{C \to S} &= \Hash(K \concat H \concat \texttt{"C"} \concat \textit{session\_id}) \\
 \text{Enckey}_{S \to C} &= \Hash(K \concat H \concat \texttt{"D"} \concat \textit{session\_id}) \\
 \text{MACkey}_{C \to S} &= \Hash(K \concat H \concat \texttt{"E"} \concat \textit{session\_id}) \\
-\text{MACkey}_{S \to C} &= \Hash(K \concat H \concat \texttt{"F"} \concat \textit{session\_id})
+\text{MACkey}_{S \to C} &= \Hash(K \concat H \concat \texttt{"F"} \concat \textit{session\_id}) .
 \end{aligned}
 \]
 
@@ -162,9 +165,10 @@ Once both sides have the six keys, each side sends \texttt{SSH\_MSG\_NEWKEYS} to
 
 \subsection{The Binary Packet Protocol: encrypt and MAC}
 
-Every byte above the transport layer is wrapped in a \emph{binary packet}:
+Every byte above the transport layer is wrapped in a \emph{binary packet} (Figure~\ref{fig:ssh-binary-packet}):
 
-\begin{center}
+\begin{figure}[htbp]
+\centering
 \begin{tikzpicture}[font=\small,node distance=0pt]
   \node[draw,fill=gray!12,minimum height=0.9cm,minimum width=1.8cm] (len) {\shortstack{packet\\length}};
   \node[draw,fill=gray!12,minimum height=0.9cm,minimum width=1.6cm,right=of len] (pad) {\shortstack{pad\\length}};
@@ -176,7 +180,9 @@ Every byte above the transport layer is wrapped in a \emph{binary packet}:
   \draw[decorate,decoration={brace,amplitude=5pt},thick]
     (len.north west) -- (padding.north east) node[midway,above=8pt] {MAC over this (plus sequence number)};
 \end{tikzpicture}
-\end{center}
+\caption{The SSH Binary Packet Protocol format. The MAC covers an implicit sequence number to prevent replay attacks.}
+\label{fig:ssh-binary-packet}
+\end{figure}
 
 The padding (4--255 random bytes) rounds the packet up to a cipher-block multiple and hides the exact payload length. The MAC is computed over an implicit 32-bit \emph{packet sequence number} concatenated with the unencrypted packet -- the sequence number is never transmitted, it is just a counter both sides keep, and including it is what makes each packet's MAC unique and prevents replay and reordering. If Eve drops or duplicates a packet, the sequence numbers desynchronize and the next MAC fails.
 
@@ -187,16 +193,68 @@ The padding (4--255 random bytes) rounds the packet up to a cipher-block multipl
 \begin{walkbox}
 Trace a tiny exchange. Take the toy group $\Z/23\Z$ with generator $g = 5$. Suppose the client draws $x = 6$ and the server draws $y = 15$.
 \begin{itemize}
-  \item Client sends $e = 5^{6} \bmod 23$. Compute: $5^2 = 25 \equiv 2$, $5^3 \equiv 10$, $5^6 = (5^3)^2 = 100 \equiv 100 - 4\cdot23 = 8$. So $e = 8$.
-  \item Server sends $f = 5^{15} \bmod 23$. Compute: $5^{15} = (5^3)^5 = 10^5 \bmod 23$. $10^2 = 100 \equiv 8$, $10^4 \equiv 8^2 = 64 \equiv 64-46 = 18$, $10^5 \equiv 18 \cdot 10 = 180 \equiv 180 - 7\cdot23 = 19$. So $f = 19$.
-  \item Server's secret $K = e^{y} = 8^{15} \bmod 23$. Client's secret $K = f^{x} = 19^{6} \bmod 23$. Check they match: $8^{15} = (g^{x})^{y} = g^{xy} = g^{90}$, and $19^{6} = (g^{y})^{x} = g^{90}$ too. Reduce $g^{90}$: the order of $5$ mod $23$ divides $22$; $5^{22} \equiv 1$, so $g^{90} = g^{90 \bmod 22} = g^{2} = 25 \equiv 2$. Both sides get $K = 2$.
+  \item Client sends $e = 5^{6} \bmod 23$. Compute:
+  \begin{align*}
+    5^2 &= 25 \equiv 2 \pmod{23} \\
+    5^3 &\equiv 10 \pmod{23} \\
+    5^6 &= (5^3)^2 = 100 \equiv 8 \pmod{23} \quad \text{So } e = 8.
+  \end{align*}
+  \item Server sends $f = 5^{15} \bmod 23$. Compute $5^{15} = (5^3)^5 = 10^5 \bmod 23$:
+  \begin{align*}
+    10^2 &= 100 \equiv 8 \pmod{23} \\
+    10^4 &\equiv 8^2 = 64 \equiv 18 \pmod{23} \\
+    10^5 &\equiv 18 \cdot 10 = 180 \equiv 19 \pmod{23} \quad \text{So } f = 19.
+  \end{align*}
+  \item Server's secret $K = e^{y} = 8^{15} \bmod 23$. Client's secret $K = f^{x} = 19^{6} \bmod 23$. Check they match:
+  \begin{align*}
+    8^{15} &= (g^{x})^{y} = g^{xy} = g^{90} \\
+    19^{6} &= (g^{y})^{x} = g^{xy} = g^{90}.
+  \end{align*}
+  Reduce $g^{90}$: the order of $5$ mod $23$ divides $22$. Since $5^{22} \equiv 1 \pmod{23}$, we get
+  \[
+    g^{90} = g^{90 \bmod 22} = g^{2} = 25 \equiv 2 \pmod{23}.
+  \]
+  Both sides get $K = 2$.
 \end{itemize}
 Now the server hashes $H = \Hash(\dots \concat \textit{pk}_H \concat 8 \concat 19 \concat 2)$ and signs it. Eve, watching $e=8$ and $f=19$ on the wire, faces the discrete-log problem $5^{x} \equiv 8$, which for these toy numbers she can brute force ($x=6$) but for a 252-bit curve she cannot. The signature over $H$ is what stops her from swapping $f=19$ for her own value.
 \end{walkbox}
 
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\small, >=stealth, every node/.style={align=center}]
+  \node[draw=aliceblue!80, fill=aliceblue!10, rounded corners=2pt, minimum width=3cm, minimum height=1.5cm] (cl) at (0, 0) {
+    \textbf{Client}\\
+    Picks $x = 6$\\
+    $e = 5^6 \bmod 23 = 8$
+  };
+  \node[draw=bobgreen!80, fill=bobgreen!10, rounded corners=2pt, minimum width=3cm, minimum height=1.5cm] (sv) at (8, 0) {
+    \textbf{Server}\\
+    Picks $y = 15$\\
+    $f = 5^{15} \bmod 23 = 19$
+  };
+  
+  \draw[->, thick, aliceblue!80!black] (cl.east) ++(0, 0.4) -- node[above, font=\footnotesize] {sends $e = 8$} ++(4.9, 0) ;
+  \draw[<-, thick, bobgreen!80!black] (cl.east) ++(0, -0.4) -- node[below, font=\footnotesize] {sends $f = 19$} ++(4.9, 0) ;
+  
+  \node[draw=aliceblue!80, fill=white, rounded corners=2pt, minimum width=3cm, minimum height=1cm] (cl_sec) at (0, -2) {
+    Compute secret:\\
+    $K = 19^6 \bmod 23 = 2$
+  };
+  \node[draw=bobgreen!80, fill=white, rounded corners=2pt, minimum width=3cm, minimum height=1cm] (sv_sec) at (8, -2) {
+    Compute secret:\\
+    $K = 8^{15} \bmod 23 = 2$
+  };
+  \draw[->, thick, gray] (cl) -- (cl_sec);
+  \draw[->, thick, gray] (sv) -- (sv_sec);
+\end{tikzpicture}
+\caption{Trace of the Diffie-Hellman key exchange over the toy group $\Z/23\Z$ with generator $g = 5$.}
+\label{fig:dh-trace-toy}
+\end{figure}
+
+
 \section{Host keys and trust on first use}
 
-This is where SSH differs most from TLS, and where users most often go wrong.
+This is where SSH differs most from TLS, and where misconfigurations often happen.
 
 The server's host key authenticates the server. But where does Alice's laptop learn the \emph{correct} host key? On the web, a certificate authority signs \texttt{example.com}'s key and your browser ships with the CA's key built in, so verification is automatic. Plain SSH has no CA. The first time Alice connects to a new server, her client has nothing to check the host key against. So OpenSSH does the only thing it can: it shows her the key's fingerprint and asks.
 
@@ -292,16 +350,16 @@ The client sends Alice's password to the server through the encrypted tunnel. Th
 \begin{trapbox}
 Password auth has three weaknesses that public keys do not:
 \begin{enumerate}
-  \item \textbf{The password reaches the server in usable form.} A malicious or compromised server -- or an attacker who fooled Alice past a host-key warning -- receives Alice's actual password and can replay it elsewhere (people reuse passwords). With public keys, the server never sees anything reusable.
+  \item \textbf{The password reaches the server in reusable form.} A malicious or compromised server -- or an attacker who fooled Alice past a host-key warning -- receives Alice's actual password and can replay it elsewhere (people reuse passwords). With public keys, the server never sees anything reusable.
   \item \textbf{Online guessing.} The server is exposed to brute-force and credential-stuffing attempts. Internet-facing \texttt{sshd} on port 22 sees thousands of login attempts an hour from botnets. Public keys with no password fallback make guessing pointless: there is nothing to guess in a $2^{256}$ keyspace.
   \item \textbf{Phishing of the secret.} Because the secret is a human-typed string, it can be socially engineered or keylogged. A private key never leaves the laptop.
 \end{enumerate}
-The standard hardening is \texttt{PasswordAuthentication no} in \texttt{sshd\_config}, allowing only public keys.
+The standard defense is \texttt{PasswordAuthentication no} in \texttt{sshd\_config}, allowing only public keys.
 \end{trapbox}
 
 \subsection{Public-key authentication}
 
-This is the right way to use SSH. Alice generates a key pair once. The public key goes into \texttt{\textasciitilde/.ssh/authorized\_keys} on every server she may log into; the private key never leaves her laptop (ideally never leaves a hardware token). To log in, she proves she holds the private key by \emph{signing a challenge that is bound to this specific session}.
+This is the secure way to use SSH. Alice generates a key pair once. The public key goes into \texttt{\textasciitilde/.ssh/authorized\_keys} on every server she may log into; the private key never leaves her laptop (ideally never leaves a hardware token). To log in, she proves she holds the private key by \emph{signing a challenge that is bound to this specific session}.
 
 \begin{formalbox}
 \textbf{SSH public-key authentication (publickey method).} Let $(\textit{pk}_U,\textit{sk}_U)$ be Alice's user key pair and $\textit{session\_id} = H$ the transport-layer exchange hash.
@@ -320,7 +378,7 @@ This is the right way to use SSH. Alice generates a key pair once. The public ke
 \end{formalbox}
 
 \begin{whybox}
-Two design points make this secure and they are easy to miss. First, the signature covers $\textit{session\_id} = H$, which is unique to this connection (it contains both fresh DH shares). So $\sigma$ cannot be replayed onto a different connection -- a captured login signature is worthless against tomorrow's session, whose $H$ differs. This is \emph{channel binding}: the auth proof is welded to the exact encrypted tunnel it was made in. Second, the server only ever sees a \emph{signature}, never the private key, so even a fully malicious server learns nothing it can reuse to impersonate Alice elsewhere. Notice also the literal boolean $\textit{true}$ inside $M$. To avoid prompting for a passphrase or YubiKey touch on five rejected keys in \texttt{\textasciitilde/.ssh/}, the client first probes each candidate key with that flag set to $\textit{false}$ and no signature, signing with $\textit{true}$ only after the server replies \texttt{PK\_OK}. Compare password auth, where a malicious server harvests the reusable secret directly. Channel binding plus a non-reusable proof is precisely why public-key auth resists the malicious-server and the man-in-the-middle cases that password auth does not.
+Two design points secure this authentication. First, the signature covers $\textit{session\_id} = H$, which is unique to this connection (it contains both fresh DH shares). So $\sigma$ cannot be replayed onto a different connection -- a captured login signature is worthless against tomorrow's session, whose $H$ differs. This is \emph{channel binding}: the auth proof is welded to the exact encrypted tunnel it was made in. Second, the server only ever sees a \emph{signature}, never the private key, so even a fully malicious server learns nothing it can reuse to impersonate Alice elsewhere. Notice also the literal boolean $\textit{true}$ inside $M$. To avoid prompting for a passphrase or YubiKey touch on five rejected keys in \texttt{\textasciitilde/.ssh/}, the client first probes each candidate key with that flag set to $\textit{false}$ and no signature, signing with $\textit{true}$ only after the server replies \texttt{PK\_OK}. Compare password auth, where a malicious server harvests the reusable secret directly. Channel binding plus a non-reusable proof is precisely why public-key auth resists the malicious-server and the man-in-the-middle cases that password auth does not.
 \end{whybox}
 
 \begin{connectionbox}
@@ -389,13 +447,14 @@ A private key sitting in \texttt{\textasciitilde/.ssh/id\_ed25519} is a plaintex
 
 \section{The agent, and the risk of forwarding it}
 
-Typing a passphrase on every \texttt{ssh}, \texttt{scp}, and \texttt{git push} is intolerable, so the \texttt{ssh-agent} holds decrypted private keys in memory and performs signatures on request. Your terminals talk to the agent over a local Unix socket; you unlock once. The agent never hands out the key -- it only ever returns \emph{signatures}, which is the right design.
+Typing a passphrase on every \texttt{ssh}, \texttt{scp}, and \texttt{git push} is intolerable, so the \texttt{ssh-agent} holds decrypted private keys in memory and performs signatures on request. Your terminals talk to the agent over a local Unix socket (a communication channel between programs); you unlock once. The agent never hands out the key -- it only ever returns \emph{signatures}, which is the right design.
 
 \subsection{Agent forwarding}
 
-Agent forwarding is where this becomes risky. Alice is logged into server \texttt{A} and from there wants to \texttt{git pull} from a repository or \texttt{ssh} onward to server \texttt{B}, both of which require her key. \emph{Agent forwarding} (\texttt{ssh -A}) makes the agent socket on her laptop reachable from \texttt{A}: processes on \texttt{A} can ask Alice's laptop agent to sign things.
+Agent forwarding is where this becomes risky. Alice is logged into server \texttt{A} and from there wants to \texttt{git pull} from a repository or \texttt{ssh} onward to server \texttt{B}, both of which require her key. \emph{Agent forwarding} (\texttt{ssh -A}) makes the agent socket on her laptop reachable from \texttt{A} (Figure~\ref{fig:ssh-agent-forwarding}): processes on \texttt{A} can ask Alice's laptop agent to sign things.
 
-\begin{center}
+\begin{figure}[htbp]
+\centering
 \begin{tikzpicture}[font=\small,every node/.style={align=center}]
   \node[draw,fill=blue!8,minimum width=2.4cm,minimum height=1cm] (lap) {Alice's\\laptop\\(agent +\\private key)};
   \node[draw,fill=green!8,minimum width=2.4cm,minimum height=1cm,right=3.2cm of lap] (A) {server A\\forwarded\\agent socket};
@@ -405,7 +464,9 @@ Agent forwarding is where this becomes risky. Alice is logged into server \textt
   \node[draw,fill=red!12,minimum width=2.2cm,minimum height=0.8cm,below=0.9cm of A] (eve) {root on A\\(or attacker)};
   \draw[->,thick,red!70!black] (eve) -- (A);
 \end{tikzpicture}
-\end{center}
+\caption{Agent forwarding risks. An attacker with root access on Server A can use the forwarded agent socket to authenticate to Server B as Alice.}
+\label{fig:ssh-agent-forwarding}
+\end{figure}
 
 \begin{attackbox}
 \textbf{Forwarded agents are a hijackable signing oracle.} Whoever can read the forwarded agent socket on \texttt{A} -- which includes \texttt{root} on \texttt{A}, and anyone who has compromised \texttt{A} -- can ask \emph{Alice's} agent to sign \emph{anything} for as long as Alice's session is open. They cannot steal the key, but they do not need to: they can use it. While Alice is connected to \texttt{A}, the attacker silently authenticates to \texttt{B}, to \texttt{C}, to her GitHub, to every machine her key opens, all with valid signatures that look exactly like Alice. The moment you \texttt{ssh -A} into a box you do not fully trust, you have lent your identity to its administrator. This has been the pivot point in real breaches.
@@ -428,7 +489,7 @@ After authentication, the connection protocol multiplexes independent logical \e
 \begin{itemize}
   \item \textbf{Local forward} (\texttt{ssh -L 5432:db.internal:5432 bastion}): your laptop's port 5432 is tunneled, through the SSH connection to \texttt{bastion}, onward to \texttt{db.internal:5432}. You reach an internal database as if it were local, with all traffic encrypted to the bastion.
   \item \textbf{Remote forward} (\texttt{ssh -R 8080:localhost:3000 server}): a port on the \emph{server} forwards back to a service on your laptop -- handy for exposing a local dev server, dangerous if it exposes you.
-  \item \textbf{Dynamic forward} (\texttt{ssh -D 1080 server}): SSH acts as a local SOCKS proxy, sending your browser's traffic out through \texttt{server}. A poor man's VPN.
+  \item \textbf{Dynamic forward} (\texttt{ssh -D 1080 server}): SSH acts as a local SOCKS proxy (a protocol that routes network packets through the server), sending your browser's traffic out through \texttt{server}. A poor man's VPN.
 \end{itemize}
 
 Figure~\ref{ch28:fig-port-forwarding} illustrates how local port forwarding encapsulates arbitrary TCP streams
@@ -482,7 +543,7 @@ and forwarded network ports), securely tunneling traffic to internal services th
 \end{figure}
 
 \begin{applicationbox}
-\textbf{Where SSH shows up.} It is the universal remote-administration tool for Linux and Unix servers -- effectively every cloud instance you will ever touch is reached over SSH. \texttt{scp} and \texttt{sftp} ride the same protocol for file transfer. \texttt{git} over SSH (\texttt{git@github.com}) is how most developers push code; the \texttt{git@} login uses your public key and a forced command. Configuration-management tools (Ansible) drive fleets entirely over SSH. Bastion/jump hosts gate access to private networks. The pattern is always the same: one well-analyzed, server-authenticated, public-key-authenticated encrypted channel, reused for shells, files, ports, and version control. When someone says ``connect to the prod box,'' this chapter describes the cryptography involved.
+\textbf{Where SSH shows up.} It is the universal remote-administration tool for Linux and Unix servers -- effectively every cloud instance you will ever touch is reached over SSH. \texttt{scp} and \texttt{sftp} ride the same protocol for file transfer. \texttt{git} over SSH (\texttt{git@github.com}) is how most developers push code; the \texttt{git@} login uses your public key and a forced command. Configuration-management tools (like Ansible) drive fleets entirely over SSH. Bastion/jump hosts gate access to private networks. The pattern is always the same: one well-analyzed, server-authenticated, public-key-authenticated encrypted channel, reused for shells, files, ports, and version control. When someone says ``connect to the prod box,'' this chapter describes the cryptography involved.
 \end{applicationbox}
 
 \section{Common misconfigurations}
@@ -498,7 +559,7 @@ The protocol is sound; deployments leak through their settings. The high-value i
   \item World-readable or group-writable \texttt{authorized\_keys}, or a writable \texttt{\textasciitilde/.ssh} -- SSH \emph{silently refuses} keys with loose permissions, and a writable \texttt{authorized\_keys} lets a local attacker add their own key. Lock to \texttt{600}/\texttt{700}.
   \item Stale \texttt{authorized\_keys} entries -- an employee leaves, their key stays, and nobody audits. This is the case SSH certificates with short expiry were invented to kill.
   \item \texttt{ForwardAgent yes} globally -- discussed above; turns every box into an agent-hijack opportunity.
-  \item No \texttt{MaxAuthTries}/rate limiting and \texttt{sshd} on the default port wide open -- pair key-only auth with \texttt{fail2ban} or a firewall to cut log noise and slow probing. (Key-only auth is the real defense; rate limiting is hygiene.)
+  \item No \texttt{MaxAuthTries}/rate limiting and \texttt{sshd} on the default port wide open -- pair key-only auth with \texttt{fail2ban} (a log-parsing tool that blocks offending IP addresses) or a firewall to cut log noise and slow probing. (Key-only auth is the real defense; rate limiting is hygiene.)
   \item Reused or backed-up \emph{host} keys across many servers -- if one server's host private key leaks, every server sharing it can be impersonated. Each host gets its own key.
 \end{itemize}
 \end{attackbox}

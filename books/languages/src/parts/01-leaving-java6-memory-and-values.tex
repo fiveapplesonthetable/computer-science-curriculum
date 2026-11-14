@@ -5,16 +5,16 @@ If you spent years writing Java~6, you learned a remarkably productive mental pi
 
 That simplification helped an entire generation ship large business systems without stray C pointer bugs. Yet it hid three steep costs: one in \textbf{hardware performance}, one in \textbf{aliasing and concurrency bugs}, and one in \textbf{type-system honesty}. Every major language designed over the past fifteen years --- Modern C++, Rust, Go, Kotlin, and TypeScript --- responds directly to one or more of those hidden costs.
 
-To see why Rust's ownership rules, C++'s destructors, Kotlin's value classes, and Go's flat structs look the way they do, we first take the lid off the JVM. This chapter goes down to virtual address spaces, stack pointers, 16-byte object headers, 64-byte cache lines, and stop-the-world GC safepoints. From there we climb back up to value semantics, aliasing bugs, \texttt{null}, and exceptions.
+This chapter examines how a computer physically stores and accesses data. It covers memory layout, the hardware costs of following pointers, and how multiple variables pointing to the same data cause bugs. It then shows how unexpected errors occur when a language hides missing values and failures.
 
 \chapterline
 
 \section{The Two Arenas of a Running Process: Stack Frames vs.\ the Heap}
 \label{ch01:stack-vs-heap}
 
-Whether a program came from C, C++, Rust, Go, or the HotSpot JVM, the OS gives the running process the same workspace: a flat, numbered byte array called its \textbf{virtual address space}. On 64-bit Linux or macOS, every pointer is a 64-bit unsigned address (using the low 48 bits in user space, from \texttt{0x0000\_0000\_0000\_0000} to \texttt{0x0000\_7FFF\_FFFF\_FFFF}).
+Whether a program came from C, C++, Rust, Go, or the HotSpot JVM, the OS gives the running process the same workspace: a flat, numbered byte array called its \textbf{virtual address space}. On 64-bit Linux or macOS, every pointer is a 64-bit unsigned address (using the low 48 bits in user space (the memory reserved for the application rather than the operating system kernel), from \texttt{0x0000\_0000\_0000\_0000} to \texttt{0x0000\_7FFF\_FFFF\_FFFF}).
 
-Inside that address space, your program's live data does not float around at random. Aside from read-only machine code (\texttt{.text}), constant literals (\texttt{.rodata}), and static globals (\texttt{.data}/\texttt{.bss}) near the bottom of memory, nearly every byte your code creates at runtime lives in one of two places: \textbf{a thread stack} or \textbf{the heap}.
+Inside that address space, your program's live data does not float around at random. Aside from read-only machine code (\texttt{.text}), constant literals (such as fixed strings in \texttt{.rodata}), and static globals (variables that live for the whole program in \texttt{.data} or \texttt{.bss}) near the bottom of memory, nearly every byte your code creates at runtime lives in one of two places: \textbf{a thread stack} or \textbf{the heap}.
 
 \subsection{How the hardware stack works in two CPU instructions}
 
@@ -25,7 +25,7 @@ Suppose function \texttt{settleBatch()} calls \texttt{computeFee(10000, 25)} in 
 \begin{lstlisting}[language=C]
 #include <stdint.h>
 
-int64_t compute_fee(int64_t amount_cents, int64_t bps) {
+int64_t compute_fee(int64_t amount_cents, int64_t bps) // bps: basis points, 100 bps = 1% {
     int64_t gross = amount_cents * bps;
     int64_t rounded = (gross + 5000) / 10000;
     return rounded;
@@ -34,8 +34,8 @@ int64_t compute_fee(int64_t amount_cents, int64_t bps) {
 
 Even before optimization (where all four numbers stay in x86-64 argument and return registers like \texttt{RDI}, \texttt{RSI}, and \texttt{RAX}), watch how cheap it is when a function needs 32 bytes of local workspace on the stack:
 \begin{enumerate}
-  \item \textbf{Allocate on entry:} The CPU subtracts 32 from the stack pointer register: \texttt{sub rsp, 32}. That single instruction costs about one cycle --- a fraction of a nanosecond --- and a superscalar core often overlaps it with neighboring work. Those 32 bytes at \texttt{[rsp .. rsp+31]} now belong exclusively to this call's \textbf{stack frame}.
-  \item \textbf{Read and write at fixed offsets:} Local variable \texttt{gross} lives at \texttt{[rsp + 8]}; \texttt{rounded} lives at \texttt{[rsp + 16]}. No lookup table, no pointer dereference to a separate block, no lock. And because the top of the stack was touched moments ago by the caller, those exact bytes are almost guaranteed to sit in the CPU core's fastest \textbf{L1 data cache}.
+  \item \textbf{Allocate on entry:} The CPU subtracts 32 from the stack pointer register: \texttt{sub rsp, 32}. That single instruction costs about one cycle --- a fraction of a nanosecond --- and a superscalar core (a processor that executes multiple instructions simultaneously) often overlaps it with neighboring work. Those 32 bytes at \texttt{[rsp .. rsp+31]} now belong exclusively to this call's \textbf{stack frame}.
+  \item \textbf{Read and write at fixed offsets:} Local variable \texttt{gross} lives at \texttt{[rsp + 8]}; \texttt{rounded} lives at \texttt{[rsp + 16]}. No lookup table, no pointer dereference to a separate block, no lock. And because the top of the stack was touched moments ago by the caller, those exact bytes are almost guaranteed to sit in the CPU core's fastest \textbf{L1 data cache} (a small, ultra-fast memory built directly into the processor).
   \item \textbf{Deallocate on return:} Just before \texttt{ret}, the CPU adds 32 back: \texttt{add rsp, 32}. Every local variable in that frame vanishes in a single instruction. There is nothing to scan, nothing to mark, and zero fragmentation left behind.
 \end{enumerate}
 
@@ -128,7 +128,7 @@ That independent arena is \textbf{the heap}. Unlike the stack, heap allocations 
 \label{ch01:fig-stack-vs-heap}
 \end{figure}
 
-Now comes the design fork that separates Java~6 from C, C++, Rust, and Go:
+Java~6 separates from C, C++, Rust, and Go in how it places data in memory:
 \begin{itemize}
   \item In \textbf{C, C++, and Rust}, \emph{you} choose the arena per variable. Every \texttt{struct} (and in Rust, every \texttt{enum} and fixed-size array \texttt{[T; N]}) is a plain \textbf{value} placed directly on the stack by default, or embedded inline inside a parent \texttt{struct} or contiguous heap array (\texttt{Vec<T>}) with zero per-element headers. You pay for a heap pointer (\texttt{malloc}, \texttt{std::unique\_ptr<T>}, \texttt{Box<T>}) only when dynamic size, recursive types, or cross-scope ownership genuinely demand it.
   \item In \textbf{Java~6}, the language makes that choice \emph{by category of type}. Only the eight built-in primitives (\texttt{boolean}, \texttt{byte}, \texttt{short}, \texttt{char}, \texttt{int}, \texttt{long}, \texttt{float}, \texttt{double}) and raw object references can sit directly in stack frames or inline inside arrays. \emph{Every user-defined \texttt{class} instance --- even a tiny two-integer \texttt{Money(long cents, int currencyCode)} pair --- is conceptually a heap-allocated object accessed through a pointer.}
@@ -141,7 +141,7 @@ Modern HotSpot JVMs include a \textbf{Just-In-Time (JIT)} compiler optimization 
 \section{Inside a Java 6 Object: Headers, Alignment, and Pointer Chasing}
 \label{ch01:java-object-layout}
 
-Let us open up a Java~6 object and count every byte. Suppose we are building an order-matching or ledger service and define a clean domain object representing a limit order:
+Suppose we define a domain object representing a limit order in Java~6:
 
 \begin{lstlisting}[language=Java]
 // Java 6 domain class for an order in our financial service
@@ -167,7 +167,7 @@ public final class Order {
 
 How much payload information is actually in one \texttt{Order}? Three 64-bit integers ($3 \times 8 = 24$ bytes), one 32-bit integer ($4$ bytes), and one bit of direction (\texttt{BUY} or \texttt{SELL}, stored nicely in 1 byte in C or Rust): \textbf{$29$ bytes of business information}, padded to \textbf{$32$ bytes} for 8-byte CPU alignment.
 
-Now let us count what a 64-bit HotSpot JVM actually allocates on the heap for \texttt{new Order(...)}.
+Here is what a 64-bit HotSpot JVM allocates on the heap for \texttt{new Order(...)}:
 
 \subsection{The 16-byte HotSpot object header}
 
@@ -184,13 +184,13 @@ To support those promises, a standard 64-bit HotSpot JVM prepends a \textbf{16-b
 \textbf{64-bit HotSpot JVM Object Layout (Uncompressed 64-bit OOPs vs.\ Compressed OOPs).}
 \begin{itemize}
   \item \textbf{Bytes 0..7 --- The Mark Word (8 bytes):} A bit-packed runtime header. It holds lock tag bits (unlocked, biased, stack-locked, or heavyweight \texttt{ObjectMonitor*}), the lazily cached 31-bit \texttt{identityHashCode}, and 4 bits of GC survivor age ($0..15$).
-  \item \textbf{Bytes 8..15 --- The Klass Word (8 bytes raw; 4 bytes with \texttt{-XX:+UseCompressedOops}):} A pointer to the JVM's \texttt{Klass} metadata describing fields, type hierarchy, and virtual method table (\emph{vtable}). With \emph{Compressed Ordinary Object Pointers} enabled (heaps up to $32\text{ GB}$), 8-byte alignment lets a 32-bit offset address $2^{32} \times 8 = 32\text{ GB}$ via $\text{addr} = \text{base} + (\text{oop} \ll 3)$. That shrinks the Klass word to 4 bytes, yielding a \textbf{12-byte header}.
+  \item \textbf{Bytes 8..15 --- The Klass Word (8 bytes raw; 4 bytes with \texttt{-XX:+UseCompressedOops}):} A pointer to the JVM's \texttt{Klass} metadata describing fields, type hierarchy, and virtual method table (\emph{vtable}). With \emph{Compressed Ordinary Object Pointers} enabled (heaps up to $32\text{ GB}$), 8-byte alignment lets a 32-bit offset address $2^{32} \times 8 = 32\text{ GB}$ via \[ \text{addr} = \text{base} + (\text{oop} \ll 3). \]. That shrinks the Klass word to 4 bytes, yielding a \textbf{12-byte header}.
   \item \textbf{Array length (arrays only, +4 bytes):} Every Java array (\texttt{int[]}, \texttt{Object[]}) adds a 4-byte signed 32-bit \texttt{length} field right after the Klass word.
   \item \textbf{8-byte external alignment:} HotSpot rounds the total size of \emph{every} heap object up to a multiple of \textbf{8 bytes}.
 \end{itemize}
 \end{formalbox}
 
-Let us run the exact byte arithmetic on two everyday Java~6 types so the overhead stops being abstract.
+Consider the exact byte arithmetic on two everyday Java~6 types:
 
 \begin{example}[Why \texttt{java.lang.Long} costs $3\times$ its payload]
 Suppose you store ledger balances in a Java~6 list: \texttt{List<Long> balances = new ArrayList<Long>();}. Java~6 generics cannot specialize over primitive \texttt{long}. Every balance is boxed into a \texttt{java.lang.Long} heap object wrapping \texttt{private final long value;} (8 bytes).
@@ -201,7 +201,36 @@ Suppose you store ledger balances in a Java~6 list: \texttt{List<Long> balances 
 Even with compressed pointers, one million \texttt{Long} values in an \texttt{ArrayList<Long>} consume roughly \textbf{28~MB} across a million tiny heap allocations. A primitive \texttt{long[1\_000\_000]} in Java or \texttt{Vec<i64>} in Rust consumes \textbf{8~MB} in one contiguous block.
 \end{example}
 
-Now let us size our \texttt{ArrayList<Order>} containing $N$ orders and compare it byte for byte against the identical data in C or Rust:
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    font=\small,
+    >=Stealth,
+    hdr/.style={draw=trapred!80!black, fill=trapred!14, minimum height=0.6cm, minimum width=2cm, align=center, font=\scriptsize\bfseries},
+    gap/.style={draw=gray!50, fill=gray!12, dashed, minimum height=0.6cm, minimum width=2cm, align=center, font=\scriptsize\itshape, text=gray!70!black},
+    pay/.style={draw=sourceblue!80!black, fill=sourceblue!10, minimum height=0.6cm, minimum width=2cm, align=center, font=\scriptsize\ttfamily}
+  ]
+  % Without Compressed OOPs
+  \node[font=\bfseries, text=trapred!90!black] at (0, 1.5) {Without Compressed OOPs (24B)};
+  \node[hdr] (m1) at (-2.2, 0.8) {Mark Word (8B)};
+  \node[hdr] (k1) at (0, 0.8) {Klass (8B)};
+  \node[pay] (p1) at (2.2, 0.8) {long (8B)};
+  \draw[thick, gray] (m1.south west) rectangle (p1.north east);
+
+  % With Compressed OOPs
+  \node[font=\bfseries, text=trapred!90!black] at (0, -0.5) {With Compressed OOPs (24B)};
+  \node[hdr, minimum width=2.4cm] (m2) at (-2.4, -1.2) {Mark Word (8B)};
+  \node[hdr, minimum width=1.2cm] (k2) at (-0.6, -1.2) {Klass (4B)};
+  \node[gap, minimum width=1.2cm] (g2) at (0.6, -1.2) {pad (4B)};
+  \node[pay, minimum width=2.4cm] (p2) at (2.4, -1.2) {long (8B)};
+  \draw[thick, gray] (m2.south west) rectangle (p2.north east);
+
+\end{tikzpicture}
+\caption{Memory layout of a \texttt{java.lang.Long} instance on a 64-bit JVM. Despite the 8-byte payload, overheads from the object header and 8-byte alignment push the size to 24 bytes per instance.}
+\label{ch01:fig-long-layout}
+\end{figure}
+
+Compare an \texttt{ArrayList<Order>} containing $N$ orders byte for byte against the identical data in C or Rust:
 
 \begin{lstlisting}[language=Rust]
 // Rust (and equivalent C struct): flat 32-byte value, zero headers
@@ -239,7 +268,7 @@ Compare what sits in memory for \texttt{ArrayList<Order>} in Java~6 versus \text
   \item \textbf{In C, C++, or Rust (\texttt{Vec<Order>}):}
     \begin{itemize}
       \item On the stack sits a 24-byte header \texttt{(ptr, len, cap)} --- just three 64-bit machine words, with zero heap allocation for the wrapper itself.
-      \item Following \texttt{ptr} once lands on a \textbf{single contiguous slab of $32 \times N$ bytes} on the heap. \texttt{Order[0]} occupies bytes \texttt{0..31}, \texttt{Order[1]} occupies \texttt{32..63}, and \texttt{Order[2]} occupies \texttt{64..95}. There are zero per-element headers, zero pointer arrays, and zero extra hops to read \texttt{side}.
+      \item Following \texttt{ptr} once lands on a \textbf{single contiguous slab of $32 \times N$ bytes} on the heap. \texttt{Order[0]} uses bytes \texttt{0..31}, \texttt{Order[1]} uses \texttt{32..63}, and \texttt{Order[2]} uses \texttt{64..95}. There are zero per-element headers, zero pointer arrays, and zero extra hops to read \texttt{side}.
     \end{itemize}
 \end{enumerate}
 
@@ -317,7 +346,7 @@ Compare what sits in memory for \texttt{ArrayList<Order>} in Java~6 versus \text
 \begin{labbox}
 \textbf{Check struct padding rules by hand.} Why did our C/Rust \texttt{struct Order} occupy 32 bytes instead of $8 + 8 + 8 + 4 + 1 = 29$ bytes? Under C's layout ABI (\texttt{\#[repr(C)]}), a struct's alignment equals the largest alignment of its fields --- here $8$ bytes for \texttt{u64}/\texttt{i64}. Its total \texttt{sizeof} must also be a multiple of $8$, so that \texttt{Order[1]} in an array \texttt{Order[N]} starts at an 8-byte boundary.
 
-Now test yourself. What if a careless author declared the C fields in alternating order:
+What if a careless author declared the C fields in alternating order:
 \texttt{uint8\_t side; uint64\_t order\_id; uint32\_t quantity; uint64\_t account\_id; int64\_t price\_cents;}?
 Count the internal alignment gaps before each 8-byte field. Byte~0 holds \texttt{side}, followed by \textbf{7 padding bytes} at \texttt{1..7}. Bytes~\texttt{8..15} hold \texttt{order\_id}, bytes~\texttt{16..19} hold \texttt{quantity}, and bytes~\texttt{20..23} add \textbf{4 more padding bytes}. Finally, \texttt{account\_id} sits at \texttt{24..31} and \texttt{price\_cents} at \texttt{32..39}, bloating the struct from \textbf{32 bytes to 40 bytes}. By contrast, Rust's default layout (without \texttt{\#[repr(C)]}) lets \texttt{rustc} reorder fields automatically, giving you the compact 32-byte layout regardless of source order.
 \end{labbox}
@@ -325,24 +354,42 @@ Count the internal alignment gaps before each 8-byte field. Byte~0 holds \texttt
 \section{The Memory Hierarchy: Cache Lines, Prefetchers, and Stop-the-World GC}
 \label{ch01:cache-and-gc}
 
-Seeing that \texttt{ArrayList<Order>} uses roughly $2\times$ the RAM of \texttt{Vec<Order>} is only the mild half of the story. RAM is cheap; \textbf{memory latency} is not. A 4~GHz CPU core executes an \texttt{add} or \texttt{cmp} in \textbf{0.25 nanoseconds}. Fetching one uncached address from main \textbf{Dynamic RAM (DRAM)} takes \textbf{70 to 100 nanoseconds} --- roughly \textbf{300 to 400 CPU cycles} during which dependent execution units sit stalled.
+An \texttt{ArrayList<Order>} uses roughly twice the memory of \texttt{Vec<Order>}. However, \textbf{memory latency} (the time it takes to fetch data) is a larger problem. A 4~GHz CPU core executes an \texttt{add} or \texttt{cmp} in \textbf{0.25 nanoseconds}. Fetching one uncached address from main \textbf{Dynamic RAM (DRAM)} (the standard main memory of the computer) takes \textbf{70 to 100 nanoseconds} --- roughly \textbf{300 to 400 CPU cycles} during which dependent execution units sit stalled.
 
 To bridge that $300\times$ speed gap between silicon registers and off-chip DRAM, every modern x86-64 and ARM64 processor places three levels of on-chip \textbf{Static RAM (SRAM)} caches between the core and main memory:
 
-\begin{center}
-\small
-\begin{tabular}{@{}llll@{}}
-\toprule
-\textbf{Storage Tier} & \textbf{Typical Size} & \textbf{Latency} & \textbf{Human Scale ($1\text{ cycle} = 1\text{ s}$)} \\
-\midrule
-CPU Registers (\texttt{RAX..R15}) & $16 \times 8\text{ B}$ & $0.25\text{ ns}$ ($1$ cyc) & $1\text{ sec}$ (on your desk) \\
-L1 Data Cache (per core) & $32\text{--}48\text{ KB}$ & $\sim 1\text{ ns}$ ($4$ cyc) & $4\text{ sec}$ (across desk) \\
-L2 Cache (per core) & $512\text{ KB--}2\text{ MB}$ & $\sim 3.5\text{ ns}$ ($14$ cyc) & $14\text{ sec}$ (across room) \\
-L3 Cache (shared) & $16\text{--}64\text{ MB}$ & $\sim 12\text{ ns}$ ($45$ cyc) & $45\text{ sec}$ (down the hall) \\
-Main Memory (DRAM) & $16\text{--}512\text{ GB}$ & $\sim 80\text{ ns}$ ($320$ cyc) & $\mathbf{5\text{ min } 20\text{ sec}}$ \\
-\bottomrule
-\end{tabular}
-\end{center}
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    font=\small,
+    >=Stealth,
+    bar/.style={fill=sourceblue!80!black, minimum height=0.4cm, inner sep=0},
+    bartext/.style={anchor=west, font=\scriptsize, text=gray!80!black}
+  ]
+  \node[anchor=east] at (0, 0) {CPU Registers ($16 \times 8\text{B}$)};
+  \node[anchor=east] at (0, -0.6) {L1 Data Cache ($32\text{--}48\text{KB}$)};
+  \node[anchor=east] at (0, -1.2) {L2 Cache ($512\text{KB--}2\text{MB}$)};
+  \node[anchor=east] at (0, -1.8) {L3 Cache ($16\text{--}64\text{MB}$)};
+  \node[anchor=east] at (0, -2.4) {Main Memory ($16\text{--}512\text{GB}$)};
+
+  \draw[bar, fill=targetgreen!80!black] (0.2, -0.2) rectangle +(0.2, 0.4);
+  \node[bartext] at (0.5, 0) {$0.25\text{ ns}$ ($1$ cyc) \quad \textit{Human: $1\text{ s}$ (on your desk)}};
+
+  \draw[bar, fill=targetgreen!80!black] (0.2, -0.8) rectangle +(1.0, 0.4);
+  \node[bartext] at (1.3, -0.6) {$\sim 1\text{ ns}$ ($4$ cyc) \quad \textit{Human: $4\text{ s}$ (across desk)}};
+
+  \draw[bar, fill=quotientorange!90!black] (0.2, -1.4) rectangle +(1.8, 0.4);
+  \node[bartext] at (2.1, -1.2) {$\sim 3.5\text{ ns}$ ($14$ cyc) \quad \textit{Human: $14\text{ s}$ (across room)}};
+
+  \draw[bar, fill=trapred!80!black] (0.2, -2.0) rectangle +(2.6, 0.4);
+  \node[bartext] at (2.9, -1.8) {$\sim 12\text{ ns}$ ($45$ cyc) \quad \textit{Human: $45\text{ s}$ (down the hall)}};
+
+  \draw[bar, fill=trapred!80!black] (0.2, -2.6) rectangle +(3.85, 0.4);
+  \node[bartext] at (4.15, -2.4) {$\sim 80\text{ ns}$ ($320$ cyc) \quad \textit{\textbf{Human: $5\text{ min } 20\text{ sec}$}}};
+\end{tikzpicture}
+\caption{Memory hierarchy latency and sizes. If one CPU cycle felt like one second, fetching an uncached value from main memory would take over five minutes.}
+\label{ch01:fig-memory-hierarchy}
+\end{figure}
 
 Look at that last column. Every time your code misses L1, L2, and L3 and goes out to main RAM, the CPU core waits the human equivalent of \textbf{five minutes} for one number to come back.
 
@@ -355,7 +402,7 @@ Two hardware rules turn Figure~\ref{ch01:fig-arraylist-vs-flat} from a tidy memo
   \item \textbf{The hardware stride prefetcher predicts linear scans, not pointer hops.} A silicon unit inside every core watches cache-miss addresses. Once it sees misses at lines $L$, $L+1$, and $L+2$, it streams $L+3, L+4, \dots$ from DRAM into L2/L1 ahead of your loop. In \texttt{ArrayList<Order>}, however, \texttt{elementData[i]} holds an arbitrary heap address. Until \texttt{elementData[i]} arrives from memory, the hardware cannot even tell where \texttt{Order i} lives, defeating prefetching whenever objects sit out of order.
 \end{enumerate}
 
-Let us put real numbers on summing open exposure across $N = 1{,}000{,}000$ resting orders in an in-memory risk check:
+Here are the real numbers for summing open exposure across $N = 1{,}000{,}000$ resting orders in an in-memory risk check:
 
 \begin{lstlisting}[language=Java]
 // Java 6: clean-looking loop, pointer-chasing every iteration
@@ -371,16 +418,18 @@ for (int i = 0; i < orders.size(); i++) {
 \begin{complexitybox}
 \textbf{Back-of-the-envelope scan time ($N = 1{,}000{,}000$ orders).}
 \begin{itemize}
-  \item \textbf{Contiguous \texttt{Vec<Order>} ($32\text{ MB}$ total):} $500{,}000$ sequential 64-byte cache lines. Streaming sequentially at a modest single-core memory bandwidth of $32\text{ GB/s}$ takes $\frac{32\text{ MB}}{32\text{ GB/s}} \approx \mathbf{1.0\text{ millisecond}}$.
-  \item \textbf{Scattered \texttt{ArrayList<Order>} ($\sim 52\text{ MB}$ total after churn):} Scanning \texttt{Object[]} is sequential, but dereferencing $1{,}000{,}000$ scattered \texttt{Order} pointers misses L3 once the working set exceeds L3 size. Even overlapping $\sim 8$ concurrent misses via out-of-order execution, $1{,}000{,}000 \times \frac{80\text{ ns}}{8} \approx \mathbf{10\text{ to } 35\text{ milliseconds}}$. That is over ten times slower for the exact same arithmetic.
+  \item \textbf{Contiguous \texttt{Vec<Order>} ($32\text{ MB}$ total):} $500{,}000$ sequential 64-byte cache lines. Streaming sequentially at a modest single-core memory bandwidth of $32\,\text{GB/s}$ takes:
+\[ \frac{32\,\text{MB}}{32\,\text{GB/s}} \approx 1.0\,\text{ms}. \]
+  \item \textbf{Scattered \texttt{ArrayList<Order>} ($\sim 52\text{ MB}$ total after churn):} Scanning \texttt{Object[]} is sequential, but dereferencing $1{,}000{,}000$ scattered \texttt{Order} pointers misses L3 once the working set exceeds L3 size. Even overlapping roughly 8 concurrent misses via out-of-order execution, the time is:
+\[ 1{,}000{,}000 \times \frac{80\,\text{ns}}{8} \approx 10\,\text{to } 35\,\text{ms}. \] That is over ten times slower for the exact same arithmetic.
 \end{itemize}
 \end{complexitybox}
 
 \subsection{How Java 6 Garbage Collection actually works --- and why Old Gen hurts tail latency}
 
-If Java~6 allocates nearly everything on the heap, why doesn't \texttt{new Order(...)} feel slow in microbenchmarks? Because HotSpot's allocator is well engineered. Instead of grabbing a global lock on every \texttt{new}, HotSpot gives each thread a private slice of Eden called a \textbf{Thread-Local Allocation Buffer (TLAB)}. Inside a TLAB, \texttt{new Order(...)} is just a bump-pointer addition (\texttt{top += 48}), almost as cheap as bumping a stack pointer.
+In microbenchmarks, \texttt{new Order(...)} does not feel slow because HotSpot's allocator is well engineered. Instead of grabbing a global lock on every \texttt{new}, HotSpot gives each thread a private slice of Eden called a \textbf{Thread-Local Allocation Buffer (TLAB)}. Inside a TLAB, \texttt{new Order(...)} is just a bump-pointer addition (\texttt{top += 48}), almost as cheap as bumping a stack pointer.
 
-The bill arrives later, when Eden fills up. HotSpot's collectors rely on the \textbf{weak generational hypothesis}: \emph{most objects die young}. Temporary strings, request \textbf{Data Transfer Objects (DTOs)}, and boxed numbers usually become unreachable within milliseconds. HotSpot exploits this by splitting the heap into generations:
+The cost is paid later, when Eden fills up. HotSpot's collectors rely on the \textbf{weak generational hypothesis}: \emph{most objects die young}. Temporary strings, request \textbf{Data Transfer Objects (DTOs)} (objects used only to pass data between systems), and boxed numbers usually become unreachable within milliseconds. HotSpot exploits this by splitting the heap into generations:
 
 \begin{enumerate}
   \item \textbf{Minor GC (Eden + Survivor spaces \texttt{S0}/\texttt{S1}):} When Eden fills, the JVM pauses application threads at \textbf{safepoints} and traces live roots from stacks, registers, and globals. It also checks Old-to-Young pointers tracked in a \textbf{card table} (one byte per 512-byte Old region, updated by a \emph{write barrier} on every \texttt{a.f = b}). Only surviving objects are copied into a clean Survivor space; dead objects cost zero work per object.
@@ -473,9 +522,9 @@ In C, passing \texttt{Account *acct} works just like Java's \texttt{Account acct
 \section{Aliasing + Mutation: Why Shared Mutable State Breaks Local Reasoning}
 \label{ch01:aliasing-and-mutation}
 
-Now we reach the idea that the rest of this book keeps returning to. Ask yourself: why did unrestricted reference semantics in Java~6 and raw pointers in C/C++ produce decades of subtle production bugs, even in code written by careful, experienced teams?
+Unrestricted reference semantics in Java~6 and raw pointers in C/C++ produce subtle bugs.
 
-It is \emph{not} aliasing by itself. Ten variables pointing to the same immutable \texttt{java.lang.String} \texttt{"USD"} never cause a bug; nobody can change the characters underneath anyone else, so sharing is $100\%$ safe and saves memory.
+The cause is \emph{not} aliasing by itself. Ten variables pointing to the same immutable \texttt{java.lang.String} \texttt{"USD"} never cause a bug; nobody can change the characters underneath anyone else, so sharing is $100\%$ safe and saves memory.
 
 And it is \emph{not} mutation by itself. Mutating a local primitive counter \texttt{long sum = 0; sum += x;} inside a function never surprises anyone, because no other part of the program holds a pointer to \texttt{sum}.
 
@@ -494,10 +543,10 @@ In Chapter~3, we will watch Rust turn that law into a compile-time type checker.
 
 \subsection{Three single-threaded aliasing bugs}
 
-Newcomers often assume aliasing only matters when multiple threads run in parallel. Not true. Here are three classic single-threaded bugs caused purely by mutating state through one alias while reading or holding invariants through another.
+Aliasing causes bugs even on a single thread. These three bugs occur by mutating state through one alias while reading through another.
 
 \textbf{Bug 1: Mutating a collection while iterating over it.}
-Every Java~6 developer has triggered \texttt{java.util.ConcurrentModificationException} on a single thread with no threads in sight:
+Iterating while mutating triggers a \texttt{ConcurrentModificationException} on a single thread:
 
 \begin{lstlisting}[language=Java]
 // Single-threaded Java 6: crashes at runtime!
@@ -551,12 +600,12 @@ In Java~6, \texttt{final} on a reference field freezes only \emph{the 8-byte poi
 
 \subsection{Multi-threaded shared mutability and Java 6's detached locks}
 
-Now add a second OS thread. In Java~6, two threads can read and mutate any shared heap object simultaneously unless you guard every access manually with \texttt{synchronized} or explicit locks.
+With multiple OS threads in Java~6, two threads can read and mutate any shared heap object simultaneously unless every access is guarded manually with \texttt{synchronized} or explicit locks.
 
 When two threads mutate a shared \texttt{Account} without synchronization, two hardware realities collide with your source code:
 \begin{enumerate}
   \item \textbf{Non-atomic read-modify-write.} \texttt{balanceCents -= cents} compiles to three steps: load \texttt{[rdi+16]} into \texttt{rax}, subtract \texttt{rsi}, and store \texttt{rax} back. Against a $\$100$ balance, two threads can both load $\$100$. Both then subtract $\$80$ and store $\$20$, losing an $\$80$ withdrawal completely. Worse, on 32-bit Java~6 JVMs, an unsynchronized 64-bit \texttt{long} write was not even atomic, risking \emph{word tearing} between its high and low 32 bits.
-  \item \textbf{Store buffers and visibility reordering.} Each core buffers writes in a private \textbf{store buffer} before flushing to cache, and both the JIT and CPU reorder independent loads and stores. Without a memory barrier (\texttt{volatile} or lock acquire/release) creating a \emph{happens-before} edge, Thread~B can read stale values indefinitely or see writes out of program order.
+  \item \textbf{Store buffers and visibility reordering.} Each core buffers writes in a private \textbf{store buffer} before flushing to cache, and both the JIT and CPU reorder independent loads and stores. Without a memory barrier (\texttt{volatile} or lock acquire/release) creating a \emph{happens-before} edge (a memory barrier that forces the CPU to flush and order memory operations), Thread~B can read stale values indefinitely or see writes out of program order.
 \end{enumerate}
 
 Java~6 provides \texttt{synchronized} to enforce mutual exclusion and memory barriers via the object's Mark Word. Yet notice \emph{where} Java~6 attaches the lock relative to the data:
@@ -641,7 +690,7 @@ Look at what compiled without a warning: \textbf{in Java~6 (and C++), a lock is 
 \section{Dishonest Signatures: \texttt{null}, Exceptions, and Hidden Control Flow}
 \label{ch01:null-and-exceptions}
 
-We have inspected the hardware cost of heap objects and the reasoning cost of shared mutability. Now look at the third foundational crack in Java~6's design: \textbf{you cannot trust a method's type signature to tell you what the method returns or how it exits.}
+In Java~6, \textbf{you cannot trust a method's type signature to tell you what the method returns or how it exits.}
 
 Here is a one-line Java~6 repository interface from a payment system:
 
@@ -651,7 +700,7 @@ public interface OrderRepository {
 }
 \end{lstlisting}
 
-Ask a deceptively simple question: \emph{if I call \texttt{Order o = repo.findById(771L);}, what can happen?}
+\emph{If a program calls \texttt{Order o = repo.findById(771L);}, what can happen?}
 
 The return type says \texttt{Order}. In mathematical reality, \texttt{Order} is a lie in two independent directions:
 
@@ -669,10 +718,10 @@ Look at what that conflation breaks:
 
 \subsection{Crack 2: Exceptions as invisible \texttt{goto}s across stack frames}
 
-Now look at the error side of \texttt{findById}. Java~6 actually tried something ambitious with \textbf{checked exceptions} (\texttt{throws SQLException}): forcing the signature to advertise recoverable failures. Every experienced Java~6 engineer knows what happened next in real codebases:
+Java~6 tried to force signatures to advertise recoverable failures with \textbf{checked exceptions} (\texttt{throws SQLException}). In real codebases, this caused three problems:
 \begin{enumerate}
-  \item \textbf{Unchecked exceptions bypass the signature.} Alongside checked \texttt{SQLException}, a call to \texttt{findById} can throw \texttt{NullPointer\allowbreak Exception}, \texttt{IllegalArgument\allowbreak Exception}, \texttt{IllegalState\allowbreak Exception}, Spring/Hibernate's unchecked \texttt{DataAccess\allowbreak Exception}, or \texttt{OutOfMemory\allowbreak Error} --- none of which appear anywhere in the signature.
-  \item \textbf{Interface composition breaks down.} Generic interfaces like \texttt{Runnable.run()} or \texttt{Callable<T>} do not declare \texttt{throws SQLException}, so callbacks cannot propagate checked exceptions cleanly. Developers retaliate by wrapping errors in \texttt{RuntimeException(e)} or swallowing them inside \texttt{catch (Exception e) \{ log.error(e); \}} and continuing with half-mutated state.
+  \item \textbf{Unchecked exceptions bypass the signature.} Alongside checked \texttt{SQLException}, a call to \texttt{findById} can throw unchecked exceptions like \texttt{NullPointerException} or \texttt{OutOfMemoryError} --- none of which appear anywhere in the signature.
+  \item \textbf{Interface composition breaks down.} Interfaces like \texttt{Runnable.run()} do not declare \texttt{throws SQLException}, so callbacks cannot easily propagate checked exceptions. Developers retaliate by wrapping errors in \texttt{RuntimeException(e)} or swallowing them.
   \item \textbf{Non-local stack unwinding fractures invariants.} Every method call in Java~6 is a hidden conditional \texttt{goto} that may jump five stack frames up, leaving partially mutated objects behind unless wrapped in rollback code. Throwing exceptions for expected outcomes like ``insufficient funds'' also pays microsecond-scale \texttt{fillInStackTrace()} costs.
 \end{enumerate}
 
@@ -733,7 +782,7 @@ Read that return type from outside in like plain English:
 \section{How a Compiler Sees Your Code: From Source Text to Silicon}
 \label{ch01:compiler-pipeline}
 
-Throughout this book, we will explain \emph{why} a language allows one program and rejects another. Those rules stop feeling arbitrary the moment you see the five stages a compiler walks through from source file to CPU instructions (Figure~\ref{ch01:fig-compiler-pipeline}):
+A compiler walks through five stages from source file to CPU instructions (Figure~\ref{ch01:fig-compiler-pipeline}):
 
 \begin{enumerate}
   \item \textbf{Source Text to Abstract Syntax Tree (AST).} Your source file starts as a flat string of \textbf{UTF-8} (variable-width Unicode) bytes. The lexer and parser check grammar rules --- matching braces, operator precedence, and keywords --- to build an in-memory \textbf{Abstract Syntax Tree (AST)}. In that tree, \texttt{a + b * c} becomes a \texttt{+} node holding \texttt{a} on the left and \texttt{b * c} on the right.

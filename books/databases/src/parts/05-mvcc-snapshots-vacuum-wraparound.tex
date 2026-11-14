@@ -10,6 +10,35 @@ SELECT SUM(balance_minor) FROM accounts;
 
 Suppose a transfer moves 5,000 cents from Account~A (on block~12) to Account~Z (on block~98,400) while the scan sits at block~40,000. If the scan reads Account~A \emph{before} the debit and reaches block~98,400 \emph{after} the credit commits, it counts those 5,000 cents twice. Flip the block order and 5,000 cents vanish from the audit, even though every single transfer balanced.
 
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex]
+  % Blocks
+  \draw[thick,gray!60,fill=gray!10,rounded corners=2pt] (0, 0) rectangle (2, 1);
+  \node[font=\scriptsize\bfseries] at (1, 0.7) {Block 12 (A)};
+  \node[font=\scriptsize] (A_val) at (1, 0.3) {Balance: \$100};
+  
+  \draw[thick,gray!60,fill=gray!10,rounded corners=2pt] (4, 0) rectangle (6, 1);
+  \node[font=\scriptsize\bfseries] at (5, 0.7) {Block 40,000};
+  \node[font=\scriptsize] at (5, 0.3) {Scan position};
+
+  \draw[thick,gray!60,fill=gray!10,rounded corners=2pt] (8, 0) rectangle (10, 1);
+  \node[font=\scriptsize\bfseries] at (9, 0.7) {Block 98,400 (Z)};
+  \node[font=\scriptsize] (Z_val) at (9, 0.3) {Balance: \$100};
+
+  % Scan arrow
+  \draw[->,very thick,sourceblue] (2.2, -0.5) -- node[below,font=\scriptsize] {Audit Scan} (7.8, -0.5);
+
+  % Transfer arrows
+  \draw[->,very thick,trapred!90!black,bend left=20] (A_val.north) to node[above,font=\scriptsize] {1. Subtract \$50} (2.5, 1.5);
+  \draw[->,very thick,targetgreen!80!black,bend left=20] (7.5, 1.5) to node[above,font=\scriptsize] {2. Add \$50} (Z_val.north);
+\end{tikzpicture}
+\caption{The Read-Write Race. If an audit scan reads Account~A before a \$50 transfer debits it, and reads Account~Z after the transfer credits it, the audit counts the \$50 twice. Without concurrency control, a naive sequential scan over moving money produces an incorrect total.}
+\label{ch05:fig-read-write-race}
+\end{figure}
+
+
+
 Early databases prevented that miscount with two-phase read/write locks. The \texttt{SELECT} locked every page it read, blocking writers until all ten million rows finished scanning, while write locks stalled the scan right back. Throughput collapsed whenever analytics and live payments shared a table.
 
 PostgreSQL takes a different path: \emph{Multi-Version Concurrency Control} (\emph{MVCC}). Under MVCC, \textbf{readers never block writers, and writers never block readers}. Instead of overwriting a row in place while another query might still be reading it, every update writes a fresh version alongside the old one. Transaction IDs stamped on each version tell every reader which copy belongs to its moment in time.
@@ -22,7 +51,7 @@ By the end of this chapter, you will be able to answer five questions from first
   \item Why does PostgreSQL write new row versions right into table pages instead of using a separate undo log, and why does that make a ten-million-row \texttt{ROLLBACK} instant?
   \item How can a 100\% read-only \texttt{SELECT} query dirty thousands of buffer pages and emit megabytes of Write-Ahead Log?
   \item How does a three-number snapshot string like \texttt{740:748:742,745} let an audit query read a frozen point in time while payments commit around it?
-  \item Why does indexing a frequently updated column slow down \emph{every} other index on the table, and how do same-page (HOT) updates avoid that trap?
+  \item Why does indexing a frequently updated column slow down \emph{every} other index on the table, and how do same-page updates (called Heap-Only Tuples, or HOT) avoid that trap?
   \item How can 32-bit transaction counter wraparound make committed rows vanish without touching a byte on disk---and how does tuple freezing prevent it?
 \end{itemize}
 \end{focusbox}
@@ -37,7 +66,7 @@ Once you decide that an \texttt{UPDATE} must not destroy the bytes an older read
 \paragraph{Design A: Overwrite in place and push old bytes to an undo log (Oracle, InnoDB).}
 In InnoDB and Oracle, the main table page holds \emph{only the newest version} of each row. When transaction~$T_2$ changes a balance from \texttt{10000} to \texttt{5000}, the engine writes \texttt{5000} straight into the table page. First, though, it copies the displaced value (``balance was \texttt{10000}'') into a separate \emph{undo log} and links the row header backward to that undo record.
 
-Look at what Design~A optimizes and what it penalizes:
+Design~A optimizes some workloads and penalizes others:
 \begin{itemize}
   \item \textbf{Fast in-place updates for unindexed columns:} If an \texttt{UPDATE} leaves secondary index columns untouched, secondary indexes need no new entries because the row's slot or primary key stayed put.
   \item \textbf{Slow \texttt{ROLLBACK} on big writes:} If a batch \texttt{UPDATE} modifies five million rows and aborts at the end, the engine must walk five million undo records and copy old bytes back into table pages.
@@ -140,7 +169,7 @@ Let us trace each of the four MVCC fields, because PostgreSQL packs a lot of sta
 
 Every writing transaction receives an increasing 32-bit transaction ID (XID, C type \texttt{TransactionId}), such as \texttt{740}. When transaction \texttt{740} runs an \texttt{INSERT}, it stamps \texttt{t\_xmin = 740} and \texttt{t\_xmax = 0} (signaling ``no deleter yet'') into the new tuple's header.
 
-Notice the qualifier: \emph{every writing transaction}. What if your app runs five thousand read-only \texttt{SELECT} queries per second? Spending a 32-bit \texttt{xid} on every read would burn through four billion IDs in days. Instead, PostgreSQL assigns 32-bit XIDs \emph{lazily}. At \texttt{BEGIN}, a session gets only a cheap, backend-local virtual XID. PostgreSQL allocates a permanent 32-bit \texttt{xid} from shared memory only when the session runs its first \texttt{INSERT}, \texttt{UPDATE}, \texttt{DELETE}, \texttt{SELECT FOR UPDATE}, or \texttt{pg\_current\_xact\_id()}.
+\emph{every writing transaction}. Suppose an application runs five thousand read-only \texttt{SELECT} queries per second? Spending a 32-bit \texttt{xid} on every read would burn through four billion IDs in days. Instead, PostgreSQL assigns 32-bit XIDs \emph{lazily}. At \texttt{BEGIN}, a session gets only a cheap, backend-local virtual XID. PostgreSQL allocates a permanent 32-bit \texttt{xid} from shared memory only when the session runs its first \texttt{INSERT}, \texttt{UPDATE}, \texttt{DELETE}, \texttt{SELECT FOR UPDATE}, or \texttt{pg\_current\_xact\_id()}.
 
 \subsection{\texttt{t\_xmax}: Deletion, Update Chains, and Row Locks}
 
@@ -208,7 +237,7 @@ Pause on \texttt{lp = 2} in the lab above: its header says \texttt{t\_xmin = 741
 
 \subsection{The Commit Log (\texttt{pg\_xact}): Two Bits per Transaction}
 
-To answer that question in $O(1)$ time, PostgreSQL keeps a compact commit-status bitmap on disk under \texttt{PGDATA/pg\_xact/} (formerly \texttt{pg\_clog}), cached in shared memory via a Simple LRU (\emph{SLRU}) pool. Because every transaction ends in one of four states, \texttt{pg\_xact} needs just \textbf{2 bits per \texttt{TransactionId}}:
+To answer that question in $O(1)$ time, PostgreSQL keeps a compact commit-status bitmap on disk under \texttt{PGDATA/pg\_xact/} (formerly \texttt{pg\_clog}), cached in shared memory via a Simple LRU (\emph{SLRU}) pool. Because every transaction ends in one of four states, \texttt{pg\_xact} needs \textbf{2 bits per \texttt{TransactionId}}:
 
 \begin{center}
 \small
@@ -272,7 +301,10 @@ Watch out for one naming quirk in PostgreSQL's C code: \texttt{xmin} and \texttt
 
 \begin{definition}[MVCC Snapshot Triple]
 \label{ch05:def-snapshot}
-A PostgreSQL MVCC snapshot $S = (\mathrm{xmin}_S,\; \mathrm{xmax}_S,\; \mathrm{xip}_S)$ captured from \texttt{ProcArray} consists of:
+A PostgreSQL MVCC snapshot $S$ captured from \texttt{ProcArray} consists of the triple:
+\[
+  S = (\mathrm{xmin}_S,\; \mathrm{xmax}_S,\; \mathrm{xip}_S)
+\]
 \begin{enumerate}
   \item $\mathrm{xmin}_S$: the \textbf{lowest still-active} transaction ID across the system at snapshot creation (or $\mathrm{xmax}_S$ if none are active). Every transaction $x < \mathrm{xmin}_S$ has already finished---it either committed before $S$ was taken or aborted.
   \item $\mathrm{xmax}_S$: \textbf{one past the highest completed} (or allocated) transaction ID at snapshot creation. Every transaction $x \ge \mathrm{xmax}_S$ had not even finished (or started) when $S$ was taken, so its effects are unconditionally \emph{invisible} to $S$.
@@ -280,7 +312,7 @@ A PostgreSQL MVCC snapshot $S = (\mathrm{xmin}_S,\; \mathrm{xmax}_S,\; \mathrm{x
 \end{enumerate}
 \end{definition}
 
-Look how cleanly $(\mathrm{xmin}_S, \mathrm{xmax}_S, \mathrm{xip}_S) = (740, 748, \{742, 745\})$ partitions the entire timeline of transactions (Figure~\ref{ch05:fig-snapshot}):
+The triple $(\mathrm{xmin}_S, \mathrm{xmax}_S, \mathrm{xip}_S) = (740, 748, \{742, 745\})$ partitions the entire timeline of transactions (Figure~\ref{ch05:fig-snapshot}):
 \begin{itemize}
   \item Any $x < 740$ (such as \texttt{738}, \texttt{739}): finished before our snapshot. Visible if committed; invisible if aborted.
   \item $x \in [740, 748)$:
@@ -388,7 +420,7 @@ When is a snapshot taken? That single timing choice is the sole difference betwe
 \section{Write Amplification and \texttt{HOT} (Heap-Only Tuple) Updates}
 \label{ch05:hot-updates}
 
-Now flip from the reader's perspective to the B-tree indexes we studied in Chapter~3, and watch a painful consequence of Design~B emerge.
+Consider the B-tree indexes we studied in Chapter~3, where Design~B causes a problem.
 
 Suppose your \texttt{accounts} table has four B-tree indexes:
 \begin{enumerate}
@@ -408,13 +440,58 @@ UPDATE accounts
 
 Old version \texttt{(0,1)} stays put; new version \texttt{(0,2)} lands on the table. Because \texttt{updated\_at} is indexed, \texttt{idx\_accounts\_updated} obviously needs a new entry pointing to \texttt{(0,2)}. What about the other three indexes---\texttt{id}, \texttt{owner\_id}, and \texttt{currency}---whose values \emph{did not change}? Those three indexes currently point only to \texttt{(0,1)}. Without an index update, a future lookup on \texttt{owner\_id = 99} would land on dead \texttt{(0,1)} and miss the row. Consequently, naive in-heap MVCC must insert a new entry into \textbf{every index on the table} pointing to \texttt{(0,2)}.
 
-Updating one 8-byte integer just dirtied one table page \emph{plus four B-tree leaf pages}, emitted five WAL records, and bloated all four indexes. Before PostgreSQL~8.3, that write amplification punished every write-heavy table.
+Updating one 8-byte integer dirtied one table page \emph{plus four B-tree leaf pages}, emitted five WAL records, and bloated all four indexes. Before PostgreSQL~8.3, that write amplification punished every write-heavy table.
+
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\small,>=Latex]
+  % Non-HOT
+  \begin{scope}[shift={(0,0)}]
+    \node[font=\bfseries,sourceblue!90!black] at (2.5, 4.5) {Non-HOT Update};
+    % Indexes
+    \draw[thick,quotientorange!80!black,fill=white,rounded corners=2pt] (0, 1.2) rectangle (1.8, 3.2);
+    \node[font=\scriptsize\bfseries,quotientorange!90!black,align=center] at (0.9, 2.2) {All\\Indexes};
+    
+    % Heap Page
+    \draw[thick,targetgreen!75!black,fill=white,rounded corners=3pt] (2.8, 0.5) rectangle (5.2, 4.0);
+    \node[font=\scriptsize\bfseries,targetgreen!85!black] at (4, 3.7) {Heap Page 0};
+    
+    \node[draw=trapred!75,fill=trapred!8,rounded corners=2pt,font=\scriptsize,minimum width=1.8cm] (v1) at (4, 2.8) {\texttt{(0,1)}};
+    \node[draw=targetgreen!85!black,fill=targetgreen!14,rounded corners=2pt,font=\scriptsize,minimum width=1.8cm] (v2) at (4, 1.4) {\texttt{(0,2)}};
+    
+    \draw[->,thick,quotientorange!90!black] (1.8, 2.8) -- (v1.west);
+    \draw[->,thick,quotientorange!90!black] (1.8, 1.4) -- (v2.west);
+    \draw[->,thick,structurepurple] (v1.south) -- node[right,font=\tiny] {\texttt{t\_ctid}} (v2.north);
+  \end{scope}
+
+  % HOT
+  \begin{scope}[shift={(7.5,0)}]
+    \node[font=\bfseries,sourceblue!90!black] at (2.5, 4.5) {HOT Update};
+    % Indexes
+    \draw[thick,quotientorange!80!black,fill=white,rounded corners=2pt] (0, 1.2) rectangle (1.8, 3.2);
+    \node[font=\scriptsize\bfseries,quotientorange!90!black,align=center] at (0.9, 2.2) {All\\Indexes};
+    
+    % Heap Page
+    \draw[thick,targetgreen!75!black,fill=white,rounded corners=3pt] (2.8, 0.5) rectangle (5.2, 4.0);
+    \node[font=\scriptsize\bfseries,targetgreen!85!black] at (4, 3.7) {Heap Page 0};
+    
+    \node[draw=trapred!75,fill=trapred!8,rounded corners=2pt,font=\scriptsize,minimum width=1.8cm] (v1) at (4, 2.8) {\texttt{(0,1)}};
+    \node[draw=targetgreen!85!black,fill=targetgreen!14,rounded corners=2pt,font=\scriptsize,minimum width=1.8cm] (v2) at (4, 1.4) {\texttt{(0,2)}};
+    
+    \draw[->,thick,quotientorange!90!black] (1.8, 2.8) -- (v1.west);
+    \draw[->,thick,structurepurple] (v1.south) -- node[right,font=\tiny,align=left] {\texttt{t\_ctid}\\\texttt{HOT}} (v2.north);
+  \end{scope}
+\end{tikzpicture}
+\caption{Non-HOT versus HOT updates. Left: When an indexed column changes or the new version lands on a different page, every index on the table must insert a new pointer to \texttt{(0,2)}. Right: When no indexed columns change and the new version fits on the same page, indexes are not touched; they point only to the root \texttt{(0,1)}, and the scan follows the HOT link inside the heap page.}
+\label{ch05:fig-hot-update}
+\end{figure}
 
 \subsection{How \texttt{HOT} Decouples B-Trees from Unindexed Updates}
 
 PostgreSQL~8.3 solved that common case with \textbf{Heap-Only Tuples} (\textbf{HOT}). Suppose we drop \texttt{idx\_accounts\_updated} (updating \emph{only} unindexed \texttt{balance\_minor}), and suppose page~0 still has free space for new version \texttt{(0,2)}.
 
-Look at what already sits inside page~0: a forward link \texttt{t\_ctid = (0,2)} from \texttt{(0,1)} to \texttt{(0,2)}. Chasing \texttt{t\_ctid} across \emph{different} blocks during an index scan would cost extra random disk reads. Chasing \texttt{t\_ctid} \textbf{inside the same 8~KB page already pinned in \texttt{shared\_buffers}}, by contrast, costs zero extra I/O and just a few nanoseconds.
+Look at what already sits inside page~0: a forward link \texttt{t\_ctid = (0,2)} from \texttt{(0,1)} to \texttt{(0,2)}. Chasing \texttt{t\_ctid} across \emph{different} blocks during an index scan would cost extra random disk reads. Chasing \texttt{t\_ctid} \textbf{inside the same 8~KB page already pinned in \texttt{shared\_buffers}}, by contrast, costs zero extra I/O and a few nanoseconds.
 
 PostgreSQL therefore runs a \textbf{HOT update} whenever \emph{both} rules hold:
 \begin{enumerate}
@@ -657,18 +734,20 @@ Here is what would happen if a row were never frozen:
   \item In January, transaction \texttt{100} inserts a founding-capital row into \texttt{journal\_entries}, so the tuple has \texttt{t\_xmin = 100}. It is an immutable historical record; nobody ever updates or deletes it again.
   \item Over the next eight months or so, your payment service runs 100 write transactions per second, advancing $x_{\text{now}}$ past $2{,}147{,}483{,}748$ ($= 2^{31} + 100$).
   \item Now an auditor runs \texttt{SELECT * FROM journal\_entries WHERE id = 1;}. PostgreSQL compares \texttt{t\_xmin = 100} against $x_{\text{now}} = 2{,}147{,}483{,}749$:
-  \[
-    \texttt{(int32)(100 - 2147483749)} \;=\; +2{,}147{,}483{,}647 \;>\; 0 \quad (\text{so } 100 \text{ is in the future}).
-  \]
+  \begin{align*}
+    \texttt{(int32)(100 - 2147483749)} &= +2{,}147{,}483{,}647 \\
+    &> 0 && \text{(so 100 is in the future)}.
+  \end{align*}
   \item No byte on disk has changed, yet \textbf{that committed row disappears from every query}, because \texttt{t\_xmin = 100} moved across the antipode from ``2.1 billion transactions ago'' to ``2.1 billion transactions in the future.''
 \end{enumerate}
 
 \subsection{The Cure: Tuple Freezing, \texttt{relfrozenxid}, and the Safety Shutdown}
 
 PostgreSQL prevents wraparound loss through \textbf{tuple freezing}. Once a committed tuple's \texttt{t\_xmin} is older than \texttt{OldestXmin} and older than \texttt{vacuum\_freeze\_min\_age} (default 50~million XIDs), \texttt{VACUUM} marks it frozen by setting \emph{both} \texttt{xmin} hint bits at once:
-\[
-  \texttt{HEAP\_XMIN\_FROZEN} \;=\; \texttt{HEAP\_XMIN\_COMMITTED} \;\mid\; \texttt{HEAP\_XMIN\_INVALID} \;=\; \texttt{0x0300}.
-\]
+\begin{align*}
+  \texttt{HEAP\_XMIN\_FROZEN} &= \texttt{HEAP\_XMIN\_COMMITTED} \;\mid\; \texttt{HEAP\_XMIN\_INVALID} \\
+  &= \texttt{0x0300}.
+\end{align*}
 (Since PostgreSQL~16, \texttt{VACUUM} also freezes younger tuples opportunistically when it is already writing a full-page image of that page, because the extra freezing then costs almost nothing.) Before PostgreSQL~9.4, freezing overwrote \texttt{t\_xmin} with \texttt{2}, which destroyed forensic history. Setting \texttt{0x0300} instead keeps the original \texttt{t\_xmin} readable in \texttt{pageinspect} while telling every visibility check to treat the tuple as committed infinitely long ago.
 
 Once every tuple on an 8~KB page is frozen, \texttt{VACUUM} also sets the page's \textbf{all-frozen bit} in the Visibility Map (\texttt{\_vm} fork). Later anti-wraparound vacuums skip those pages entirely, so a 50~TB archive table whose old pages are all frozen costs almost nothing to keep safe.
